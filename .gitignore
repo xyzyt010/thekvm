@@ -1,4 +1,8 @@
 /target/
+thekvm-target-*/
+
+# Separate unrelated project sharing the scratch folder.
+/gods-eye/
 
 # Release binaries ship separately; rebuild from source per dist/README.md.
 # Installer scripts and docs stay tracked, binaries stay untracked.
