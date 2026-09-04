@@ -9,10 +9,37 @@ param(
 )
 
 $serviceName = "TheKVM"
+$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $binary = Join-Path $InstallDirectory "kvm-daemon.exe"
 
-if (-not (Test-Path -LiteralPath $binary)) {
-    throw "kvm-daemon.exe was not found at $binary"
+# Require elevation: service registration, Program Files writes, and the
+# firewall rule all need administrator rights.
+$principal = New-Object Security.Principal.WindowsPrincipal(
+    [Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Run this installer from an elevated PowerShell (Run as Administrator)"
+}
+
+# Self-contained install: copy the binaries from the installer directory
+# (release zip or source checkout) into Program Files first.
+$sourceDaemon = Join-Path $scriptDirectory "kvm-daemon.exe"
+$sourceUi = Join-Path $scriptDirectory "kvm-ui.exe"
+if (-not (Test-Path -LiteralPath $sourceDaemon)) {
+    $checkoutDaemon = Join-Path $scriptDirectory "..\..\target\release\kvm-daemon.exe"
+    if (Test-Path -LiteralPath $checkoutDaemon) {
+        $sourceDaemon = (Resolve-Path -LiteralPath $checkoutDaemon).Path
+        $checkoutUi = Join-Path $scriptDirectory "..\..\target\release\kvm-ui.exe"
+        if (Test-Path -LiteralPath $checkoutUi) {
+            $sourceUi = (Resolve-Path -LiteralPath $checkoutUi).Path
+        }
+    } else {
+        throw "kvm-daemon.exe was not found beside $scriptDirectory"
+    }
+}
+New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
+Copy-Item -LiteralPath $sourceDaemon -Destination $binary -Force
+if (Test-Path -LiteralPath $sourceUi) {
+    Copy-Item -LiteralPath $sourceUi -Destination (Join-Path $InstallDirectory "kvm-ui.exe") -Force
 }
 
 New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
@@ -85,4 +112,8 @@ sc.exe description $serviceName "TheKVM privileged receiver service" | Out-Host
 sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/5000/restart/10000 | Out-Host
 sc.exe start $serviceName | Out-Host
 
+# Idempotent firewall rule: replace any previous TheKVM rule.
+Get-NetFirewallRule -DisplayName "TheKVM QUIC and discovery" -ErrorAction SilentlyContinue |
+    Remove-NetFirewallRule -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName "TheKVM QUIC and discovery" -Direction Inbound -Action Allow -Protocol UDP -LocalPort 42110,42111 -Program $binary -Profile Domain,Private | Out-Null
+Write-Host "TheKVM installed to $InstallDirectory and the $serviceName service is running."

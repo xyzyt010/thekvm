@@ -1,9 +1,15 @@
 # TheKVM first-iteration binaries
 
-Two ready-to-run builds of the same 0.1.0 workspace, verified by the
+Two ready-to-run builds of the same 0.1.1 workspace, verified by the
 repository gates on the build machine (Windows `lan-integration.ps1` and
 Linux `lan-integration.sh` both pass, including the six-digit pairing
 verification-code assertions).
+
+The Linux binaries are linked against a glibc 2.35 baseline, so they run on
+Ubuntu 22.04 / Linux Mint 21 and everything newer (Mint 22, Debian 12,
+Fedora, Arch). The Windows and Linux installers are self-contained: they
+copy the binaries from their own directory and, on Linux, auto-install the
+UI's fontconfig dependency via apt/dnf/pacman/zypper/apk.
 
 | Folder | Target | Binaries |
 |---|---|---|

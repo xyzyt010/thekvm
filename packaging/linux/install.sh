@@ -2,7 +2,8 @@
 set -eu
 
 # Install the release binaries and the privileged receiver service. Run this
-# script as root from a source checkout after `cargo build --release`.
+# script as root, either from a source checkout after `cargo build --release`
+# or from an extracted release tarball (binaries beside this script).
 
 DESKTOP_USER=${THEKVM_DESKTOP_USER:-${SUDO_USER:-}}
 while [ "$#" -gt 0 ]; do
@@ -15,33 +16,82 @@ while [ "$#" -gt 0 ]; do
             DESKTOP_USER=$2
             shift 2
             ;;
+        --binary-dir)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "--binary-dir requires a directory" >&2
+                exit 2
+            fi
+            BINARY_DIR_OVERRIDE=$2
+            shift 2
+            ;;
+        --no-dependencies)
+            SKIP_DEPENDENCIES=1
+            shift
+            ;;
         --)
             shift
             break
             ;;
         *)
-            echo "usage: $0 [--desktop-user LOGIN]" >&2
+            echo "usage: $0 [--desktop-user LOGIN] [--binary-dir DIR] [--no-dependencies]" >&2
             exit 2
             ;;
     esac
 done
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "install.sh must be run as root" >&2
+    echo "install.sh must be run as root (try: sudo sh install.sh)" >&2
     exit 1
 fi
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
-RELEASE_DIR=${RELEASE_DIR:-"$PROJECT_DIR/target/release"}
+# Release tarballs place the binaries beside this script; a source checkout
+# keeps them under target/release. Prefer an explicit override, then the
+# script directory, then the checkout build output.
+if [ -n "${BINARY_DIR_OVERRIDE:-}" ]; then
+    RELEASE_DIR=$BINARY_DIR_OVERRIDE
+elif [ -x "$SCRIPT_DIR/kvm-daemon" ]; then
+    RELEASE_DIR=$SCRIPT_DIR
+else
+    PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+    RELEASE_DIR=${RELEASE_DIR:-"$PROJECT_DIR/target/release"}
+fi
 PREFIX=/usr
 DATA_DIR=/var/lib/thekvm
 SERVICE_USER=thekvm
 SERVICE_GROUP=thekvm
 
 if [ ! -x "$RELEASE_DIR/kvm-daemon" ]; then
-    echo "missing $RELEASE_DIR/kvm-daemon; run cargo build --release first" >&2
+    echo "missing $RELEASE_DIR/kvm-daemon" >&2
+    echo "from a source checkout, run cargo build --release first;" >&2
+    echo "from a release tarball, run this script from the extracted directory" >&2
     exit 1
+fi
+
+# The desktop UI needs the system font stack. Install it automatically when a
+# supported package manager is available; pass --no-dependencies to skip.
+if [ -z "${SKIP_DEPENDENCIES:-}" ] && [ -x "$RELEASE_DIR/kvm-ui" ]; then
+    if [ -e /etc/debian_version ] && command -v apt-get >/dev/null 2>&1; then
+        echo "installing UI dependencies with apt-get..."
+        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y libfontconfig1
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "installing UI dependencies with dnf..."
+        dnf install -y fontconfig
+    elif command -v yum >/dev/null 2>&1; then
+        echo "installing UI dependencies with yum..."
+        yum install -y fontconfig
+    elif command -v pacman >/dev/null 2>&1; then
+        echo "installing UI dependencies with pacman..."
+        pacman -Sy --noconfirm fontconfig
+    elif command -v zypper >/dev/null 2>&1; then
+        echo "installing UI dependencies with zypper..."
+        zypper install -y fontconfig
+    elif command -v apk >/dev/null 2>&1; then
+        echo "installing UI dependencies with apk..."
+        apk add fontconfig
+    else
+        echo "warning: no supported package manager found; install the 'fontconfig' system package manually or the UI cannot start" >&2
+    fi
 fi
 
 # The receiver's virtual HID devices are created at the kernel input layer,
@@ -98,12 +148,20 @@ fi
 
 install -D -m 0644 "$SCRIPT_DIR/99-thekvm-uinput.rules" \
     /etc/udev/rules.d/99-thekvm-uinput.rules
-install -D -m 0644 "$SCRIPT_DIR/thekvm.conf" \
-    /etc/modules-load.d/thekvm.conf
+# The modules-load entry is optional in tarballs that omit it; the running
+# modprobe above already covers the current boot.
+if [ -f "$SCRIPT_DIR/thekvm.conf" ]; then
+    install -D -m 0644 "$SCRIPT_DIR/thekvm.conf" \
+        /etc/modules-load.d/thekvm.conf
+fi
 install -D -m 0644 "$SCRIPT_DIR/thekvmd.service" \
     /etc/systemd/system/thekvmd.service
 install -D -m 0644 "$SCRIPT_DIR/thekvm-agent.service" \
     /etc/systemd/system/thekvm-agent.service
+if [ -f "$SCRIPT_DIR/thekvm-agent-user.service" ]; then
+    install -D -m 0644 "$SCRIPT_DIR/thekvm-agent-user.service" \
+        /usr/lib/systemd/user/thekvm-agent-user.service
+fi
 
 if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules || true
