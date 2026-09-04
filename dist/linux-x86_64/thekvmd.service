@@ -1,0 +1,24 @@
+[Unit]
+Description=TheKVM cross-OS KVM receiver daemon
+After=network-online.target systemd-udev-settle.service
+Wants=network-online.target
+ConditionPathExists=/dev/uinput
+
+[Service]
+Type=simple
+User=thekvm
+Group=thekvm
+SupplementaryGroups=input
+ExecStart=/usr/bin/kvm-daemon serve
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/thekvm
+PrivateTmp=yes
+ProtectHome=yes
+DeviceAllow=/dev/uinput rw
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target

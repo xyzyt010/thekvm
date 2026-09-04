@@ -1,0 +1,835 @@
+slint::include_modules!();
+
+use anyhow::{Context, Result};
+use kvm_core::Mode;
+use kvm_protocol::control::{
+    read_response, write_request, ControlRequest, ControlResponse, DaemonStatus, PendingPairing,
+};
+use kvm_protocol::pairing::Identity;
+use kvm_protocol::transport;
+use kvm_protocol::wire::{read_frame, write_frame, WireMessage};
+use sha2::{Digest, Sha256};
+use slint::{ComponentHandle, SharedString};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+struct PendingPair {
+    peer_fingerprint: String,
+    address: String,
+    /// Six-digit code both endpoints derive from the two fingerprints so
+    /// the two users can compare digits instead of hexadecimal strings.
+    verification_code: String,
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let ui = AppWindow::new()?;
+    let pending_pair = Arc::new(Mutex::new(None::<PendingPair>));
+    let startup_dir = data_dir();
+
+    if let Ok(config) = kvm_core::Config::load(&startup_dir.join("config.json")) {
+        ui.set_lock_screen_control(config.allow_lock_screen_control);
+        ui.set_clipboard_enabled(config.clipboard_enabled);
+        ui.set_device_name(SharedString::from(config.device_name.clone()));
+        ui.set_auto_connect_address(SharedString::from(
+            config.auto_connect_address.unwrap_or_default(),
+        ));
+        ui.set_mode_index(match config.mode {
+            kvm_core::Mode::Bidirectional => 0,
+            kvm_core::Mode::ServerClient => 1,
+            kvm_core::Mode::ClientOnly => 2,
+        });
+    }
+
+    let weak = ui.as_weak();
+    let last_invite = Arc::new(Mutex::new(String::new()));
+    let invite_state = last_invite.clone();
+    std::thread::spawn(move || loop {
+        if weak.upgrade().is_none() {
+            break;
+        }
+        match control_request(ControlRequest::Status) {
+            Ok(ControlResponse::Status(status)) => {
+                let port = status.listen_port;
+                let fingerprint = status.fingerprint_hex.clone();
+                set_daemon_status(&weak, status);
+                refresh_invite(&weak, &invite_state, port, &fingerprint);
+                match control_request(ControlRequest::ListPeers) {
+                    Ok(ControlResponse::Peers(peers)) => set_peer_list(&weak, peers),
+                    Ok(other) => set_status(&weak, format!("Unexpected peer list: {other:?}")),
+                    Err(error) => set_status(&weak, format!("Peer list unavailable: {error}")),
+                }
+                if let Ok(ControlResponse::PendingPairings(pairings)) =
+                    control_request(ControlRequest::ListPendingPairings)
+                {
+                    set_incoming_pairing(&weak, pairings);
+                }
+            }
+            Ok(other) => {
+                set_daemon_offline(&weak, format!("Unexpected daemon status: {other:?}"));
+                clear_invite(&weak, &invite_state);
+            }
+            Err(error) => {
+                set_daemon_offline(&weak, format!("Daemon offline: {error}"));
+                clear_invite(&weak, &invite_state);
+            }
+        }
+        // Status is intentionally polled instead of pushed over the local
+        // endpoint so the UI also recovers cleanly when the privileged daemon
+        // restarts, upgrades, or changes active sessions.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    });
+
+    let weak = ui.as_weak();
+    let pending_for_pair = pending_pair.clone();
+    let pair_data_dir = startup_dir.clone();
+    ui.on_pair_with(move |address| {
+        begin_pairing(
+            &weak,
+            &pending_for_pair,
+            &pair_data_dir,
+            address.to_string(),
+            None,
+        );
+    });
+
+    let weak = ui.as_weak();
+    let pending_for_invite = pending_pair.clone();
+    let invite_data_dir = startup_dir.clone();
+    ui.on_pair_from_invite(move |invite| {
+        let weak = weak.clone();
+        match kvm_protocol::invite::parse(&invite) {
+            Ok((target, fingerprint)) if !target.trim().is_empty() => {
+                begin_pairing(
+                    &weak,
+                    &pending_for_invite,
+                    &invite_data_dir,
+                    target,
+                    Some(fingerprint),
+                );
+            }
+            Ok(_) => set_status(
+                &weak,
+                "Invite has no address; enter the peer's LAN IP manually".into(),
+            ),
+            Err(error) => set_status(&weak, format!("Invalid invite: {error}")),
+        }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_discover_lan(move || {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<(String, Option<String>)> {
+                let runtime = tokio::runtime::Runtime::new()?;
+                let peers = runtime.block_on(kvm_protocol::discovery::scan(
+                    std::time::Duration::from_secs(1),
+                ))?;
+                if peers.is_empty() {
+                    return Ok(("No TheKVM receivers found".into(), None));
+                }
+                let text = peers
+                    .iter()
+                    .map(|(address, peer)| {
+                        format!(
+                            "{} · {} · {}",
+                            peer.node_name, address, peer.fingerprint_hex
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let address = (peers.len() == 1).then(|| peers[0].0.to_string());
+                Ok((text, address))
+            })();
+            match result {
+                Ok((text, address)) => set_discovery(&weak, text, address),
+                Err(error) => set_discovery(&weak, format!("Discovery failed: {error}"), None),
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let pending_for_confirm = pending_pair.clone();
+    ui.on_confirm_pairing(move || {
+        let pending = pending_for_confirm
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        let Some(pending) = pending else {
+            set_status(&weak, "No pending pairing".into());
+            return;
+        };
+        let weak = weak.clone();
+        std::thread::spawn(move || match finish_pair(pending) {
+            Ok(fingerprint) => {
+                set_status(&weak, format!("Paired with {fingerprint}"));
+                set_pending(&weak, String::new(), String::new());
+            }
+            Err(error) => set_status(&weak, format!("Pairing failed: {error}")),
+        });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_approve_incoming_pairing(move |fingerprint| {
+        decide_incoming_pairing(&weak, fingerprint.to_string(), true);
+    });
+
+    let weak = ui.as_weak();
+    ui.on_reject_incoming_pairing(move |fingerprint| {
+        decide_incoming_pairing(&weak, fingerprint.to_string(), false);
+    });
+
+    let weak = ui.as_weak();
+    ui.on_revoke_peer(move |fingerprint| {
+        let weak = weak.clone();
+        let fingerprint = fingerprint.to_string();
+        std::thread::spawn(move || {
+            match control_request(ControlRequest::Unpair {
+                fingerprint_hex: fingerprint.clone(),
+            }) {
+                Ok(ControlResponse::Unpaired { .. }) => {
+                    set_status(&weak, format!("Revoked peer {fingerprint}"));
+                    if let Ok(ControlResponse::Peers(peers)) =
+                        control_request(ControlRequest::ListPeers)
+                    {
+                        set_peer_list(&weak, peers);
+                    }
+                }
+                Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+                Ok(other) => set_status(&weak, format!("Unexpected revoke response: {other:?}")),
+                Err(error) => set_status(&weak, format!("Peer revocation failed: {error}")),
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_apply_config(
+        move |allow_lock_screen, mode_index, device_name, auto_address, clipboard_enabled| {
+            let weak = weak.clone();
+            let device_name = device_name.to_string();
+            let auto_address = auto_address.to_string();
+            std::thread::spawn(move || {
+                let mode = match mode_index {
+                    1 => "server-client",
+                    2 => "receiver-only",
+                    _ => "bidirectional",
+                };
+                let daemon =
+                    std::env::var("THEKVM_DAEMON_PATH").unwrap_or_else(|_| "kvm-daemon".into());
+                let mut command = std::process::Command::new(daemon);
+                command.args(["configure", "--mode", mode]);
+                command.arg("--device-name").arg(&device_name);
+                if allow_lock_screen {
+                    command.arg("--allow-lock-screen-control");
+                } else {
+                    command.arg("--disable-lock-screen-control");
+                }
+                if !auto_address.trim().is_empty() {
+                    command.arg("--auto-connect").arg(&auto_address);
+                } else {
+                    command.arg("--clear-auto-connect");
+                }
+                if clipboard_enabled {
+                    command.arg("--enable-clipboard");
+                } else {
+                    command.arg("--disable-clipboard");
+                }
+                let requested_mode = match mode_index {
+                    1 => Mode::ServerClient,
+                    2 => Mode::ClientOnly,
+                    _ => Mode::Bidirectional,
+                };
+                match control_request(ControlRequest::SetConfig {
+                    device_name: Some(device_name.clone()),
+                    mode: Some(requested_mode),
+                    allow_lock_screen_control: Some(allow_lock_screen),
+                    listen_port: None,
+                    layout: None,
+                    auto_connect_address: (!auto_address.trim().is_empty())
+                        .then_some(auto_address.clone()),
+                    clear_auto_connect: auto_address.trim().is_empty(),
+                    clipboard_enabled: Some(clipboard_enabled),
+                }) {
+                    Ok(ControlResponse::Applied { restart_required }) => set_status(
+                        &weak,
+                        if restart_required {
+                            "Configuration saved; restart daemon".into()
+                        } else {
+                            "Configuration saved".into()
+                        },
+                    ),
+                    Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+                    Ok(other) => {
+                        set_status(&weak, format!("Unexpected daemon response: {other:?}"))
+                    }
+                    Err(control_error) => match command.output() {
+                        Ok(output) if output.status.success() => {
+                            set_status(&weak, "Configuration saved (CLI fallback)".into())
+                        }
+                        Ok(output) => set_status(
+                            &weak,
+                            format!(
+                                "Configuration failed: {}; control: {control_error}",
+                                String::from_utf8_lossy(&output.stderr)
+                            ),
+                        ),
+                        Err(error) => set_status(
+                            &weak,
+                            format!("Cannot start daemon: {error}; control: {control_error}"),
+                        ),
+                    },
+                }
+            });
+        },
+    );
+
+    let weak = ui.as_weak();
+    ui.on_import_layout(move |path| {
+        let weak = weak.clone();
+        let path = PathBuf::from(path.to_string());
+        std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let raw = std::fs::read_to_string(&path)
+                    .with_context(|| format!("read layout {}", path.display()))?;
+                let layout: kvm_core::Layout = serde_json::from_str(&raw)
+                    .with_context(|| format!("decode layout {}", path.display()))?;
+                layout.validate().map_err(anyhow::Error::msg)?;
+                match control_request(ControlRequest::GetConfig) {
+                    Ok(ControlResponse::Config(current)) => {
+                        match control_request(ControlRequest::SetConfig {
+                            device_name: Some(current.device_name.clone()),
+                            mode: Some(current.mode),
+                            allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                            listen_port: None,
+                            layout: Some(layout),
+                            auto_connect_address: None,
+                            clear_auto_connect: false,
+                            clipboard_enabled: Some(current.clipboard_enabled),
+                        })? {
+                            ControlResponse::Applied { .. } => Ok(()),
+                            ControlResponse::Error { message } => anyhow::bail!(message),
+                            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+                        }
+                    }
+                    Ok(other) => anyhow::bail!("unexpected daemon config response: {other:?}"),
+                    Err(control_error) => {
+                        let daemon = std::env::var("THEKVM_DAEMON_PATH")
+                            .unwrap_or_else(|_| "kvm-daemon".into());
+                        let output = std::process::Command::new(daemon)
+                            .args(["configure", "--layout"])
+                            .arg(&path)
+                            .output()
+                            .with_context(|| {
+                                format!("start daemon CLI after control error: {control_error}")
+                            })?;
+                        if output.status.success() {
+                            Ok(())
+                        } else {
+                            anyhow::bail!(
+                                "daemon CLI failed: {}",
+                                String::from_utf8_lossy(&output.stderr)
+                            )
+                        }
+                    }
+                }
+            })();
+            match result {
+                Ok(()) => set_status(&weak, "Screen topology imported".into()),
+                Err(error) => set_status(&weak, format!("Topology import failed: {error}")),
+            }
+        });
+    });
+
+    ui.run()?;
+    Ok(())
+}
+
+fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                // Status polling is authoritative. Do not feed the daemon's
+                // mode value back through the user-edit callback every three
+                // seconds, which would otherwise create redundant writes and
+                // restart notifications.
+                ui.set_suppress_config(true);
+                ui.set_connected(true);
+                ui.set_status_text(SharedString::from(format!(
+                    "Daemon online · {} trusted peer(s) · {} active session(s)",
+                    status.peer_count, status.active_session_count
+                )));
+                ui.set_lock_screen_control(status.allow_lock_screen_control);
+                ui.set_clipboard_enabled(status.clipboard_enabled);
+                ui.set_device_name(SharedString::from(status.node_name));
+                ui.set_auto_connect_address(SharedString::from(
+                    status.auto_connect_address.unwrap_or_default(),
+                ));
+                ui.set_mode_index(match status.mode {
+                    Mode::Bidirectional => 0,
+                    Mode::ServerClient => 1,
+                    Mode::ClientOnly => 2,
+                });
+                ui.set_fingerprint(SharedString::from(status.fingerprint_hex));
+                ui.set_suppress_config(false);
+            }
+        }
+    });
+}
+
+fn set_daemon_offline(weak: &slint::Weak<AppWindow>, message: String) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_connected(false);
+                ui.set_status_text(SharedString::from(message));
+                ui.set_incoming_pairing(SharedString::new());
+                ui.set_incoming_pairing_fingerprint(SharedString::new());
+                ui.set_incoming_verification_code(SharedString::new());
+            }
+        }
+    });
+}
+
+fn set_peer_list(weak: &slint::Weak<AppWindow>, peers: Vec<kvm_protocol::pairing::Peer>) {
+    let text = if peers.is_empty() {
+        "No trusted peers".to_owned()
+    } else {
+        peers
+            .iter()
+            .map(|peer| {
+                format!(
+                    "{} · {} · {}",
+                    peer.name,
+                    peer.address.as_deref().unwrap_or("address unknown"),
+                    peer.fingerprint_hex
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_peer_list(SharedString::from(text));
+            }
+        }
+    });
+}
+
+fn set_incoming_pairing(weak: &slint::Weak<AppWindow>, pairings: Vec<PendingPairing>) {
+    let (summary, fingerprint, verification_code) = match pairings.first() {
+        Some(pairing) => {
+            let suffix = if pairings.len() > 1 {
+                format!(" (+{} more)", pairings.len() - 1)
+            } else {
+                String::new()
+            };
+            (
+                format!(
+                    "{} · {} · {}{}",
+                    pairing.node_name, pairing.address, pairing.fingerprint_hex, suffix
+                ),
+                pairing.fingerprint_hex.clone(),
+                pairing.verification_code.clone(),
+            )
+        }
+        None => (String::new(), String::new(), String::new()),
+    };
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_incoming_pairing(SharedString::from(summary));
+                ui.set_incoming_pairing_fingerprint(SharedString::from(fingerprint));
+                ui.set_incoming_verification_code(SharedString::from(verification_code));
+            }
+        }
+    });
+}
+
+fn decide_incoming_pairing(weak: &slint::Weak<AppWindow>, fingerprint: String, approved: bool) {
+    let weak = weak.clone();
+    std::thread::spawn(move || {
+        let request = if approved {
+            ControlRequest::ApprovePairing {
+                fingerprint_hex: fingerprint.clone(),
+            }
+        } else {
+            ControlRequest::RejectPairing {
+                fingerprint_hex: fingerprint.clone(),
+            }
+        };
+        match control_request(request) {
+            Ok(ControlResponse::PairingApproved { .. }) if approved => {
+                set_status(&weak, format!("Approved incoming pairing {fingerprint}"));
+                set_incoming_pairing(&weak, Vec::new());
+            }
+            Ok(ControlResponse::PairingRejected { .. }) if !approved => {
+                set_status(&weak, format!("Rejected incoming pairing {fingerprint}"));
+                set_incoming_pairing(&weak, Vec::new());
+            }
+            Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+            Ok(other) => set_status(&weak, format!("Unexpected pairing decision: {other:?}")),
+            Err(error) => set_status(&weak, format!("Pairing decision failed: {error}")),
+        }
+    });
+}
+
+fn begin_pairing(
+    weak: &slint::Weak<AppWindow>,
+    pending: &Arc<Mutex<Option<PendingPair>>>,
+    data_dir: &std::path::Path,
+    address: String,
+    expected_peer: Option<String>,
+) {
+    let weak = weak.clone();
+    let pending = pending.clone();
+    let data_dir = data_dir.to_owned();
+    std::thread::spawn(move || {
+        let (node_name, daemon_fingerprint) = match control_request(ControlRequest::Status) {
+            Ok(ControlResponse::Status(status)) => (status.node_name, Some(status.fingerprint_hex)),
+            _ => (
+                kvm_core::Config::load(&data_dir.join("config.json"))
+                    .map(|config| config.device_name)
+                    .unwrap_or_else(|_| fallback_node_name()),
+                None,
+            ),
+        };
+        set_peer_address_field(&weak, &address);
+        let result = pair_prepare(
+            &address,
+            &data_dir,
+            &node_name,
+            daemon_fingerprint,
+            expected_peer,
+        );
+        match result {
+            Ok(pair) => {
+                let fingerprint = pair.peer_fingerprint.clone();
+                let code = pair.verification_code.clone();
+                if let Ok(mut slot) = pending.lock() {
+                    *slot = Some(pair);
+                }
+                set_status(
+                    &weak,
+                    format!("Peer verified. Confirm code {code} matches the other machine"),
+                );
+                set_pending(&weak, fingerprint, code);
+            }
+            Err(error) => set_status(&weak, format!("Pairing failed: {error}")),
+        }
+    });
+}
+
+fn set_peer_address_field(weak: &slint::Weak<AppWindow>, address: &str) {
+    let address = SharedString::from(address);
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_peer_address(address.clone());
+            }
+        }
+    });
+}
+
+fn render_invite_qr(invite: &str) -> Result<slint::Image> {
+    let code = qrcode::QrCode::new(invite.as_bytes())
+        .map_err(|error| anyhow::anyhow!("QR encode failed: {error}"))?;
+    let modules = code.width() as u32;
+    let quiet = 4u32;
+    let scale = 6u32;
+    let size = (modules + quiet * 2) * scale;
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(size, size);
+    let dark = slint::Rgba8Pixel {
+        r: 10,
+        g: 10,
+        b: 10,
+        a: 255,
+    };
+    {
+        let pixels = buffer.make_mut_slice();
+        pixels.fill(slint::Rgba8Pixel {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        });
+        for (index, color) in code.to_colors().iter().enumerate() {
+            if matches!(color, qrcode::Color::Dark) {
+                let module_x = index as u32 % modules;
+                let module_y = index as u32 / modules;
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let x = (module_x + quiet) * scale + dx;
+                        let y = (module_y + quiet) * scale + dy;
+                        pixels[(y * size + x) as usize] = dark;
+                    }
+                }
+            }
+        }
+    }
+    Ok(slint::Image::from_rgba8(buffer))
+}
+
+/// Rebuild this machine's invite (and its QR) whenever the daemon identity,
+/// port, or LAN address changes. Runs on the status-poll thread; rendering
+/// is skipped while the displayed invite is still current.
+fn refresh_invite(
+    weak: &slint::Weak<AppWindow>,
+    last_invite: &Arc<Mutex<String>>,
+    listen_port: u16,
+    fingerprint_hex: &str,
+) {
+    let address = match kvm_protocol::invite::lan_address() {
+        Some(ip) => format!("{ip}:{listen_port}"),
+        None => String::new(),
+    };
+    let Ok(invite) = kvm_protocol::invite::build(&address, fingerprint_hex) else {
+        return;
+    };
+    match last_invite.lock() {
+        Ok(mut slot) => {
+            if *slot == invite {
+                return;
+            }
+            *slot = invite.clone();
+        }
+        Err(_) => return,
+    }
+    let local_address = if address.is_empty() {
+        "address unknown".to_owned()
+    } else {
+        address
+    };
+    // The invite string is Send; the QR image is rendered on the UI thread
+    // because `slint::Image` must not cross thread boundaries.
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_invite_text(SharedString::from(invite.clone()));
+            ui.set_local_address(SharedString::from(local_address));
+            ui.set_invite_ready(true);
+            if let Ok(qr) = render_invite_qr(&invite) {
+                ui.set_invite_qr(qr);
+            }
+        }
+    });
+}
+
+fn clear_invite(weak: &slint::Weak<AppWindow>, last_invite: &Arc<Mutex<String>>) {
+    if let Ok(mut slot) = last_invite.lock() {
+        slot.clear();
+    }
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_invite_text(SharedString::new());
+                ui.set_local_address(SharedString::new());
+                ui.set_invite_ready(false);
+            }
+        }
+    });
+}
+
+fn control_request(request: ControlRequest) -> Result<ControlResponse> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        #[cfg(unix)]
+        let mut stream = tokio::net::UnixStream::connect(control_data_dir().join("control.sock"))
+            .await
+            .context("connect daemon control socket")?;
+
+        #[cfg(target_os = "windows")]
+        let pipe = kvm_protocol::control::windows_control_pipe();
+        #[cfg(target_os = "windows")]
+        let mut stream = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(&pipe)
+            .context("connect daemon control pipe")?;
+
+        #[cfg(not(any(unix, target_os = "windows")))]
+        anyhow::bail!("local daemon control is not available on this operating system");
+
+        write_request(&mut stream, &request).await?;
+        read_response(&mut stream)
+            .await?
+            .context("daemon closed control connection")
+    })
+}
+
+fn pair_prepare(
+    address: &str,
+    dir: &std::path::Path,
+    node_name: &str,
+    daemon_fingerprint: Option<String>,
+    expected_peer: Option<String>,
+) -> Result<PendingPair> {
+    let identity = Identity::load_or_create(dir)?;
+    let address = normalize_addr(address)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let endpoint = transport::make_client_endpoint(&identity)?;
+        let conn = endpoint.connect(address, "thekvm")?.await?;
+        let peer_fingerprint = peer_fingerprint(&conn)?;
+        if let Some(expected) = expected_peer {
+            if peer_fingerprint != expected.to_ascii_lowercase() {
+                anyhow::bail!("peer's certificate does not match the invite fingerprint");
+            }
+        }
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_frame(
+            &mut send,
+            &WireMessage::PairRequest {
+                node_name: node_name.to_owned(),
+                fingerprint_hex: identity.fingerprint_hex(),
+            },
+        )
+        .await?;
+        let challenge = read_frame(&mut recv)
+            .await?
+            .context("peer closed pairing stream")?;
+        let challenged_fingerprint = match challenge {
+            WireMessage::PairChallenge {
+                fingerprint_hex, ..
+            } => fingerprint_hex,
+            WireMessage::Reject { reason } => anyhow::bail!("peer rejected pairing: {reason}"),
+            other => anyhow::bail!("unexpected pairing response: {other:?}"),
+        };
+        if challenged_fingerprint != peer_fingerprint {
+            anyhow::bail!("peer fingerprint changed during pairing")
+        }
+        // The verification code must be derived from the daemon identity,
+        // because the daemon (not this preview connection) performs the real
+        // pairing. In single-directory setups both identities coincide.
+        let local_fingerprint = daemon_fingerprint.unwrap_or_else(|| identity.fingerprint_hex());
+        let verification_code =
+            kvm_protocol::pairing::verification_code(&local_fingerprint, &peer_fingerprint);
+        Ok(PendingPair {
+            verification_code,
+            peer_fingerprint,
+            address: address.to_string(),
+        })
+    })
+}
+
+fn finish_pair(pending: PendingPair) -> Result<String> {
+    let peer_fingerprint = pending.peer_fingerprint.clone();
+    match control_request(ControlRequest::Pair {
+        address: pending.address,
+        expected_fingerprint_hex: peer_fingerprint.clone(),
+    })? {
+        ControlResponse::Paired { fingerprint_hex } => Ok(fingerprint_hex),
+        ControlResponse::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected daemon pairing response: {other:?}"),
+    }
+}
+
+fn set_status(weak: &slint::Weak<AppWindow>, text: String) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_status_text(SharedString::from(text));
+            }
+        }
+    });
+}
+
+fn set_pending(weak: &slint::Weak<AppWindow>, fingerprint: String, verification_code: String) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_pending_peer_fingerprint(SharedString::from(fingerprint));
+                ui.set_pending_verification_code(SharedString::from(verification_code));
+            }
+        }
+    });
+}
+
+fn set_discovery(weak: &slint::Weak<AppWindow>, text: String, address: Option<String>) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_discovery_text(SharedString::from(text));
+                if let Some(address) = address {
+                    ui.set_peer_address(SharedString::from(address));
+                }
+            }
+        }
+    });
+}
+
+fn data_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("THEKVM_DATA_DIR") {
+        return PathBuf::from(path);
+    }
+    kvm_core::Config::default_path().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The UI keeps its temporary discovery identity in the logged-in user's
+/// config directory, while the production daemon owns its privileged state in
+/// /var/lib/thekvm. Allow a dedicated override for packaged deployments and
+/// retain THEKVM_DATA_DIR for single-user development setups.
+#[cfg(unix)]
+fn control_data_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("THEKVM_CONTROL_DATA_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Ok(path) = std::env::var("THEKVM_DATA_DIR") {
+        return PathBuf::from(path);
+    }
+    #[cfg(target_os = "linux")]
+    return PathBuf::from("/var/lib/thekvm");
+    #[cfg(target_os = "freebsd")]
+    return PathBuf::from("/var/db/thekvm");
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    data_dir()
+}
+
+fn fallback_node_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "thekvm-ui".into())
+}
+
+fn normalize_addr(address: &str) -> Result<SocketAddr> {
+    if let Ok(addr) = address.parse() {
+        return Ok(addr);
+    }
+    let address = if address.contains(':') {
+        address.to_string()
+    } else {
+        format!("{address}:42110")
+    };
+    address
+        .to_socket_addrs()?
+        .next()
+        .context("address resolved to nothing")
+}
+
+fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
+    let identity = conn.peer_identity().context("no peer certificate")?;
+    let certs = identity
+        .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+        .map_err(|_| anyhow::anyhow!("unexpected peer identity type"))?;
+    let leaf = certs.first().context("empty cert chain")?;
+    let mut hasher = Sha256::new();
+    hasher.update(leaf.as_ref());
+    let fingerprint: [u8; 32] = hasher.finalize().into();
+    Ok(fingerprint
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}

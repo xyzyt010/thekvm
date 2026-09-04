@@ -1,0 +1,27 @@
+[Unit]
+Description=TheKVM physical input controller agent
+After=network-online.target thekvmd.service
+Wants=network-online.target
+
+# Optional: enable only on a machine whose physical input should control
+# configured peers automatically at boot.
+
+[Service]
+Type=simple
+User=thekvm
+Group=thekvm
+SupplementaryGroups=input
+Environment=THEKVM_DATA_DIR=/var/lib/thekvm
+ExecStart=/usr/bin/kvm-daemon connect
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/thekvm
+PrivateTmp=yes
+ProtectHome=yes
+DeviceAllow=/dev/input/event* r
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target

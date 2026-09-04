@@ -1,0 +1,23 @@
+{
+  "screens": [
+    {
+      "id": 1,
+      "name": "This machine",
+      "x": 0,
+      "y": 0,
+      "width": 1920,
+      "height": 1080,
+      "peer_fingerprint": null
+    },
+    {
+      "id": 2,
+      "name": "Office laptop",
+      "x": 1,
+      "y": 0,
+      "width": 1920,
+      "height": 1080,
+      "peer_fingerprint": "replace-with-64-character-peer-fingerprint"
+    }
+  ],
+  "self_screen": 1
+}

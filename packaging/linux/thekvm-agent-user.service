@@ -1,0 +1,18 @@
+[Unit]
+Description=TheKVM logged-in desktop controller agent
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=THEKVM_DATA_DIR=%h/.local/share/thekvm
+ExecStart=/usr/bin/kvm-daemon connect
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=graphical-session.target

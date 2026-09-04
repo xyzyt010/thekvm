@@ -1,0 +1,35 @@
+#!/bin/sh
+
+# PROVIDE: thekvm
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="thekvm"
+rcvar="thekvm_enable"
+load_rc_config "$name"
+
+: "${thekvm_enable:=NO}"
+: "${thekvm_user:=thekvm}"
+: "${thekvm_data_dir:=/var/db/thekvm}"
+: "${thekvm_command:=serve}"
+
+pidfile="/var/run/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-f -p ${pidfile} -u ${thekvm_user} /usr/bin/env THEKVM_DATA_DIR=${thekvm_data_dir} /usr/local/bin/kvm-daemon ${thekvm_command}"
+
+export THEKVM_DATA_DIR="${thekvm_data_dir}"
+
+thekvm_precmd()
+{
+    install -d -o "${thekvm_user}" -g "${thekvm_user}" -m 0770 "${thekvm_data_dir}"
+    if [ ! -e "${thekvm_data_dir}/config.json" ]; then
+        env THEKVM_DATA_DIR="${thekvm_data_dir}" /usr/local/bin/kvm-daemon configure --mode receiver-only
+        chown "${thekvm_user}:${thekvm_user}" "${thekvm_data_dir}/config.json"
+    fi
+}
+
+start_precmd="thekvm_precmd"
+
+run_rc_command "$1"

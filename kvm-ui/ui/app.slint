@@ -1,0 +1,371 @@
+import { Button, LineEdit, ComboBox, Switch, TabWidget } from "std-widgets.slint";
+
+// Theme: black/white base, red + green highlights.
+export component AppWindow inherits Window {
+    title: "TheKVM";
+    min-width: 720px;
+    min-height: 560px;
+    background: #0a0a0a;
+
+    in property <string> status-text: "Not connected";
+    in property <bool> connected: false;
+    in-out property <string> fingerprint: "…";
+    in-out property <string> peer-list: "No trusted peers";
+    in-out property <string> revoke-fingerprint: "";
+    in-out property <string> pending-peer-fingerprint: "";
+    in-out property <string> pending-verification-code: "";
+    in-out property <string> incoming-pairing: "";
+    in-out property <string> incoming-pairing-fingerprint: "";
+    in-out property <string> incoming-verification-code: "";
+    in-out property <bool> lock-screen-control: false;
+    in-out property <bool> clipboard-enabled: false;
+    in-out property <int> mode-index: 0;
+    in-out property <string> layout-path: "";
+    in-out property <string> peer-address: "";
+    in-out property <string> discovery-text: "No LAN scan yet";
+    in-out property <string> device-name: "";
+    in-out property <string> auto-connect-address: "";
+    in-out property <bool> suppress-config: false;
+    in-out property <string> local-address: "";
+    in-out property <string> invite-text: "";
+    in-out property <image> invite-qr;
+    in-out property <bool> invite-ready: false;
+    in-out property <string> invite-input: "";
+
+    callback pair-with(string /* address */);
+    callback pair-from-invite(string /* invite */);
+    callback discover-lan();
+    callback confirm-pairing();
+    callback approve-incoming-pairing(string);
+    callback reject-incoming-pairing(string);
+    callback revoke-peer(string);
+    callback apply-config(bool, int, string, string, bool);
+    callback import-layout(string);
+
+    changed mode-index => {
+        if (!suppress-config) {
+            apply-config(lock-screen-control, mode-index, device-name, auto-connect-address, clipboard-enabled);
+        }
+    }
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 12px;
+            Text {
+                text: "TheKVM";
+                font-size: 28px;
+                font-weight: 800;
+                color: white;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                width: 4px;
+                height: 28px;
+                background: connected ? #22c55e : #ef4444;
+            }
+            Text {
+                text: status-text;
+                color: connected ? #22c55e : #9ca3af;
+                vertical-alignment: center;
+            }
+        }
+
+        TabWidget {
+            Tab {
+                title: "Status";
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 10px;
+                    Text {
+                        text: local-address == "" ? "Local address: unknown (daemon offline?)" : "Local address: " + local-address;
+                        color: #9ca3af;
+                        font-size: 12px;
+                    }
+                    Text {
+                        text: "Daemon fingerprint (share this to pair):";
+                        color: #9ca3af;
+                        font-size: 12px;
+                    }
+                    Text {
+                        text: fingerprint;
+                        color: #ef4444;
+                        font-size: 14px;
+                    }
+                    Rectangle { height: 1px; background: #262626; }
+                    Text {
+                        text: pending-peer-fingerprint == "" ? "No pending pairing" : "Pending peer: " + pending-peer-fingerprint;
+                        color: pending-peer-fingerprint == "" ? #6b7280 : #facc15;
+                        font-size: 12px;
+                    }
+                    Text {
+                        visible: pending-verification-code != "";
+                        text: "Verification code: " + pending-verification-code;
+                        color: #22c55e;
+                        font-size: 24px;
+                        font-weight: 800;
+                        letter-spacing: 4px;
+                    }
+                    Text {
+                        visible: pending-verification-code != "";
+                        text: "Compare with the other machine; both must show this exact code.";
+                        color: #9ca3af;
+                        font-size: 11px;
+                    }
+                    Button {
+                        text: "Confirm pairing";
+                        enabled: pending-peer-fingerprint != "";
+                        clicked => { confirm-pairing(); }
+                    }
+                    Text {
+                        text: incoming-pairing == "" ? "No incoming pairing request" : "Incoming peer: " + incoming-pairing;
+                        color: incoming-pairing == "" ? #6b7280 : #22c55e;
+                        font-size: 12px;
+                    }
+                    Text {
+                        visible: incoming-verification-code != "";
+                        text: "Verification code: " + incoming-verification-code;
+                        color: #22c55e;
+                        font-size: 24px;
+                        font-weight: 800;
+                        letter-spacing: 4px;
+                    }
+                    Text {
+                        visible: incoming-verification-code != "";
+                        text: "Compare with the other machine before approving; both must show this exact code.";
+                        color: #9ca3af;
+                        font-size: 11px;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Button {
+                            text: "Approve incoming";
+                            enabled: incoming-pairing-fingerprint != "";
+                            clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
+                        }
+                        Button {
+                            text: "Reject incoming";
+                            enabled: incoming-pairing-fingerprint != "";
+                            clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
+                        }
+                    }
+                    Rectangle { height: 1px; background: #262626; }
+                    Text { text: "Trusted peers"; color: white; font-size: 18px; font-weight: 700; }
+                    Text {
+                        text: peer-list;
+                        color: #9ca3af;
+                        font-size: 11px;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        revoke := LineEdit {
+                            text <=> root.revoke-fingerprint;
+                            placeholder-text: "fingerprint to revoke";
+                        }
+                        Button {
+                            text: "Revoke peer";
+                            enabled: revoke.text != "";
+                            clicked => { revoke-peer(revoke.text); }
+                        }
+                    }
+                }
+            }
+
+            Tab {
+                title: "Pair";
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 10px;
+                    Text { text: "Pair a machine"; color: white; font-size: 18px; font-weight: 700; }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        addr := LineEdit { text <=> root.peer-address; placeholder-text: "peer IP or hostname"; }
+                        Button { text: "Pair"; clicked => { pair-with(addr.text); } }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Button { text: "Discover LAN"; clicked => { discover-lan(); } }
+                        Text {
+                            text: discovery-text;
+                            color: #9ca3af;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            Tab {
+                title: "Invite";
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 10px;
+                    Text { text: "Share this machine"; color: white; font-size: 18px; font-weight: 700; }
+                    Text {
+                        text: "The peer scans this QR or pastes the invite text instead of typing an address. Pairing still requires the verification code on both screens.";
+                        color: #9ca3af;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 16px;
+                        Rectangle {
+                            width: 232px;
+                            height: 232px;
+                            background: white;
+                            border-radius: 8px;
+                            Image {
+                                x: 8px; y: 8px;
+                                width: 216px; height: 216px;
+                                visible: invite-ready;
+                                source: root.invite-qr;
+                                image-fit: contain;
+                            }
+                            Text {
+                                visible: !invite-ready;
+                                text: "Start the daemon to generate the invite";
+                                color: #6b7280;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 8px;
+                            Text { text: "Invite text (copy from here):"; color: #9ca3af; font-size: 12px; }
+                            shown := LineEdit {
+                                text: root.invite-text;
+                                read-only: true;
+                                placeholder-text: "invite appears when the daemon is online";
+                            }
+                        }
+                    }
+                    Rectangle { height: 1px; background: #262626; }
+                    Text { text: "Pair from an invite"; color: white; font-size: 18px; font-weight: 700; }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        pasted := LineEdit {
+                            text <=> root.invite-input;
+                            placeholder-text: "paste thekvm:// invite";
+                        }
+                        Button {
+                            text: "Pair from invite";
+                            enabled: pasted.text != "";
+                            clicked => { pair-from-invite(pasted.text); }
+                        }
+                    }
+                }
+            }
+
+            Tab {
+                title: "Topology";
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 10px;
+                    Text { text: "This machine"; color: white; font-size: 18px; font-weight: 700; }
+                    Text {
+                        text: "The name shown to nearby machines during discovery and pairing.";
+                        color: #9ca3af;
+                        font-size: 12px;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        name := LineEdit {
+                            text <=> root.device-name;
+                            placeholder-text: "friendly device name";
+                        }
+                        Button {
+                            text: "Save name";
+                            enabled: name.text != "";
+                            clicked => { apply-config(lock-screen-control, mode-index, name.text, auto-connect-address, clipboard-enabled); }
+                        }
+                    }
+                    Rectangle { height: 1px; background: #262626; }
+                    Text { text: "Screen topology"; color: white; font-size: 18px; font-weight: 700; }
+                    Text {
+                        text: "Import a JSON Layout with screen geometry and paired peer fingerprints.";
+                        color: #9ca3af;
+                        font-size: 12px;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        path := LineEdit {
+                            text <=> root.layout-path;
+                            placeholder-text: "path to layout.json";
+                        }
+                        Button {
+                            text: "Import layout";
+                            enabled: path.text != "";
+                            clicked => { import-layout(path.text); }
+                        }
+                    }
+                }
+            }
+
+            Tab {
+                title: "Settings";
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 10px;
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text { text: "Mode"; color: #d1d5db; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["Bidirectional", "Controller only", "Receiver only"];
+                            width: 240px;
+                            current-index <=> root.mode-index;
+                        }
+                    }
+                    Text {
+                        text: "Windows service startup peer (optional)";
+                        color: white;
+                        font-size: 16px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: "When configured, the LocalSystem service starts desktop-bound capture helpers and reconnects to this paired peer at boot.";
+                        color: #9ca3af;
+                        font-size: 12px;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        startup := LineEdit {
+                            text <=> root.auto-connect-address;
+                            placeholder-text: "peer IP or hostname:42110";
+                        }
+                        Button {
+                            text: "Save startup peer";
+                            clicked => { apply-config(lock-screen-control, mode-index, device-name, startup.text, clipboard-enabled); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Allow lock-screen control (privileged service)";
+                            color: #d1d5db;
+                            vertical-alignment: center;
+                        }
+                        Switch {
+                            checked <=> root.lock-screen-control;
+                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Sync text clipboard (logged-in sessions)";
+                            color: #d1d5db;
+                            vertical-alignment: center;
+                        }
+                        Switch {
+                            checked <=> root.clipboard-enabled;
+                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

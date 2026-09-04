@@ -1,0 +1,13 @@
+/target/
+
+# Release binaries ship separately; rebuild from source per dist/README.md.
+# Installer scripts and docs stay tracked, binaries stay untracked.
+dist/**/kvm-daemon
+dist/**/kvm-daemon.exe
+dist/**/kvm-ui
+dist/**/kvm-ui.exe
+dist/**/*.zip
+dist/**/*.tar.gz
+
+# Runtime audit output is deployment-local and should not be committed.
+*.log

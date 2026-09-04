@@ -1,0 +1,3 @@
+[thekvm=10]
+add path 'uinput' mode 0660 group thekvm
+add path 'input/event*' mode 0660 group thekvm
