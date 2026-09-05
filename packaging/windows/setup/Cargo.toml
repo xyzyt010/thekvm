@@ -1,0 +1,29 @@
+[package]
+name = "thekvm-setup"
+version = "0.1.2"
+edition = "2021"
+
+# Intentionally outside the main workspace: this is a build-time packaging
+# step, not a shipped crate.
+[workspace]
+
+[[bin]]
+name = "thekvm-setup"
+path = "src/main.rs"
+
+[dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

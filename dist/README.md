@@ -1,9 +1,27 @@
 # TheKVM first-iteration binaries
 
-Two ready-to-run builds of the same 0.1.1 workspace, verified by the
+Two ready-to-run builds of the same 0.1.2 workspace, verified by the
 repository gates on the build machine (Windows `lan-integration.ps1` and
 Linux `lan-integration.sh` both pass, including the six-digit pairing
 verification-code assertions).
+
+## Simplest install
+
+- **Windows:** download `thekvm-0.1.2-setup.exe`, double-click it, approve
+  the single UAC prompt. It installs to Program Files, registers and starts
+  the LocalSystem receiver service, adds the firewall rule, and creates a
+  Start-menu shortcut. Uninstall from Add/Remove Programs, or run the same
+  exe with `--uninstall`.
+- **Linux Mint / Ubuntu / Debian:** download `thekvm_0.1.2_amd64.deb` and run
+  `sudo apt install ./thekvm_0.1.2_amd64.deb` — apt pulls in the
+  fontconfig dependency automatically. The post-install script creates the
+  service account, enrolls your user, loads uinput, and starts the receiver.
+  Remove with `sudo apt remove thekvm`, purge state with
+  `sudo apt purge thekvm`.
+
+Manual installs remain available: `thekvm-0.1.2-windows-x86_64.zip`
+(extract and run `install-service.ps1` elevated) and
+`thekvm-0.1.2-linux-x86_64.tar.gz` (extract and run `sudo sh install.sh`).
 
 The Linux binaries are linked against a glibc 2.35 baseline, so they run on
 Ubuntu 22.04 / Linux Mint 21 and everything newer (Mint 22, Debian 12,

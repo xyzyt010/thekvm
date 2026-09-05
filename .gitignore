@@ -12,6 +12,8 @@ dist/**/kvm-ui
 dist/**/kvm-ui.exe
 dist/**/*.zip
 dist/**/*.tar.gz
+dist/**/*.deb
+dist/**/thekvm-*-setup.exe
 
 # Runtime audit output is deployment-local and should not be committed.
 *.log
