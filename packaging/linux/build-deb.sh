@@ -3,7 +3,7 @@
 # Layout: ./in holds the release binaries; metadata is generated here.
 set -eu
 cd ~/thekvm-build
-VER=0.1.2
+VER=0.1.3
 PKG=thekvm
 ROOT=debroot
 rm -rf "$ROOT" "${PKG}_${VER}_amd64.deb"
@@ -177,6 +177,7 @@ case "$1" in
     systemctl daemon-reload
     systemctl enable --now thekvmd.service
     echo "TheKVM receiver service installed and running."
+    echo "Log out and back in so the 'thekvm' group applies to your desktop session, then launch TheKVM from the start menu."
     ;;
 esac
 EOF
