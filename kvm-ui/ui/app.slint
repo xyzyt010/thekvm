@@ -35,6 +35,7 @@ export component AppWindow inherits Window {
     callback pair-with(string /* address */);
     callback pair-from-invite(string /* invite */);
     callback discover-lan();
+    callback start-daemon();
     callback confirm-pairing();
     callback approve-incoming-pairing(string);
     callback reject-incoming-pairing(string);
@@ -80,9 +81,39 @@ export component AppWindow inherits Window {
                     padding: 12px;
                     spacing: 10px;
                     Text {
-                        text: local-address == "" ? "Local address: unknown (daemon offline?)" : "Local address: " + local-address;
+                        text: local-address == "" ? "Local address: detecting…" : "Local address: " + local-address;
                         color: #9ca3af;
                         font-size: 12px;
+                    }
+                    Text { text: "This machine acts as:"; color: white; font-size: 14px; font-weight: 700; }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Button {
+                            text: "Controller";
+                            enabled: connected && mode-index != 1;
+                            clicked => { root.mode-index = 1; }
+                        }
+                        Button {
+                            text: "Receiver";
+                            enabled: connected && mode-index != 2;
+                            clicked => { root.mode-index = 2; }
+                        }
+                        Button {
+                            text: "Both ways";
+                            enabled: connected && mode-index != 0;
+                            clicked => { root.mode-index = 0; }
+                        }
+                    }
+                    Text {
+                        text: mode-index == 1 ? "Controller only: this keyboard/mouse drives a paired machine." : mode-index == 2 ? "Receiver only: a paired machine drives this keyboard/mouse." : "Bidirectional: both machines can drive each other.";
+                        color: #9ca3af;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    Button {
+                        visible: !connected;
+                        text: "Start background service";
+                        clicked => { start-daemon(); }
                     }
                     Text {
                         text: "Daemon fingerprint (share this to pair):";

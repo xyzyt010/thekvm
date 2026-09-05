@@ -1,5 +1,6 @@
 /target/
 thekvm-target-*/
+packaging/windows/setup/target/
 
 # Separate unrelated project sharing the scratch folder.
 /gods-eye/

@@ -1,3 +1,7 @@
+// GUI subsystem on Windows so double-clicking the app never flashes a
+// console window; diagnostics go through the status line and logs.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 slint::include_modules!();
 
 use anyhow::{Context, Result};
@@ -50,6 +54,14 @@ fn main() -> Result<()> {
     let weak = ui.as_weak();
     let last_invite = Arc::new(Mutex::new(String::new()));
     let invite_state = last_invite.clone();
+    // Throttle for automatic background-daemon starts: at most one attempt
+    // per poll window so a broken install cannot fork-bomb the machine.
+    let last_autostart = Arc::new(Mutex::new(None::<std::time::Instant>));
+    let autostart_state = last_autostart.clone();
+    // Local LAN address is shown even while the daemon is unreachable so the
+    // Status tab never reads "unknown" for something the UI can compute
+    // itself.
+    set_local_address_direct(&weak);
     std::thread::spawn(move || loop {
         if weak.upgrade().is_none() {
             break;
@@ -74,10 +86,56 @@ fn main() -> Result<()> {
             Ok(other) => {
                 set_daemon_offline(&weak, format!("Unexpected daemon status: {other:?}"));
                 clear_invite(&weak, &invite_state);
+                set_local_address_direct(&weak);
             }
             Err(error) => {
-                set_daemon_offline(&weak, format!("Daemon offline: {error}"));
+                let failure = classify_control_error(&error);
+                match failure {
+                    ControlFailure::Missing => {
+                        // No daemon endpoint at all: start a user-session
+                        // daemon next to this app so launching TheKVM always
+                        // yields a working app, then keep polling until its
+                        // control endpoint appears.
+                        let mut attempt = false;
+                        if let Ok(mut slot) = autostart_state.lock() {
+                            let due = slot
+                                .map(|last| last.elapsed() >= std::time::Duration::from_secs(15))
+                                .unwrap_or(true);
+                            if due {
+                                *slot = Some(std::time::Instant::now());
+                                attempt = true;
+                            }
+                        }
+                        if attempt {
+                            match ensure_user_daemon() {
+                                Ok(()) => set_status(
+                                    &weak,
+                                    "Background service was not running; started it, connecting…"
+                                        .into(),
+                                ),
+                                Err(start_error) => set_daemon_offline(
+                                    &weak,
+                                    format!("Daemon not started: {start_error}"),
+                                ),
+                            }
+                        }
+                    }
+                    ControlFailure::AccessDenied => {
+                        // A daemon owns this machine but this session may not
+                        // reach it (Linux: desktop session predates the
+                        // `thekvm` group). Never spawn a second daemon here:
+                        // it would steal port 42110 from the real service.
+                        set_daemon_offline(
+                            &weak,
+                            "Access denied to the background service. Log out and back in, then relaunch TheKVM.".into(),
+                        );
+                    }
+                    ControlFailure::Other(message) => {
+                        set_daemon_offline(&weak, format!("Daemon not started: {message}"));
+                    }
+                }
                 clear_invite(&weak, &invite_state);
+                set_local_address_direct(&weak);
             }
         }
         // Status is intentionally polled instead of pushed over the local
@@ -151,6 +209,18 @@ fn main() -> Result<()> {
                 Ok((text, address)) => set_discovery(&weak, text, address),
                 Err(error) => set_discovery(&weak, format!("Discovery failed: {error}"), None),
             }
+        });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_start_daemon(move || {
+        let weak = weak.clone();
+        std::thread::spawn(move || match ensure_user_daemon() {
+            Ok(()) => set_status(
+                &weak,
+                "Background service started, connecting…".into(),
+            ),
+            Err(error) => set_status(&weak, format!("Could not start background service: {error}")),
         });
     });
 
@@ -642,8 +712,113 @@ fn clear_invite(weak: &slint::Weak<AppWindow>, last_invite: &Arc<Mutex<String>>)
     });
 }
 
-fn control_request(request: ControlRequest) -> Result<ControlResponse> {
-    let runtime = tokio::runtime::Runtime::new()?;
+/// Why a control request failed, so the UI can respond professionally
+/// instead of printing a raw OS error: start a missing daemon, or explain a
+/// permissions problem without spawning a conflicting second daemon.
+enum ControlFailure {
+    Missing,
+    AccessDenied,
+    Other(String),
+}
+
+fn classify_control_error(error: &anyhow::Error) -> ControlFailure {
+    for cause in error.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                std::io::ErrorKind::PermissionDenied => ControlFailure::AccessDenied,
+                std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof => ControlFailure::Missing,
+                _ => ControlFailure::Other(io.to_string()),
+            };
+        }
+    }
+    ControlFailure::Other(error.to_string())
+}
+
+/// Locate the daemon binary shipped next to this UI executable, falling back
+/// to THEKVM_DAEMON_PATH for development layouts.
+fn daemon_binary() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("THEKVM_DAEMON_PATH") {
+        let path = PathBuf::from(&path);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let name = if cfg!(target_os = "windows") {
+                "kvm-daemon.exe"
+            } else {
+                "kvm-daemon"
+            };
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    anyhow::bail!("no daemon binary found next to this app; reinstall TheKVM")
+}
+
+/// Start a user-session daemon so opening TheKVM always yields a working app,
+/// even when no system service is installed or running. Refuses when the
+/// privileged system daemon already owns this machine (Linux control socket
+/// present) so two daemons never fight over port 42110.
+fn ensure_user_daemon() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if std::path::Path::new("/var/lib/thekvm/control.sock").exists() {
+            anyhow::bail!(
+                "the system service owns this machine but is unreachable; log out and back in, then relaunch"
+            );
+        }
+    }
+    let binary = daemon_binary()?;
+    let mut command = std::process::Command::new(&binary);
+    command.arg("serve");
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        // A user-session daemon must keep its state somewhere writable
+        // without elevation, and must never flash a console window.
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+        command.env(
+            "THEKVM_DATA_DIR",
+            PathBuf::from(local).join("TheKVM"),
+        );
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+        .spawn()
+        .with_context(|| format!("start {}", binary.display()))?;
+    Ok(())
+}
+
+/// Show this machine's LAN address even while the daemon is unreachable; it
+/// is needed to tell the peer operator what to type.
+fn set_local_address_direct(weak: &slint::Weak<AppWindow>) {
+    let address = kvm_protocol::invite::lan_address()
+        .map(|ip| format!("{ip}:42110"))
+        .unwrap_or_default();
+    let address = SharedString::from(address);
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_local_address(address.clone());
+            }
+        }
+    });
+}
+
+fn control_request(request: ControlRequest) -> Result<ControlResponse> {    let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         #[cfg(unix)]
         let mut stream = tokio::net::UnixStream::connect(control_data_dir().join("control.sock"))

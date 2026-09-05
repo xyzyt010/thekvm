@@ -1,6 +1,6 @@
 [package]
 name = "thekvm-setup"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 
 # Intentionally outside the main workspace: this is a build-time packaging
@@ -12,6 +12,7 @@ name = "thekvm-setup"
 path = "src/main.rs"
 
 [dependencies]
+slint = "1.8"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -22,6 +23,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+slint-build = "1.8"
 
 [profile.release]
 lto = "thin"
