@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings even on Windows checkouts; the .deb is
+# assembled on Linux and bash chokes on CRLF.
+packaging/linux/*.sh text eol=lf
+tools/*.sh text eol=lf
