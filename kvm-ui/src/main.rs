@@ -78,10 +78,20 @@ fn main() -> Result<()> {
     // Status tab never reads "unknown" for something the UI can compute
     // itself.
     set_local_address_direct(&weak);
-    std::thread::spawn(move || loop {
+    ui_log(&format!(
+        "UI started; user state at {}",
+        startup_dir.display()
+    ));
+    let poll_weak = weak.clone();
+    std::thread::spawn(move || {
+        let weak = poll_weak;
+        let mut tick: u64 = 0;
+        loop {
         if weak.upgrade().is_none() {
             break;
         }
+        tick += 1;
+        set_poll_count(&weak, tick);
         match control_request(ControlRequest::Status) {
             Ok(ControlResponse::Status(status)) => {
                 let port = status.listen_port;
@@ -100,6 +110,7 @@ fn main() -> Result<()> {
                 }
             }
             Ok(other) => {
+                ui_log(&format!("poll: unexpected daemon status: {other:?}"));
                 set_daemon_offline(&weak, format!("Unexpected daemon status: {other:?}"));
                 clear_invite(&weak, &invite_state);
                 set_local_address_direct(&weak);
@@ -124,15 +135,21 @@ fn main() -> Result<()> {
                         }
                         if attempt {
                             match ensure_user_daemon() {
-                                Ok(()) => set_status(
-                                    &weak,
-                                    "Background service was not running; started it, connecting…"
-                                        .into(),
-                                ),
-                                Err(start_error) => set_daemon_offline(
-                                    &weak,
-                                    format!("Daemon not started: {start_error}"),
-                                ),
+                                Ok(()) => {
+                                    ui_log("poll: no daemon endpoint; started user-session daemon");
+                                    set_status(
+                                        &weak,
+                                        "Background service was not running; started it, connecting…"
+                                            .into(),
+                                    )
+                                }
+                                Err(start_error) => {
+                                    ui_log(&format!("poll: daemon autostart failed: {start_error}"));
+                                    set_daemon_offline(
+                                        &weak,
+                                        format!("Daemon not started: {start_error}"),
+                                    )
+                                }
                             }
                         }
                     }
@@ -141,12 +158,14 @@ fn main() -> Result<()> {
                         // reach it (Linux: desktop session predates the
                         // `thekvm` group). Never spawn a second daemon here:
                         // it would steal port 42110 from the real service.
+                        ui_log("poll: access denied to daemon control endpoint");
                         set_daemon_offline(
                             &weak,
                             "Access denied to the background service. Log out and back in, then relaunch TheKVM.".into(),
                         );
                     }
                     ControlFailure::Other(message) => {
+                        ui_log(&format!("poll: daemon control failed: {message}"));
                         set_daemon_offline(&weak, format!("Daemon not started: {message}"));
                     }
                 }
@@ -187,6 +206,7 @@ fn main() -> Result<()> {
         // endpoint so the UI also recovers cleanly when the privileged daemon
         // restarts, upgrades, or changes active sessions.
         std::thread::sleep(std::time::Duration::from_secs(3));
+        }
     });
 
     let weak = ui.as_weak();
@@ -206,6 +226,7 @@ fn main() -> Result<()> {
     let weak = ui.as_weak();
     ui.on_set_role(move |role| {
         let weak = weak.clone();
+        ui_log(&format!("role button pressed: {role}"));
         std::thread::spawn(move || {
             let requested = match role {
                 1 => Mode::ServerClient,
@@ -242,18 +263,50 @@ fn main() -> Result<()> {
                         current.allow_lock_screen_control,
                         current.clipboard_enabled,
                     );
+                    ui_log(&format!("role applied: {}", role_name(requested)));
                     set_status(
                         &weak,
                         format!("Role set: {}.", role_name(requested)),
                     );
                 }
-                Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+                Ok(ControlResponse::Error { message }) => {
+                    ui_log(&format!("role change refused: {message}"));
+                    set_status(&weak, message)
+                }
                 Ok(other) => {
+                    ui_log(&format!("role change unexpected: {other:?}"));
                     set_status(&weak, format!("Unexpected daemon response: {other:?}"))
                 }
-                Err(error) => set_status(&weak, format!("Cannot set role: {error}")),
+                Err(error) => {
+                    ui_log(&format!("role change failed: {error}"));
+                    set_status(&weak, format!("Cannot set role: {error}"))
+                }
             }
         });
+    });
+
+    let _weak = ui.as_weak();
+    ui.on_open_log_folder(move || {
+        let dir = data_dir();
+        ui_log("log folder opened from Settings");
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("explorer.exe")
+                .arg(dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("xdg-open")
+                .arg(dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
     });
 
     let weak = ui.as_weak();
@@ -294,7 +347,7 @@ fn main() -> Result<()> {
         let weak = weak.clone();
         std::thread::spawn(move || {
             let result = (|| -> Result<(String, Option<String>)> {
-                let runtime = tokio::runtime::Runtime::new()?;
+                let runtime = runtime();
                 let peers = runtime.block_on(kvm_protocol::discovery::scan(
                     std::time::Duration::from_secs(1),
                 ))?;
@@ -1044,6 +1097,38 @@ fn ensure_user_daemon() -> Result<()> {
 
 /// Show this machine's LAN address even while the daemon is unreachable; it
 /// is needed to tell the peer operator what to type.
+/// Append a timestamped line to the UI log beside the user state. The UI
+/// never shows a console, so this file is the ground truth when something
+/// looks dead: every poll failure, role change, and session event lands
+/// here with a reason instead of failing silently on screen.
+fn ui_log(message: &str) {
+    use std::io::Write as _;
+    let dir = data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("ui.log"))
+    {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let _ = writeln!(file, "{millis}\t{message}");
+    }
+}
+
+fn set_poll_count(weak: &slint::Weak<AppWindow>, count: u64) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_poll_count(count as i32);
+            }
+        }
+    });
+}
+
 fn set_local_address_direct(weak: &slint::Weak<AppWindow>) {
     let address = kvm_protocol::invite::lan_address()
         .map(|ip| format!("{ip}:42110"))
@@ -1058,8 +1143,19 @@ fn set_local_address_direct(weak: &slint::Weak<AppWindow>) {
         }
     });
 }
+/// One shared runtime for every background call (control pipe, pairing
+/// preview dials, LAN scans). Creating a fresh Tokio runtime per request
+/// churns threads and turns a failed creation into an untraceable call
+/// failure; a single long-lived runtime removes that entire class.
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Runtime::new().expect("start UI background runtime")
+    })
+}
 
-fn control_request(request: ControlRequest) -> Result<ControlResponse> {    let runtime = tokio::runtime::Runtime::new()?;
+fn control_request(request: ControlRequest) -> Result<ControlResponse> {
+    let runtime = runtime();
     runtime.block_on(async move {
         #[cfg(unix)]
         let mut stream = tokio::net::UnixStream::connect(control_data_dir().join("control.sock"))
@@ -1091,7 +1187,7 @@ fn control_request(request: ControlRequest) -> Result<ControlResponse> {    let 
 fn pair_prepare(address: &str, dir: &std::path::Path, node_name: &str) -> Result<PendingPair> {
     let identity = Identity::load_or_create(dir)?;
     let address = normalize_addr(address)?;
-    let runtime = tokio::runtime::Runtime::new()?;
+    let runtime = runtime();
     runtime.block_on(async move {
         let endpoint = transport::make_client_endpoint(&identity)?;
         let conn = endpoint

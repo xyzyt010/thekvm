@@ -26,6 +26,7 @@ export component AppWindow inherits Window {
     in-out property <bool> clipboard-enabled: false;
     in-out property <int> mode-index: 0;
     in property <string> role-text: "Both ways";
+    in property <int> poll-count: 0;
     in-out property <string> layout-path: "";
     in-out property <string> peer-address: "";
     in-out property <string> discovery-text: "No LAN scan yet";
@@ -48,6 +49,7 @@ export component AppWindow inherits Window {
     callback approve-incoming-pairing(string);
     callback reject-incoming-pairing(string);
     callback revoke-peer(string);
+    callback open-log-folder();
     callback apply-config(bool, int, string, string, bool);
     callback import-layout(string);
 
@@ -407,6 +409,17 @@ export component AppWindow inherits Window {
                     Rectangle { height: 1px; background: #262626; }
                     Text { text: "This computer's fingerprint:"; color: #9ca3af; font-size: 12px; }
                     Text { text: fingerprint; color: #ef4444; font-size: 12px; }
+                    Rectangle { height: 1px; background: #262626; }
+                    Text {
+                        text: "Background updates: " + poll-count + " (grows every few seconds while the app talks to its background service)";
+                        color: #6b7280;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    Button {
+                        text: "Open log folder";
+                        clicked => { open-log-folder(); }
+                    }
                 }
             }
         }

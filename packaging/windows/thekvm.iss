@@ -13,7 +13,7 @@
 ; Build: iscc packaging\windows\thekvm.iss   (output: dist\thekvm-<ver>-setup.exe)
 
 #define MyAppName "TheKVM"
-#define MyAppVersion "0.1.7"
+#define MyAppVersion "0.1.8"
 #define MyAppPublisher "TheKVM project"
 #define MyAppURL "https://github.com/xyzyt010/thekvm"
 #define ServiceName "TheKVM"
@@ -135,18 +135,33 @@ function ConfigureDaemon(): Boolean;
 var
   ResultCode: Integer;
   Args, DeviceName: String;
+  ExistingConfig: String;
 begin
   SetEnv('THEKVM_DATA_DIR', DataDir());
   DeviceName := Trim(DeviceNameEdit.Text);
   StringChangeEx(DeviceName, '"', '', True);
-  Args := 'configure --mode receiver-only';
-  if DeviceName <> '' then
-    Args := Args + ' --device-name ' + AddQuotes(DeviceName);
+  Args := 'configure';
+  ExistingConfig := DataDir() + '\config.json';
+  if FileExists(ExistingConfig) then
+  begin
+    { Upgrade: never touch the operator's mode, name, or peers. A past
+      installer run forced receiver-only here on every reinstall and silently
+      reverted roles users had just chosen in the app. Only the explicit
+      lock-screen checkbox is honored on upgrade. }
+    Log('Existing configuration found; preserving mode and device name.');
+  end
+  else
+  begin
+    { Fresh install: receiver-only default with the wizard's choices. }
+    Args := Args + ' --mode receiver-only';
+    if DeviceName <> '' then
+      Args := Args + ' --device-name ' + AddQuotes(DeviceName);
+    Args := Args + ' --clear-auto-connect';
+  end;
   if LockScreenCheck.Checked then
     Args := Args + ' --allow-lock-screen-control'
   else
     Args := Args + ' --disable-lock-screen-control';
-  Args := Args + ' --clear-auto-connect';
   if (not RunHidden(DaemonPath(), Args, ResultCode)) or (ResultCode <> 0) then
   begin
     MsgBox('TheKVM configuration failed (exit code ' + IntToStr(ResultCode) +
