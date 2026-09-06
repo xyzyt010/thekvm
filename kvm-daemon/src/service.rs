@@ -417,6 +417,8 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     } else {
         Config::default()
     };
+    let previous_mode = config.mode;
+    let previous_name = config.device_name.clone();
     if let Some(mode) = requested_mode {
         config.mode = mode;
     }
@@ -444,6 +446,18 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
         config.clipboard_enabled = enabled;
     }
     config.save(&path).context("saving config")?;
+    if config.mode != previous_mode {
+        audit_event(
+            &dir,
+            &format!("mode {previous_mode:?} -> {:?} via CLI file write", config.mode),
+        );
+    }
+    if config.device_name != previous_name {
+        audit_event(
+            &dir,
+            &format!("device renamed {previous_name:?} -> {:?} via CLI file write", config.device_name),
+        );
+    }
     println!("saved {}", path.display());
     Ok(())
 }
@@ -2021,6 +2035,7 @@ pub async fn run() -> Result<()> {
     let listen_port = config.listen_port;
     let fingerprint = identity.fingerprint_hex();
     tracing::info!(fingerprint = %fingerprint, port = listen_port, "starting daemon");
+    tracing::info!(mode = ?config.mode, device = %config.device_name, "loaded daemon config");
     let peers = PeerBook::load_or_create(&dir).context("loading peer book")?;
     let peers = Arc::new(tokio::sync::RwLock::new(peers));
     let configured_node_name = config.device_name.clone();

@@ -13,7 +13,7 @@
 ; Build: iscc packaging\windows\thekvm.iss   (output: dist\thekvm-<ver>-setup.exe)
 
 #define MyAppName "TheKVM"
-#define MyAppVersion "0.1.9"
+#define MyAppVersion "0.1.10"
 #define MyAppPublisher "TheKVM project"
 #define MyAppURL "https://github.com/xyzyt010/thekvm"
 #define ServiceName "TheKVM"
@@ -31,6 +31,7 @@ DefaultDirName={autopf}\TheKVM
 DefaultGroupName=TheKVM
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 WizardImageFile=assets\wizard-image.bmp
 SetupIconFile=assets\setup.ico
@@ -144,19 +145,18 @@ begin
   ExistingConfig := DataDir() + '\config.json';
   if FileExists(ExistingConfig) then
   begin
-    { Upgrade: never touch the operator's mode, name, or peers. A past
-      installer run forced receiver-only here on every reinstall and silently
-      reverted roles users had just chosen in the app. Only the explicit
-      lock-screen checkbox is honored on upgrade. }
-    Log('Existing configuration found; preserving mode and device name.');
+    { Upgrade: never touch mode, name, peers, or boot peer. Setup used to
+      force receiver-only here and silently reverted roles users had just
+      chosen in the app. Only the explicit lock-screen checkbox is honored. }
+    Log('Existing configuration found; preserving mode, name, and peers.');
   end
   else
   begin
-    { Fresh install: receiver-only default with the wizard's choices. }
-    Args := Args + ' --mode receiver-only';
+    { Fresh install: the daemon default is both-ways with the machine's own
+      hostname, so pairing works in both directions out of the box. Setup
+      only stamps the wizard's device name; it never forces a mode. }
     if DeviceName <> '' then
       Args := Args + ' --device-name ' + AddQuotes(DeviceName);
-    Args := Args + ' --clear-auto-connect';
   end;
   if LockScreenCheck.Checked then
     Args := Args + ' --allow-lock-screen-control'

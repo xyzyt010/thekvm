@@ -378,6 +378,27 @@ where
                                         && (updated.mode != current.mode
                                             || updated.allow_lock_screen_control
                                                 != current.allow_lock_screen_control)));
+                            // Audit every applied change with its provenance:
+                            // if a mode ever "reverts by itself", this trail
+                            // names exactly which writer did it and when.
+                            if updated.mode != current.mode {
+                                crate::service::audit_event(
+                                    &data_dir,
+                                    &format!(
+                                        "mode {:?} -> {:?} via local control",
+                                        current.mode, updated.mode
+                                    ),
+                                );
+                            }
+                            if updated.device_name != current.device_name {
+                                crate::service::audit_event(
+                                    &data_dir,
+                                    &format!(
+                                        "device renamed {:?} -> {:?} via local control",
+                                        current.device_name, updated.device_name
+                                    ),
+                                );
+                            }
                             *current = updated;
                             ControlResponse::Applied { restart_required }
                         }
