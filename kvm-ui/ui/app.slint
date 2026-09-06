@@ -26,6 +26,7 @@ export component AppWindow inherits Window {
     in-out property <bool> clipboard-enabled: false;
     in-out property <int> mode-index: 0;
     in property <string> role-text: "Both ways";
+    in property <string> app-version: "";
     in property <int> poll-count: 0;
     in-out property <string> layout-path: "";
     in-out property <string> peer-address: "";
@@ -61,7 +62,7 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             spacing: 12px;
             Text {
-                text: "TheKVM";
+                text: "TheKVM " + app-version;
                 font-size: 28px;
                 font-weight: 800;
                 color: white;
@@ -103,24 +104,33 @@ export component AppWindow inherits Window {
                     }
                     HorizontalLayout {
                         spacing: 12px;
+                        // Role selection is local configuration, not a
+                        // daemon-dependent action: these buttons are always
+                        // pressable. Gating them on daemon reachability once
+                        // made them look permanently dead (no hover, no
+                        // click, no feedback) whenever the status poll
+                        // failed, with no way to tell why.
                         Button {
                             text: "Control other";
-                            enabled: connected;
                             clicked => { set-role(1); }
                         }
                         Button {
                             text: "Be controlled";
-                            enabled: connected;
                             clicked => { set-role(2); }
                         }
                         Button {
                             text: "Both ways";
-                            enabled: connected;
                             clicked => { set-role(0); }
                         }
                     }
                     Text {
                         text: mode-index == 1 ? "Your keyboard and mouse will drive the other computer." : mode-index == 2 ? "The other computer will drive this keyboard and mouse." : "Both computers can drive each other.";
+                        color: #9ca3af;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "Linking two computers takes two sides. STATION (waits): choose 'Be controlled' or 'Both ways' and read this computer's address above. NODE (dials): choose 'Control other' or 'Both ways', type the station's address below, press Connect. Both sides compare the 6-digit code before anything connects. Either side can Disconnect and reconnect at any time.";
                         color: #9ca3af;
                         font-size: 12px;
                         wrap: word-wrap;

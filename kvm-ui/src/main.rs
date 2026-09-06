@@ -32,10 +32,13 @@ struct PendingPair {
 
 /// A controller session supervised by the UI: `kvm-daemon connect` retries
 /// internally forever, so the UI only needs to start it, watch it, and kill
-/// it on Disconnect.
+/// it on Disconnect. `verified` is set only when the child reports a live,
+/// verified session, so the UI can never again claim "Connected" for a
+/// process that merely started.
 struct Session {
     child: std::process::Child,
     address: String,
+    verified: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn main() -> Result<()> {
@@ -48,6 +51,31 @@ fn main() -> Result<()> {
     let ui = AppWindow::new()?;
     let pending_pair = Arc::new(Mutex::new(None::<PendingPair>));
     let startup_dir = data_dir();
+    ui.set_app_version(SharedString::from(format!("v{}", env!("CARGO_PKG_VERSION"))));
+
+    // A GUI-subsystem app has no console: without this hook any panicking
+    // background thread dies silently and the UI just looks "dead" (this is
+    // how permanently unresponsive buttons happened with zero log evidence).
+    // Route every panic into ui.log with its location.
+    {
+        let panic_log_dir = startup_dir.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            use std::io::Write as _;
+            let dir = panic_log_dir.clone();
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("ui.log"))
+            {
+                let millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let _ = writeln!(file, "{millis}\tUI thread panicked: {info}");
+            }
+        }));
+    }
 
     if let Ok(config) = kvm_core::Config::load(&startup_dir.join("config.json")) {
         ui.set_lock_screen_control(config.allow_lock_screen_control);
@@ -88,10 +116,14 @@ fn main() -> Result<()> {
         let mut tick: u64 = 0;
         let mut consecutive_failures: u32 = 0;
         let mut was_failing = false;
+        ui_log("poll thread started");
         loop {
         if weak.upgrade().is_none() {
             break;
         }
+        // One panicking iteration must never kill the whole poll thread:
+        // catch it, log it, count it as a failure, keep polling.
+        let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         tick += 1;
         set_poll_count(&weak, tick);
         match control_request(ControlRequest::Status) {
@@ -187,17 +219,27 @@ fn main() -> Result<()> {
         // The supervised `connect` process retries internally, so an exit
         // always means the session ended abnormally (or was disconnected,
         // which clears the slot first). Surface it instead of silently
-        // showing a stale "connected" state.
+        // showing a stale "connected" state. The verified flag keeps the
+        // message honest: a child that never reported `established` never
+        // connected, so say so instead of implying a live session dropped.
         if let Ok(mut slot) = session_for_poll.lock() {
             if let Some(session) = slot.as_mut() {
                 match session.child.try_wait() {
                     Ok(Some(status)) => {
                         let address = session.address.clone();
+                        let verified =
+                            session.verified.load(std::sync::atomic::Ordering::Relaxed);
                         *slot = None;
                         set_session(&weak, None);
                         set_status(
                             &weak,
-                            format!("Connection to {address} ended ({status})"),
+                            if verified {
+                                format!("Connection to {address} ended ({status})")
+                            } else {
+                                format!(
+                                    "Could not establish a connection to {address} ({status}). Check the address and that the other side is waiting, then Connect again."
+                                )
+                            },
                         );
                     }
                     Ok(None) => {}
@@ -212,6 +254,12 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        })); // end catch_unwind for one poll iteration
+        if iteration.is_err() {
+            consecutive_failures += 1;
+            was_failing = true;
+            ui_log("poll: iteration panicked and was caught; continuing");
         }
         // Status is intentionally polled instead of pushed over the local
         // endpoint so the UI also recovers cleanly when the privileged daemon
@@ -247,6 +295,9 @@ fn main() -> Result<()> {
     ui.on_set_role(move |role| {
         let weak = weak.clone();
         ui_log(&format!("role button pressed: {role}"));
+        // Instant local feedback: the press always lands, even if the daemon
+        // turns out to be unreachable. The result overwrites this below.
+        set_status(&weak, "Applying role…".into());
         std::thread::spawn(move || {
             let requested = match role {
                 1 => Mode::ServerClient,
@@ -778,6 +829,10 @@ fn decide_incoming_pairing(weak: &slint::Weak<AppWindow>, fingerprint: String, a
 /// runs the six-digit ceremony first, then connects. The controller session
 /// dials with the USER identity (the same peer book the ceremony pins), so
 /// no privileged state is ever needed on the controller side.
+///
+/// NODE side of the station/node contract: this computer dials out to a
+/// waiting station. "Connected" is reported only after the session child
+/// confirms a live connection; until then the status says connecting.
 fn start_session_flow(
     weak: &slint::Weak<AppWindow>,
     pending: &Arc<Mutex<Option<PendingPair>>>,
@@ -785,20 +840,18 @@ fn start_session_flow(
     session: &Arc<Mutex<Option<Session>>>,
     address: String,
 ) {
-    if session.lock().ok().is_some_and(|slot| slot.is_some()) {
-        set_status(&weak, "Already connected — Disconnect first".into());
-        return;
-    }
-    // A receiver-only machine must not initiate sessions; the daemon would
-    // refuse them. Refuse early with guidance instead of a cryptic failure.
-    // When the daemon is unreachable the mode cannot be checked, so the
-    // session is attempted anyway and the daemon reports the real error.
-    if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
-        if status.mode == kvm_core::Mode::ClientOnly {
-            set_status(
-                &weak,
-                "This computer is set to 'Be controlled', so it cannot dial out. Press 'Control other' or 'Both ways' above, then Connect again.".into(),
-            );
+    // Reap a dead previous session first so a stale slot can never wedge
+    // reconnect behind a permanent "Already connected".
+    if let Ok(mut slot) = session.lock() {
+        let dead = slot.as_mut().is_some_and(|session| {
+            matches!(session.child.try_wait(), Ok(Some(_)) | Err(_))
+        });
+        if dead {
+            *slot = None;
+            set_session(weak, None);
+        }
+        if slot.is_some() {
+            set_status(weak, "Already connected — Disconnect first".into());
             return;
         }
     }
@@ -807,6 +860,21 @@ fn start_session_flow(
     let session = session.clone();
     let data_dir = data_dir.to_owned();
     std::thread::spawn(move || {
+        // A receiver-only machine must not initiate sessions; the daemon
+        // would refuse them. Refuse early with guidance instead of a
+        // cryptic failure. When the daemon is unreachable the mode cannot
+        // be checked, so the session is attempted anyway and the daemon
+        // reports the real error. This check runs here (not on the UI
+        // thread) so a wedged control endpoint can never freeze the app.
+        if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
+            if status.mode == kvm_core::Mode::ClientOnly {
+                set_status(
+                    &weak,
+                    "This computer is set to 'Be controlled', so it cannot dial out. Press 'Control other' or 'Both ways' above, then Connect again.".into(),
+                );
+                return;
+            }
+        }
         let node_name = kvm_core::Config::load(&data_dir.join("config.json"))
             .map(|config| config.device_name)
             .unwrap_or_else(|_| fallback_node_name());
@@ -863,6 +931,11 @@ fn pin_controller_peer(data_dir: &std::path::Path, pending: &PendingPair) -> Res
 /// Start the supervised `connect` session. It inherits this process's
 /// environment, so it uses the same user data directory (and therefore the
 /// same identity and peer book the ceremony just pinned).
+///
+/// Honesty contract: spawning the child is NOT connecting. The status stays
+/// at "Connecting…" until the child reports THEKVM_STATUS established on
+/// its stderr; only then does the UI say "Connected". A child that exits
+/// before that is reported as a failed connection, never a live one.
 fn spawn_session(
     weak: &slint::Weak<AppWindow>,
     session: &Arc<Mutex<Option<Session>>>,
@@ -879,7 +952,9 @@ fn spawn_session(
     command.arg("connect").arg(&address);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
-    command.stderr(std::process::Stdio::null());
+    // Piped (not nulled): the child reports dialing/established/waiting
+    // progress here and the relay below turns it into truthful status.
+    command.stderr(std::process::Stdio::piped());
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -887,20 +962,73 @@ fn spawn_session(
         command.creation_flags(CREATE_NO_WINDOW);
     }
     match command.spawn() {
-        Ok(child) => {
+        Ok(mut child) => {
+            let stderr = child.stderr.take();
+            let verified = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Ok(mut slot) = session.lock() {
                 *slot = Some(Session {
                     child,
                     address: address.clone(),
+                    verified: verified.clone(),
                 });
             }
             set_session(&weak, Some(address.clone()));
             set_status(
                 &weak,
-                format!("Connected to {address} — your keyboard and mouse drive it now. It keeps retrying across reboots until you Disconnect."),
+                format!(
+                    "Connecting to {address}… verifying the other side (a few seconds). Press Disconnect to stop."
+                ),
             );
+            if let Some(stderr) = stderr {
+                let weak = weak.clone();
+                std::thread::spawn(move || {
+                    relay_session_progress(&weak, stderr, &address, &verified)
+                });
+            } else {
+                ui_log("session: child stderr unavailable; connection cannot be verified");
+            }
         }
         Err(error) => set_status(&weak, format!("Cannot start connection: {error}")),
+    }
+}
+
+/// Relay the `connect` child's THEKVM_STATUS progress lines into the UI
+/// status line. Only `established` flips the session to Connected; anything
+/// else is shown as still-connecting. Identical consecutive lines are
+/// coalesced so retry loops don't churn the event loop.
+fn relay_session_progress(
+    weak: &slint::Weak<AppWindow>,
+    stderr: std::process::ChildStderr,
+    address: &str,
+    verified: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::io::BufRead as _;
+    let reader = std::io::BufReader::new(stderr);
+    let mut last_shown = String::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let Some(progress) = line.strip_prefix("THEKVM_STATUS ") else {
+            continue;
+        };
+        let (kind, detail) = match progress.find(' ') {
+            Some(index) => (&progress[..index], progress[index + 1..].trim()),
+            None => (progress, ""),
+        };
+        let text = match kind {
+            "established" => {
+                verified.store(true, std::sync::atomic::Ordering::Relaxed);
+                format!(
+                    "Connected to {address} — your keyboard and mouse drive it now. It retries automatically until you Disconnect."
+                )
+            }
+            "waiting" => format!("Still reaching {address}… ({detail})"),
+            "dialing" => format!("Contacting {address}…"),
+            "ended" => format!("Connection to {address} ended ({detail})"),
+            _ => continue,
+        };
+        if text != last_shown {
+            last_shown = text.clone();
+            set_status(weak, text);
+        }
     }
 }
 
@@ -910,12 +1038,21 @@ fn stop_session(
     message: &str,
 ) {
     let child = session.lock().ok().and_then(|mut slot| slot.take());
-    if let Some(mut session) = child {
-        let _ = session.child.kill();
-        let _ = session.child.wait();
-    }
+    let message = match child {
+        Some(mut session) => {
+            let address = session.address.clone();
+            let _ = session.child.kill();
+            // Wait reaps the child; the piped stderr then hits EOF so the
+            // relay thread ends on its own. Report what actually happened.
+            match session.child.wait() {
+                Ok(status) => format!("Disconnected from {address} ({status})"),
+                Err(error) => format!("Disconnected from {address} (stop failed: {error})"),
+            }
+        }
+        None => message.to_owned(),
+    };
     set_session(&weak, None);
-    set_status(&weak, message.into());
+    set_status(&weak, message);
 }
 
 fn set_peer_address_field(weak: &slint::Weak<AppWindow>, address: &str) {

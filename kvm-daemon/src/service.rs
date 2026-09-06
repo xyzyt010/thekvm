@@ -115,6 +115,31 @@ pub(crate) fn audit_event(dir: &std::path::Path, event: &str) {
     }
 }
 
+/// Append a control-endpoint lifecycle line beside the daemon state. A
+/// system service has no visible stderr, so without this file a dead
+/// control pipe is invisible from the outside: the UI poll just fails
+/// forever and its buttons stay dark with no reason anywhere. This file
+/// names the failure (or proves the endpoint is up).
+pub(crate) fn control_lifecycle_log(dir: &std::path::Path, event: &str) {
+    let path = dir.join("control.log");
+    let result = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true).write(true);
+        let mut file = options.open(&path)?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let safe_event = event.replace(['\r', '\n'], " ");
+        writeln!(file, "{timestamp}\t{safe_event}")?;
+        file.flush()
+    })();
+    if let Err(error) = result {
+        tracing::warn!(path = %path.display(), %error, "cannot write TheKVM control log");
+    }
+}
+
 fn load_local_config() -> Result<Config> {
     let path = data_dir().join("config.json");
     if path.exists() {
@@ -759,6 +784,11 @@ pub async fn connect(address: Option<&str>) -> Result<()> {
     let mut clipboard = start_clipboard_agent(config.clipboard_enabled);
     let mut clipboard_revision = 0;
 
+    // Machine-readable progress for a supervising UI (which pipes stderr):
+    // dialing -> waiting <reason> (retries) -> established <peer>, and ended
+    // on a clean shutdown. The UI must only claim "Connected" after
+    // `established`; anything earlier is still connecting.
+    eprintln!("THEKVM_STATUS dialing {address}");
     loop {
         match connect_input(
             &identity,
@@ -781,6 +811,7 @@ pub async fn connect(address: Option<&str>) -> Result<()> {
                 send_state_sync(&mut send, snapshot.state).await?;
                 capture_control.set_exclusive(true)?;
                 tracing::info!(peer = %address, "connected input session");
+                eprintln!("THEKVM_STATUS established {address}");
                 let result = run_capture_stream(
                     conn,
                     send,
@@ -795,14 +826,19 @@ pub async fn connect(address: Option<&str>) -> Result<()> {
                 .await;
                 capture_control.set_exclusive(false)?;
                 match result {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        eprintln!("THEKVM_STATUS ended clean");
+                        return Ok(());
+                    }
                     Err(error) => {
                         tracing::warn!(%error, peer = %address, "input session lost; retrying");
+                        eprintln!("THEKVM_STATUS waiting {error:#}");
                     }
                 }
             }
             Err(error) => {
                 tracing::warn!(%error, peer = %address, "peer unavailable; retrying");
+                eprintln!("THEKVM_STATUS waiting {error:#}");
             }
         }
 
@@ -814,7 +850,10 @@ pub async fn connect(address: Option<&str>) -> Result<()> {
         while motion_rx.try_recv().is_ok() {}
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(2)) => {},
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("THEKVM_STATUS ended interrupted");
+                return Ok(());
+            }
         }
     }
 }
@@ -2087,8 +2126,10 @@ pub async fn run() -> Result<()> {
     let input_session_slot = Arc::new(tokio::sync::Semaphore::new(1));
     let control_revoked_peers = revoked_peers.clone();
     let control_pairing_approvals = pairing_approvals.clone();
+    let control_log_dir = dir.clone();
     tokio::spawn(async move {
-        if let Err(error) = crate::control::run_server(
+        control_lifecycle_log(&control_log_dir, "control server starting");
+        match crate::control::run_server(
             control_dir,
             control_config,
             control_peers,
@@ -2100,7 +2141,14 @@ pub async fn run() -> Result<()> {
         )
         .await
         {
-            tracing::warn!(%error, "local daemon control server stopped");
+            Ok(()) => control_lifecycle_log(&control_log_dir, "control server stopped cleanly"),
+            Err(error) => {
+                tracing::warn!(%error, "local daemon control server stopped");
+                control_lifecycle_log(
+                    &control_log_dir,
+                    &format!("control server FAILED: {error:#}"),
+                );
+            }
         }
     });
 
