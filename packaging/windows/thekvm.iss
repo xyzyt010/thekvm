@@ -13,7 +13,7 @@
 ; Build: iscc packaging\windows\thekvm.iss   (output: dist\thekvm-<ver>-setup.exe)
 
 #define MyAppName "TheKVM"
-#define MyAppVersion "0.1.4"
+#define MyAppVersion "0.1.5"
 #define MyAppPublisher "TheKVM project"
 #define MyAppURL "https://github.com/xyzyt010/thekvm"
 #define ServiceName "TheKVM"
@@ -109,6 +109,9 @@ begin
   LockScreenCheck.Top := DeviceNameEdit.Top + 36;
   LockScreenCheck.Width := OptionsPage.SurfaceWidth;
   LockScreenCheck.Caption := 'Allow lock-screen control (privileged service)';
+  { Product default: lock-screen control ships enabled. The user can still
+    untick this box or flip the switch in the app's Settings tab later. }
+  LockScreenCheck.Checked := True;
   LockHint := TNewStaticText.Create(OptionsPage);
   LockHint.Parent := OptionsPage.Surface;
   LockHint.Top := LockScreenCheck.Top + 24;
@@ -196,19 +199,82 @@ begin
   Result := True;
 end;
 
-procedure AddFirewallRule();
+{ True when the rule exists, checked through netsh so every creation
+  method is verified the same way. }
+function RuleVerified(): Boolean;
 var
   ResultCode: Integer;
 begin
+  Result := RunHidden('netsh.exe', 'advfirewall firewall show rule name=' +
+    AddQuotes('{#FirewallRule}') + ' verbose', ResultCode) and (ResultCode = 0);
+end;
+
+{ True when at least one firewall profile enforces rules. Runs PowerShell
+  and treats any failure to query as "on" (fail safe: keep the warning). }
+function AnyFirewallProfileOn(): Boolean;
+var
+  ResultCode: Integer;
+  PSPath: String;
+begin
+  PSPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  Result := True;
+  if RunHidden(PSPath, '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' +
+    AddQuotes('if ((Get-NetFirewallProfile -ErrorAction Stop | ' +
+    'Where-Object { $_.Enabled } | Measure-Object).Count -eq 0) { exit 42 }'),
+    ResultCode) then
+    Result := ResultCode <> 42;
+end;
+
+procedure AddFirewallRule();
+var
+  PSPath, LogFile: String;
+  Output: AnsiString;
+begin
+  { Idempotent: drop any previous rule first. }
   SoftRun('netsh.exe', 'advfirewall firewall delete rule name=' +
     AddQuotes('{#FirewallRule}'));
-  if (not RunHidden('netsh.exe', 'advfirewall firewall add rule name=' +
+  PSPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  LogFile := ExpandConstant('{tmp}\thekvm-firewall.log');
+
+  { Method 1: modern PowerShell cmdlet. Output goes to a log file so a
+    failure is diagnosable instead of a mystery. }
+  SoftRun(PSPath, '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' +
+    AddQuotes('Remove-NetFirewallRule -DisplayName ' +
+    AddQuotes(AddQuotes('{#FirewallRule}')) + ' -ErrorAction SilentlyContinue; ' +
+    'New-NetFirewallRule -DisplayName ' + AddQuotes(AddQuotes('{#FirewallRule}')) +
+    ' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 42110,42111 ' +
+    '-Program ' + AddQuotes(AddQuotes(DaemonPath())) +
+    ' -Profile Domain,Private,Public -ErrorAction Stop ' +
+    '> ' + AddQuotes(LogFile) + ' 2>&1'));
+  if RuleVerified() then
+    Exit;
+
+  { Method 2: classic netsh fallback. Its exit code is unreliable, so the
+    show-rule check below decides success, not this call. }
+  SoftRun('cmd.exe', '/c ' + AddQuotes('netsh.exe advfirewall firewall add rule name=' +
     AddQuotes('{#FirewallRule}') + ' dir=in action=allow protocol=UDP ' +
-    'localport=42110,42111 ExeFile=' + AddQuotes(DaemonPath()) +
-    ' enable=yes', ResultCode)) or (ResultCode <> 0) then
-    MsgBox('The firewall rule could not be added. Pairing needs UDP ' +
-      'ports 42110-42111 inbound for kvm-daemon.exe; add it manually ' +
-      'in Windows Defender Firewall.', mbError, MB_OK);
+    'localport=42110,42111 program=' + AddQuotes(DaemonPath()) +
+    ' enable=yes > ' + AddQuotes(LogFile) + ' 2>&1'));
+  if RuleVerified() then
+    Exit;
+
+  { If every firewall profile is off, nothing filters inbound traffic, so
+    pairing works without a rule. Stay silent instead of alarming the user;
+    the log records why. }
+  if not AnyFirewallProfileOn() then
+  begin
+    Output := '';
+    LoadStringFromFile(LogFile, Output);
+    Log('Firewall rule not verified but all profiles are off; pairing is unfiltered. Last output: ' + Output);
+    Exit;
+  end;
+
+  Output := '';
+  LoadStringFromFile(LogFile, Output);
+  MsgBox('The firewall rule could not be added automatically. ' +
+    'Pairing needs UDP ports 42110-42111 inbound for kvm-daemon.exe. ' +
+    'Details were saved to ' + LogFile + ' :' + #13#10 + Output,
+    mbError, MB_OK);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
