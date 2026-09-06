@@ -1579,12 +1579,33 @@ fn pair_prepare(address: &str, dir: &std::path::Path, node_name: &str) -> Result
     let runtime = runtime();
     runtime.block_on(async move {
         let endpoint = transport::make_client_endpoint(&identity)?;
-        let conn = endpoint
-            .connect(address, "thekvm")?
-            .await
-            .with_context(|| format!("connect to {address}"))?;
+        // Every network wait here is bounded. Unbounded waits used to leave
+        // the UI stuck on "Contacting…" forever (blackholed UDP from a
+        // wrong IP, AP isolation, or a firewall) with zero evidence about
+        // which stage died. Now each stage fails loudly with its remedy.
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            endpoint.connect(address, "thekvm")?,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "no answer from {address} after 10s — check the typed IP and that both computers share the same network"
+            )
+        })?
+        .with_context(|| format!("connect to {address}"))?;
         let peer_fingerprint = peer_fingerprint(&conn)?;
-        let (mut send, mut recv) = conn.open_bi().await?;
+        let (mut send, mut recv) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            conn.open_bi(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "{address} connected but opened no pairing stream (10s) — update TheKVM on both computers"
+            )
+        })?
+        .with_context(|| format!("open pairing stream to {address}"))?;
         write_frame(
             &mut send,
             &WireMessage::PairRequest {
@@ -1593,9 +1614,18 @@ fn pair_prepare(address: &str, dir: &std::path::Path, node_name: &str) -> Result
             },
         )
         .await?;
-        let challenge = read_frame(&mut recv)
-            .await?
-            .context("peer closed pairing stream")?;
+        let challenge = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_frame(&mut recv),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "{address} is not answering pairing (10s) — look at its app window for the incoming request"
+            )
+        })?
+        .with_context(|| format!("read pairing answer from {address}"))?
+        .context("peer closed pairing stream")?;
         let (peer_node_name, challenged_fingerprint) = match challenge {
             WireMessage::PairChallenge {
                 node_name,
