@@ -86,6 +86,8 @@ fn main() -> Result<()> {
     std::thread::spawn(move || {
         let weak = poll_weak;
         let mut tick: u64 = 0;
+        let mut consecutive_failures: u32 = 0;
+        let mut was_failing = false;
         loop {
         if weak.upgrade().is_none() {
             break;
@@ -94,6 +96,11 @@ fn main() -> Result<()> {
         set_poll_count(&weak, tick);
         match control_request(ControlRequest::Status) {
             Ok(ControlResponse::Status(status)) => {
+                if was_failing {
+                    was_failing = false;
+                    ui_log("poll: daemon reachable again after failures");
+                }
+                consecutive_failures = 0;
                 let port = status.listen_port;
                 let fingerprint = status.fingerprint_hex.clone();
                 set_daemon_status(&weak, status);
@@ -110,12 +117,16 @@ fn main() -> Result<()> {
                 }
             }
             Ok(other) => {
+                consecutive_failures += 1;
+                was_failing = true;
                 ui_log(&format!("poll: unexpected daemon status: {other:?}"));
                 set_daemon_offline(&weak, format!("Unexpected daemon status: {other:?}"));
                 clear_invite(&weak, &invite_state);
                 set_local_address_direct(&weak);
             }
             Err(error) => {
+                consecutive_failures += 1;
+                was_failing = true;
                 let failure = classify_control_error(&error);
                 match failure {
                     ControlFailure::Missing => {
@@ -204,8 +215,17 @@ fn main() -> Result<()> {
         }
         // Status is intentionally polled instead of pushed over the local
         // endpoint so the UI also recovers cleanly when the privileged daemon
-        // restarts, upgrades, or changes active sessions.
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        // restarts, upgrades, or changes active sessions. After sustained
+        // failure, back off so a dead endpoint cannot churn threads: the
+        // Start button and any later poll still retry.
+        if consecutive_failures == 10 {
+            ui_log("poll: 10 consecutive failures; backing off to 15s intervals");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(if consecutive_failures >= 10 {
+            15
+        } else {
+            3
+        }));
         }
     });
 
@@ -1162,12 +1182,33 @@ fn control_request(request: ControlRequest) -> Result<ControlResponse> {
             .await
             .context("connect daemon control socket")?;
 
+        // The synchronous pipe open blocks indefinitely when no server
+        // instance is currently accepting. A single wedged open used to
+        // freeze the whole status poll forever (buttons stuck disabled with
+        // no hover) while one-shot calls kept working, so bound it: the
+        // blocking open runs on the pool and gives up after 3 seconds.
+        // Next poll retries; see the consecutive-failure backoff below.
         #[cfg(target_os = "windows")]
-        let pipe = kvm_protocol::control::windows_control_pipe();
-        #[cfg(target_os = "windows")]
-        let mut stream = tokio::net::windows::named_pipe::ClientOptions::new()
-            .open(&pipe)
-            .context("connect daemon control pipe")?;
+        let mut stream = {
+            let pipe = kvm_protocol::control::windows_control_pipe();
+            let opened = tokio::task::spawn_blocking(move || {
+                tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe)
+            });
+            match tokio::time::timeout(std::time::Duration::from_secs(3), opened).await {
+                Ok(Ok(Ok(stream))) => stream,
+                Ok(Ok(Err(error))) => {
+                    return Err(anyhow::Error::new(error).context("connect daemon control pipe"));
+                }
+                Ok(Err(join_error)) => {
+                    return Err(anyhow::anyhow!("control pipe opener failed: {join_error}"));
+                }
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "control pipe open timed out after 3s (daemon not accepting)"
+                    ));
+                }
+            }
+        };
 
         #[cfg(not(any(unix, target_os = "windows")))]
         anyhow::bail!("local daemon control is not available on this operating system");
