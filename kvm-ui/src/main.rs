@@ -89,6 +89,9 @@ fn main() -> Result<()> {
             kvm_core::Mode::ServerClient => 1,
             kvm_core::Mode::ClientOnly => 2,
         });
+        // Seed the green "Current role" text from the same file: until the
+        // first successful poll it is the only source of truth on screen.
+        ui.set_role_text(SharedString::from(role_name(config.mode)));
     }
 
     let weak = ui.as_weak();
@@ -204,7 +207,7 @@ fn main() -> Result<()> {
                         ui_log("poll: access denied to daemon control endpoint");
                         set_daemon_offline(
                             &weak,
-                            "Access denied to the background service. Log out and back in, then relaunch TheKVM.".into(),
+                            control_denied_status(&error, "Access denied to the background service"),
                         );
                     }
                     ControlFailure::Other(message) => {
@@ -306,14 +309,17 @@ fn main() -> Result<()> {
             };
             // Read-modify-write against the live daemon config so pressing a
             // role button only ever changes the role, never anything else.
+            // Every outcome is logged: a silent press must be impossible.
             let current = match control_request(ControlRequest::GetConfig) {
                 Ok(ControlResponse::Config(config)) => config,
                 Ok(other) => {
+                    ui_log(&format!("role change: cannot read settings: {other:?}"));
                     set_status(&weak, format!("Cannot read settings: {other:?}"));
                     return;
                 }
                 Err(error) => {
-                    set_status(&weak, format!("Background service unreachable: {error}"));
+                    ui_log(&format!("role change: settings unreadable: {error:#}"));
+                    set_status(&weak, control_denied_status(&error, "Background service unreachable"));
                     return;
                 }
             };
@@ -335,6 +341,10 @@ fn main() -> Result<()> {
                         current.clipboard_enabled,
                     );
                     ui_log(&format!("role applied: {}", role_name(requested)));
+                    // Update the green role text from the authoritative
+                    // Applied result now; the poll refreshes it again when
+                    // healthy.
+                    set_role_display(&weak, requested);
                     set_status(
                         &weak,
                         format!("Role set: {}.", role_name(requested)),
@@ -448,12 +458,35 @@ fn main() -> Result<()> {
     let weak = ui.as_weak();
     ui.on_start_daemon(move || {
         let weak = weak.clone();
-        std::thread::spawn(move || match ensure_user_daemon() {
-            Ok(()) => set_status(
-                &weak,
-                "Background service started, connecting…".into(),
-            ),
-            Err(error) => set_status(&weak, format!("Could not start background service: {error}")),
+        std::thread::spawn(move || {
+            // Explicit button press, so an admin prompt is appropriate:
+            // when the packaged system service exists but is stopped,
+            // start (and enable) it with one approval instead of making
+            // the user open a terminal. The unit check runs first so a
+            // machine without the package never sees a password prompt.
+            #[cfg(target_os = "linux")]
+            if !systemctl_ok("is-active", "thekvmd") && systemctl_unit_present("thekvmd") {
+                let elevated = std::process::Command::new("pkexec")
+                    .args(["systemctl", "enable", "--now", "thekvmd"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false);
+                if elevated {
+                    ui_log("background service started from the Start button");
+                    set_status(&weak, "Background service started.".into());
+                    return;
+                }
+            }
+            match ensure_user_daemon() {
+                Ok(()) => set_status(
+                    &weak,
+                    "Background service started, connecting…".into(),
+                ),
+                Err(error) => set_status(&weak, format!("Could not start background service: {error}")),
+            }
         });
     });
 
@@ -578,7 +611,8 @@ fn main() -> Result<()> {
                 } else {
                     command.arg("--disable-clipboard");
                 }
-                match control_request(ControlRequest::SetConfig {                    device_name: Some(device_name.clone()),
+                match control_request(ControlRequest::SetConfig {
+                    device_name: Some(device_name.clone()),
                     mode: Some(requested_mode),
                     allow_lock_screen_control: Some(allow_lock_screen),
                     listen_port: None,
@@ -588,20 +622,30 @@ fn main() -> Result<()> {
                     clear_auto_connect: auto_address.trim().is_empty(),
                     clipboard_enabled: Some(clipboard_enabled),
                 }) {
-                    Ok(ControlResponse::Applied { restart_required }) => set_status(
-                        &weak,
-                        if restart_required {
-                            "Configuration saved; restart daemon".into()
-                        } else {
-                            "Configuration saved".into()
-                        },
-                    ),
-                    Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+                    Ok(ControlResponse::Applied { restart_required }) => {
+                        // Same truth rule as the role buttons: the green
+                        // role text follows the Applied result at once.
+                        set_role_display(&weak, requested_mode);
+                        set_status(
+                            &weak,
+                            if restart_required {
+                                "Configuration saved; restart daemon".into()
+                            } else {
+                                "Configuration saved".into()
+                            },
+                        )
+                    }
+                    Ok(ControlResponse::Error { message }) => {
+                        ui_log(&format!("settings save refused: {message}"));
+                        set_status(&weak, message)
+                    }
                     Ok(other) => {
+                        ui_log(&format!("settings save unexpected: {other:?}"));
                         set_status(&weak, format!("Unexpected daemon response: {other:?}"))
                     }
                     Err(control_error) => match command.output() {
                         Ok(output) if output.status.success() => {
+                            set_role_display(&weak, requested_mode);
                             set_status(&weak, "Configuration saved (CLI fallback)".into())
                         }
                         Ok(output) => set_status(
@@ -690,6 +734,85 @@ fn role_name(mode: Mode) -> &'static str {
         Mode::ServerClient => "Control other",
         Mode::ClientOnly => "Be controlled",
     }
+}
+
+/// Show the authoritative role immediately. The green "Current role" text
+/// must reflect an applied change at once — not wait for the next
+/// successful status poll, which can be failing for unrelated reasons
+/// (and then the display would lie until the poll recovers).
+fn set_role_display(weak: &slint::Weak<AppWindow>, mode: Mode) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_mode_index(match mode {
+                    Mode::Bidirectional => 0,
+                    Mode::ServerClient => 1,
+                    Mode::ClientOnly => 2,
+                });
+                ui.set_role_text(SharedString::from(role_name(mode)));
+            }
+        }
+    });
+}
+
+/// Status text for a failed control request. A permission problem names its
+/// remedy (including the stale-login-session case) instead of a raw OS
+/// error, so the user always knows the next step.
+fn control_denied_status(error: &anyhow::Error, prefix: &str) -> String {
+    let permission_denied = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    });
+    if permission_denied {
+        #[cfg(unix)]
+        if unix_session_lacks_thekvm_group() {
+            return "No permission for the background service: this login started before TheKVM added you to the 'thekvm' group. Log out and back in once (no reinstall needed), then retry.".into();
+        }
+        return format!(
+            "{prefix}: permission denied by the background service. Log out and back in, then relaunch TheKVM."
+        );
+    }
+    format!("{prefix}: {error:#}")
+}
+
+/// True when the desktop user is listed in the `thekvm` group in /etc/group
+/// (install-time membership) but this process's own login-time groups lack
+/// it — proof the session predates the install and a re-login will fix
+/// access. No libc dependency: one `id` call, only on permission failures.
+#[cfg(unix)]
+fn unix_session_lacks_thekvm_group() -> bool {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default();
+    if user.is_empty() {
+        return false;
+    }
+    let Ok(groups) = std::fs::read_to_string("/etc/group") else {
+        return false;
+    };
+    let listed = groups.lines().any(|line| {
+        let mut fields = line.split(':');
+        if fields.next() != Some("thekvm") {
+            return false;
+        }
+        fields.nth(2).is_some_and(|members| {
+            members.split(',').any(|member| member.trim() == user)
+        })
+    });
+    if !listed {
+        return false;
+    }
+    std::process::Command::new("id")
+        .arg("-Gn")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|names| !names.split_whitespace().any(|name| name == "thekvm"))
+        .unwrap_or(false)
 }
 
 fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
@@ -1221,7 +1344,9 @@ fn daemon_binary() -> Result<PathBuf> {
 /// Start a user-session daemon so opening TheKVM always yields a working app,
 /// even when no system service is installed or running. Refuses when the
 /// privileged system daemon already owns this machine (Linux control socket
-/// present) so two daemons never fight over port 42110.
+/// present) so two daemons never fight over port 42110. When the system
+/// service is installed but stopped, says exactly how to start it instead
+/// of spawning a conflicting user daemon.
 fn ensure_user_daemon() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -1230,12 +1355,25 @@ fn ensure_user_daemon() -> Result<()> {
                 "the system service owns this machine but is unreachable; log out and back in, then relaunch"
             );
         }
+        if systemctl_ok("is-active", "thekvmd") {
+            anyhow::bail!("the system service is starting; retry in a few seconds");
+        }
+        if systemctl_ok("is-enabled", "thekvmd") {
+            anyhow::bail!(
+                "the system service is installed but stopped; start it once with: sudo systemctl start thekvmd (it then starts automatically on later boots)"
+            );
+        }
+        // No system service: fall through and run our own user daemon below.
+        // The UI's control path tries the user socket as a fallback, so this
+        // daemon is reachable the moment it is up.
     }
     let binary = daemon_binary()?;
-    // Inherit this process's environment so the daemon uses the same user
-    // data directory (and identity) the UI and the controller session use.
+    // Pin the child to THIS UI's data directory: without this a user-session
+    // daemon would resolve the privileged system directory, fail on
+    // permissions, and serve a socket the UI never queries.
     let mut command = std::process::Command::new(&binary);
     command.arg("serve");
+    command.env("THEKVM_DATA_DIR", data_dir());
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
     command.stderr(std::process::Stdio::null());
@@ -1250,6 +1388,38 @@ fn ensure_user_daemon() -> Result<()> {
         .spawn()
         .with_context(|| format!("start {}", binary.display()))?;
     Ok(())
+}
+
+/// Unprivileged systemd state probe (is-active / is-enabled). Read-only, so
+/// it never prompts and is safe to call from the poll path.
+#[cfg(target_os = "linux")]
+fn systemctl_ok(verb: &str, unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .arg(verb)
+        .arg(unit)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// True when the packaged unit file exists at all (enabled, disabled, or
+/// failed — anything but absent). Read-only; gates the pkexec path so the
+/// Start button never prompts for a password on machines without the
+/// package installed.
+#[cfg(target_os = "linux")]
+fn systemctl_unit_present(unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .arg("cat")
+        .arg(format!("{unit}.service"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Show this machine's LAN address even while the daemon is unreachable; it
@@ -1315,9 +1485,50 @@ fn control_request(request: ControlRequest) -> Result<ControlResponse> {
     let runtime = runtime();
     runtime.block_on(async move {
         #[cfg(unix)]
-        let mut stream = tokio::net::UnixStream::connect(control_data_dir().join("control.sock"))
-            .await
-            .context("connect daemon control socket")?;
+        let mut stream = {
+            // Prefer the privileged system daemon; fall back to a
+            // user-session daemon's socket so an automatically started
+            // user daemon (the no-system-service case) just works — its
+            // identity matches this UI's, so sessions dial with the
+            // right peer book. Both attempts are bounded: a wedged
+            // endpoint must fail loudly instead of freezing the caller
+            // forever with zero log evidence.
+            let system = control_data_dir().join("control.sock");
+            let system_attempt = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                tokio::net::UnixStream::connect(&system),
+            )
+            .await;
+            match system_attempt {
+                Ok(Ok(stream)) => stream,
+                system_outcome => {
+                    let user = data_dir().join("control.sock");
+                    let user_attempt = if user != system {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            tokio::net::UnixStream::connect(&user),
+                        )
+                        .await
+                        .ok()
+                    } else {
+                        None
+                    };
+                    match user_attempt {
+                        Some(Ok(stream)) => stream,
+                        _ => {
+                            return Err(match system_outcome {
+                                Ok(Err(error)) => anyhow::Error::new(error)
+                                    .context("connect daemon control socket"),
+                                Err(_) => anyhow::anyhow!(
+                                    "connect daemon control socket timed out after 3s"
+                                ),
+                                Ok(Ok(_)) => anyhow::anyhow!("unreachable control socket branch"),
+                            });
+                        }
+                    }
+                }
+            }
+        };
 
         // The synchronous pipe open blocks indefinitely when no server
         // instance is currently accepting. A single wedged open used to
