@@ -1051,9 +1051,16 @@ fn pin_controller_peer(data_dir: &std::path::Path, pending: &PendingPair) -> Res
     Ok(())
 }
 
-/// Start the supervised `connect` session. It inherits this process's
-/// environment, so it uses the same user data directory (and therefore the
-/// same identity and peer book the ceremony just pinned).
+/// Start the supervised `connect` session.
+///
+/// Identity contract (this was the connection bug): the pairing ceremony
+/// and the peer book live in THIS UI's user data directory, so the child
+/// is pinned to the same directory via THEKVM_DATA_DIR. Inheriting the
+/// environment is NOT enough — the daemon defaults to the privileged
+/// system directory, which would make the child dial with a different
+/// identity than the ceremony approved (and read an empty system peer
+/// book), leaving the other side waiting for an approval that never
+/// matches, stuck on "Connecting…" forever.
 ///
 /// Honesty contract: spawning the child is NOT connecting. The status stays
 /// at "Connecting…" until the child reports THEKVM_STATUS established on
@@ -1073,6 +1080,7 @@ fn spawn_session(
     };
     let mut command = std::process::Command::new(&binary);
     command.arg("connect").arg(&address);
+    command.env("THEKVM_DATA_DIR", data_dir());
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
     // Piped (not nulled): the child reports dialing/established/waiting
