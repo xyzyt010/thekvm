@@ -1,32 +1,39 @@
 # TheKVM first-iteration binaries
 
-Two ready-to-run builds of the same 0.1.4 workspace (65 unit tests pass;
-the six-digit pairing ceremony is covered by the repository gates).
+Two ready-to-run builds of the same 0.1.6 workspace (65 unit tests pass;
+the LAN integration gate passes on Linux Mint, covering two-sided pairing
+approval, strict roles, and revocation).
+
+## The three-click flow (both machines)
+
+1. Open TheKVM. The background service starts itself if needed.
+2. Choose what this computer does: **Control other**, **Be controlled**,
+   or **Both ways**.
+3. Type the other computer's address (shown at the top of its window),
+   press **Connect**, compare the six-digit code on both screens, confirm
+   on both sides. Done — Disconnect ends it.
 
 ## Simplest install
 
-- **Windows:** download `thekvm-0.1.4-setup.exe`, double-click it — a
+- **Windows:** download `thekvm-0.1.6-setup.exe`, double-click it — a
   standard installer wizard (Inno Setup): Options page, progress, Finish
   with a Launch checkbox. Approve the single UAC prompt. It stops any
   previous TheKVM service first, installs to Program Files, configures the
   receiver, registers and starts the LocalSystem service, adds the
-  firewall rule, and creates Start-menu entries. The app auto-starts its
-  background service if none is running, always shows your LAN address,
-  and has Controller / Receiver / Both-ways role buttons. Uninstall from
+  firewall rule, and creates Start-menu entries. Uninstall from
   Add/Remove Programs (service and firewall rule are removed too).
-- **Linux Mint / Ubuntu / Debian:** download `thekvm_0.1.3_amd64.deb` and run
-  `sudo apt install ./thekvm_0.1.3_amd64.deb` — apt pulls in the
+- **Linux Mint / Ubuntu / Debian:** download `thekvm_0.1.6_amd64.deb` and run
+  `sudo apt install ./thekvm_0.1.6_amd64.deb` — apt pulls in the
   fontconfig dependency automatically. The post-install script creates the
-  service account, enrolls your user, loads uinput, and starts the receiver.
-  Log out and back in once so the `thekvm` group applies to your desktop
+  service account, enrolls your user (service access plus input access for
+  the Connect button), loads uinput, and starts the receiver.
+  Log out and back in once so the groups apply to your desktop
   session, then launch TheKVM from the start menu. Remove with
   `sudo apt remove thekvm`, purge state with `sudo apt purge thekvm`.
 
-Manual installs remain available: `thekvm-0.1.4-windows-x86_64.zip`
+Manual installs remain available: `thekvm-0.1.6-windows-x86_64.zip`
 (extract and run `install-service.ps1` elevated) and
-`thekvm-0.1.3-linux-x86_64.tar.gz` (extract and run `sudo sh install.sh`).
-Linux packages are unchanged in 0.1.4; Mint/Ubuntu/Debian stay on
-`thekvm_0.1.3_amd64.deb`.
+`thekvm-0.1.6-linux-x86_64.tar.gz` (extract and run `sudo sh install.sh`).
 
 The Linux binaries are linked against a glibc 2.35 baseline, so they run on
 Ubuntu 22.04 / Linux Mint 21 and everything newer (Mint 22, Debian 12,
