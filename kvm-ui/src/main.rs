@@ -204,6 +204,59 @@ fn main() -> Result<()> {
     });
 
     let weak = ui.as_weak();
+    ui.on_set_role(move |role| {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            let requested = match role {
+                1 => Mode::ServerClient,
+                2 => Mode::ClientOnly,
+                _ => Mode::Bidirectional,
+            };
+            // Read-modify-write against the live daemon config so pressing a
+            // role button only ever changes the role, never anything else.
+            let current = match control_request(ControlRequest::GetConfig) {
+                Ok(ControlResponse::Config(config)) => config,
+                Ok(other) => {
+                    set_status(&weak, format!("Cannot read settings: {other:?}"));
+                    return;
+                }
+                Err(error) => {
+                    set_status(&weak, format!("Background service unreachable: {error}"));
+                    return;
+                }
+            };
+            match control_request(ControlRequest::SetConfig {
+                device_name: Some(current.device_name.clone()),
+                mode: Some(requested),
+                allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                listen_port: None,
+                layout: None,
+                auto_connect_address: current.auto_connect_address.clone(),
+                clear_auto_connect: current.auto_connect_address.is_none(),
+                clipboard_enabled: Some(current.clipboard_enabled),
+            }) {
+                Ok(ControlResponse::Applied { .. }) => {
+                    mirror_user_config(
+                        &current.device_name,
+                        requested,
+                        current.allow_lock_screen_control,
+                        current.clipboard_enabled,
+                    );
+                    set_status(
+                        &weak,
+                        format!("Role set: {}.", role_name(requested)),
+                    );
+                }
+                Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+                Ok(other) => {
+                    set_status(&weak, format!("Unexpected daemon response: {other:?}"))
+                }
+                Err(error) => set_status(&weak, format!("Cannot set role: {error}")),
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
     let disconnect_session = session_state.clone();
     ui.on_disconnect(move || {
         stop_session(&weak, &disconnect_session, "Disconnected");
@@ -505,16 +558,24 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Plain-language role names shown next to "Current role:" and in the
+/// connect gate message, so selection is never ambiguous.
+fn role_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Bidirectional => "Both ways",
+        Mode::ServerClient => "Control other",
+        Mode::ClientOnly => "Be controlled",
+    }
+}
+
 fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
-                // Status polling is authoritative. Do not feed the daemon's
-                // mode value back through the user-edit callback every three
-                // seconds, which would otherwise create redundant writes and
-                // restart notifications.
-                ui.set_suppress_config(true);
+                // The role buttons apply explicitly through set-role; status
+                // polling only displays the daemon's authoritative state and
+                // must never write settings back.
                 ui.set_connected(true);
                 ui.set_status_text(SharedString::from(format!(
                     "Daemon online · {} trusted peer(s) · {} active session(s)",
@@ -532,7 +593,7 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                     Mode::ClientOnly => 2,
                 });
                 ui.set_fingerprint(SharedString::from(status.fingerprint_hex));
-                ui.set_suppress_config(false);
+                ui.set_role_text(SharedString::from(role_name(status.mode)));
             }
         }
     });
@@ -663,7 +724,7 @@ fn start_session_flow(
         if status.mode == kvm_core::Mode::ClientOnly {
             set_status(
                 &weak,
-                "This machine is a Receiver only. Switch to Controller or Both ways to connect.".into(),
+                "This computer is set to 'Be controlled', so it cannot dial out. Press 'Control other' or 'Both ways' above, then Connect again.".into(),
             );
             return;
         }

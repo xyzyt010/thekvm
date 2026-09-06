@@ -1,4 +1,4 @@
-import { Button, LineEdit, ComboBox, Switch, TabWidget } from "std-widgets.slint";
+import { Button, LineEdit, Switch, TabWidget } from "std-widgets.slint";
 
 // TheKVM: Deskflow-simple. The Connect tab is the whole product for most
 // users: pick what this computer does, type the other computer's address,
@@ -25,12 +25,12 @@ export component AppWindow inherits Window {
     in-out property <bool> lock-screen-control: false;
     in-out property <bool> clipboard-enabled: false;
     in-out property <int> mode-index: 0;
+    in property <string> role-text: "Both ways";
     in-out property <string> layout-path: "";
     in-out property <string> peer-address: "";
     in-out property <string> discovery-text: "No LAN scan yet";
     in-out property <string> device-name: "";
     in-out property <string> auto-connect-address: "";
-    in-out property <bool> suppress-config: false;
     in-out property <string> local-address: "";
     in-out property <string> invite-text: "";
     in-out property <image> invite-qr;
@@ -39,6 +39,7 @@ export component AppWindow inherits Window {
 
     callback connect-to(string /* address */);
     callback disconnect();
+    callback set-role(int /* 0 both, 1 controller, 2 receiver */);
     callback pair-from-invite(string /* invite */);
     callback discover-lan();
     callback start-daemon();
@@ -50,11 +51,6 @@ export component AppWindow inherits Window {
     callback apply-config(bool, int, string, string, bool);
     callback import-layout(string);
 
-    changed mode-index => {
-        if (!suppress-config) {
-            apply-config(lock-screen-control, mode-index, device-name, auto-connect-address, clipboard-enabled);
-        }
-    }
 
     VerticalLayout {
         padding: 16px;
@@ -97,22 +93,28 @@ export component AppWindow inherits Window {
                     padding: 12px;
                     spacing: 10px;
                     Text { text: "This computer will:"; color: white; font-size: 16px; font-weight: 700; }
+                    Text {
+                        text: "Current role: " + role-text;
+                        color: #22c55e;
+                        font-size: 14px;
+                        font-weight: 700;
+                    }
                     HorizontalLayout {
                         spacing: 12px;
                         Button {
                             text: "Control other";
-                            enabled: connected && mode-index != 1;
-                            clicked => { root.mode-index = 1; }
+                            enabled: connected;
+                            clicked => { set-role(1); }
                         }
                         Button {
                             text: "Be controlled";
-                            enabled: connected && mode-index != 2;
-                            clicked => { root.mode-index = 2; }
+                            enabled: connected;
+                            clicked => { set-role(2); }
                         }
                         Button {
                             text: "Both ways";
-                            enabled: connected && mode-index != 0;
-                            clicked => { root.mode-index = 0; }
+                            enabled: connected;
+                            clicked => { set-role(0); }
                         }
                     }
                     Text {
