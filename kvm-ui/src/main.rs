@@ -20,10 +20,22 @@ use std::sync::{Arc, Mutex};
 
 struct PendingPair {
     peer_fingerprint: String,
+    peer_node_name: String,
     address: String,
-    /// Six-digit code both endpoints derive from the two fingerprints so
-    /// the two users can compare digits instead of hexadecimal strings.
+    /// Six-digit code derived from the USER identity (the identity the
+    /// controller session dials with) and the peer fingerprint, so both
+    /// screens show the same digits. verification_code() is order
+    /// independent, matching what the receiver displays for the dialing
+    /// fingerprint.
     verification_code: String,
+}
+
+/// A controller session supervised by the UI: `kvm-daemon connect` retries
+/// internally forever, so the UI only needs to start it, watch it, and kill
+/// it on Disconnect.
+struct Session {
+    child: std::process::Child,
+    address: String,
 }
 
 fn main() -> Result<()> {
@@ -54,6 +66,10 @@ fn main() -> Result<()> {
     let weak = ui.as_weak();
     let last_invite = Arc::new(Mutex::new(String::new()));
     let invite_state = last_invite.clone();
+    // Controller session supervised by this UI (at most one).
+    let session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
+    let session_state = session.clone();
+    let session_for_poll = session.clone();
     // Throttle for automatic background-daemon starts: at most one attempt
     // per poll window so a broken install cannot fork-bomb the machine.
     let last_autostart = Arc::new(Mutex::new(None::<std::time::Instant>));
@@ -138,6 +154,35 @@ fn main() -> Result<()> {
                 set_local_address_direct(&weak);
             }
         }
+        // The supervised `connect` process retries internally, so an exit
+        // always means the session ended abnormally (or was disconnected,
+        // which clears the slot first). Surface it instead of silently
+        // showing a stale "connected" state.
+        if let Ok(mut slot) = session_for_poll.lock() {
+            if let Some(session) = slot.as_mut() {
+                match session.child.try_wait() {
+                    Ok(Some(status)) => {
+                        let address = session.address.clone();
+                        *slot = None;
+                        set_session(&weak, None);
+                        set_status(
+                            &weak,
+                            format!("Connection to {address} ended ({status})"),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let address = session.address.clone();
+                        *slot = None;
+                        set_session(&weak, None);
+                        set_status(
+                            &weak,
+                            format!("Connection to {address} lost: {error}"),
+                        );
+                    }
+                }
+            }
+        }
         // Status is intentionally polled instead of pushed over the local
         // endpoint so the UI also recovers cleanly when the privileged daemon
         // restarts, upgrades, or changes active sessions.
@@ -145,31 +190,42 @@ fn main() -> Result<()> {
     });
 
     let weak = ui.as_weak();
-    let pending_for_pair = pending_pair.clone();
-    let pair_data_dir = startup_dir.clone();
-    ui.on_pair_with(move |address| {
-        begin_pairing(
+    let pending_for_connect = pending_pair.clone();
+    let connect_data_dir = startup_dir.clone();
+    let connect_session = session_state.clone();
+    ui.on_connect_to(move |address| {
+        start_session_flow(
             &weak,
-            &pending_for_pair,
-            &pair_data_dir,
+            &pending_for_connect,
+            &connect_data_dir,
+            &connect_session,
             address.to_string(),
-            None,
         );
+    });
+
+    let weak = ui.as_weak();
+    let disconnect_session = session_state.clone();
+    ui.on_disconnect(move || {
+        stop_session(&weak, &disconnect_session, "Disconnected");
     });
 
     let weak = ui.as_weak();
     let pending_for_invite = pending_pair.clone();
     let invite_data_dir = startup_dir.clone();
+    let invite_session = session_state.clone();
     ui.on_pair_from_invite(move |invite| {
         let weak = weak.clone();
         match kvm_protocol::invite::parse(&invite) {
-            Ok((target, fingerprint)) if !target.trim().is_empty() => {
-                begin_pairing(
+            // An invite is just a trusted address: fill the field and run
+            // the same connect flow as a typed IP.
+            Ok((target, _)) if !target.trim().is_empty() => {
+                set_peer_address_field(&weak, &target);
+                start_session_flow(
                     &weak,
                     &pending_for_invite,
                     &invite_data_dir,
+                    &invite_session,
                     target,
-                    Some(fingerprint),
                 );
             }
             Ok(_) => set_status(
@@ -226,6 +282,8 @@ fn main() -> Result<()> {
 
     let weak = ui.as_weak();
     let pending_for_confirm = pending_pair.clone();
+    let confirm_data_dir = startup_dir.clone();
+    let confirm_session = session_state.clone();
     ui.on_confirm_pairing(move || {
         let pending = pending_for_confirm
             .lock()
@@ -236,13 +294,32 @@ fn main() -> Result<()> {
             return;
         };
         let weak = weak.clone();
-        std::thread::spawn(move || match finish_pair(pending) {
-            Ok(fingerprint) => {
-                set_status(&weak, format!("Paired with {fingerprint}"));
-                set_pending(&weak, String::new(), String::new());
+        let confirm_data_dir = confirm_data_dir.clone();
+        let confirm_session = confirm_session.clone();
+        std::thread::spawn(move || {
+            // The user compared the six-digit code on both screens and
+            // approved: pin the peer in the controller (user) book, then
+            // start the session. The receiver side approved the same
+            // fingerprint through its own Approve button.
+            match pin_controller_peer(&confirm_data_dir, &pending) {
+                Ok(()) => {
+                    set_pending(&weak, String::new(), String::new(), String::new());
+                    set_status(&weak, format!("Paired with {}", pending.peer_node_name));
+                    spawn_session(&weak, &confirm_session, pending.address);
+                }
+                Err(error) => set_status(&weak, format!("Pairing failed: {error}")),
             }
-            Err(error) => set_status(&weak, format!("Pairing failed: {error}")),
         });
+    });
+
+    let weak = ui.as_weak();
+    let pending_for_cancel = pending_pair.clone();
+    ui.on_cancel_pairing(move || {
+        if let Ok(mut slot) = pending_for_cancel.lock() {
+            *slot = None;
+        }
+        set_pending(&weak, String::new(), String::new(), String::new());
+        set_status(&weak, "Pairing cancelled".into());
     });
 
     let weak = ui.as_weak();
@@ -285,6 +362,20 @@ fn main() -> Result<()> {
             let device_name = device_name.to_string();
             let auto_address = auto_address.to_string();
             std::thread::spawn(move || {
+                let requested_mode = match mode_index {
+                    1 => Mode::ServerClient,
+                    2 => Mode::ClientOnly,
+                    _ => Mode::Bidirectional,
+                };
+                // The supervised controller session reads the USER config, so
+                // mirror the same choices there (without any boot peer, which
+                // the user config must never carry).
+                mirror_user_config(
+                    &device_name,
+                    requested_mode,
+                    allow_lock_screen,
+                    clipboard_enabled,
+                );
                 let mode = match mode_index {
                     1 => "server-client",
                     2 => "receiver-only",
@@ -310,13 +401,7 @@ fn main() -> Result<()> {
                 } else {
                     command.arg("--disable-clipboard");
                 }
-                let requested_mode = match mode_index {
-                    1 => Mode::ServerClient,
-                    2 => Mode::ClientOnly,
-                    _ => Mode::Bidirectional,
-                };
-                match control_request(ControlRequest::SetConfig {
-                    device_name: Some(device_name.clone()),
+                match control_request(ControlRequest::SetConfig {                    device_name: Some(device_name.clone()),
                     mode: Some(requested_mode),
                     allow_lock_screen_control: Some(allow_lock_screen),
                     listen_port: None,
@@ -554,50 +639,149 @@ fn decide_incoming_pairing(weak: &slint::Weak<AppWindow>, fingerprint: String, a
     });
 }
 
-fn begin_pairing(
+/// Deskflow-simple connect flow: type (or scan) the other computer's
+/// address, press Connect. A trusted peer connects immediately; a new peer
+/// runs the six-digit ceremony first, then connects. The controller session
+/// dials with the USER identity (the same peer book the ceremony pins), so
+/// no privileged state is ever needed on the controller side.
+fn start_session_flow(
     weak: &slint::Weak<AppWindow>,
     pending: &Arc<Mutex<Option<PendingPair>>>,
     data_dir: &std::path::Path,
+    session: &Arc<Mutex<Option<Session>>>,
     address: String,
-    expected_peer: Option<String>,
 ) {
+    if session.lock().ok().is_some_and(|slot| slot.is_some()) {
+        set_status(&weak, "Already connected — Disconnect first".into());
+        return;
+    }
+    // A receiver-only machine must not initiate sessions; the daemon would
+    // refuse them. Refuse early with guidance instead of a cryptic failure.
+    // When the daemon is unreachable the mode cannot be checked, so the
+    // session is attempted anyway and the daemon reports the real error.
+    if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
+        if status.mode == kvm_core::Mode::ClientOnly {
+            set_status(
+                &weak,
+                "This machine is a Receiver only. Switch to Controller or Both ways to connect.".into(),
+            );
+            return;
+        }
+    }
     let weak = weak.clone();
     let pending = pending.clone();
+    let session = session.clone();
     let data_dir = data_dir.to_owned();
     std::thread::spawn(move || {
-        let (node_name, daemon_fingerprint) = match control_request(ControlRequest::Status) {
-            Ok(ControlResponse::Status(status)) => (status.node_name, Some(status.fingerprint_hex)),
-            _ => (
-                kvm_core::Config::load(&data_dir.join("config.json"))
-                    .map(|config| config.device_name)
-                    .unwrap_or_else(|_| fallback_node_name()),
-                None,
-            ),
-        };
+        let node_name = kvm_core::Config::load(&data_dir.join("config.json"))
+            .map(|config| config.device_name)
+            .unwrap_or_else(|_| fallback_node_name());
         set_peer_address_field(&weak, &address);
-        let result = pair_prepare(
-            &address,
-            &data_dir,
-            &node_name,
-            daemon_fingerprint,
-            expected_peer,
-        );
-        match result {
+        set_status(&weak, format!("Contacting {address}…"));
+        match pair_prepare(&address, &data_dir, &node_name) {
             Ok(pair) => {
+                // Already trusted: skip the ceremony entirely.
+                if is_controller_peer_pinned(&data_dir, &pair.peer_fingerprint) {
+                    set_status(&weak, format!("Connecting to {}…", pair.peer_node_name));
+                    spawn_session(&weak, &session, pair.address);
+                    return;
+                }
                 let fingerprint = pair.peer_fingerprint.clone();
+                let peer_name = pair.peer_node_name.clone();
                 let code = pair.verification_code.clone();
                 if let Ok(mut slot) = pending.lock() {
                     *slot = Some(pair);
                 }
                 set_status(
                     &weak,
-                    format!("Peer verified. Confirm code {code} matches the other machine"),
+                    format!("Does {peer_name} show the code {code}? Approve it there too, then confirm here."),
                 );
-                set_pending(&weak, fingerprint, code);
+                set_pending(&weak, fingerprint, code, peer_name);
             }
-            Err(error) => set_status(&weak, format!("Pairing failed: {error}")),
+            Err(error) => set_status(&weak, format!("Cannot reach {address}: {error}")),
         }
     });
+}
+
+fn is_controller_peer_pinned(data_dir: &std::path::Path, fingerprint: &str) -> bool {
+    kvm_protocol::pairing::PeerBook::load_or_create(data_dir)
+        .map(|book| book.is_pinned(fingerprint))
+        .unwrap_or(false)
+}
+
+/// Record the approved peer in the controller (user) book. Mirrors the
+/// daemon-side pin: name, lowercase fingerprint, and canonical address so
+/// later sessions take the TLS-pinned fast path.
+fn pin_controller_peer(data_dir: &std::path::Path, pending: &PendingPair) -> Result<()> {
+    let mut book = kvm_protocol::pairing::PeerBook::load_or_create(data_dir)
+        .with_context(|| format!("open peer book in {}", data_dir.display()))?;
+    let name = if pending.peer_node_name.trim().is_empty() {
+        pending.address.clone()
+    } else {
+        pending.peer_node_name.clone()
+    };
+    book
+        .pin_with_address(name, pending.peer_fingerprint.clone(), Some(pending.address.clone()))
+        .with_context(|| format!("pin peer {}", pending.peer_fingerprint))?;
+    Ok(())
+}
+
+/// Start the supervised `connect` session. It inherits this process's
+/// environment, so it uses the same user data directory (and therefore the
+/// same identity and peer book the ceremony just pinned).
+fn spawn_session(
+    weak: &slint::Weak<AppWindow>,
+    session: &Arc<Mutex<Option<Session>>>,
+    address: String,
+) {
+    let binary = match daemon_binary() {
+        Ok(binary) => binary,
+        Err(error) => {
+            set_status(&weak, format!("Cannot start connection: {error}"));
+            return;
+        }
+    };
+    let mut command = std::process::Command::new(&binary);
+    command.arg("connect").arg(&address);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    match command.spawn() {
+        Ok(child) => {
+            if let Ok(mut slot) = session.lock() {
+                *slot = Some(Session {
+                    child,
+                    address: address.clone(),
+                });
+            }
+            set_session(&weak, Some(address.clone()));
+            set_status(
+                &weak,
+                format!("Connected to {address} — your keyboard and mouse drive it now. It keeps retrying across reboots until you Disconnect."),
+            );
+        }
+        Err(error) => set_status(&weak, format!("Cannot start connection: {error}")),
+    }
+}
+
+fn stop_session(
+    weak: &slint::Weak<AppWindow>,
+    session: &Arc<Mutex<Option<Session>>>,
+    message: &str,
+) {
+    let child = session.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(mut session) = child {
+        let _ = session.child.kill();
+        let _ = session.child.wait();
+    }
+    set_session(&weak, None);
+    set_status(&weak, message.into());
 }
 
 fn set_peer_address_field(weak: &slint::Weak<AppWindow>, address: &str) {
@@ -777,6 +961,8 @@ fn ensure_user_daemon() -> Result<()> {
         }
     }
     let binary = daemon_binary()?;
+    // Inherit this process's environment so the daemon uses the same user
+    // data directory (and identity) the UI and the controller session use.
     let mut command = std::process::Command::new(&binary);
     command.arg("serve");
     command.stdin(std::process::Stdio::null());
@@ -784,13 +970,7 @@ fn ensure_user_daemon() -> Result<()> {
     command.stderr(std::process::Stdio::null());
     #[cfg(target_os = "windows")]
     {
-        // A user-session daemon must keep its state somewhere writable
-        // without elevation, and must never flash a console window.
-        let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-        command.env(
-            "THEKVM_DATA_DIR",
-            PathBuf::from(local).join("TheKVM"),
-        );
+        // A user-session daemon must never flash a console window.
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
@@ -842,25 +1022,22 @@ fn control_request(request: ControlRequest) -> Result<ControlResponse> {    let 
     })
 }
 
-fn pair_prepare(
-    address: &str,
-    dir: &std::path::Path,
-    node_name: &str,
-    daemon_fingerprint: Option<String>,
-    expected_peer: Option<String>,
-) -> Result<PendingPair> {
+/// Preview-dial the peer with the USER identity (the identity the
+/// controller session will use), returning its fingerprint, advertised
+/// name, and the ceremony code. The receiver shows the identical code for
+/// the dialing fingerprint because verification_code() is order
+/// independent.
+fn pair_prepare(address: &str, dir: &std::path::Path, node_name: &str) -> Result<PendingPair> {
     let identity = Identity::load_or_create(dir)?;
     let address = normalize_addr(address)?;
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let endpoint = transport::make_client_endpoint(&identity)?;
-        let conn = endpoint.connect(address, "thekvm")?.await?;
+        let conn = endpoint
+            .connect(address, "thekvm")?
+            .await
+            .with_context(|| format!("connect to {address}"))?;
         let peer_fingerprint = peer_fingerprint(&conn)?;
-        if let Some(expected) = expected_peer {
-            if peer_fingerprint != expected.to_ascii_lowercase() {
-                anyhow::bail!("peer's certificate does not match the invite fingerprint");
-            }
-        }
         let (mut send, mut recv) = conn.open_bi().await?;
         write_frame(
             &mut send,
@@ -873,40 +1050,72 @@ fn pair_prepare(
         let challenge = read_frame(&mut recv)
             .await?
             .context("peer closed pairing stream")?;
-        let challenged_fingerprint = match challenge {
+        let (peer_node_name, challenged_fingerprint) = match challenge {
             WireMessage::PairChallenge {
-                fingerprint_hex, ..
-            } => fingerprint_hex,
+                node_name,
+                fingerprint_hex,
+                ..
+            } => (node_name, fingerprint_hex),
             WireMessage::Reject { reason } => anyhow::bail!("peer rejected pairing: {reason}"),
             other => anyhow::bail!("unexpected pairing response: {other:?}"),
         };
         if challenged_fingerprint != peer_fingerprint {
             anyhow::bail!("peer fingerprint changed during pairing")
         }
-        // The verification code must be derived from the daemon identity,
-        // because the daemon (not this preview connection) performs the real
-        // pairing. In single-directory setups both identities coincide.
-        let local_fingerprint = daemon_fingerprint.unwrap_or_else(|| identity.fingerprint_hex());
         let verification_code =
-            kvm_protocol::pairing::verification_code(&local_fingerprint, &peer_fingerprint);
+            kvm_protocol::pairing::verification_code(&identity.fingerprint_hex(), &peer_fingerprint);
         Ok(PendingPair {
             verification_code,
             peer_fingerprint,
+            peer_node_name,
             address: address.to_string(),
         })
     })
 }
 
-fn finish_pair(pending: PendingPair) -> Result<String> {
-    let peer_fingerprint = pending.peer_fingerprint.clone();
-    match control_request(ControlRequest::Pair {
-        address: pending.address,
-        expected_fingerprint_hex: peer_fingerprint.clone(),
-    })? {
-        ControlResponse::Paired { fingerprint_hex } => Ok(fingerprint_hex),
-        ControlResponse::Error { message } => anyhow::bail!(message),
-        other => anyhow::bail!("unexpected daemon pairing response: {other:?}"),
+/// Mirror UI choices into the USER config file so the supervised
+/// controller session (which reads the user directory, not the privileged
+/// daemon state) dials with the right name, mode, and capabilities.
+/// Best effort: the daemon-side SetConfig result is authoritative for the
+/// user-visible status.
+fn mirror_user_config(
+    device_name: &str,
+    mode: Mode,
+    allow_lock_screen: bool,
+    clipboard_enabled: bool,
+) {
+    let path = data_dir().join("config.json");
+    let mut config = kvm_core::Config::load(&path).unwrap_or_default();
+    if !device_name.trim().is_empty() {
+        config.device_name = device_name.trim().to_owned();
     }
+    config.mode = mode;
+    config.allow_lock_screen_control = allow_lock_screen;
+    config.clipboard_enabled = clipboard_enabled;
+    config.auto_connect_address = None;
+    let _ = config.save(&path);
+}
+
+fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                match address {
+                    Some(address) => {
+                        ui.set_session_active(true);
+                        ui.set_session_text(SharedString::from(format!(
+                            "Connected to {address}"
+                        )));
+                    }
+                    None => {
+                        ui.set_session_active(false);
+                        ui.set_session_text(SharedString::from("Not connected"));
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn set_status(weak: &slint::Weak<AppWindow>, text: String) {
@@ -920,13 +1129,19 @@ fn set_status(weak: &slint::Weak<AppWindow>, text: String) {
     });
 }
 
-fn set_pending(weak: &slint::Weak<AppWindow>, fingerprint: String, verification_code: String) {
+fn set_pending(
+    weak: &slint::Weak<AppWindow>,
+    fingerprint: String,
+    verification_code: String,
+    peer_name: String,
+) {
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
                 ui.set_pending_peer_fingerprint(SharedString::from(fingerprint));
                 ui.set_pending_verification_code(SharedString::from(verification_code));
+                ui.set_pending_peer_name(SharedString::from(peer_name));
             }
         }
     });

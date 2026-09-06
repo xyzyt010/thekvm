@@ -3,7 +3,7 @@
 # Layout: ./in holds the release binaries; metadata is generated here.
 set -eu
 cd ~/thekvm-build
-VER=0.1.3
+VER=0.1.6
 PKG=thekvm
 ROOT=debroot
 rm -rf "$ROOT" "${PKG}_${VER}_amd64.deb"
@@ -163,6 +163,9 @@ case "$1" in
     fi
     if [ -n "$DESKTOP_USER" ] && id "$DESKTOP_USER" >/dev/null 2>&1; then
         usermod --append --groups thekvm "$DESKTOP_USER"
+        # The Connect button supervises a user-session controller that reads
+        # the physical devices directly; applies on next login.
+        usermod --append --groups input "$DESKTOP_USER" 2>/dev/null || true
     fi
 
     install -d -o thekvm -g thekvm -m 0770 /var/lib/thekvm

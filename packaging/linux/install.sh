@@ -132,6 +132,12 @@ if [ -n "$DESKTOP_USER" ]; then
         exit 1
     fi
     usermod --append --groups "$SERVICE_GROUP" "$DESKTOP_USER"
+    # The Connect button supervises a user-session controller that reads the
+    # physical devices directly, so the desktop user needs input access too.
+    # Takes effect on next login, same session as the service-group membership.
+    if getent group input >/dev/null 2>&1; then
+        usermod --append --groups input "$DESKTOP_USER"
+    fi
 else
     echo "warning: no desktop user selected; pass --desktop-user LOGIN or set THEKVM_DESKTOP_USER so the UI can access control.sock" >&2
 fi
@@ -182,7 +188,8 @@ TheKVM receiver installed.
   service: thekvmd.service (enabled and running)
 
 The desktop user must be in the '$SERVICE_GROUP' group to use the UI/control
-socket. Start a new login session after adding that user to the group.
+socket, and in 'input' to drive other computers with the Connect button.
+Start a new login session after adding that user to the groups.
 
 The optional physical-input controller remains disabled. Pair peers and
 configure a layout first, then enable it explicitly with:
