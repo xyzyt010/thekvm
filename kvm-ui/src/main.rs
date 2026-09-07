@@ -63,6 +63,31 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // One UI per machine. A second window splits attention (an approval can
+    // sit unseen in the other one) and doubles daemon traffic. A loopback
+    // TCP bind is the lock: the OS holds it while we live and releases it
+    // on ANY death, so unlike a pidfile it can never go stale. Port 42109
+    // is reserved for this lock (42110 sessions, 42111 discovery).
+    // Fail-open: on exotic machines without loopback we run unguarded
+    // rather than refuse to start.
+    let _instance_lock = match std::net::TcpListener::bind("127.0.0.1:42109") {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            ui_log(&format!(
+                "single-instance lock unavailable ({error}); running unguarded"
+            ));
+            None
+        }
+    };
+    if _instance_lock.is_none() {
+        // Distinguish "no loopback" from "already running": a connect probe
+        // answers only when a live instance holds the port.
+        if std::net::TcpStream::connect("127.0.0.1:42109").is_ok() {
+            ui_log("second UI instance exiting; the running one already shows everything");
+            return Ok(());
+        }
+    }
+
     let ui = AppWindow::new()?;
     let pending_pair = Arc::new(Mutex::new(None::<PendingPair>));
     let startup_dir = data_dir();
@@ -983,6 +1008,13 @@ fn set_incoming_pairing(weak: &slint::Weak<AppWindow>, pairings: Vec<PendingPair
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
+                // Taskbar/dock visibility: a minimized window must still
+                // announce the request. Restored when the request clears.
+                if summary.is_empty() {
+                    ui.set_title_alert(SharedString::new());
+                } else {
+                    ui.set_title_alert(SharedString::from(" — incoming pairing!"));
+                }
                 ui.set_incoming_pairing(SharedString::from(summary));
                 ui.set_incoming_pairing_fingerprint(SharedString::from(fingerprint));
                 ui.set_incoming_verification_code(SharedString::from(verification_code));

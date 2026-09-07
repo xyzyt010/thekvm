@@ -4,7 +4,7 @@ import { Button, LineEdit, Switch, TabWidget } from "std-widgets.slint";
 // users: pick what this computer does, type the other computer's address,
 // press Connect. Everything advanced lives under Devices and Settings.
 export component AppWindow inherits Window {
-    title: "TheKVM";
+    title: "TheKVM " + app-version + title-alert;
     min-width: 720px;
     min-height: 560px;
     background: #0a0a0a;
@@ -27,6 +27,9 @@ export component AppWindow inherits Window {
     in-out property <int> mode-index: 0;
     in property <string> role-text: "Both ways";
     in property <string> app-version: "";
+    // Taskbar/dock alert: set while an incoming pairing waits, so a
+    // minimized window still announces the request.
+    in property <string> title-alert: "";
     in property <int> poll-count: 0;
     in-out property <string> layout-path: "";
     in-out property <string> peer-address: "";
@@ -85,6 +88,37 @@ export component AppWindow inherits Window {
                     text: local-address == "" ? "This computer: detecting…" : "This computer: " + local-address;
                     color: #6b7280;
                     font-size: 11px;
+                }
+            }
+        }
+
+        Rectangle {
+            // Approval rendezvous must not depend on which tab is open. A
+            // missed incoming request (wrong tab, minimized window) used to
+            // be indistinguishable from a broken network — same silence on
+            // both ends. This strip is visible on EVERY tab while a request
+            // is pending, with the full details under the Connect tab.
+            visible: incoming-pairing != "";
+            background: #453008;
+            border-radius: 8px;
+            HorizontalLayout {
+                padding: 8px;
+                spacing: 12px;
+                Text {
+                    text: "INCOMING pairing — code " + incoming-verification-code + " (details under Connect tab)";
+                    color: #fcd34d;
+                    font-size: 13px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+                Button {
+                    text: "Allow";
+                    primary: true;
+                    clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
+                }
+                Button {
+                    text: "Deny";
+                    clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
                 }
             }
         }

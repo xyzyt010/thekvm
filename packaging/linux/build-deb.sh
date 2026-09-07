@@ -3,7 +3,7 @@
 # Layout: ./in holds the release binaries; metadata is generated here.
 set -eu
 cd ~/thekvm-build
-VER=0.1.18
+VER=0.1.19
 PKG=thekvm
 ROOT=debroot
 rm -rf "$ROOT" "${PKG}_${VER}_amd64.deb"
@@ -13,8 +13,9 @@ mkdir -p "$ROOT/DEBIAN" \
          "$ROOT/usr/lib/systemd/user" \
          "$ROOT/etc/udev/rules.d" \
          "$ROOT/etc/modules-load.d" \
-         "$ROOT/usr/share/applications" \
-         "$ROOT/usr/share/doc/$PKG"
+          "$ROOT/usr/share/applications" \
+          "$ROOT/etc/xdg/autostart" \
+          "$ROOT/usr/share/doc/$PKG"
 
 install -m 0755 in/kvm-daemon "$ROOT/usr/bin/kvm-daemon"
 install -m 0755 in/kvm-ui "$ROOT/usr/bin/kvm-ui"
@@ -112,6 +113,11 @@ Terminal=false
 Categories=Network;Utility;
 Keywords=kvm;keyboard;mouse;synergy;deskflow;
 EOF
+
+# Start the UI at graphical login so approvals can never be missed because
+# the app was never opened. The UI single-instance lock makes a manual
+# launch alongside this harmless.
+cp "$ROOT/usr/share/applications/thekvm-ui.desktop" "$ROOT/etc/xdg/autostart/thekvm-ui.desktop"
 
 cat > "$ROOT/usr/share/doc/$PKG/copyright" <<'EOF'
 TheKVM is licensed under GPL-3.0-or-later.

@@ -18,7 +18,11 @@ pub type SharedConfig = Arc<RwLock<Config>>;
 pub type SharedPeers = Arc<RwLock<PeerBook>>;
 
 const MAX_PENDING_PAIRINGS: usize = 16;
-const PAIRING_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+// Approval window deliberately generous: pairing is a human rendezvous
+// across two screens (find the window, compare digits, click twice), not a
+// network handshake. A tight timeout turns slow humans into expired
+// requests that look exactly like a broken network on the other side.
+const PAIRING_APPROVAL_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// In-memory approval queue owned by the running daemon. A pairing request is
 /// not persisted or trusted until the local user approves it through the
