@@ -506,6 +506,7 @@ fn main() -> Result<()> {
         let weak = weak.clone();
         let confirm_data_dir = confirm_data_dir.clone();
         let confirm_session = confirm_session.clone();
+        let confirm_pending = pending_for_confirm.clone();
         std::thread::spawn(move || {
             // The user compared the six-digit code on both screens and
             // approved: pin the peer in the controller (user) book, then
@@ -515,7 +516,7 @@ fn main() -> Result<()> {
                 Ok(()) => {
                     set_pending(&weak, String::new(), String::new(), String::new());
                     set_status(&weak, format!("Paired with {}", pending.peer_node_name));
-                    spawn_session(&weak, &confirm_session, pending.address);
+                    spawn_session(&weak, &confirm_session, &confirm_pending, &confirm_data_dir, pending.address);
                 }
                 Err(error) => set_status(&weak, format!("Pairing failed: {error}")),
             }
@@ -1008,7 +1009,7 @@ fn start_session_flow(
                 // Already trusted: skip the ceremony entirely.
                 if is_controller_peer_pinned(&data_dir, &pair.peer_fingerprint) {
                     set_status(&weak, format!("Connecting to {}…", pair.peer_node_name));
-                    spawn_session(&weak, &session, pair.address);
+                    spawn_session(&weak, &session, &pending, &data_dir, pair.address);
                     return;
                 }
                 let fingerprint = pair.peer_fingerprint.clone();
@@ -1032,6 +1033,40 @@ fn is_controller_peer_pinned(data_dir: &std::path::Path, fingerprint: &str) -> b
     kvm_protocol::pairing::PeerBook::load_or_create(data_dir)
         .map(|book| book.is_pinned(fingerprint))
         .unwrap_or(false)
+}
+
+/// Remove the locally pinned peer(s) for an address — full or host-part
+/// match, so `192.168.1.7` and `192.168.1.7:42110` find each other — forcing
+/// the next Connect to run the full code ceremony again. Returns true when
+/// anything was removed.
+fn unpin_peer_by_address(data_dir: &std::path::Path, address: &str) -> bool {
+    let mut removed = false;
+    if let Ok(mut book) = kvm_protocol::pairing::PeerBook::load_or_create(data_dir) {
+        let host = address.split(':').next().unwrap_or(address);
+        let fingerprints: Vec<String> = book
+            .peers
+            .iter()
+            .filter(|peer| {
+                peer.address.as_deref().is_some_and(|stored| {
+                    stored == address || stored.split(':').next() == Some(host)
+                })
+            })
+            .map(|peer| peer.fingerprint_hex.clone())
+            .collect();
+        for fingerprint in fingerprints {
+            match book.unpin(&fingerprint) {
+                Ok(true) => {
+                    ui_log(&format!("session: removed stale local pin for {address}"));
+                    removed = true;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    ui_log(&format!("session: cannot remove stale pin: {error}"));
+                }
+            }
+        }
+    }
+    removed
 }
 
 /// Record the approved peer in the controller (user) book. Mirrors the
@@ -1069,6 +1104,8 @@ fn pin_controller_peer(data_dir: &std::path::Path, pending: &PendingPair) -> Res
 fn spawn_session(
     weak: &slint::Weak<AppWindow>,
     session: &Arc<Mutex<Option<Session>>>,
+    pending: &Arc<Mutex<Option<PendingPair>>>,
+    data_dir: &std::path::Path,
     address: String,
 ) {
     let binary = match daemon_binary() {
@@ -1080,7 +1117,7 @@ fn spawn_session(
     };
     let mut command = std::process::Command::new(&binary);
     command.arg("connect").arg(&address);
-    command.env("THEKVM_DATA_DIR", data_dir());
+    command.env("THEKVM_DATA_DIR", data_dir);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
     // Piped (not nulled): the child reports dialing/established/waiting
@@ -1112,8 +1149,11 @@ fn spawn_session(
             );
             if let Some(stderr) = stderr {
                 let weak = weak.clone();
+                let session = session.clone();
+                let pending = pending.clone();
+                let data_dir = data_dir.to_owned();
                 std::thread::spawn(move || {
-                    relay_session_progress(&weak, stderr, &address, &verified)
+                    relay_session_progress(&weak, stderr, &address, &verified, &session, &pending, data_dir)
                 });
             } else {
                 ui_log("session: child stderr unavailable; connection cannot be verified");
@@ -1127,15 +1167,27 @@ fn spawn_session(
 /// status line. Only `established` flips the session to Connected; anything
 /// else is shown as still-connecting. Identical consecutive lines are
 /// coalesced so retry loops don't churn the event loop.
+///
+/// Self-healing trust: when the peer reports "not paired" three times in a
+/// row, the local pin is provably one-sided (the ceremony completed here
+/// but never there). Instead of retrying forever, the relay removes the
+/// stale local pin, stops the hopeless child, and restarts the full code
+/// ceremony automatically — the user only watches two code screens match.
+/// This is safe: the refusal arrives over the peer's authenticated channel,
+/// and the fresh ceremony still needs both sides to approve the codes.
 fn relay_session_progress(
     weak: &slint::Weak<AppWindow>,
     stderr: std::process::ChildStderr,
     address: &str,
     verified: &Arc<std::sync::atomic::AtomicBool>,
+    session: &Arc<Mutex<Option<Session>>>,
+    pending: &Arc<Mutex<Option<PendingPair>>>,
+    data_dir: std::path::PathBuf,
 ) {
     use std::io::BufRead as _;
     let reader = std::io::BufReader::new(stderr);
     let mut last_shown = String::new();
+    let mut not_paired_streak: u32 = 0;
     for line in reader.lines().map_while(Result::ok) {
         let Some(progress) = line.strip_prefix("THEKVM_STATUS ") else {
             continue;
@@ -1144,6 +1196,31 @@ fn relay_session_progress(
             Some(index) => (&progress[..index], progress[index + 1..].trim()),
             None => (progress, ""),
         };
+        // Count refusals before dedup: identical repeats carry no new text
+        // but each one is fresh evidence of one-sided trust.
+        if kind == "waiting" && detail.contains("peer is not paired") {
+            not_paired_streak += 1;
+            if not_paired_streak == 3 {
+                if unpin_peer_by_address(&data_dir, address) {
+                    ui_log(
+                        "session: peer reports us unknown 3x; restarting pairing automatically",
+                    );
+                    set_status(
+                        weak,
+                        format!(
+                            "{address} didn't recognize us — restarting the code check automatically…"
+                        ),
+                    );
+                    stop_session(weak, session, "Restarting the code check…");
+                    start_session_flow(weak, pending, &data_dir, session, address.to_owned());
+                    return;
+                }
+                // Nothing pinned locally under that address: fall through to
+                // the manual recovery text below instead of looping.
+            }
+        } else if kind == "established" {
+            not_paired_streak = 0;
+        }
         let text = match kind {
             "established" => {
                 verified.store(true, std::sync::atomic::Ordering::Relaxed);
