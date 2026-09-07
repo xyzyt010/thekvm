@@ -3024,7 +3024,14 @@ async fn reject(send: &mut quinn::SendStream, reason: &str) -> std::io::Result<(
             reason: reason.to_string(),
         },
     )
-    .await
+    .await?;
+    // Finish the stream and give the peer a moment to read the reason.
+    // Returning immediately drops the connection handle, which QUIC turns
+    // into a bare "closed by peer" — the reason dies in flight and the
+    // dialing side can never tell "not paired" from a network failure.
+    let _ = send.finish();
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), send.stopped()).await;
+    Ok(())
 }
 
 fn confirm_pairing() -> Result<bool> {

@@ -1151,7 +1151,24 @@ fn relay_session_progress(
                     "Connected to {address} — your keyboard and mouse drive it now. It retries automatically until you Disconnect."
                 )
             }
-            "waiting" => format!("Still reaching {address}… ({detail})"),
+            "waiting" => {
+                if detail.contains("peer is not paired") {
+                    // Half-finished pairing: this computer pinned the peer
+                    // locally, but the peer never approved us, so every dial
+                    // skips the ceremony and runs into a refusal. The only
+                    // way forward is a fresh code check, which needs the
+                    // stale local pin removed first.
+                    #[cfg(target_os = "windows")]
+                    let fix = "close the app, delete %APPDATA%\\TheKVM\\peers.json, reopen it";
+                    #[cfg(not(target_os = "windows"))]
+                    let fix = "close the app, delete ~/.config/thekvm/peers.json, reopen it";
+                    format!(
+                        "{address} does not recognize this computer (pairing was left half-finished). Press Disconnect, {fix}, then Connect again to repeat the code check."
+                    )
+                } else {
+                    format!("Still reaching {address}… ({detail})")
+                }
+            }
             "dialing" => format!("Contacting {address}…"),
             "ended" => format!("Connection to {address} ended ({detail})"),
             _ => continue,
