@@ -33,13 +33,33 @@ struct PendingEntry {
     decision: oneshot::Sender<bool>,
 }
 
+/// Handle for a registered pairing request. Registering (listing it for the
+/// local approval UI) and waiting for the decision are separate steps so the
+/// station can show the request while the initiator is still comparing
+/// codes: whichever side approves first, its decision is held in the channel
+/// until the other side arrives. Dropping the waiter without waiting leaves
+/// the entry listed until it is decided, cancelled, or times out — callers
+/// must cancel on early exit.
+pub struct DecisionWaiter {
+    approvals: PairingApprovals,
+    fingerprint: String,
+    receiver: Option<oneshot::Receiver<bool>>,
+}
+
 impl PairingApprovals {
-    pub async fn wait_for_decision(&self, request: PendingPairing) -> Result<bool> {
-        // This is intentionally an opt-in test/integration hook. Production
-        // deployments must leave it unset so every incoming request reaches
-        // the local approval UI or CLI.
+    /// List the request for local approval immediately. A second request for
+    /// the same fingerprint is refused so retries surface as guidance
+    /// ("approve or deny it on the other computer") instead of silent
+    /// duplicate rows.
+    pub async fn register(&self, request: PendingPairing) -> Result<DecisionWaiter> {
+        // Opt-in test/integration hook. With it set the request is approved
+        // without ever being listed, exactly like the old combined call.
         if std::env::var("THEKVM_AUTO_CONFIRM").ok().as_deref() == Some("1") {
-            return Ok(true);
+            return Ok(DecisionWaiter {
+                approvals: self.clone(),
+                fingerprint: request.fingerprint_hex.to_ascii_lowercase(),
+                receiver: None,
+            });
         }
 
         let fingerprint = request.fingerprint_hex.to_ascii_lowercase();
@@ -60,13 +80,11 @@ impl PairingApprovals {
                 },
             );
         }
-
-        let decision = match tokio::time::timeout(PAIRING_APPROVAL_TIMEOUT, decision_rx).await {
-            Ok(Ok(approved)) => approved,
-            Ok(Err(_)) | Err(_) => false,
-        };
-        self.pending.lock().await.remove(&fingerprint);
-        Ok(decision)
+        Ok(DecisionWaiter {
+            approvals: self.clone(),
+            fingerprint,
+            receiver: Some(decision_rx),
+        })
     }
 
     pub async fn list(&self) -> Vec<PendingPairing> {
@@ -93,6 +111,30 @@ impl PairingApprovals {
             .lock()
             .await
             .remove(&fingerprint.to_ascii_lowercase());
+    }
+}
+
+impl DecisionWaiter {
+    /// Wait for the local decision (up to the approval timeout). Works no
+    /// matter which side approved first: an early local decision is already
+    /// sitting in the channel when this runs.
+    pub async fn wait(mut self) -> Result<bool> {
+        let Some(receiver) = self.receiver.take() else {
+            return Ok(true);
+        };
+        let fingerprint = std::mem::take(&mut self.fingerprint);
+        let decision = match tokio::time::timeout(PAIRING_APPROVAL_TIMEOUT, receiver).await {
+            Ok(Ok(approved)) => approved,
+            Ok(Err(_)) | Err(_) => false,
+        };
+        self.approvals.pending.lock().await.remove(&fingerprint);
+        Ok(decision)
+    }
+
+    /// Drop a request that will never complete (initiator vanished, protocol
+    /// error) so it stops occupying the approval list.
+    pub async fn cancel(&self) {
+        self.approvals.cancel(&self.fingerprint).await;
     }
 }
 
@@ -486,20 +528,46 @@ mod tests {
             address: "127.0.0.1:42110".into(),
             verification_code: "123456".into(),
         };
-        let waiter = {
-            let approvals = approvals.clone();
-            let pending = pending.clone();
-            tokio::spawn(async move { approvals.wait_for_decision(pending).await.unwrap() })
-        };
-        for _ in 0..100 {
-            if !approvals.list().await.is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        // Registration alone must list the request (the station UI shows it
+        // while the initiator compares codes); the waiter resolves later no
+        // matter which side approved first.
+        let waiter = approvals.register(pending.clone()).await.unwrap();
         assert_eq!(approvals.list().await.len(), 1);
         assert!(approvals.decide(&pending.fingerprint_hex, true).await);
-        assert!(waiter.await.unwrap());
+        assert!(waiter.wait().await.unwrap());
+        assert!(approvals.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn early_local_decision_is_held_for_a_late_waiter() {
+        // The station user Allows before the initiator confirms: decide()
+        // removes the row but the decision must still reach wait().
+        let approvals = PairingApprovals::default();
+        let pending = PendingPairing {
+            node_name: "early".into(),
+            fingerprint_hex: "cd".repeat(32),
+            address: "127.0.0.1:42110".into(),
+            verification_code: "654321".into(),
+        };
+        let waiter = approvals.register(pending.clone()).await.unwrap();
+        assert_eq!(approvals.list().await.len(), 1);
+        assert!(approvals.decide(&pending.fingerprint_hex, true).await);
+        assert!(approvals.list().await.is_empty());
+        assert!(waiter.wait().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn duplicate_pairing_request_is_refused_while_listed() {
+        let approvals = PairingApprovals::default();
+        let pending = PendingPairing {
+            node_name: "dup".into(),
+            fingerprint_hex: "ef".repeat(32),
+            address: "127.0.0.1:42110".into(),
+            verification_code: "111111".into(),
+        };
+        let _first = approvals.register(pending.clone()).await.unwrap();
+        assert!(approvals.register(pending.clone()).await.is_err());
+        approvals.cancel(&pending.fingerprint_hex).await;
         assert!(approvals.list().await.is_empty());
     }
 }

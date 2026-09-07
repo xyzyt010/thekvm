@@ -28,6 +28,21 @@ struct PendingPair {
     /// independent, matching what the receiver displays for the dialing
     /// fingerprint.
     verification_code: String,
+    /// The open pairing channel to the peer. It MUST stay alive between the
+    /// code screen and the confirm click: the station registers our request
+    /// when the challenge goes out and waits for our PairConfirm on this
+    /// exact stream. Dropping it here is what used to make the station-side
+    /// popup impossible — the request vanished before it could be shown.
+    pairing: Option<PairingChannel>,
+}
+
+/// One initiator-side pairing conversation, kept open across the two user
+/// clicks (code compare, then confirm) so the station's approval and our
+/// confirmation can arrive in either order.
+struct PairingChannel {
+    connection: quinn::Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
 }
 
 /// A controller session supervised by the UI: `kvm-daemon connect` retries
@@ -509,16 +524,69 @@ fn main() -> Result<()> {
         let confirm_pending = pending_for_confirm.clone();
         std::thread::spawn(move || {
             // The user compared the six-digit code on both screens and
-            // approved: pin the peer in the controller (user) book, then
-            // start the session. The receiver side approved the same
-            // fingerprint through its own Approve button.
-            match pin_controller_peer(&confirm_data_dir, &pending) {
-                Ok(()) => {
-                    set_pending(&weak, String::new(), String::new(), String::new());
-                    set_status(&weak, format!("Paired with {}", pending.peer_node_name));
-                    spawn_session(&weak, &confirm_session, &confirm_pending, &confirm_data_dir, pending.address);
+            // approved: confirm on the pairing channel we held open, then
+            // wait for the station's answer. It may have approved already
+            // (answer is instant) or still be deciding (we wait, saying
+            // so). Only an Accepted pins the peer locally and starts the
+            // session — a one-sided local pin is exactly the trap that
+            // used to wedge reconnects forever.
+            let mut pending = pending;
+            let Some(mut channel) = pending.pairing.take() else {
+                ui_log("pairing: confirm without an open channel");
+                set_status(&weak, "Pairing channel is gone — press Connect again.".into());
+                return;
+            };
+            let peer_name = pending.peer_node_name.clone();
+            set_status(&weak, format!("Waiting for approval on {peer_name}…"));
+            ui_log(&format!("pairing: codes approved locally, awaiting {peer_name}"));
+            let answer = runtime().block_on(async {
+                write_frame(
+                    &mut channel.send,
+                    &WireMessage::PairConfirm {
+                        server_fingerprint_hex: pending.peer_fingerprint.clone(),
+                    },
+                )
+                .await?;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(150),
+                    read_frame(&mut channel.recv),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("timed out waiting for {peer_name} to approve (150s)")
+                })?
+                .context("peer closed pairing without answering")?
+                .context("peer closed pairing without answering")
+            });
+            match answer {
+                Ok(WireMessage::Accepted { .. }) => {
+                    match pin_controller_peer(&confirm_data_dir, &pending) {
+                        Ok(()) => {
+                            set_pending(&weak, String::new(), String::new(), String::new());
+                            set_status(&weak, format!("Paired with {peer_name}"));
+                            ui_log(&format!("pairing: accepted by {peer_name}"));
+                            spawn_session(&weak, &confirm_session, &confirm_pending, &confirm_data_dir, pending.address);
+                        }
+                        Err(error) => {
+                            ui_log(&format!("pairing: accepted but pin failed: {error:#}"));
+                            set_status(&weak, format!("Pairing failed: {error}"))
+                        }
+                    }
                 }
-                Err(error) => set_status(&weak, format!("Pairing failed: {error}")),
+                Ok(WireMessage::Reject { reason }) => {
+                    ui_log(&format!("pairing: declined by {peer_name}: {reason}"));
+                    set_status(&weak, format!("{peer_name} declined pairing: {reason}"))
+                }
+                Ok(other) => {
+                    ui_log(&format!("pairing: unexpected completion: {other:?}"));
+                    channel.connection.close(0u32.into(), b"pairing done");
+                    set_status(&weak, format!("Unexpected pairing answer: {other:?}"))
+                }
+                Err(error) => {
+                    ui_log(&format!("pairing: confirm failed: {error:#}"));
+                    channel.connection.close(0u32.into(), b"pairing done");
+                    set_status(&weak, format!("{peer_name} did not answer: {error:#}"))
+                }
             }
         });
     });
@@ -527,8 +595,11 @@ fn main() -> Result<()> {
     let pending_for_cancel = pending_pair.clone();
     ui.on_cancel_pairing(move || {
         if let Ok(mut slot) = pending_for_cancel.lock() {
+            // Dropping the open channel tells the station to withdraw the
+            // approval request it is showing.
             *slot = None;
         }
+        ui_log("pairing: cancelled by user");
         set_pending(&weak, String::new(), String::new(), String::new());
         set_status(&weak, "Pairing cancelled".into());
     });
@@ -984,6 +1055,18 @@ fn start_session_flow(
     let session = session.clone();
     let data_dir = data_dir.to_owned();
     std::thread::spawn(move || {
+        // A fresh Connect supersedes any lingering code check: dropping the
+        // old pairing channel tells the station to withdraw its popup, so
+        // retries never stack duplicate requests there.
+        if pending
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .is_some()
+        {
+            ui_log("pairing: previous code check superseded by a new Connect");
+            set_pending(&weak, String::new(), String::new(), String::new());
+        }
         // A receiver-only machine must not initiate sessions; the daemon
         // would refuse them. Refuse early with guidance instead of a
         // cryptic failure. When the daemon is unreachable the mode cannot
@@ -1747,6 +1830,11 @@ fn pair_prepare(address: &str, dir: &std::path::Path, node_name: &str) -> Result
             peer_fingerprint,
             peer_node_name,
             address: address.to_string(),
+            pairing: Some(PairingChannel {
+                connection: conn,
+                send,
+                recv,
+            }),
         })
     })
 }

@@ -2791,74 +2791,97 @@ async fn handle_pairing(
         },
     )
     .await?;
-    match read_frame(recv)
-        .await?
-        .context("peer closed pairing stream")?
-    {
-        WireMessage::PairConfirm {
-            server_fingerprint_hex,
-        } if server_fingerprint_hex == identity.fingerprint_hex() => {
-            let pending = kvm_protocol::control::PendingPairing {
-                node_name: node_name.clone(),
-                fingerprint_hex: actual_peer_fingerprint.to_owned(),
-                address: conn.remote_address().to_string(),
-                verification_code,
-            };
-            let pending_fingerprint = pending.fingerprint_hex.clone();
-            let approval = pairing_approvals.wait_for_decision(pending);
-            tokio::pin!(approval);
-            let approved = tokio::select! {
-                decision = &mut approval => decision?,
-                _ = conn.closed() => {
-                    pairing_approvals.cancel(&pending_fingerprint).await;
-                    bail!("peer disconnected before local pairing approval");
-                }
-            };
-            if !approved {
-                reject(send, "pairing was rejected or timed out locally").await?;
-                audit_event(
-                    &data_dir(),
-                    &format!(
-                        "pairing-rejected fingerprint={actual_peer_fingerprint} remote={}",
-                        conn.remote_address()
-                    ),
-                );
-                bail!("pairing was rejected or timed out locally");
-            }
-            peers
-                .write()
-                .await
-                .pin(node_name, actual_peer_fingerprint.to_owned())?;
-            write_frame(
-                send,
-                &WireMessage::Accepted {
-                    lock_screen_enabled: false,
-                    clipboard_enabled: false,
-                    screen_geometry: None,
-                },
-            )
-            .await?;
-            send.finish()?;
-            // Keep the QUIC connection alive until the final pairing result
-            // has been acknowledged by the peer. Dropping the last
-            // Connection handle immediately can turn a valid final frame into
-            // a connection close before the initiator's application reads it.
-            let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
-            audit_event(
-                &data_dir(),
-                &format!(
-                    "pairing-completed fingerprint={actual_peer_fingerprint} remote={}",
-                    conn.remote_address()
-                ),
-            );
-            tracing::info!(peer = %actual_peer_fingerprint, remote = %conn.remote_address(), "paired peer");
-            Ok(())
+    // Register the request for local approval RIGHT NOW — while the
+    // initiator compares codes — not only after it confirms. Otherwise the
+    // station UI can never show the request during the code check, and the
+    // ceremony can never complete. The initiator's PairConfirm and the local
+    // Allow/Deny race in either order; both must arrive before trust is
+    // granted. Whichever side approves first, its decision is held until the
+    // other side arrives.
+    let pending = kvm_protocol::control::PendingPairing {
+        node_name: node_name.clone(),
+        fingerprint_hex: actual_peer_fingerprint.to_owned(),
+        address: conn.remote_address().to_string(),
+        verification_code,
+    };
+    let waiter = match pairing_approvals.register(pending).await {
+        Ok(waiter) => waiter,
+        Err(error) => {
+            let _ = reject(send, &format!("{error:#}")).await;
+            bail!("pairing not registered: {error:#}");
         }
-        _ => {
-            reject(send, "invalid pairing confirmation").await?;
-            bail!("invalid pairing confirmation")
+    };
+    let confirmed = async {
+        match read_frame(recv)
+            .await?
+            .context("peer closed pairing stream")?
+        {
+            WireMessage::PairConfirm {
+                server_fingerprint_hex,
+            } if server_fingerprint_hex == identity.fingerprint_hex() => Ok(()),
+            WireMessage::Reject { reason } => {
+                Err(anyhow::anyhow!("initiator aborted pairing: {reason}"))
+            }
+            other => Err(anyhow::anyhow!(
+                "invalid pairing confirmation: {other:?}"
+            )),
+        }
+    };
+    tokio::pin!(confirmed);
+    tokio::select! {
+        _ = conn.closed() => {
+            waiter.cancel().await;
+            bail!("peer disconnected before pairing completed");
+        }
+        result = &mut confirmed => {
+            if let Err(error) = result {
+                waiter.cancel().await;
+                let _ = reject(send, &format!("{error:#}")).await;
+                return Err(error);
+            }
         }
     }
+    // The initiator approved the codes; now the LOCAL decision (which may
+    // already have been made minutes ago — it was held in the channel).
+    if !waiter.wait().await? {
+        reject(send, "pairing was rejected or timed out locally").await?;
+        audit_event(
+            &data_dir(),
+            &format!(
+                "pairing-rejected fingerprint={actual_peer_fingerprint} remote={}",
+                conn.remote_address()
+            ),
+        );
+        bail!("pairing was rejected or timed out locally");
+    }
+    peers
+        .write()
+        .await
+        .pin(node_name, actual_peer_fingerprint.to_owned())?;
+    write_frame(
+        send,
+        &WireMessage::Accepted {
+            lock_screen_enabled: false,
+            clipboard_enabled: false,
+            screen_geometry: None,
+        },
+    )
+    .await?;
+    send.finish()?;
+    // Keep the QUIC connection alive until the final pairing result
+    // has been acknowledged by the peer. Dropping the last
+    // Connection handle immediately can turn a valid final frame into
+    // a connection close before the initiator's application reads it.
+    let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
+    audit_event(
+        &data_dir(),
+        &format!(
+            "pairing-completed fingerprint={actual_peer_fingerprint} remote={}",
+            conn.remote_address()
+        ),
+    );
+    tracing::info!(peer = %actual_peer_fingerprint, remote = %conn.remote_address(), "paired peer");
+    Ok(())
 }
 
 struct ConnectPolicy<'a> {
