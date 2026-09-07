@@ -173,6 +173,12 @@ export component AppWindow inherits Window {
                         spacing: 6px;
                         visible: pending-verification-code != "";
                         Text {
+                            text: "OUTGOING — you are calling the other computer:";
+                            color: #f59e0b;
+                            font-size: 12px;
+                            font-weight: 700;
+                        }
+                        Text {
                             text: "Does " + (pending-peer-name == "" ? "the other computer" : pending-peer-name) + " show this same code?";
                             color: white;
                             font-size: 15px;
@@ -188,7 +194,7 @@ export component AppWindow inherits Window {
                             horizontal-alignment: center;
                         }
                         Text {
-                            text: "Approve it on the other computer too, then confirm here to connect.";
+                            text: "The other computer shows this request under its own INCOMING section — compare the codes, press Allow there, then confirm here to connect.";
                             color: #9ca3af;
                             font-size: 11px;
                             wrap: word-wrap;
@@ -209,7 +215,20 @@ export component AppWindow inherits Window {
                     }
                     VerticalLayout {
                         spacing: 6px;
-                        visible: incoming-pairing != "" && pending-verification-code == "";
+                        // Both directions must be visible SIMULTANEOUSLY. This
+                        // used to hide while our own outgoing code check was
+                        // open — so when both computers pressed Connect, each
+                        // side showed only its outgoing screen and neither
+                        // could ever approve the other: a mutual-blindness
+                        // deadlock with both users staring at unanswerable
+                        // code screens until everything timed out.
+                        visible: incoming-pairing != "";
+                        Text {
+                            text: "INCOMING — the other computer is calling you:";
+                            color: #f59e0b;
+                            font-size: 12px;
+                            font-weight: 700;
+                        }
                         Text {
                             text: "A computer wants to connect: " + incoming-pairing;
                             color: white;
