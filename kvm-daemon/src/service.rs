@@ -545,6 +545,7 @@ pub async fn pair(address: &str) -> Result<()> {
             node_name,
             fingerprint_hex,
             verification_code,
+            ..
         } => (node_name, fingerprint_hex, verification_code),
         WireMessage::Reject { reason } => bail!("peer rejected pairing: {reason}"),
         other => bail!("unexpected pairing response: {other:?}"),
@@ -635,6 +636,7 @@ pub async fn pair_for_daemon(
             node_name,
             fingerprint_hex,
             verification_code,
+            ..
         } if fingerprint_hex == remote_fingerprint => {
             let local_fingerprint = identity.fingerprint_hex();
             let expected =
@@ -2062,7 +2064,7 @@ async fn run_capture_stream(
 pub async fn run() -> Result<()> {
     let dir = data_dir();
     let config_path = dir.join("config.json");
-    let config = if config_path.exists() {
+    let mut config = if config_path.exists() {
         Config::load(&config_path).context("loading config")?
     } else {
         let config = Config::default();
@@ -2071,6 +2073,21 @@ pub async fn run() -> Result<()> {
             .context("writing default config")?;
         config
     };
+    // A station that calls itself "unknown" poisons every pairing screen
+    // ("Does unknown show the code…?"). Fresh installs that never received
+    // an explicit name inherit the OS host name once, persisted, so later
+    // role presses (read-modify-write) keep it instead of echoing "unknown".
+    if config.device_name.trim().is_empty()
+        || config.device_name.trim().eq_ignore_ascii_case("unknown")
+    {
+        if let Some(host) = os_host_name() {
+            tracing::info!(from = %config.device_name, to = %host, "adopting host name as device name");
+            config.device_name = host;
+            if let Err(error) = config.save(&config_path) {
+                tracing::warn!(%error, "cannot persist adopted device name");
+            }
+        }
+    }
 
     let identity = Identity::load_or_create(&dir).context("creating identity")?;
     let listen_port = config.listen_port;
@@ -2819,6 +2836,10 @@ async fn handle_pairing(
             node_name: local_node_name.clone(),
             fingerprint_hex: local_fingerprint.clone(),
             verification_code: Some(verification_code.clone()),
+            // The initiator typed this machine's rotating code: it already
+            // approved itself, so its UI must finish without a compare
+            // screen and without asking anyone here to click.
+            pre_approved: typed_code_accepted,
         },
     )
     .await?;
@@ -3115,6 +3136,44 @@ fn confirm_pairing() -> Result<bool> {
 
 fn local_node_name(config: &Config) -> String {
     config.device_name.clone()
+}
+
+/// Best-effort OS host name without new dependencies: environment first,
+/// then the platform's canonical source. Returns None when nothing usable
+/// is found, so callers keep their existing name.
+fn os_host_name() -> Option<String> {
+    let from_env = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    if from_env.is_some() {
+        return from_env;
+    }
+    #[cfg(unix)]
+    {
+        if let Ok(raw) = std::fs::read_to_string("/etc/hostname") {
+            let name = raw.trim().trim_matches('.').to_owned();
+            if !name.is_empty()
+                && name.len() <= 64
+                && !name.chars().any(char::is_control)
+            {
+                return Some(name);
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Last resort on Windows when COMPUTERNAME is absent (services
+        // normally have it; this is only belt-and-braces).
+        if let Ok(output) = std::process::Command::new("hostname").output() {
+            let name = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !name.is_empty() && !name.chars().any(char::is_control) {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {

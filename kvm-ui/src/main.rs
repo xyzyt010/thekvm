@@ -37,6 +37,14 @@ struct PendingPair {
     /// Distinguishes successive code checks so a late event (e.g. the
     /// station closing yesterday's request) can never clear today's screen.
     generation: u64,
+    /// True when the station's challenge says it already approved this exact
+    /// request (we typed its rotating pairing code). The UI must then finish
+    /// WITHOUT a compare screen: no station click is outstanding.
+    station_pre_approved: bool,
+    /// True when a typed code went out with the request but the station did
+    /// NOT pre-approve (wrong/stale code): the status text must say so
+    /// honestly instead of implying the station is showing a popup for us.
+    typed_code_sent: bool,
 }
 
 /// One initiator-side pairing conversation, kept open across the two user
@@ -165,6 +173,7 @@ fn main() -> Result<()> {
         ui_log("poll thread started");
         loop {
         if weak.upgrade().is_none() {
+            ui_log("poll thread exiting: app window is gone");
             break;
         }
         // One panicking iteration must never kill the whole poll thread:
@@ -174,9 +183,26 @@ fn main() -> Result<()> {
         set_poll_count(&weak, tick);
         match control_request(ControlRequest::Status) {
             Ok(ControlResponse::Status(status)) => {
+                // Make every success transition provable in ui.log: a poll
+                // that works but stays silent is indistinguishable from a
+                // dead one, and that ambiguity has cost real debugging days.
+                let code_state = if status.pairing_code.is_empty() {
+                    "station code unset"
+                } else {
+                    "station code set"
+                };
                 if was_failing {
                     was_failing = false;
-                    ui_log("poll: daemon reachable again after failures");
+                    ui_log(&format!(
+                        "poll: daemon reachable again after failures ({} peers, {code_state})",
+                        status.peer_count
+                    ));
+                }
+                if !POLL_FIRST_OK.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    ui_log(&format!(
+                        "poll: first status ok ({} peers, {code_state})",
+                        status.peer_count
+                    ));
                 }
                 consecutive_failures = 0;
                 let port = status.listen_port;
@@ -558,77 +584,13 @@ fn main() -> Result<()> {
             set_status(&weak, "No pending pairing".into());
             return;
         };
-        let weak = weak.clone();
-        let confirm_data_dir = confirm_data_dir.clone();
-        let confirm_session = confirm_session.clone();
-        let confirm_pending = pending_for_confirm.clone();
-        std::thread::spawn(move || {
-            // The user compared the six-digit code on both screens and
-            // approved: confirm on the pairing channel we held open, then
-            // wait for the station's answer. It may have approved already
-            // (answer is instant) or still be deciding (we wait, saying
-            // so). Only an Accepted pins the peer locally and starts the
-            // session — a one-sided local pin is exactly the trap that
-            // used to wedge reconnects forever.
-            let mut pending = pending;
-            let Some(mut channel) = pending.pairing.take() else {
-                ui_log("pairing: confirm without an open channel");
-                set_status(&weak, "Pairing channel is gone — press Connect again.".into());
-                return;
-            };
-            let peer_name = pending.peer_node_name.clone();
-            set_status(&weak, format!("Waiting for approval on {peer_name}…"));
-            ui_log(&format!("pairing: codes approved locally, awaiting {peer_name}"));
-            let answer = runtime().block_on(async {
-                write_frame(
-                    &mut channel.send,
-                    &WireMessage::PairConfirm {
-                        server_fingerprint_hex: pending.peer_fingerprint.clone(),
-                    },
-                )
-                .await?;
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(150),
-                    read_frame(&mut channel.recv),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("timed out waiting for {peer_name} to approve (150s)")
-                })?
-                .context("peer closed pairing without answering")?
-                .context("peer closed pairing without answering")
-            });
-            match answer {
-                Ok(WireMessage::Accepted { .. }) => {
-                    match pin_controller_peer(&confirm_data_dir, &pending) {
-                        Ok(()) => {
-                            set_pending(&weak, String::new(), String::new(), String::new());
-                            set_status(&weak, format!("Paired with {peer_name}"));
-                            ui_log(&format!("pairing: accepted by {peer_name}"));
-                            spawn_session(&weak, &confirm_session, &confirm_pending, &confirm_data_dir, pending.address);
-                        }
-                        Err(error) => {
-                            ui_log(&format!("pairing: accepted but pin failed: {error:#}"));
-                            set_status(&weak, format!("Pairing failed: {error}"))
-                        }
-                    }
-                }
-                Ok(WireMessage::Reject { reason }) => {
-                    ui_log(&format!("pairing: declined by {peer_name}: {reason}"));
-                    set_status(&weak, format!("{peer_name} declined pairing: {reason}"))
-                }
-                Ok(other) => {
-                    ui_log(&format!("pairing: unexpected completion: {other:?}"));
-                    channel.connection.close(0u32.into(), b"pairing done");
-                    set_status(&weak, format!("Unexpected pairing answer: {other:?}"))
-                }
-                Err(error) => {
-                    ui_log(&format!("pairing: confirm failed: {error:#}"));
-                    channel.connection.close(0u32.into(), b"pairing done");
-                    set_status(&weak, format!("{peer_name} did not answer: {error:#}"))
-                }
-            }
-        });
+        run_pair_confirm(
+            &weak,
+            confirm_data_dir.clone(),
+            &confirm_session,
+            &pending_for_confirm,
+            pending,
+        );
     });
 
     let weak = ui.as_weak();
@@ -1147,7 +1109,24 @@ fn start_session_flow(
                 let fingerprint = pair.peer_fingerprint.clone();
                 let peer_name = pair.peer_node_name.clone();
                 let code = pair.verification_code.clone();
+                // Typed-code pairing, approved by the station itself: finish
+                // immediately on the held-open channel. No compare screen
+                // ever shows (there is nothing left for either human to
+                // approve), and the misleading "approve it there too" text
+                // must never appear for this path.
+                if pair.station_pre_approved {
+                    ui_log(&format!(
+                        "pairing: station {peer_name} approved via typed code; finishing without a code screen"
+                    ));
+                    set_status(
+                        &weak,
+                        format!("{peer_name} approved automatically — finishing pairing…"),
+                    );
+                    run_pair_confirm(&weak, data_dir, &session, &pending, pair);
+                    return;
+                }
                 let generation = pair.generation;
+                let typed_code_sent = pair.typed_code_sent;
                 // Hold the pairing channel open (stored in the slot) and
                 // watch it: if the station ends the request (expiry,
                 // restart, denial-by-closure), the code screen must die
@@ -1192,15 +1171,113 @@ fn start_session_flow(
                         }
                     });
                 }
-                set_status(
-                    &weak,
-                    format!("Does {peer_name} show the code {code}? Approve it there too, then confirm here."),
-                );
+                set_status(&weak, pair_status_text(&peer_name, &code, typed_code_sent));
                 set_pending(&weak, fingerprint, code, peer_name);
             }
             Err(error) => set_status(&weak, format!("Cannot reach {address}: {error}")),
         }
     });
+}
+
+/// Finish a pairing on the held-open channel: send PairConfirm, wait for the
+/// station's answer, pin on Accepted and start the session. Shared by the
+/// manual Confirm click (compare-codes path) and the automatic finish
+/// (typed-code path: the station already approved, so no code screen ever
+/// shows and this runs immediately).
+fn run_pair_confirm(
+    weak: &slint::Weak<AppWindow>,
+    data_dir: std::path::PathBuf,
+    session: &Arc<Mutex<Option<Session>>>,
+    pending_arc: &Arc<Mutex<Option<PendingPair>>>,
+    pending: PendingPair,
+) {
+    let weak = weak.clone();
+    let confirm_data_dir = data_dir;
+    let confirm_session = session.clone();
+    let confirm_pending = pending_arc.clone();
+    std::thread::spawn(move || {
+        // The user compared the six-digit code on both screens and
+        // approved (or the station pre-approved via the typed code):
+        // confirm on the pairing channel we held open, then wait for the
+        // station's answer. It may have approved already (answer is
+        // instant) or still be deciding (we wait, saying so). Only an
+        // Accepted pins the peer locally and starts the session — a
+        // one-sided local pin is exactly the trap that used to wedge
+        // reconnects forever.
+        let mut pending = pending;
+        let Some(mut channel) = pending.pairing.take() else {
+            ui_log("pairing: confirm without an open channel");
+            set_status(&weak, "Pairing channel is gone — press Connect again.".into());
+            return;
+        };
+        let peer_name = pending.peer_node_name.clone();
+        set_status(&weak, format!("Waiting for approval on {peer_name}…"));
+        ui_log(&format!("pairing: codes approved locally, awaiting {peer_name}"));
+        let answer = runtime().block_on(async {
+            write_frame(
+                &mut channel.send,
+                &WireMessage::PairConfirm {
+                    server_fingerprint_hex: pending.peer_fingerprint.clone(),
+                },
+            )
+            .await?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(150),
+                read_frame(&mut channel.recv),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("timed out waiting for {peer_name} to approve (150s)")
+            })?
+            .context("peer closed pairing without answering")?
+            .context("peer closed pairing without answering")
+        });
+        match answer {
+            Ok(WireMessage::Accepted { .. }) => {
+                match pin_controller_peer(&confirm_data_dir, &pending) {
+                    Ok(()) => {
+                        set_pending(&weak, String::new(), String::new(), String::new());
+                        set_status(&weak, format!("Paired with {peer_name}"));
+                        ui_log(&format!("pairing: accepted by {peer_name}"));
+                        spawn_session(&weak, &confirm_session, &confirm_pending, &confirm_data_dir, pending.address);
+                    }
+                    Err(error) => {
+                        ui_log(&format!("pairing: accepted but pin failed: {error:#}"));
+                        set_status(&weak, format!("Pairing failed: {error}"))
+                    }
+                }
+            }
+            Ok(WireMessage::Reject { reason }) => {
+                ui_log(&format!("pairing: declined by {peer_name}: {reason}"));
+                set_status(&weak, format!("{peer_name} declined pairing: {reason}"))
+            }
+            Ok(other) => {
+                ui_log(&format!("pairing: unexpected completion: {other:?}"));
+                channel.connection.close(0u32.into(), b"pairing done");
+                set_status(&weak, format!("Unexpected pairing answer: {other:?}"))
+            }
+            Err(error) => {
+                ui_log(&format!("pairing: confirm failed: {error:#}"));
+                channel.connection.close(0u32.into(), b"pairing done");
+                set_status(&weak, format!("{peer_name} did not answer: {error:#}"))
+            }
+        }
+    });
+}
+
+/// Status sentence for the compare-code screen. It must never imply the
+/// station is showing a popup "for us" when we know it isn't: a typed code
+/// that the station rejected (wrong/stale digits) falls back to comparison,
+/// and the user must hear that the typed code failed — not wait for an
+/// approval that will never come.
+fn pair_status_text(peer_name: &str, code: &str, typed_code_sent: bool) -> String {
+    if typed_code_sent {
+        format!(
+            "The typed code was not accepted on {peer_name} (wrong or expired digits) — compare instead: does {peer_name} show the code {code}? Approve it there too, then confirm here."
+        )
+    } else {
+        format!("Does {peer_name} show the code {code}? Approve it there too, then confirm here.")
+    }
 }
 
 fn is_controller_peer_pinned(data_dir: &std::path::Path, fingerprint: &str) -> bool {
@@ -1755,6 +1832,12 @@ static PAIRING_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 static LAST_INCOMING_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Whether the poll has ever completed a Status round-trip. First success is
+/// logged once with the station-code state, so a healthy-but-silent poll is
+/// distinguishable from a dead one in ui.log alone.
+static POLL_FIRST_OK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// One shared runtime for every background call (control pipe, pairing
 /// preview dials, LAN scans). Creating a fresh Tokio runtime per request
 /// churns threads and turns a failed creation into an untraceable call
@@ -1922,12 +2005,13 @@ fn pair_prepare(
         })?
         .with_context(|| format!("read pairing answer from {address}"))?
         .context("peer closed pairing stream")?;
-        let (peer_node_name, challenged_fingerprint) = match challenge {
+        let (peer_node_name, challenged_fingerprint, station_pre_approved) = match challenge {
             WireMessage::PairChallenge {
                 node_name,
                 fingerprint_hex,
+                pre_approved,
                 ..
-            } => (node_name, fingerprint_hex),
+            } => (node_name, fingerprint_hex, pre_approved),
             WireMessage::Reject { reason } => anyhow::bail!("peer rejected pairing: {reason}"),
             other => anyhow::bail!("unexpected pairing response: {other:?}"),
         };
@@ -1936,8 +2020,13 @@ fn pair_prepare(
         }
         let verification_code =
             kvm_protocol::pairing::verification_code(&identity.fingerprint_hex(), &peer_fingerprint);
-        if pairing_code.as_deref().is_some_and(|code| !code.trim().is_empty()) {
+        let typed_code_sent =
+            pairing_code.as_deref().is_some_and(|code| !code.trim().is_empty());
+        if typed_code_sent {
             ui_log("pairing: typed station code sent with the request");
+        }
+        if station_pre_approved {
+            ui_log("pairing: station pre-approved via typed code; no compare screen will show");
         }
         Ok(PendingPair {
             verification_code,
@@ -1950,6 +2039,8 @@ fn pair_prepare(
                 recv,
             }),
             generation,
+            station_pre_approved,
+            typed_code_sent,
         })
     })
 }
@@ -2104,3 +2195,24 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
         .map(|byte| format!("{byte:02x}"))
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::pair_status_text;
+
+    #[test]
+    fn compare_screen_names_peer_and_code() {
+        let text = pair_status_text("mint", "862077", false);
+        assert!(text.contains("mint"), "{text}");
+        assert!(text.contains("862077"), "{text}");
+        assert!(!text.contains("not accepted"), "{text}");
+    }
+
+    #[test]
+    fn rejected_typed_code_says_so_instead_of_implying_a_popup() {
+        let text = pair_status_text("mint", "862077", true);
+        assert!(text.contains("not accepted"), "{text}");
+        assert!(text.contains("862077"), "{text}");
+    }
+}
+

@@ -174,6 +174,13 @@ pub enum WireMessage {
         /// when the peer predates this field; present peers must agree.
         #[serde(default)]
         verification_code: Option<String>,
+        /// True when the station already approved this exact request because
+        /// the initiator typed the station's rotating pairing code. The
+        /// initiator must then finish WITHOUT showing a compare screen:
+        /// nobody on the station side needs to click anything. Absent/false
+        /// for classic compare-codes pairings and older peers.
+        #[serde(default)]
+        pre_approved: bool,
     },
     PairConfirm {
         server_fingerprint_hex: String,
@@ -295,6 +302,7 @@ pub fn validate_message(message: &WireMessage) -> std::io::Result<()> {
             node_name,
             fingerprint_hex,
             verification_code,
+            ..
         } => {
             validate_node_name(node_name)?;
             validate_fingerprint(fingerprint_hex)?;
@@ -565,25 +573,28 @@ mod tests {
             node_name: "receiver".into(),
             fingerprint_hex: "cd".repeat(32),
             verification_code: Some("123456".into()),
+            pre_approved: true,
         };
         assert!(validate_message(&challenge).is_ok());
         let encoded = serde_json::to_vec(&challenge).unwrap();
         let decoded: WireMessage = serde_json::from_slice(&encoded).unwrap();
         assert!(matches!(
             &decoded,
-            WireMessage::PairChallenge { verification_code: Some(code), .. } if code == "123456"
+            WireMessage::PairChallenge { verification_code: Some(code), pre_approved: true, .. } if code == "123456"
         ));
 
         assert!(validate_message(&WireMessage::PairChallenge {
             node_name: "receiver".into(),
             fingerprint_hex: "cd".repeat(32),
             verification_code: Some("12a456".into()),
+            pre_approved: false,
         })
         .is_err());
         assert!(validate_message(&WireMessage::PairChallenge {
             node_name: "receiver".into(),
             fingerprint_hex: "cd".repeat(32),
             verification_code: Some("12345".into()),
+            pre_approved: false,
         })
         .is_err());
 
@@ -596,6 +607,7 @@ mod tests {
             legacy,
             WireMessage::PairChallenge {
                 verification_code: None,
+                pre_approved: false,
                 ..
             }
         ));
