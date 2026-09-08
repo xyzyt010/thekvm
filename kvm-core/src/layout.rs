@@ -249,33 +249,6 @@ impl Layout {
         }
     }
 
-    /// Point on the self edge facing one screen: where control re-enters
-    /// this machine when it returns from that screen. The midpoint is
-    /// predictable (no disorienting jumps to stale coordinates); the
-    /// arrangement decides which edge it is.
-    pub fn facing_edge_midpoint(&self, target: ScreenId) -> Option<(Edge, u32, u32)> {
-        let me = self.self_screen.and_then(|id| self.screen(id))?;
-        let peer = self.screen(target)?;
-        let edge = if peer.x < me.x {
-            Edge::Left
-        } else if peer.x > me.x {
-            Edge::Right
-        } else if peer.y < me.y {
-            Edge::Top
-        } else if peer.y > me.y {
-            Edge::Bottom
-        } else {
-            return None;
-        };
-        let (x, y) = match edge {
-            Edge::Left => (0, me.height / 2),
-            Edge::Right => (me.width.saturating_sub(1), me.height / 2),
-            Edge::Top => (me.width / 2, 0),
-            Edge::Bottom => (me.width / 2, me.height.saturating_sub(1)),
-        };
-        Some((edge, x, y))
-    }
-
     /// Next free screen id (one past the current maximum, starting at 1).
     /// Arrangement edits use this so added screens never collide, on any
     /// machine, under the global-id convention.
@@ -417,6 +390,11 @@ pub struct EdgeRouter {
     local_cursor_x: u32,
     local_cursor_y: u32,
     active_remote: Option<ScreenId>,
+    /// Deskflow-style screen lock (ScrollLock): while set, no edge crossing
+    /// opens a new handoff — the cursor stays where it is. Locking never
+    /// strands control remotely: engaging it returns home first (see the
+    /// daemon handoff arm), so the lock always means "held locally".
+    locked: bool,
 }
 
 impl EdgeRouter {
@@ -439,7 +417,18 @@ impl EdgeRouter {
             local_cursor_x: screen_width / 2,
             local_cursor_y: screen_height / 2,
             active_remote: None,
+            locked: false,
         })
+    }
+
+    /// Engage or release the screen lock. Locking only affects FUTURE
+    /// crossings (the caller returns home first); unlocking resumes.
+    pub fn set_locked(&mut self, locked: bool) {
+        self.locked = locked;
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.locked
     }
 
     pub fn current_screen(&self) -> ScreenId {
@@ -525,21 +514,13 @@ impl EdgeRouter {
             self.local_cursor_y = self.cursor_y;
             return RoutedEvent::Local(event);
         };
+        // Locked screens never open a handoff: clamp like an unlinked edge
+        // so local window controls stay reachable.
+        if self.locked {
+            return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
+        }
         let Some(target) = self.layout.edge_target(self.current_screen, edge) else {
-            let previous_x = self.cursor_x;
-            let previous_y = self.cursor_y;
-            let clamped_x = next_x.clamp(0, i64::from(screen.width - 1));
-            let clamped_y = next_y.clamp(0, i64::from(screen.height - 1));
-            self.cursor_x = clamped_x as u32;
-            self.cursor_y = clamped_y as u32;
-            self.local_cursor_x = self.cursor_x;
-            self.local_cursor_y = self.cursor_y;
-            return RoutedEvent::Local(InputEvent::MouseMove {
-                dx: (clamped_x - i64::from(previous_x))
-                    .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-                dy: (clamped_y - i64::from(previous_y))
-                    .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-            });
+            return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
         };
         let target_screen = self
             .layout
@@ -602,6 +583,27 @@ impl EdgeRouter {
             target_y,
             event: remainder,
         }
+    }
+
+    /// Clamp an out-of-bounds motion back inside the current screen and
+    /// report the surviving remainder as a local event (unlinked edges and
+    /// the screen lock behave identically: the cursor stops, nothing
+    /// crosses).
+    fn clamp_to_edge(&mut self, next_x: i64, next_y: i64, width: u32, height: u32) -> RoutedEvent {
+        let previous_x = self.cursor_x;
+        let previous_y = self.cursor_y;
+        let clamped_x = next_x.clamp(0, i64::from(width - 1));
+        let clamped_y = next_y.clamp(0, i64::from(height - 1));
+        self.cursor_x = clamped_x as u32;
+        self.cursor_y = clamped_y as u32;
+        self.local_cursor_x = self.cursor_x;
+        self.local_cursor_y = self.cursor_y;
+        RoutedEvent::Local(InputEvent::MouseMove {
+            dx: (clamped_x - i64::from(previous_x))
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            dy: (clamped_y - i64::from(previous_y))
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        })
     }
 
     pub fn return_to_local(&mut self, from: ScreenId, x: u32, y: u32) -> Result<(), String> {
@@ -783,19 +785,24 @@ mod tests {
     }
 
     #[test]
-    fn facing_edge_midpoint_returns_through_the_arranged_edge() {
+    fn locked_router_holds_the_cursor_locally() {
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
-        let (edge, x, y) = layout
-            .facing_edge_midpoint(FIRST_PEER_SCREEN_ID)
-            .expect("peer is arranged");
-        assert_eq!(edge, Edge::Right);
-        assert_eq!((x, y), (1919, 540));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_locked(true);
+        assert!(router.is_locked());
+        // Even a full crossing stays local while locked.
+        let result = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(matches!(result, RoutedEvent::Local(_)));
+        assert_eq!(router.active_remote(), None);
+        router.set_locked(false);
+        assert!(!router.is_locked());
+        let result = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(matches!(result, RoutedEvent::Handoff { .. }));
+    }
+
+    #[test]
+    fn next_screen_id_never_collides() {
         let mirror = Layout::pair_mirror("me", "peer", &"ab".repeat(32));
-        let (edge, x, y) = mirror
-            .facing_edge_midpoint(MIRROR_PEER_SCREEN_ID)
-            .expect("peer is arranged");
-        assert_eq!(edge, Edge::Left);
-        assert_eq!((x, y), (0, 540));
         assert_eq!(mirror.next_screen_id(), ScreenId(3));
         assert_eq!(Layout::default().next_screen_id(), ScreenId(1));
     }

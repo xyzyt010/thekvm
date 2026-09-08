@@ -173,7 +173,7 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
                     Text {
-                        text: "Linking two computers takes two sides. STATION (waits): choose 'Be controlled' or 'Both ways' and read this computer's address and pairing code above. NODE (dials): choose 'Control other' or 'Both ways', type the station's address and its pairing code, press Connect — no click needed on the station. Without a code, both sides compare the 6-digit code before anything connects. Either side can Disconnect and reconnect at any time.";
+                        text: "Linking two computers takes two sides. STATION (waits): choose 'Be controlled' or 'Both ways' and read this computer's address and pairing code above. NODE (dials): choose 'Control other' or 'Both ways', type the station's address and its pairing code, press Take over — no click needed on the station. Without a code, both sides compare the 6-digit code before anything connects. For daily shared-cursor use, start edge control above instead of taking over. Either side can Disconnect and reconnect at any time.";
                         color: #9ca3af;
                         font-size: 12px;
                         wrap: word-wrap;
@@ -200,6 +200,37 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
                     Rectangle { height: 1px; background: #262626; }
+                    Text { text: "Edge control (shared cursor):"; color: white; font-size: 16px; font-weight: 700; }
+                    Text {
+                        text: "Both computers stay usable — only cursor crossings move control. Arrange the screens under Devices first.";
+                        color: #9ca3af;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Button {
+                            text: edge-active ? "Stop edge control" : "Start edge control";
+                            primary: true;
+                            clicked => { set-edge-mode(!edge-active); }
+                        }
+                    }
+                    Text {
+                        visible: driving-text != "";
+                        text: driving-text;
+                        color: #22c55e;
+                        font-size: 13px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                    }
+                    Rectangle { height: 1px; background: #262626; }
+                    Text { text: "Take over one computer (full control):"; color: white; font-size: 16px; font-weight: 700; }
+                    Text {
+                        text: "The other computer gets your whole keyboard and mouse and this screen freezes until Disconnect. For daily use, prefer edge control above.";
+                        color: #9ca3af;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
                     Text { text: "Other computer's address:"; color: white; font-size: 16px; font-weight: 700; }
                     HorizontalLayout {
                         spacing: 12px;
@@ -209,7 +240,7 @@ export component AppWindow inherits Window {
                             enabled: !session-active;
                         }
                         Button {
-                            text: "Connect";
+                            text: "Take over";
                             primary: true;
                             visible: !session-active;
                             enabled: addr.text != "";
@@ -233,29 +264,6 @@ export component AppWindow inherits Window {
                         text: session-text;
                         color: session-active ? #22c55e : #9ca3af;
                         font-size: 13px;
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        visible: driving-text != "";
-                        text: driving-text;
-                        color: #22c55e;
-                        font-size: 13px;
-                        font-weight: 700;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        visible: !session-active;
-                        Button {
-                            text: edge-active ? "Stop edge control" : "Start edge control";
-                            primary: true;
-                            clicked => { set-edge-mode(!edge-active); }
-                        }
-                    }
-                    Text {
-                        text: "Connect (above) is full takeover: the other computer gets your whole keyboard and mouse until Disconnect. Edge control keeps both computers usable — only cursor crossings move control, and pushing back returns it.";
-                        color: #9ca3af;
-                        font-size: 11px;
                         wrap: word-wrap;
                     }
                     Button {

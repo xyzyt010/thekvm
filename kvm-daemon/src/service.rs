@@ -1183,7 +1183,6 @@ async fn connect_topology() -> Result<()> {
             } => {
                 match signal {
                     Some(RemoteSignal::Handoff(handoff)) => {
-                        let returning_from = active.as_ref().map(|session| session.target);
                         if let Some(session) = active.take() {
                             session.finish().await;
                             capture_control.set_exclusive(false)?;
@@ -1208,32 +1207,20 @@ async fn connect_topology() -> Result<()> {
                             })
                             .unwrap_or((handoff.x, handoff.y));
                         // A handoff naming this machine's own screen hands
-                        // control back: re-enter through the arranged facing
-                        // edge (predictable midpoint) instead of the stale
-                        // exit coordinates, so the cursor never jumps
-                        // somewhere unexpected on return.
+                        // control back: re-enter at the exact pixel
+                        // departed (saved local position, Deskflow
+                        // jump-position semantics) instead of stale exit
+                        // coordinates, so return never jumps somewhere
+                        // unexpected.
                         if target == router.local_screen() {
-                            if let Some(from) = returning_from {
-                                let faced = router.layout().facing_edge_midpoint(from).and_then(
-                                    |(_, face_x, face_y)| {
-                                        router.screen(target).map(|mine| {
-                                            (
-                                                face_x.min(mine.width.saturating_sub(1)),
-                                                face_y.min(mine.height.saturating_sub(1)),
-                                            )
-                                        })
-                                    },
-                                );
-                                if let Some((face_x, face_y)) = faced {
-                                    router
-                                        .handoff_to(target, face_x, face_y)
-                                        .map_err(anyhow::Error::msg)?;
-                                    capture_control.warp_cursor(face_x, face_y)?;
-                                    tracing::info!(?target, "topology peer returned control locally");
-                                    eprintln!("THEKVM_STATUS local");
-                                    continue;
-                                }
-                            }
+                            let (home_x, home_y) = router.local_cursor_position();
+                            router
+                                .handoff_to(target, home_x, home_y)
+                                .map_err(anyhow::Error::msg)?;
+                            capture_control.warp_cursor(home_x, home_y)?;
+                            tracing::info!(?target, "topology peer returned control locally");
+                            eprintln!("THEKVM_STATUS local");
+                            continue;
                         }
                         if !router
                             .handoff_to(target, handoff_x, handoff_y)
@@ -1342,6 +1329,7 @@ async fn connect_topology() -> Result<()> {
                     initial_clipboard: latest_clipboard.clone(),
                     clipboard_revision: &mut clipboard_revision,
                     dir: &dir,
+                    discarded_event_barrier: &mut discarded_event_barrier,
                 })
                 .await?;
             }
@@ -1369,6 +1357,7 @@ async fn connect_topology() -> Result<()> {
                     initial_clipboard: latest_clipboard.clone(),
                     clipboard_revision: &mut clipboard_revision,
                     dir: &dir,
+                    discarded_event_barrier: &mut discarded_event_barrier,
                 })
                 .await?;
             }
@@ -1474,6 +1463,7 @@ struct TopologyEventContext<'a> {
     initial_clipboard: Option<String>,
     clipboard_revision: &'a mut u64,
     dir: &'a std::path::Path,
+    discarded_event_barrier: &'a mut u64,
 }
 
 async fn handle_topology_event(
@@ -1495,7 +1485,33 @@ async fn handle_topology_event(
         initial_clipboard,
         clipboard_revision,
         dir,
+        discarded_event_barrier,
     } = context;
+    // ScrollLock toggles the Deskflow-style screen lock (consumed, never
+    // forwarded): locking returns home first so it always means "held
+    // locally", never "stranded remotely".
+    if is_scroll_lock_press(&captured.event) {
+        if router.is_locked() {
+            router.set_locked(false);
+            tracing::info!("edge control unlocked");
+            eprintln!("THEKVM_STATUS local");
+        } else {
+            if let Some(session) = active.take() {
+                let target = session.target;
+                session.finish().await;
+                capture_control.set_exclusive(false)?;
+                *discarded_event_barrier = (*discarded_event_barrier)
+                    .max(capture_control.snapshot().last_event_id);
+                let _ = router.restore_local(target);
+                let (x, y) = router.cursor_position();
+                let _ = capture_control.warp_cursor(x, y);
+            }
+            router.set_locked(true);
+            tracing::info!("edge control locked to this computer");
+            eprintln!("THEKVM_STATUS locked");
+        }
+        return Ok(());
+    }
     let routed = router.route(captured.event);
     match routed {
         RoutedEvent::Local(_) => {
@@ -2126,6 +2142,14 @@ async fn run_capture_stream(
             event = priority_rx.recv() => match event {
                 Some(captured) if captured.event_id <= event_barrier => continue,
                 Some(captured) => {
+                    // ScrollLock restores local control immediately
+                    // (consumed, never forwarded): the only key that can
+                    // break a fullscreen takeover from the inside.
+                    if is_scroll_lock_press(&captured.event) {
+                        tracing::info!("ScrollLock pressed; restoring local control");
+                        eprintln!("THEKVM_STATUS ended ScrollLock pressed — local control restored");
+                        break Ok(());
+                    }
                     sequence = sequence.wrapping_add(1);
                     if let Err(error) = write_frame(&mut send, &WireMessage::Input(InputPacket { sequence, event: captured.event })).await {
                         break Err(error.into());
@@ -3038,11 +3062,21 @@ async fn handle_pairing(
             }
         }
     };
+    // Bound the confirmation wait like the local approval window (30
+    // minutes): an initiator that walks away mid-ceremony must not hold a
+    // pairing task (and the initiator's open channel) forever. Expiry
+    // closes the station side, which tells a lingering initiator to clear
+    // its code screen instead of showing stale digits.
+    const PAIRING_CONFIRM_TIMEOUT_SECS: u64 = 1800;
     let confirmed = async {
-        match read_frame(recv)
-            .await?
-            .context("peer closed pairing stream")?
-        {
+        let incoming = tokio::time::timeout(
+            std::time::Duration::from_secs(PAIRING_CONFIRM_TIMEOUT_SECS),
+            read_frame(recv),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("pairing confirmation timed out"))?
+        .map_err(|error| anyhow::anyhow!("pairing stream failed: {error:#}"))?;
+        match incoming.context("peer closed pairing stream")? {
             WireMessage::PairConfirm {
                 server_fingerprint_hex,
             } if server_fingerprint_hex == identity.fingerprint_hex() => Ok(()),
@@ -3118,6 +3152,21 @@ async fn handle_pairing(
     );
     tracing::info!(peer = %actual_peer_fingerprint, remote = %conn.remote_address(), "paired peer");
     Ok(())
+}
+
+/// USB HID usage for Scroll Lock. Every capture backend decodes the
+/// platform key to this usage (Windows scan 0x46, evdev 70, X11 keycode 78),
+/// so hotkey detection below is platform independent. Deskflow parity: the
+/// lock key holds the cursor on the current screen; in fixed takeover there
+/// is no local screen to hold, so it restores local control by exiting.
+const SCROLL_LOCK_USAGE: u16 = 0x47;
+
+fn is_scroll_lock_press(event: &kvm_core::InputEvent) -> bool {
+    matches!(
+        event,
+        kvm_core::InputEvent::Key(kvm_core::KeyEvent { usage, pressed: true })
+            if *usage == SCROLL_LOCK_USAGE
+    )
 }
 
 struct ConnectPolicy<'a> {
@@ -3685,8 +3734,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_peer_rejection_matches_only_trust_failures() {
-        assert!(unknown_peer_rejection(&anyhow::anyhow!(
+    fn input_capability_policy_matches_platform() {
+        let locked_off = kvm_core::Config {
+            allow_lock_screen_control: false,
+            ..kvm_core::Config::default()
+        };
+        let locked_on = kvm_core::Config {
+            allow_lock_screen_control: true,
+            ..kvm_core::Config::default()
+        };
+        if cfg!(target_os = "windows") {
+            // Windows isolates ordinary sessions in the Default desktop
+            // helper: no opt-in needed, privileged input stays gated.
+            assert!(validate_input_capability(&locked_off, false).is_ok());
+            assert!(validate_input_capability(&locked_off, true).is_err());
+            assert!(validate_input_capability(&locked_on, true).is_ok());
+        } else {
+            // evdev/uinput writes below the compositor and can reach a
+            // greeter, so every non-Windows session needs the explicit
+            // opt-in — ordinary and privileged alike.
+            assert!(validate_input_capability(&locked_off, false).is_err());
+            assert!(validate_input_capability(&locked_off, true).is_err());
+            assert!(validate_input_capability(&locked_on, false).is_ok());
+            assert!(validate_input_capability(&locked_on, true).is_ok());
+        }
+    }
+
+    #[test]
+    fn scroll_lock_press_detects_only_the_lock_key_down() {
+        use kvm_core::{InputEvent, KeyEvent};
+        assert!(is_scroll_lock_press(&InputEvent::Key(KeyEvent {
+            usage: SCROLL_LOCK_USAGE,
+            pressed: true,
+        })));
+        assert!(!is_scroll_lock_press(&InputEvent::Key(KeyEvent {
+            usage: SCROLL_LOCK_USAGE,
+            pressed: false,
+        })));
+        assert!(!is_scroll_lock_press(&InputEvent::Key(KeyEvent {
+            usage: 0x04,
+            pressed: true,
+        })));
+        assert!(!is_scroll_lock_press(&InputEvent::MouseMove { dx: 1, dy: 0 }));
+    }
+
+    #[test]
+    fn unknown_peer_rejection_matches_only_trust_failures() {        assert!(unknown_peer_rejection(&anyhow::anyhow!(
             "peer 192.168.1.7:42110 is not paired (fingerprint {})",
             "ab".repeat(32)
         )));

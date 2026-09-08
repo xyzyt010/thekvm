@@ -2168,7 +2168,11 @@ fn relay_session_progress(
             }
             "local" => {
                 set_driving(weak, String::new());
-                "Edge control is on — this computer. Push past the arranged edge to drive the other screen.".into()
+                "Edge control is on — this computer. Push past any edge to drive the other screen.".into()
+            }
+            "locked" => {
+                set_driving(weak, String::new());
+                "Edge control locked to this computer — press ScrollLock to unlock.".into()
             }
             "waiting" => {
                 if detail.contains("peer is not paired") {
