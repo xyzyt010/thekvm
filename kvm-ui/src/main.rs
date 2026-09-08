@@ -172,10 +172,15 @@ fn main() -> Result<()> {
         let mut was_failing = false;
         ui_log("poll thread started");
         loop {
-        if weak.upgrade().is_none() {
-            ui_log("poll thread exiting: app window is gone");
-            break;
-        }
+        // NOTE: never gate this loop on weak.upgrade(). Slint component
+        // handles live on the event-loop thread: upgrading a Weak from any
+        // background thread ALWAYS returns None, so such a check exits the
+        // poll on its very first iteration — silently killing every
+        // poll-driven display (status, station code, invite, peers,
+        // incoming approvals, update counter) on all machines while buttons
+        // keep working. The per-update closures below upgrade safely
+        // because invoke_from_event_loop runs them ON the UI thread. This
+        // thread holds no strong handle, so process exit still ends it.
         // One panicking iteration must never kill the whole poll thread:
         // catch it, log it, count it as a failure, keep polling.
         let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
