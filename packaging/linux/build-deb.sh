@@ -176,6 +176,13 @@ case "$1" in
 
     install -d -o thekvm -g thekvm -m 0770 /var/lib/thekvm
 
+    # Station-side edge control runs as the desktop user (thekvm group) and
+    # reads the system identity and peer book to dial with the trusted
+    # identity. Additive only: the group gains read, nothing is removed.
+    for f in identity.key peers.json config.json; do
+        [ -e "/var/lib/thekvm/$f" ] && chmod g+r "/var/lib/thekvm/$f" || true
+    done
+
     udevadm control --reload-rules || true
     udevadm trigger --name-match=uinput || true
 
