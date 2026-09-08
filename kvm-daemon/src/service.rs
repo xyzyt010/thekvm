@@ -532,6 +532,7 @@ pub async fn pair(address: &str) -> Result<()> {
         &WireMessage::PairRequest {
             node_name: local_node_name(&config),
             fingerprint_hex: identity.fingerprint_hex(),
+            pairing_code: None,
         },
     )
     .await?;
@@ -622,6 +623,7 @@ pub async fn pair_for_daemon(
         &WireMessage::PairRequest {
             node_name: local_node_name(&config),
             fingerprint_hex: identity.fingerprint_hex(),
+            pairing_code: None,
         },
     )
     .await?;
@@ -2269,6 +2271,7 @@ async fn handle_connection(
         WireMessage::PairRequest {
             node_name,
             fingerprint_hex,
+            pairing_code,
         } => {
             handle_pairing(
                 &conn,
@@ -2281,6 +2284,7 @@ async fn handle_connection(
                     local_node_name: local_config.device_name.clone(),
                     node_name,
                     claimed_fingerprint: fingerprint_hex,
+                    pairing_code,
                 },
             )
             .await
@@ -2758,6 +2762,10 @@ struct PairingRequest {
     local_node_name: String,
     node_name: String,
     claimed_fingerprint: String,
+    /// Typed station code from the initiator, if it entered one. Verified
+    /// against the rotating station code; a match pre-approves the pairing
+    /// with no local click needed.
+    pairing_code: Option<String>,
 }
 
 async fn handle_pairing(
@@ -2773,6 +2781,7 @@ async fn handle_pairing(
         local_node_name,
         node_name,
         claimed_fingerprint,
+        pairing_code,
     } = request;
     if claimed_fingerprint != actual_peer_fingerprint {
         reject(send, "pairing identity does not match the certificate").await?;
@@ -2782,6 +2791,28 @@ async fn handle_pairing(
     let local_fingerprint = identity.fingerprint_hex();
     let verification_code =
         kvm_protocol::pairing::verification_code(&local_fingerprint, actual_peer_fingerprint);
+    // Typed-code pairing (MWB security-key model): the initiator typed the
+    // digits shown on this machine's screen, proving human presence here
+    // without any popup, simultaneity, or second screen-watch. Pre-approve:
+    // no pending is registered, no local click is needed, and the decision
+    // lands in the audit trail instead of the approval queue. A wrong code
+    // simply falls through to the compare-codes flow below.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let typed_code_accepted = pairing_code.as_deref().is_some_and(|code| {
+        kvm_protocol::pairing::station_code_valid(&local_fingerprint, code, now_secs)
+    });
+    if typed_code_accepted {
+        audit_event(
+            &data_dir(),
+            &format!(
+                "pairing-code-accepted fingerprint={actual_peer_fingerprint} remote={}",
+                conn.remote_address()
+            ),
+        );
+    }
     write_frame(
         send,
         &WireMessage::PairChallenge {
@@ -2797,18 +2828,23 @@ async fn handle_pairing(
     // ceremony can never complete. The initiator's PairConfirm and the local
     // Allow/Deny race in either order; both must arrive before trust is
     // granted. Whichever side approves first, its decision is held until the
-    // other side arrives.
-    let pending = kvm_protocol::control::PendingPairing {
-        node_name: node_name.clone(),
-        fingerprint_hex: actual_peer_fingerprint.to_owned(),
-        address: conn.remote_address().to_string(),
-        verification_code,
-    };
-    let waiter = match pairing_approvals.register(pending).await {
-        Ok(waiter) => waiter,
-        Err(error) => {
-            let _ = reject(send, &format!("{error:#}")).await;
-            bail!("pairing not registered: {error:#}");
+    // other side arrives. (Skipped for typed-code pairings: nobody needs to
+    // click anything there.)
+    let waiter = if typed_code_accepted {
+        None
+    } else {
+        let pending = kvm_protocol::control::PendingPairing {
+            node_name: node_name.clone(),
+            fingerprint_hex: actual_peer_fingerprint.to_owned(),
+            address: conn.remote_address().to_string(),
+            verification_code,
+        };
+        match pairing_approvals.register(pending).await {
+            Ok(waiter) => Some(waiter),
+            Err(error) => {
+                let _ = reject(send, &format!("{error:#}")).await;
+                bail!("pairing not registered: {error:#}");
+            }
         }
     };
     let confirmed = async {
@@ -2830,12 +2866,16 @@ async fn handle_pairing(
     tokio::pin!(confirmed);
     tokio::select! {
         _ = conn.closed() => {
-            waiter.cancel().await;
+            if let Some(waiter) = &waiter {
+                waiter.cancel().await;
+            }
             bail!("peer disconnected before pairing completed");
         }
         result = &mut confirmed => {
             if let Err(error) = result {
-                waiter.cancel().await;
+                if let Some(waiter) = &waiter {
+                    waiter.cancel().await;
+                }
                 let _ = reject(send, &format!("{error:#}")).await;
                 return Err(error);
             }
@@ -2843,7 +2883,12 @@ async fn handle_pairing(
     }
     // The initiator approved the codes; now the LOCAL decision (which may
     // already have been made minutes ago — it was held in the channel).
-    if !waiter.wait().await? {
+    // Typed-code pairings skip this: the typed digits were the approval.
+    let approved = match waiter {
+        Some(waiter) => waiter.wait().await?,
+        None => typed_code_accepted,
+    };
+    if !approved {
         reject(send, "pairing was rejected or timed out locally").await?;
         audit_event(
             &data_dir(),

@@ -246,8 +246,16 @@ where
         ControlRequest::Status => {
             let current = config.read().await.clone();
             let peer_count = peers.read().await.peers.len();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             ControlResponse::Status(DaemonStatus {
                 node_name: current.device_name,
+                pairing_code: kvm_protocol::pairing::station_pairing_code(
+                    &fingerprint,
+                    now_secs,
+                ),
                 fingerprint_hex: fingerprint,
                 listen_port: current.listen_port,
                 mode: current.mode,

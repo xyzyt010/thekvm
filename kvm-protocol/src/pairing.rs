@@ -2,11 +2,51 @@
 
 use kvm_core::MAX_DEVICE_NAME_BYTES;
 use rcgen::{generate_simple_self_signed, CertifiedKey};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::PathBuf;
 
 const MAX_TRUSTED_PEERS: usize = 256;
 const MAX_PEER_ADDRESS_BYTES: usize = 256;
+
+/// Station pairing-code rotation: the displayed code changes every 30
+/// minutes. Long enough that a human can walk between machines and type it
+/// at leisure (no simultaneity race); short enough that a leaked code
+/// quickly dies. This is the Mouse Without Borders security-key model:
+/// whoever can READ the station screen can pair — no popup, no second
+/// screen-watch, no expiry ambush.
+pub const PAIRING_CODE_ROTATION_SECS: u64 = 1800;
+
+/// Six digits derived from the station identity and the current time
+/// window. A leaked/guessed code is only useful inside its window, and
+/// each guess costs the attacker a full QUIC handshake plus streams.
+pub fn station_pairing_code(identity_fingerprint_hex: &str, unix_secs: u64) -> String {
+    let window = unix_secs / PAIRING_CODE_ROTATION_SECS;
+    let mut hasher = Sha256::new();
+    hasher.update(b"thekvm-pairing-code-v1");
+    hasher.update(identity_fingerprint_hex.trim().to_ascii_lowercase().as_bytes());
+    hasher.update(window.to_be_bytes());
+    let digest = hasher.finalize();
+    let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{value:06}")
+}
+
+/// Accept the current window plus one on each side: honest clocks skew,
+/// and a code typed at 29:59 must still work at 30:01.
+pub fn station_code_valid(
+    identity_fingerprint_hex: &str,
+    code: &str,
+    unix_secs: u64,
+) -> bool {
+    let code = code.trim();
+    if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let current = unix_secs / PAIRING_CODE_ROTATION_SECS;
+    [current.saturating_sub(1), current, current + 1]
+        .into_iter()
+        .any(|window| station_pairing_code(identity_fingerprint_hex, window * PAIRING_CODE_ROTATION_SECS) == code)
+}
 
 #[derive(Debug, Clone)]
 pub struct Identity {
@@ -677,6 +717,56 @@ mod peer_tests {
         std::fs::write(root.join("peers.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
         assert!(PeerBook::load_or_create(&root).is_err());
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod station_code_tests {
+    use super::{station_code_valid, station_pairing_code, PAIRING_CODE_ROTATION_SECS};
+
+    #[test]
+    fn code_is_six_digits_and_stable_inside_its_window() {
+        let fingerprint = "ab".repeat(32);
+        let code = station_pairing_code(&fingerprint, 1_700_000_000);
+        assert_eq!(code.len(), 6);
+        assert!(code.bytes().all(|byte| byte.is_ascii_digit()));
+        assert_eq!(code, station_pairing_code(&fingerprint, 1_700_000_100));
+        assert!(station_code_valid(&fingerprint, &code, 1_700_000_000));
+    }
+
+    #[test]
+    fn code_changes_across_windows_and_old_codes_die() {
+        let fingerprint = "ab".repeat(32);
+        let first = station_pairing_code(&fingerprint, PAIRING_CODE_ROTATION_SECS * 100);
+        let second = station_pairing_code(&fingerprint, PAIRING_CODE_ROTATION_SECS * 101);
+        assert_ne!(first, second);
+        assert!(!station_code_valid(
+            &fingerprint,
+            &first,
+            PAIRING_CODE_ROTATION_SECS * 103
+        ));
+    }
+
+    #[test]
+    fn boundary_typing_is_accepted_on_either_side() {
+        // Typed at 29:59, submitted at 30:01: the ±1 window tolerance.
+        let fingerprint = "cd".repeat(32);
+        let edge = PAIRING_CODE_ROTATION_SECS * 50;
+        let code = station_pairing_code(&fingerprint, edge - 1);
+        assert!(station_code_valid(&fingerprint, &code, edge + 1));
+    }
+
+    #[test]
+    fn malformed_codes_never_validate() {
+        let fingerprint = "ef".repeat(32);
+        for bad in ["", "12345", "1234567", "12a456", "  12345 ", "abcdef"] {
+            assert!(!station_code_valid(&fingerprint, bad, 1_700_000_000));
+        }
+        assert!(!station_code_valid(
+            &"00".repeat(32),
+            &station_pairing_code(&fingerprint, 1_700_000_000),
+            1_700_000_000
+        ));
     }
 }
 

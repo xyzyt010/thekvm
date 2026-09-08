@@ -158,6 +158,13 @@ pub enum WireMessage {
     PairRequest {
         node_name: String,
         fingerprint_hex: String,
+        /// Typed station code (the digits shown on the other computer's
+        /// screen), when the user entered one. Absent for classic
+        /// compare-codes pairing and for older peers. The station verifies
+        /// it against its rotating code; a wrong code simply falls back to
+        /// the compare flow instead of failing.
+        #[serde(default)]
+        pairing_code: Option<String>,
     },
     PairChallenge {
         node_name: String,
@@ -267,9 +274,21 @@ pub fn validate_message(message: &WireMessage) -> std::io::Result<()> {
         WireMessage::PairRequest {
             node_name,
             fingerprint_hex,
+            pairing_code,
         } => {
             validate_node_name(node_name)?;
             validate_fingerprint(fingerprint_hex)?;
+            // Lenient on purpose: a malformed typed code is a user typo,
+            // and typos must fall back to the compare-codes flow — not kill
+            // the whole request. The station semantic-checks the digits.
+            if let Some(code) = pairing_code {
+                if code.len() > 16 || code.chars().any(char::is_control) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "pairing code is too long or contains control characters",
+                    ));
+                }
+            }
             None
         }
         WireMessage::PairChallenge {
@@ -527,6 +546,7 @@ mod tests {
         assert!(validate_message(&WireMessage::PairRequest {
             node_name: "node".into(),
             fingerprint_hex: "not-a-fingerprint".into(),
+            pairing_code: None,
         })
         .is_err());
         assert!(validate_message(&WireMessage::Reject {

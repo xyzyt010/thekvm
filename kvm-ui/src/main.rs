@@ -34,6 +34,9 @@ struct PendingPair {
     /// exact stream. Dropping it here is what used to make the station-side
     /// popup impossible — the request vanished before it could be shown.
     pairing: Option<PairingChannel>,
+    /// Distinguishes successive code checks so a late event (e.g. the
+    /// station closing yesterday's request) can never clear today's screen.
+    generation: u64,
 }
 
 /// One initiator-side pairing conversation, kept open across the two user
@@ -188,6 +191,15 @@ fn main() -> Result<()> {
                 if let Ok(ControlResponse::PendingPairings(pairings)) =
                     control_request(ControlRequest::ListPendingPairings)
                 {
+                    // Log arrivals and clears: "UI knew but didn't show" vs
+                    // "UI never knew" must always be answerable from ui.log.
+                    let count = pairings.len();
+                    if LAST_INCOMING_COUNT
+                        .swap(count, std::sync::atomic::Ordering::Relaxed)
+                        != count
+                    {
+                        ui_log(&format!("poll: {count} incoming pairing(s) listed"));
+                    }
                     set_incoming_pairing(&weak, pairings);
                 }
             }
@@ -324,13 +336,15 @@ fn main() -> Result<()> {
     let pending_for_connect = pending_pair.clone();
     let connect_data_dir = startup_dir.clone();
     let connect_session = session_state.clone();
-    ui.on_connect_to(move |address| {
+    ui.on_connect_to(move |address, code| {
+        let code = code.trim().to_owned();
         start_session_flow(
             &weak,
             &pending_for_connect,
             &connect_data_dir,
             &connect_session,
             address.to_string(),
+            (!code.is_empty()).then_some(code),
         );
     });
 
@@ -453,6 +467,7 @@ fn main() -> Result<()> {
                     &invite_data_dir,
                     &invite_session,
                     target,
+                    None,
                 );
             }
             Ok(_) => set_status(
@@ -938,6 +953,7 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                 });
                 ui.set_fingerprint(SharedString::from(status.fingerprint_hex));
                 ui.set_role_text(SharedString::from(role_name(status.mode)));
+                ui.set_pairing_code(SharedString::from(status.pairing_code));
             }
         }
     });
@@ -1066,6 +1082,7 @@ fn start_session_flow(
     data_dir: &std::path::Path,
     session: &Arc<Mutex<Option<Session>>>,
     address: String,
+    pairing_code: Option<String>,
 ) {
     // Reap a dead previous session first so a stale slot can never wedge
     // reconnect behind a permanent "Already connected".
@@ -1119,7 +1136,7 @@ fn start_session_flow(
             .unwrap_or_else(|_| fallback_node_name());
         set_peer_address_field(&weak, &address);
         set_status(&weak, format!("Contacting {address}…"));
-        match pair_prepare(&address, &data_dir, &node_name) {
+        match pair_prepare(&address, &data_dir, &node_name, pairing_code) {
             Ok(pair) => {
                 // Already trusted: skip the ceremony entirely.
                 if is_controller_peer_pinned(&data_dir, &pair.peer_fingerprint) {
@@ -1130,8 +1147,50 @@ fn start_session_flow(
                 let fingerprint = pair.peer_fingerprint.clone();
                 let peer_name = pair.peer_node_name.clone();
                 let code = pair.verification_code.clone();
+                let generation = pair.generation;
+                // Hold the pairing channel open (stored in the slot) and
+                // watch it: if the station ends the request (expiry,
+                // restart, denial-by-closure), the code screen must die
+                // with it instead of showing stale digits forever. Only
+                // this generation may clear the screen.
+                let watch_connection = pair
+                    .pairing
+                    .as_ref()
+                    .map(|channel| channel.connection.clone());
                 if let Ok(mut slot) = pending.lock() {
                     *slot = Some(pair);
+                }
+                if let Some(watch_connection) = watch_connection {
+                    let watch_weak = weak.clone();
+                    let watch_pending = pending.clone();
+                    let watch_address = address.clone();
+                    std::thread::spawn(move || {
+                        runtime().block_on(async move {
+                            watch_connection.closed().await;
+                        });
+                        let live = watch_pending.lock().ok().is_some_and(|slot| {
+                            slot.as_ref()
+                                .is_some_and(|current| current.generation == generation)
+                        });
+                        if live {
+                            if let Ok(mut slot) = watch_pending.lock() {
+                                *slot = None;
+                            }
+                            ui_log("pairing: station ended the request; code screen cleared");
+                            set_pending(
+                                &watch_weak,
+                                String::new(),
+                                String::new(),
+                                String::new(),
+                            );
+                            set_status(
+                                &watch_weak,
+                                format!(
+                                    "The request on {watch_address} ended before approval — press Connect again for a fresh code."
+                                ),
+                            );
+                        }
+                    });
                 }
                 set_status(
                     &weak,
@@ -1327,7 +1386,7 @@ fn relay_session_progress(
                         ),
                     );
                     stop_session(weak, session, "Restarting the code check…");
-                    start_session_flow(weak, pending, &data_dir, session, address.to_owned());
+                    start_session_flow(weak, pending, &data_dir, session, address.to_owned(), None);
                     return;
                 }
                 // Nothing pinned locally under that address: fall through to
@@ -1687,6 +1746,15 @@ fn set_local_address_direct(weak: &slint::Weak<AppWindow>) {
         }
     });
 }
+/// Monotonic ids for code checks; see PendingPair.generation.
+static PAIRING_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Last incoming-pairing count already logged; the poll logs arrivals and
+/// clears, so "UI knew but didn't show" vs "UI never knew" is always
+/// answerable from ui.log alone.
+static LAST_INCOMING_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// One shared runtime for every background call (control pipe, pairing
 /// preview dials, LAN scans). Creating a fresh Tokio runtime per request
 /// churns threads and turns a failed creation into an untraceable call
@@ -1790,9 +1858,15 @@ fn control_request(request: ControlRequest) -> Result<ControlResponse> {
 /// name, and the ceremony code. The receiver shows the identical code for
 /// the dialing fingerprint because verification_code() is order
 /// independent.
-fn pair_prepare(address: &str, dir: &std::path::Path, node_name: &str) -> Result<PendingPair> {
+fn pair_prepare(
+    address: &str,
+    dir: &std::path::Path,
+    node_name: &str,
+    pairing_code: Option<String>,
+) -> Result<PendingPair> {
     let identity = Identity::load_or_create(dir)?;
     let address = normalize_addr(address)?;
+    let generation = PAIRING_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let runtime = runtime();
     runtime.block_on(async move {
         let endpoint = transport::make_client_endpoint(&identity)?;
@@ -1828,6 +1902,11 @@ fn pair_prepare(address: &str, dir: &std::path::Path, node_name: &str) -> Result
             &WireMessage::PairRequest {
                 node_name: node_name.to_owned(),
                 fingerprint_hex: identity.fingerprint_hex(),
+                pairing_code: pairing_code
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|code| !code.is_empty())
+                    .map(str::to_owned),
             },
         )
         .await?;
@@ -1857,6 +1936,9 @@ fn pair_prepare(address: &str, dir: &std::path::Path, node_name: &str) -> Result
         }
         let verification_code =
             kvm_protocol::pairing::verification_code(&identity.fingerprint_hex(), &peer_fingerprint);
+        if pairing_code.as_deref().is_some_and(|code| !code.trim().is_empty()) {
+            ui_log("pairing: typed station code sent with the request");
+        }
         Ok(PendingPair {
             verification_code,
             peer_fingerprint,
@@ -1867,6 +1949,7 @@ fn pair_prepare(address: &str, dir: &std::path::Path, node_name: &str) -> Result
                 send,
                 recv,
             }),
+            generation,
         })
     })
 }

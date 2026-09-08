@@ -33,6 +33,8 @@ export component AppWindow inherits Window {
     in property <int> poll-count: 0;
     in-out property <string> layout-path: "";
     in-out property <string> peer-address: "";
+    in-out property <string> pair-code: "";
+    in property <string> pairing-code: "";
     in-out property <string> discovery-text: "No LAN scan yet";
     in-out property <string> device-name: "";
     in-out property <string> auto-connect-address: "";
@@ -42,7 +44,7 @@ export component AppWindow inherits Window {
     in-out property <bool> invite-ready: false;
     in-out property <string> invite-input: "";
 
-    callback connect-to(string /* address */);
+    callback connect-to(string /* address */, string /* typed station code, may be empty */);
     callback disconnect();
     callback set-role(int /* 0 both, 1 controller, 2 receiver */);
     callback pair-from-invite(string /* invite */);
@@ -164,9 +166,30 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
                     Text {
-                        text: "Linking two computers takes two sides. STATION (waits): choose 'Be controlled' or 'Both ways' and read this computer's address above. NODE (dials): choose 'Control other' or 'Both ways', type the station's address below, press Connect. Both sides compare the 6-digit code before anything connects. Either side can Disconnect and reconnect at any time.";
+                        text: "Linking two computers takes two sides. STATION (waits): choose 'Be controlled' or 'Both ways' and read this computer's address and pairing code above. NODE (dials): choose 'Control other' or 'Both ways', type the station's address and its pairing code, press Connect — no click needed on the station. Without a code, both sides compare the 6-digit code before anything connects. Either side can Disconnect and reconnect at any time.";
                         color: #9ca3af;
                         font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    Rectangle { height: 1px; background: #262626; }
+                    Text {
+                        text: "Your pairing code — the other computer types this instead of waiting for a popup:";
+                        color: white;
+                        font-size: 16px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: pairing-code == "" ? "starting…" : pairing-code;
+                        color: #22c55e;
+                        font-size: 32px;
+                        font-weight: 800;
+                        letter-spacing: 6px;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Read it over once (phone, chat, sticky note). Whoever types it can pair — no approval click needed here, and it changes every 30 minutes.";
+                        color: #9ca3af;
+                        font-size: 11px;
                         wrap: word-wrap;
                     }
                     Rectangle { height: 1px; background: #262626; }
@@ -183,12 +206,20 @@ export component AppWindow inherits Window {
                             primary: true;
                             visible: !session-active;
                             enabled: addr.text != "";
-                            clicked => { connect-to(addr.text); }
+                            clicked => { connect-to(addr.text, code-field.text); }
                         }
                         Button {
                             text: "Disconnect";
                             visible: session-active;
                             clicked => { disconnect(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        code-field := LineEdit {
+                            text <=> root.pair-code;
+                            placeholder-text: "code shown on the other computer (recommended — skips its popup)";
+                            enabled: !session-active;
                         }
                     }
                     Text {

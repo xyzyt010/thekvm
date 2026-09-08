@@ -85,6 +85,11 @@ pub struct DaemonStatus {
     pub peer_count: usize,
     pub active_session_count: usize,
     pub uptime_seconds: u64,
+    /// This machine's current 30-minute station pairing code, so the UI can
+    /// display it for typing on the other computer. Empty when the responder
+    /// predates this field.
+    #[serde(default)]
+    pub pairing_code: String,
 }
 
 /// A remote identity that completed the network half of pairing and is
