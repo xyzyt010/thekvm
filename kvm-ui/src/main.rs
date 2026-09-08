@@ -693,6 +693,20 @@ fn main() -> Result<()> {
                 fingerprint_hex: fingerprint.clone(),
             }) {
                 Ok(ControlResponse::Unpaired { .. }) => {
+                    // Revocation must clear BOTH books: the user book would
+                    // otherwise resurrect the trust at the next automatic
+                    // setup pass (which mirrors user pins into the daemon).
+                    if let Ok(mut book) =
+                        kvm_protocol::pairing::PeerBook::load_or_create(&data_dir())
+                    {
+                        match book.unpin(&fingerprint) {
+                            Ok(true) => ui_log("revoke: removed peer from user book too"),
+                            Ok(false) => {}
+                            Err(error) => {
+                                ui_log(&format!("revoke: user book removal failed: {error:#}"))
+                            }
+                        }
+                    }
                     set_status(&weak, format!("Revoked peer {fingerprint}"));
                     if let Ok(ControlResponse::Peers(peers)) =
                         control_request(ControlRequest::ListPeers)
@@ -1534,18 +1548,61 @@ fn ensure_default_arrangement(peer_name: &str, peer_fingerprint: &str) {
     }
 }
 
-/// Throttle for the station-side default arrangement check (seconds).
+/// Throttle for the automatic arrangement/trust setup check (seconds).
 static LAST_MIRROR_CHECK_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Station-side default (Machine 2 mirrors): when this machine trusts peers
-/// but never arranged its screens, put the first peer on the left (one exit
-/// edge). Checked at most once a minute, and only ever writes an EMPTY
-/// layout — a saved arrangement is sacred.
-fn maybe_mirror_station_arrangement(status: &DaemonStatus) {
-    if status.peer_count == 0 {
-        return;
+/// Rewrite a 0.2.0 station-mirror layout (self=1, peer=2 on the left) into
+/// the global-id convention (self=2, peer=1). 0.2.0 sessions could never
+/// open with the old ids — the receiver only accepts its own self screen —
+/// so any exact-shape match is provably pre-fix and safe to rewrite.
+/// Returns None for anything else (including already-correct layouts).
+fn migrate_020_mirror(layout: &kvm_core::Layout) -> Option<kvm_core::Layout> {
+    if layout.self_screen != Some(kvm_core::SELF_SCREEN_ID) || layout.screens.len() != 2 {
+        return None;
     }
+    let me = layout.screen(kvm_core::SELF_SCREEN_ID)?;
+    let peer = layout
+        .screens
+        .iter()
+        .find(|screen| screen.id == kvm_core::FIRST_PEER_SCREEN_ID)?;
+    let peer_fp = peer.peer_fingerprint.clone()?;
+    if peer.x >= me.x || peer.y != me.y {
+        return None;
+    }
+    Some(kvm_core::Layout {
+        screens: vec![
+            kvm_core::Screen {
+                id: kvm_core::MIRROR_SELF_SCREEN_ID,
+                name: me.name.clone(),
+                x: 0,
+                y: 0,
+                width: me.width,
+                height: me.height,
+                peer_fingerprint: None,
+            },
+            kvm_core::Screen {
+                id: kvm_core::MIRROR_PEER_SCREEN_ID,
+                name: peer.name.clone(),
+                x: -1,
+                y: 0,
+                width: peer.width,
+                height: peer.height,
+                peer_fingerprint: Some(peer_fp),
+            },
+        ],
+        self_screen: Some(kvm_core::MIRROR_SELF_SCREEN_ID),
+    })
+}
+
+/// Automatic first-time setup (at most once a minute, never overwriting):
+/// 1. migrate any 0.2.0 mirror layout into global screen ids;
+/// 2. station side (daemon trusts peers, nothing arranged): mirror Machine 1
+///    onto the left, pin the user book, link the daemon book;
+/// 3. initiator side (user book trusts peers, daemon empty, nothing
+///    arranged): take the Machine-1 default (peer on the right), link the
+///    daemon book so the reverse direction can open sessions too.
+fn maybe_mirror_station_arrangement(status: &DaemonStatus) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1558,30 +1615,66 @@ fn maybe_mirror_station_arrangement(status: &DaemonStatus) {
         _ => return,
     };
     if !config.layout.screens.is_empty() {
+        if let Some(fixed) = migrate_020_mirror(&config.layout) {
+            match write_arrangement(fixed) {
+                Ok(_) => ui_log("arrange: migrated 0.2.0 mirror layout to shared screen ids"),
+                Err(error) => ui_log(&format!("arrange: layout migration failed: {error:#}")),
+            }
+        }
         return;
     }
-    let peers = match control_request(ControlRequest::ListPeers) {
-        Ok(ControlResponse::Peers(peers)) => peers,
-        _ => return,
+    if status.peer_count > 0 {
+        let peers = match control_request(ControlRequest::ListPeers) {
+            Ok(ControlResponse::Peers(peers)) => peers,
+            _ => return,
+        };
+        let Some(peer) = peers.first() else {
+            return;
+        };
+        let layout = kvm_core::Layout::pair_mirror(
+            &config.device_name,
+            &peer.name,
+            &peer.fingerprint_hex,
+        );
+        match write_arrangement(layout) {
+            Ok(_) => {
+                ensure_user_pin(
+                    &peer.fingerprint_hex,
+                    &peer.name,
+                    peer.address.as_deref(),
+                );
+                ui_log("arrange: station default arrangement saved (peer on the left)");
+            }
+            Err(error) => ui_log(&format!("arrange: station default failed: {error:#}")),
+        }
+        return;
+    }
+    // Initiator side of an older pairing: the user book already trusts the
+    // peer (ceremony pin) but the daemon book is empty, so the reverse
+    // direction cannot open sessions. Arrange Machine-1 default and link
+    // the daemon book — initiation from the other side starts working.
+    let user_peers = match kvm_protocol::pairing::PeerBook::load_or_create(&data_dir()) {
+        Ok(book) => book.peers,
+        Err(_) => return,
     };
-    let Some(peer) = peers.first() else {
+    let Some(peer) = user_peers.first() else {
         return;
     };
-    let layout = kvm_core::Layout::pair_mirror(
+    let layout = kvm_core::Layout::pair_default(
         &config.device_name,
         &peer.name,
         &peer.fingerprint_hex,
     );
     match write_arrangement(layout) {
         Ok(_) => {
-            ensure_user_pin(
+            pin_daemon_peer(
                 &peer.fingerprint_hex,
                 &peer.name,
                 peer.address.as_deref(),
             );
-            ui_log("arrange: station default arrangement saved (peer on the left)");
+            ui_log("arrange: linked existing pairing for both directions (peer on the right)");
         }
-        Err(error) => ui_log(&format!("arrange: station default failed: {error:#}")),
+        Err(error) => ui_log(&format!("arrange: existing-pairing setup failed: {error:#}")),
     }
 }
 
@@ -1626,7 +1719,7 @@ fn linked_peers() -> Vec<LinkedPeer> {
     ordered
         .into_iter()
         .map(|(name, fingerprint, address)| {
-            let side = layout_side(&layout, &fingerprint);
+            let side = layout.side_of_peer(&fingerprint);
             LinkedPeer {
                 name,
                 fingerprint,
@@ -1635,26 +1728,6 @@ fn linked_peers() -> Vec<LinkedPeer> {
             }
         })
         .collect()
-}
-
-/// Where a peer screen sits relative to the self screen, if arranged.
-fn layout_side(layout: &kvm_core::Layout, fingerprint: &str) -> Option<kvm_core::Edge> {
-    let me = layout.self_screen.and_then(|id| layout.screen(id))?;
-    let peer = layout
-        .screens
-        .iter()
-        .find(|screen| screen.peer_fingerprint.as_deref() == Some(fingerprint))?;
-    if peer.x < me.x {
-        Some(kvm_core::Edge::Left)
-    } else if peer.x > me.x {
-        Some(kvm_core::Edge::Right)
-    } else if peer.y < me.y {
-        Some(kvm_core::Edge::Top)
-    } else if peer.y > me.y {
-        Some(kvm_core::Edge::Bottom)
-    } else {
-        None
-    }
 }
 
 fn side_name(side: kvm_core::Edge) -> &'static str {
@@ -1666,10 +1739,20 @@ fn side_name(side: kvm_core::Edge) -> &'static str {
     }
 }
 
+/// True when this machine links exactly one peer screen: any edge crosses
+/// (double edge exit), so status text must say "any edge", never one side.
+fn any_edge_link() -> bool {
+    matches!(
+        control_request(ControlRequest::GetConfig),
+        Ok(ControlResponse::Config(config)) if config.layout.single_peer_screen().is_some()
+    )
+}
+
 /// Refresh the Devices arrangement display from live state. Runs on the
 /// poll worker; all blocking calls are fine there.
 fn refresh_arrangement(weak: &slint::Weak<AppWindow>, edge_active: bool) {
     let peers = linked_peers();
+    let any_edge = any_edge_link();
     let (peer_name, text, peer_on_right) = match peers.first() {
         None => (
             String::new(),
@@ -1683,12 +1766,19 @@ fn refresh_arrangement(weak: &slint::Weak<AppWindow>, edge_active: bool) {
                 peer.name.clone()
             };
             match peer.side {
-                Some(side) => (
+                Some(side) if !any_edge => (
                     label.clone(),
                     format!(
                         "{label} is on your {} — push past the {} edge to drive it. Push back past the edge to return.",
                         side_name(side),
                         edge_name(side)
+                    ),
+                    !matches!(side, kvm_core::Edge::Left),
+                ),
+                Some(side) => (
+                    label.clone(),
+                    format!(
+                        "{label} is linked — push past ANY edge to drive it, on either computer. Push back past any edge to return."
                     ),
                     !matches!(side, kvm_core::Edge::Left),
                 ),
@@ -1767,8 +1857,9 @@ fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kv
         .iter()
         .any(|screen| screen.peer_fingerprint.as_deref() == Some(fingerprint))
     {
+        let id = layout.next_screen_id();
         layout.screens.push(kvm_core::Screen {
-            id: kvm_core::FIRST_PEER_SCREEN_ID,
+            id,
             name: name.clone(),
             x: 0,
             y: 0,
@@ -1790,7 +1881,7 @@ fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kv
             .or_else(|| layout.screens.first())
             .map(|screen| screen.id);
     }
-    if let Err(error) = layout.place_peer(side) {
+    if let Err(error) = layout.place_peer(fingerprint, side) {
         set_status(&weak, format!("Cannot place the screen there: {error}"));
         return;
     }
@@ -2063,7 +2154,7 @@ fn relay_session_progress(
             "established" => {
                 verified.store(true, std::sync::atomic::Ordering::Relaxed);
                 format!(
-                    "Connected to {address} — your keyboard and mouse drive it now. It retries automatically until you Disconnect."
+                    "Connected to {address} — your whole keyboard and mouse drive it now (this screen is frozen). Disconnect to take it back. It retries automatically until you Disconnect."
                 )
             }
             "edge-ready" => {
@@ -2726,10 +2817,15 @@ fn edge_ready_text() -> String {
                 .screens
                 .iter()
                 .find(|screen| screen.peer_fingerprint.is_some());
+            let any_edge = config.layout.single_peer_screen().is_some();
             match (config.layout.peer_exit_edge(), peer) {
-                (Some(edge), Some(screen)) => format!(
+                (Some(edge), Some(screen)) if !any_edge => format!(
                     "Edge control is on — push past the {} edge to drive {}. Push back past the edge to return here.",
                     edge_name(edge),
+                    screen.name
+                ),
+                (_, Some(screen)) => format!(
+                    "Edge control is on — push past ANY edge to drive {}. Push back past any edge to return here.",
                     screen.name
                 ),
                 _ => "Edge control is on, but no linked screen is arranged yet — open Devices, place the other screen, and push past an edge.".into(),
@@ -2858,7 +2954,7 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{edge_name, layout_side, pair_status_text};
+    use super::{edge_name, pair_status_text};
 
     #[test]
     fn compare_screen_names_peer_and_code() {
@@ -2887,12 +2983,51 @@ mod tests {
     fn layout_side_reports_peer_position() {
         let fp = "ee".repeat(32);
         let layout = kvm_core::Layout::pair_default("me", "peer", &fp);
-        assert_eq!(layout_side(&layout, &fp), Some(kvm_core::Edge::Right));
-        assert_eq!(layout_side(&layout, &"ff".repeat(32)), None);
+        assert_eq!(layout.side_of_peer(&fp), Some(kvm_core::Edge::Right));
+        assert_eq!(layout.side_of_peer(&"ff".repeat(32)), None);
         let mirror = kvm_core::Layout::pair_mirror("me", "peer", &fp);
-        assert_eq!(layout_side(&mirror, &fp), Some(kvm_core::Edge::Left));
+        assert_eq!(mirror.side_of_peer(&fp), Some(kvm_core::Edge::Left));
         let empty = kvm_core::Layout::default();
-        assert_eq!(layout_side(&empty, &fp), None);
+        assert_eq!(empty.side_of_peer(&fp), None);
+    }
+
+    #[test]
+    fn migrate_020_mirror_rewrites_ids_only() {
+        let fp = "ee".repeat(32);
+        // 0.2.0 wrote the mirror with self=1: rebuild that exact shape.
+        let old = kvm_core::Layout {
+            screens: vec![
+                kvm_core::Screen {
+                    id: kvm_core::SELF_SCREEN_ID,
+                    name: "me".into(),
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    peer_fingerprint: None,
+                },
+                kvm_core::Screen {
+                    id: kvm_core::FIRST_PEER_SCREEN_ID,
+                    name: "peer".into(),
+                    x: -1,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    peer_fingerprint: Some(fp.clone()),
+                },
+            ],
+            self_screen: Some(kvm_core::SELF_SCREEN_ID),
+        };
+        let fixed = super::migrate_020_mirror(&old).expect("exact 0.2.0 shape must migrate");
+        assert_eq!(fixed.self_screen, Some(kvm_core::MIRROR_SELF_SCREEN_ID));
+        assert_eq!(fixed.side_of_peer(&fp), Some(kvm_core::Edge::Left));
+        assert_eq!(fixed.validate(), Ok(()));
+        // Anything else is left alone: fresh defaults, empty, multi-screen.
+        assert!(super::migrate_020_mirror(
+            &kvm_core::Layout::pair_default("me", "peer", &fp)
+        )
+        .is_none());
+        assert!(super::migrate_020_mirror(&kvm_core::Layout::default()).is_none());
     }
 }
 

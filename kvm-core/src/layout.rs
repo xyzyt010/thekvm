@@ -2,6 +2,14 @@ use crate::InputEvent;
 use serde::{Deserialize, Serialize};
 
 /// Screen arrangement, like MWB's topology grid / Deskflow's layout editor.
+///
+/// Screen ids are GLOBALLY unique across a linked set: each machine's own
+/// screen keeps its own id, and handoff requests name screens in this shared
+/// numbering so both ends resolve them without an id-exchange protocol. The
+/// pairing convention is Machine 1 (the connector): self=1, peer=2; Machine 2
+/// (the station mirror): self=2, peer=1. The receiver only accepts a session
+/// naming its own self screen, so both sides must follow the convention —
+/// two self=1 layouts can pair but can never open edge sessions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Layout {
     pub screens: Vec<Screen>,
@@ -12,12 +20,13 @@ pub struct Layout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScreenId(pub u32);
 
-/// Screen-id convention for paired machines: the local screen is always 1
-/// and the first linked peer is always 2. Both machines follow it, so a
-/// handoff request naming a screen id means the same screen on both ends
-/// without any extra id-exchange protocol.
+/// Screen-id convention for paired machines (see [`Layout`]): ids are
+/// globally unique per linked set; each side's self screen keeps its own id.
 pub const SELF_SCREEN_ID: ScreenId = ScreenId(1);
 pub const FIRST_PEER_SCREEN_ID: ScreenId = ScreenId(2);
+/// Machine-2 self id in the pairing convention (its peer screen is 1).
+pub const MIRROR_SELF_SCREEN_ID: ScreenId = ScreenId(2);
+pub const MIRROR_PEER_SCREEN_ID: ScreenId = ScreenId(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Screen {
@@ -99,6 +108,36 @@ impl Layout {
             .map(|s| s.id)
     }
 
+    /// True when the layout links exactly one peer screen (the normal
+    /// two-machine link). Single-peer links are double-edged: pushing past
+    /// ANY edge hands control to the peer, so a link works with zero
+    /// arrangement fuss and a stale arrangement can never strand the
+    /// cursor. Multi-screen grids keep strict facing edges.
+    pub fn single_peer_screen(&self) -> Option<ScreenId> {
+        let mut found = None;
+        for screen in &self.screens {
+            if screen.peer_fingerprint.is_some() {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(screen.id);
+            }
+        }
+        found
+    }
+
+    /// Edge target with the single-peer fallback: a grid neighbour wins;
+    /// otherwise, on a two-machine link, the lone peer takes ANY edge.
+    pub fn edge_target(&self, me: ScreenId, edge: Edge) -> Option<ScreenId> {
+        if let Some(neighbour) = self.neighbor_for_edge(me, edge) {
+            return Some(neighbour);
+        }
+        let peer = self.single_peer_screen()?;
+        if peer == me {
+            return None;
+        }
+        Some(peer)
+    }
     pub fn screen(&self, id: ScreenId) -> Option<&Screen> {
         self.screens.iter().find(|screen| screen.id == id)
     }
@@ -142,40 +181,113 @@ impl Layout {
     }
 
     /// Mirror image for the station side (Machine 2): this machine on the
-    /// right, the peer on the left — one exit edge (Left). Same id
-    /// convention, so handoff requests agree on screen ids.
+    /// right, the peer on the left — one exit edge (Left). Global ids are
+    /// swapped (self=2, peer=1) so the receiver check — which only accepts
+    /// sessions naming its own self screen — passes in both directions.
     pub fn pair_mirror(
         self_name: &str,
         peer_name: &str,
         peer_fingerprint: &str,
     ) -> Self {
-        let mut layout = Self::pair_default(self_name, peer_name, peer_fingerprint);
-        if let Some(peer) = layout
-            .screens
-            .iter_mut()
-            .find(|screen| screen.id == FIRST_PEER_SCREEN_ID)
-        {
-            peer.x = -1;
+        Self {
+            screens: vec![
+                Screen {
+                    id: MIRROR_SELF_SCREEN_ID,
+                    name: display_name(self_name, "This computer"),
+                    x: 0,
+                    y: 0,
+                    width: default_screen_width(),
+                    height: default_screen_height(),
+                    peer_fingerprint: None,
+                },
+                Screen {
+                    id: MIRROR_PEER_SCREEN_ID,
+                    name: display_name(peer_name, "Other computer"),
+                    x: -1,
+                    y: 0,
+                    width: default_screen_width(),
+                    height: default_screen_height(),
+                    peer_fingerprint: Some(peer_fingerprint.to_ascii_lowercase()),
+                },
+            ],
+            self_screen: Some(MIRROR_SELF_SCREEN_ID),
         }
-        layout
     }
 
-    /// Which edge of the self screen leads to the first linked peer screen,
-    /// if the layout links exactly the paired default (one exit edge).
+    /// Which edge of the self screen leads to a linked peer screen, if any.
+    /// (Display helper for icons and texts; the router itself crosses ANY
+    /// edge on single-peer links — see [`Layout::edge_target`].)
     pub fn peer_exit_edge(&self) -> Option<Edge> {
         let me = self.self_screen?;
-        for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
-            if self.neighbor_for_edge(me, edge) == Some(FIRST_PEER_SCREEN_ID) {
-                return Some(edge);
-            }
-        }
-        None
+        [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
+            .into_iter()
+            .find(|edge| {
+                self.neighbor_for_edge(me, *edge).is_some_and(|id| {
+                    self.screen(id)
+                        .is_some_and(|screen| screen.peer_fingerprint.is_some())
+                })
+            })
     }
 
-    /// Move the first linked peer screen to the given side of the self
-    /// screen (the arrangement UI). The change is validated: colliding with
+    /// Where the screen for one peer fingerprint sits relative to self.
+    pub fn side_of_peer(&self, fingerprint: &str) -> Option<Edge> {
+        let me = self.self_screen.and_then(|id| self.screen(id))?;
+        let peer = self
+            .screens
+            .iter()
+            .find(|screen| screen.peer_fingerprint.as_deref() == Some(fingerprint))?;
+        if peer.x < me.x {
+            Some(Edge::Left)
+        } else if peer.x > me.x {
+            Some(Edge::Right)
+        } else if peer.y < me.y {
+            Some(Edge::Top)
+        } else if peer.y > me.y {
+            Some(Edge::Bottom)
+        } else {
+            None
+        }
+    }
+
+    /// Point on the self edge facing one screen: where control re-enters
+    /// this machine when it returns from that screen. The midpoint is
+    /// predictable (no disorienting jumps to stale coordinates); the
+    /// arrangement decides which edge it is.
+    pub fn facing_edge_midpoint(&self, target: ScreenId) -> Option<(Edge, u32, u32)> {
+        let me = self.self_screen.and_then(|id| self.screen(id))?;
+        let peer = self.screen(target)?;
+        let edge = if peer.x < me.x {
+            Edge::Left
+        } else if peer.x > me.x {
+            Edge::Right
+        } else if peer.y < me.y {
+            Edge::Top
+        } else if peer.y > me.y {
+            Edge::Bottom
+        } else {
+            return None;
+        };
+        let (x, y) = match edge {
+            Edge::Left => (0, me.height / 2),
+            Edge::Right => (me.width.saturating_sub(1), me.height / 2),
+            Edge::Top => (me.width / 2, 0),
+            Edge::Bottom => (me.width / 2, me.height.saturating_sub(1)),
+        };
+        Some((edge, x, y))
+    }
+
+    /// Next free screen id (one past the current maximum, starting at 1).
+    /// Arrangement edits use this so added screens never collide, on any
+    /// machine, under the global-id convention.
+    pub fn next_screen_id(&self) -> ScreenId {
+        let max = self.screens.iter().map(|screen| screen.id.0).max().unwrap_or(0);
+        ScreenId(max.saturating_add(1).max(1))
+    }
+
+    /// Move one linked peer screen to the given side of the self screen
+    /// (the arrangement UI). The change is validated: colliding with
     /// another screen is refused instead of silently overlapping.
-    pub fn place_peer(&mut self, side: Edge) -> Result<(), String> {
+    pub fn place_peer(&mut self, fingerprint: &str, side: Edge) -> Result<(), String> {
         let me = self
             .self_screen
             .and_then(|id| self.screen(id))
@@ -186,17 +298,17 @@ impl Layout {
             Edge::Top => (me.x, me.y - 1),
             Edge::Bottom => (me.x, me.y + 1),
         };
-        if self
-            .screens
-            .iter()
-            .any(|screen| screen.id != FIRST_PEER_SCREEN_ID && screen.x == x && screen.y == y)
-        {
+        if self.screens.iter().any(|screen| {
+            screen.peer_fingerprint.as_deref() != Some(fingerprint)
+                && screen.x == x
+                && screen.y == y
+        }) {
             return Err("another screen already occupies that position".into());
         }
         let peer = self
             .screens
             .iter_mut()
-            .find(|screen| screen.id == FIRST_PEER_SCREEN_ID)
+            .find(|screen| screen.peer_fingerprint.as_deref() == Some(fingerprint))
             .ok_or_else(|| "layout has no linked peer screen".to_string())?;
         peer.x = x;
         peer.y = y;
@@ -230,7 +342,7 @@ impl Layout {
         } else {
             return None;
         };
-        let target = self.neighbor_for_edge(screen_id, edge)?;
+        let target = self.edge_target(screen_id, edge)?;
         let target_screen = self.screen(target)?;
         let along = match edge {
             Edge::Left | Edge::Right => y,
@@ -334,6 +446,14 @@ impl EdgeRouter {
         self.current_screen
     }
 
+    pub fn local_screen(&self) -> ScreenId {
+        self.local_screen
+    }
+
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
     pub fn active_remote(&self) -> Option<ScreenId> {
         self.active_remote
     }
@@ -405,7 +525,7 @@ impl EdgeRouter {
             self.local_cursor_y = self.cursor_y;
             return RoutedEvent::Local(event);
         };
-        let Some(target) = self.layout.neighbor_for_edge(self.current_screen, edge) else {
+        let Some(target) = self.layout.edge_target(self.current_screen, edge) else {
             let previous_x = self.cursor_x;
             let previous_y = self.cursor_y;
             let clamped_x = next_x.clamp(0, i64::from(screen.width - 1));
@@ -663,6 +783,63 @@ mod tests {
     }
 
     #[test]
+    fn facing_edge_midpoint_returns_through_the_arranged_edge() {
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let (edge, x, y) = layout
+            .facing_edge_midpoint(FIRST_PEER_SCREEN_ID)
+            .expect("peer is arranged");
+        assert_eq!(edge, Edge::Right);
+        assert_eq!((x, y), (1919, 540));
+        let mirror = Layout::pair_mirror("me", "peer", &"ab".repeat(32));
+        let (edge, x, y) = mirror
+            .facing_edge_midpoint(MIRROR_PEER_SCREEN_ID)
+            .expect("peer is arranged");
+        assert_eq!(edge, Edge::Left);
+        assert_eq!((x, y), (0, 540));
+        assert_eq!(mirror.next_screen_id(), ScreenId(3));
+        assert_eq!(Layout::default().next_screen_id(), ScreenId(1));
+    }
+
+    #[test]
+    fn double_edge_exit_on_single_peer_links() {        // Machine 1: peer on the right, but the LEFT (outer) edge must also
+        // cross on a two-machine link.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        assert_eq!(
+            layout.edge_target(SELF_SCREEN_ID, Edge::Left),
+            Some(FIRST_PEER_SCREEN_ID)
+        );
+        assert_eq!(
+            layout.edge_target(SELF_SCREEN_ID, Edge::Top),
+            Some(FIRST_PEER_SCREEN_ID)
+        );
+        assert_eq!(
+            layout.edge_target(SELF_SCREEN_ID, Edge::Bottom),
+            Some(FIRST_PEER_SCREEN_ID)
+        );
+        // The receiver side agrees: any motion out of its screen hops back.
+        let back = layout
+            .handoff_for_motion(SELF_SCREEN_ID, 0, 540, -50, 0)
+            .expect("outer edge must hand off on a single-peer link");
+        assert_eq!(back.target, FIRST_PEER_SCREEN_ID);
+        // Grids keep strict facing edges: no fallback past real neighbours.
+        let mut grid = layout.clone();
+        grid.screens.push(Screen {
+            id: ScreenId(9),
+            name: "third".into(),
+            x: -1,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            peer_fingerprint: Some("ff".repeat(32)),
+        });
+        assert_eq!(
+            grid.edge_target(SELF_SCREEN_ID, Edge::Left),
+            Some(ScreenId(9))
+        );
+        assert_eq!(grid.single_peer_screen(), None);
+    }
+
+    #[test]
     fn restores_saved_local_position_when_remote_handoff_fails() {        let layout = Layout {
             screens: vec![screen(1, "main", 0, 0), screen(2, "right", 1, 0)],
             self_screen: Some(ScreenId(1)),
@@ -698,29 +875,49 @@ mod tests {
             .expect("right edge must hand off");
         assert_eq!(handoff.target, FIRST_PEER_SCREEN_ID);
         assert_eq!(handoff.target_x, 0);
-        // Outer edges do nothing.
+        // No grid neighbour on the outer edge — but edge_target still
+        // crosses there on a single-peer link (double edge exit).
         assert_eq!(layout.neighbor_for_edge(SELF_SCREEN_ID, Edge::Left), None);
+        assert_eq!(
+            layout.edge_target(SELF_SCREEN_ID, Edge::Left),
+            Some(FIRST_PEER_SCREEN_ID)
+        );
     }
 
     #[test]
-    fn pair_mirror_puts_peer_left_with_one_exit_edge() {
+    fn pair_mirror_puts_peer_left_with_global_ids() {
         let layout = Layout::pair_mirror("mint", "laptop", &"ab".repeat(32));
         assert_eq!(layout.validate(), Ok(()));
+        // Global ids are swapped on the mirror side: self=2, peer=1, so the
+        // receiver check (which only accepts its own self screen) passes in
+        // both directions.
+        assert_eq!(layout.self_screen, Some(MIRROR_SELF_SCREEN_ID));
         assert_eq!(layout.peer_exit_edge(), Some(Edge::Left));
+        assert_eq!(
+            layout.side_of_peer(&"ab".repeat(32)),
+            Some(Edge::Left)
+        );
         let handoff = layout
-            .handoff_for_motion(SELF_SCREEN_ID, 0, 540, -50, 0)
+            .handoff_for_motion(MIRROR_SELF_SCREEN_ID, 0, 540, -50, 0)
             .expect("left edge must hand off");
-        assert_eq!(handoff.target, FIRST_PEER_SCREEN_ID);
+        assert_eq!(handoff.target, MIRROR_PEER_SCREEN_ID);
         assert_eq!(handoff.edge, Edge::Left);
+        // The pair agrees end to end: default names 2, mirror accepts 2 as
+        // self; mirror names 1, default accepts 1 as self.
+        let default = Layout::pair_default("laptop", "mint", &"cd".repeat(32));
+        assert_eq!(default.self_screen, Some(SELF_SCREEN_ID));
+        assert!(default.screen(MIRROR_SELF_SCREEN_ID).is_some());
+        assert!(layout.screen(SELF_SCREEN_ID).is_some());
     }
 
     #[test]
     fn place_peer_moves_exit_edge_and_refuses_collisions() {
-        let mut layout = Layout::pair_default("a", "b", &"cd".repeat(32));
-        layout.place_peer(Edge::Top).expect("top must be free");
+        let fp = &"cd".repeat(32);
+        let mut layout = Layout::pair_default("a", "b", fp);
+        layout.place_peer(fp, Edge::Top).expect("top must be free");
         assert_eq!(layout.validate(), Ok(()));
         assert_eq!(layout.peer_exit_edge(), Some(Edge::Top));
-        layout.place_peer(Edge::Right).expect("right must be free");
+        layout.place_peer(fp, Edge::Right).expect("right must be free");
         assert_eq!(layout.peer_exit_edge(), Some(Edge::Right));
 
         // A third screen on the left blocks moving the peer there.
@@ -733,10 +930,14 @@ mod tests {
             height: 1080,
             peer_fingerprint: None,
         });
-        assert!(layout.place_peer(Edge::Left).is_err());
+        assert!(layout.place_peer(fp, Edge::Left).is_err());
+        // An unknown fingerprint cannot be placed.
+        assert!(layout.place_peer(&"ff".repeat(32), Edge::Left).is_err());
         // And a layout without a peer screen cannot place one.
-        layout.screens.retain(|screen| screen.id != FIRST_PEER_SCREEN_ID);
-        assert!(layout.place_peer(Edge::Left).is_err());
+        layout
+            .screens
+            .retain(|screen| screen.peer_fingerprint.is_none());
+        assert!(layout.place_peer(fp, Edge::Left).is_err());
     }
 }
 

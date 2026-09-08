@@ -71,10 +71,12 @@ async fn process_shutdown_signal() {
     std::future::pending::<()>().await;
 }
 
-fn data_dir() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("THEKVM_DATA_DIR") {
-        return std::path::PathBuf::from(path);
-    }
+/// Privileged system state directory, ignoring any THEKVM_DATA_DIR override.
+/// Supervised user-session children run with the override pointing at the
+/// user directory; station-side edge mode needs to ALSO read the system
+/// identity and peer book (same machine, desktop user in the service
+/// group), so both paths are available side by side.
+fn system_data_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     return std::env::var("PROGRAMDATA")
         .map(|p| std::path::PathBuf::from(p).join("TheKVM"))
@@ -83,6 +85,13 @@ fn data_dir() -> std::path::PathBuf {
     return std::path::PathBuf::from("/var/db/thekvm");
     #[cfg(all(not(target_os = "windows"), not(target_os = "freebsd")))]
     return std::path::PathBuf::from("/var/lib/thekvm");
+}
+
+fn data_dir() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("THEKVM_DATA_DIR") {
+        return std::path::PathBuf::from(path);
+    }
+    system_data_dir()
 }
 
 /// Record security-relevant session boundaries without recording input data.
@@ -741,6 +750,7 @@ pub async fn send_test(address: &str, usage: u16) -> Result<()> {
             clipboard_enabled: false,
             screen_geometry: local_screen_geometry(&config.layout),
         },
+        None,
     )
     .await?;
     write_frame(
@@ -780,7 +790,7 @@ pub async fn capture(address: &str) -> Result<()> {
     // authenticated session handshake. A failed connection must never leave
     // the local desktop temporarily without its keyboard or mouse.
     let (mut priority_rx, mut motion_rx, capture_control) = start_capture(false, false)?;
-    let (conn, mut send, recv, capabilities) = connect_input(
+    let (conn, mut send, recv, capabilities) = dial_session(
         &identity,
         &peers,
         address,
@@ -791,6 +801,8 @@ pub async fn capture(address: &str) -> Result<()> {
             clipboard_enabled: config.clipboard_enabled,
             screen_geometry: local_screen_geometry(&config.layout),
         },
+        None,
+        &data_dir(),
     )
     .await?;
     let clipboard_enabled = capabilities.clipboard_enabled;
@@ -837,7 +849,7 @@ pub async fn connect(address: Option<&str>) -> Result<()> {
     // `established`; anything earlier is still connecting.
     eprintln!("THEKVM_STATUS dialing {address}");
     loop {
-        match connect_input(
+        match dial_session(
             &identity,
             &peers,
             address,
@@ -848,6 +860,8 @@ pub async fn connect(address: Option<&str>) -> Result<()> {
                 clipboard_enabled: config.clipboard_enabled,
                 screen_geometry: local_screen_geometry(&config.layout),
             },
+            None,
+            &data_dir(),
         )
         .await
         {
@@ -953,6 +967,7 @@ async fn run_windows_service_controller(
                     clipboard_enabled: false,
                     screen_geometry,
                 },
+                None,
             )
             .await
             {
@@ -1168,6 +1183,7 @@ async fn connect_topology() -> Result<()> {
             } => {
                 match signal {
                     Some(RemoteSignal::Handoff(handoff)) => {
+                        let returning_from = active.as_ref().map(|session| session.target);
                         if let Some(session) = active.take() {
                             session.finish().await;
                             capture_control.set_exclusive(false)?;
@@ -1191,6 +1207,34 @@ async fn connect_topology() -> Result<()> {
                                 )
                             })
                             .unwrap_or((handoff.x, handoff.y));
+                        // A handoff naming this machine's own screen hands
+                        // control back: re-enter through the arranged facing
+                        // edge (predictable midpoint) instead of the stale
+                        // exit coordinates, so the cursor never jumps
+                        // somewhere unexpected on return.
+                        if target == router.local_screen() {
+                            if let Some(from) = returning_from {
+                                let faced = router.layout().facing_edge_midpoint(from).and_then(
+                                    |(_, face_x, face_y)| {
+                                        router.screen(target).map(|mine| {
+                                            (
+                                                face_x.min(mine.width.saturating_sub(1)),
+                                                face_y.min(mine.height.saturating_sub(1)),
+                                            )
+                                        })
+                                    },
+                                );
+                                if let Some((face_x, face_y)) = faced {
+                                    router
+                                        .handoff_to(target, face_x, face_y)
+                                        .map_err(anyhow::Error::msg)?;
+                                    capture_control.warp_cursor(face_x, face_y)?;
+                                    tracing::info!(?target, "topology peer returned control locally");
+                                    eprintln!("THEKVM_STATUS local");
+                                    continue;
+                                }
+                            }
+                        }
                         if !router
                             .handoff_to(target, handoff_x, handoff_y)
                             .map_err(anyhow::Error::msg)?
@@ -1224,6 +1268,7 @@ async fn connect_topology() -> Result<()> {
                             initial_clipboard: latest_clipboard.clone(),
                             sequence: &mut sequence,
                             clipboard_revision: &mut clipboard_revision,
+                            dir: &dir,
                         }).await {
                             Ok(session) => {
                                 capture_control.set_exclusive(true)?;
@@ -1296,6 +1341,7 @@ async fn connect_topology() -> Result<()> {
                     clipboard_enabled,
                     initial_clipboard: latest_clipboard.clone(),
                     clipboard_revision: &mut clipboard_revision,
+                    dir: &dir,
                 })
                 .await?;
             }
@@ -1322,6 +1368,7 @@ async fn connect_topology() -> Result<()> {
                     clipboard_enabled,
                     initial_clipboard: latest_clipboard.clone(),
                     clipboard_revision: &mut clipboard_revision,
+                    dir: &dir,
                 })
                 .await?;
             }
@@ -1426,6 +1473,7 @@ struct TopologyEventContext<'a> {
     clipboard_enabled: bool,
     initial_clipboard: Option<String>,
     clipboard_revision: &'a mut u64,
+    dir: &'a std::path::Path,
 }
 
 async fn handle_topology_event(
@@ -1446,6 +1494,7 @@ async fn handle_topology_event(
         clipboard_enabled,
         initial_clipboard,
         clipboard_revision,
+        dir,
     } = context;
     let routed = router.route(captured.event);
     match routed {
@@ -1508,6 +1557,7 @@ async fn handle_topology_event(
                 initial_clipboard,
                 clipboard_revision,
                 sequence,
+                dir,
             })
             .await
             {
@@ -1552,6 +1602,7 @@ struct TopologyOpen<'a> {
     initial_clipboard: Option<String>,
     clipboard_revision: &'a mut u64,
     sequence: &'a mut u64,
+    dir: &'a std::path::Path,
 }
 
 async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySession> {
@@ -1573,6 +1624,7 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         initial_clipboard,
         clipboard_revision,
         sequence,
+        dir,
     } = request;
     let screen = router
         .screen(target)
@@ -1581,14 +1633,9 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         .peer_fingerprint
         .as_deref()
         .context("target screen has no paired peer fingerprint")?;
-    let address = peers
-        .peers
-        .iter()
-        .find(|peer| peer.fingerprint_hex == fingerprint)
-        .and_then(|peer| peer.address.as_deref())
-        .context("target screen peer has no saved address")?
-        .to_owned();
-    let (conn, mut send, recv, capabilities) = connect_input(
+    let peer_name = screen.name.clone();
+    let address = resolve_peer_address(peers, fingerprint, &peer_name)?;
+    let (conn, mut send, recv, capabilities) = dial_session(
         identity,
         peers,
         &address,
@@ -1599,8 +1646,15 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
             clipboard_enabled,
             screen_geometry: local_geometry,
         },
+        Some(fingerprint),
+        dir,
     )
     .await?;
+    // Remember the working address for the fingerprint that actually
+    // answered (heals entries pinned without one, tracks DHCP moves).
+    if let Ok(presented) = peer_fingerprint(&conn) {
+        note_peer_address(dir, &presented, &address);
+    }
     let clipboard_enabled = capabilities.clipboard_enabled;
     let target_geometry = ScreenGeometry {
         screen_id: target.0,
@@ -2149,6 +2203,36 @@ async fn run_capture_stream(
 
 pub async fn run() -> Result<()> {
     let dir = data_dir();
+    // Station-side edge control runs as the desktop user (same machine,
+    // service group): it must READ the system identity and peer book to
+    // dial with the identity the peers already trust. Access is only ever
+    // ADDED for the group (never removed from anyone): owner keeps full
+    // control, the group gains read (+traverse on the directory). Sockets
+    // and the audit trail keep their own tighter permissions (handled where
+    // created).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(&dir) {
+            let mode = metadata.permissions().mode() | 0o050;
+            if let Err(error) =
+                std::fs::set_permissions(&dir, PermissionsExt::from_mode(mode))
+            {
+                tracing::warn!(path = %dir.display(), %error, "cannot add daemon directory group access");
+            }
+        }
+        for file in ["identity.key", "peers.json", "config.json"] {
+            let path = dir.join(file);
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                let mode = metadata.permissions().mode() | 0o040;
+                if let Err(error) =
+                    std::fs::set_permissions(&path, PermissionsExt::from_mode(mode))
+                {
+                    tracing::warn!(path = %path.display(), %error, "cannot add daemon file group access");
+                }
+            }
+        }
+    }
     let config_path = dir.join("config.json");
     let mut config = if config_path.exists() {
         Config::load(&config_path).context("loading config")?
@@ -3044,11 +3128,156 @@ struct ConnectPolicy<'a> {
     screen_geometry: Option<ScreenGeometry>,
 }
 
+impl Clone for ConnectPolicy<'_> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl Copy for ConnectPolicy<'_> {}
+
+/// True when a dial failed because the peer does not know the identity we
+/// presented — locally ("not paired") or remotely ("peer rejected session:
+/// ... not paired"). Only this narrow case retries with the alternate local
+/// identity; network and policy failures surface immediately.
+fn unknown_peer_rejection(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("is not paired"))
+}
+
+/// Alternate dial state for the unknown-peer retry: the system identity and
+/// a merged peer book (user book plus system entries), used when this
+/// process runs as the desktop user but the peer only trusts the identity
+/// this machine shows as a pairing station (and vice versa). Returns None
+/// when there is no usable alternate (same directory, unreadable key, or
+/// identical fingerprint).
+fn load_fallback_dial(dir: &std::path::Path, primary_fingerprint: &str) -> Option<(Identity, PeerBook)> {
+    let system = system_data_dir();
+    if system == dir {
+        return None;
+    }
+    let identity = Identity::load_or_create(&system).ok()?;
+    if identity.fingerprint_hex() == primary_fingerprint {
+        return None;
+    }
+    let mut merged = PeerBook::load_or_create(dir).ok()?;
+    if let Ok(system_book) = PeerBook::load_or_create(&system) {
+        for peer in system_book.peers {
+            if !merged.is_pinned(&peer.fingerprint_hex) {
+                merged.peers.push(peer);
+            }
+        }
+    }
+    tracing::info!("alternate local identity available for unknown-peer retry");
+    Some((identity, merged))
+}
+
+/// Dial with automatic identity fallback: the primary identity first; when
+/// the peer reports us unknown and an alternate local identity exists, one
+/// retry with it. Trust never weakens — either identity must be pinned by
+/// the peer; this only survives the user-vs-service identity split that
+/// pairing ceremonies naturally produce on each machine.
+async fn dial_session(
+    primary_identity: &Identity,
+    peers: &PeerBook,
+    address: &str,
+    policy: ConnectPolicy<'_>,
+    intended_fingerprint: Option<&str>,
+    dir: &std::path::Path,
+) -> Result<(
+    quinn::Connection,
+    quinn::SendStream,
+    quinn::RecvStream,
+    SessionCapabilities,
+)> {
+    match connect_input(primary_identity, peers, address, policy, intended_fingerprint).await
+    {
+        Ok(session) => Ok(session),
+        Err(first) if unknown_peer_rejection(&first) => {
+            let primary_fp = primary_identity.fingerprint_hex();
+            match load_fallback_dial(dir, &primary_fp) {
+                Some((identity, merged)) => {
+                    tracing::info!(peer = %address, "peer reports this computer unknown; retrying with the alternate local identity");
+                    connect_input(&identity, &merged, address, policy, intended_fingerprint).await
+                }
+                None => Err(first),
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Resolve a dial address for a layout peer fingerprint: the exact entry's
+/// address first; otherwise a same-named sibling entry's address (same
+/// machine, re-paired identity — the address moved with it). Fingerprint
+/// verification at handshake stays strict; an address only decides where
+/// to knock.
+fn resolve_peer_address(
+    peers: &PeerBook,
+    fingerprint: &str,
+    peer_name: &str,
+) -> Result<String> {
+    if let Some(address) = peers
+        .peers
+        .iter()
+        .find(|peer| peer.fingerprint_hex == fingerprint)
+        .and_then(|peer| peer.address.as_deref())
+        .filter(|address| !address.trim().is_empty())
+    {
+        return Ok(address.to_owned());
+    }
+    if let Some(address) = peers
+        .peers
+        .iter()
+        .find(|peer| {
+            peer.fingerprint_hex != fingerprint
+                && !peer.name.trim().is_empty()
+                && peer.name == peer_name
+        })
+        .and_then(|peer| peer.address.as_deref())
+        .filter(|address| !address.trim().is_empty())
+    {
+        tracing::info!("dialling the intended peer via a same-named sibling entry's address");
+        return Ok(address.to_owned());
+    }
+    anyhow::bail!("target screen peer has no saved address")
+}
+
+/// Record a working address for a fingerprint in a peer book (best effort,
+/// logged). Keeps dial addresses fresh across DHCP changes and heals
+/// entries pinned without one.
+fn note_peer_address(dir: &std::path::Path, fingerprint: &str, address: &str) {
+    match PeerBook::load_or_create(dir) {
+        Ok(mut book) => {
+            let current = book
+                .peers
+                .iter()
+                .find(|peer| peer.fingerprint_hex == fingerprint)
+                .and_then(|peer| peer.address.clone());
+            if current.as_deref() != Some(address) {
+                let name = book
+                    .peers
+                    .iter()
+                    .find(|peer| peer.fingerprint_hex == fingerprint)
+                    .map(|peer| peer.name.clone())
+                    .unwrap_or_else(|| fingerprint.to_owned());
+                match book.pin_with_address(name, fingerprint.to_owned(), Some(address.to_owned())) {
+                    Ok(()) => tracing::info!("recorded working address for known peer"),
+                    Err(error) => tracing::debug!(%error, "cannot record peer address"),
+                }
+            }
+        }
+        Err(error) => tracing::debug!(%error, "cannot open peer book to record address"),
+    }
+}
+
 async fn connect_input(
     identity: &Identity,
     peers: &PeerBook,
     address: &str,
     policy: ConnectPolicy<'_>,
+    intended_fingerprint: Option<&str>,
 ) -> Result<(
     quinn::Connection,
     quinn::SendStream,
@@ -3066,7 +3295,28 @@ async fn connect_input(
         bail!("receiver-only mode cannot initiate an input session");
     }
     let addr = normalize_addr(address)?;
-    let endpoint = if let Some(expected_fingerprint) = saved_peer_fingerprint(peers, addr) {
+    // Pin the TLS handshake to the intended peer when the address owner
+    // agrees with it (the normal case). When dialling a sibling address for
+    // the intended fingerprint — same machine, re-paired identity, address
+    // carried by the newer book entry — pinning to the address owner would
+    // fail the handshake even though either fingerprint is trusted, so stay
+    // unpinned: the fingerprint check below runs against the SAME
+    // connection object (no TOCTOU), keeping trust exactly as strict.
+    let owner = saved_peer_fingerprint(peers, addr);
+    let pin_to = match (intended_fingerprint, owner) {
+        (Some(intended), Some(owner)) if owner == intended => Some(intended),
+        (Some(intended), None) => Some(intended),
+        (Some(_), Some(_)) => {
+            tracing::info!(
+                peer = %addr,
+                "dialling a sibling address for the intended peer; TLS pinning relaxed, peer-book check still enforced"
+            );
+            None
+        }
+        (None, Some(owner)) => Some(owner),
+        (None, None) => None,
+    };
+    let endpoint = if let Some(expected_fingerprint) = pin_to {
         transport::make_pinned_client_endpoint(identity, expected_fingerprint)?
     } else {
         // Keep first-run/manual-address compatibility; the application layer
@@ -3433,6 +3683,26 @@ unsafe extern "system" fn windows_service_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_peer_rejection_matches_only_trust_failures() {
+        assert!(unknown_peer_rejection(&anyhow::anyhow!(
+            "peer 192.168.1.7:42110 is not paired (fingerprint {})",
+            "ab".repeat(32)
+        )));
+        assert!(unknown_peer_rejection(&anyhow::anyhow!(
+            "peer rejected session: peer is not paired"
+        )));
+        assert!(!unknown_peer_rejection(&anyhow::anyhow!(
+            "peer rejected session: privileged remote input is disabled locally"
+        )));
+        assert!(!unknown_peer_rejection(&anyhow::anyhow!(
+            "connect daemon control socket timed out after 3s"
+        )));
+        assert!(!unknown_peer_rejection(&anyhow::anyhow!(
+            "no answer from 192.168.1.7:42110 after 10s"
+        )));
+    }
 
     #[test]
     fn audit_log_sanitizes_multiline_boundary_records() {

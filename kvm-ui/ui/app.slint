@@ -235,6 +235,29 @@ export component AppWindow inherits Window {
                         font-size: 13px;
                         wrap: word-wrap;
                     }
+                    Text {
+                        visible: driving-text != "";
+                        text: driving-text;
+                        color: #22c55e;
+                        font-size: 13px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        visible: !session-active;
+                        Button {
+                            text: edge-active ? "Stop edge control" : "Start edge control";
+                            primary: true;
+                            clicked => { set-edge-mode(!edge-active); }
+                        }
+                    }
+                    Text {
+                        text: "Connect (above) is full takeover: the other computer gets your whole keyboard and mouse until Disconnect. Edge control keeps both computers usable — only cursor crossings move control, and pushing back returns it.";
+                        color: #9ca3af;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
                     Button {
                         visible: !connected;
                         text: "Start background service";
