@@ -12,6 +12,13 @@ pub struct Layout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScreenId(pub u32);
 
+/// Screen-id convention for paired machines: the local screen is always 1
+/// and the first linked peer is always 2. Both machines follow it, so a
+/// handoff request naming a screen id means the same screen on both ends
+/// without any extra id-exchange protocol.
+pub const SELF_SCREEN_ID: ScreenId = ScreenId(1);
+pub const FIRST_PEER_SCREEN_ID: ScreenId = ScreenId(2);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Screen {
     pub id: ScreenId,
@@ -98,6 +105,102 @@ impl Layout {
 
     pub fn self_screen(&self) -> Option<&Screen> {
         self.self_screen.and_then(|id| self.screen(id))
+    }
+
+    /// Default two-screen arrangement for a fresh pairing, Machine 1 on the
+    /// left: this machine at (0,0), the peer at (1,0) — one exit edge
+    /// (Right). The connector (the machine whose user typed the code)
+    /// writes this at pairing time.
+    pub fn pair_default(
+        self_name: &str,
+        peer_name: &str,
+        peer_fingerprint: &str,
+    ) -> Self {
+        Self {
+            screens: vec![
+                Screen {
+                    id: SELF_SCREEN_ID,
+                    name: display_name(self_name, "This computer"),
+                    x: 0,
+                    y: 0,
+                    width: default_screen_width(),
+                    height: default_screen_height(),
+                    peer_fingerprint: None,
+                },
+                Screen {
+                    id: FIRST_PEER_SCREEN_ID,
+                    name: display_name(peer_name, "Other computer"),
+                    x: 1,
+                    y: 0,
+                    width: default_screen_width(),
+                    height: default_screen_height(),
+                    peer_fingerprint: Some(peer_fingerprint.to_ascii_lowercase()),
+                },
+            ],
+            self_screen: Some(SELF_SCREEN_ID),
+        }
+    }
+
+    /// Mirror image for the station side (Machine 2): this machine on the
+    /// right, the peer on the left — one exit edge (Left). Same id
+    /// convention, so handoff requests agree on screen ids.
+    pub fn pair_mirror(
+        self_name: &str,
+        peer_name: &str,
+        peer_fingerprint: &str,
+    ) -> Self {
+        let mut layout = Self::pair_default(self_name, peer_name, peer_fingerprint);
+        if let Some(peer) = layout
+            .screens
+            .iter_mut()
+            .find(|screen| screen.id == FIRST_PEER_SCREEN_ID)
+        {
+            peer.x = -1;
+        }
+        layout
+    }
+
+    /// Which edge of the self screen leads to the first linked peer screen,
+    /// if the layout links exactly the paired default (one exit edge).
+    pub fn peer_exit_edge(&self) -> Option<Edge> {
+        let me = self.self_screen?;
+        for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+            if self.neighbor_for_edge(me, edge) == Some(FIRST_PEER_SCREEN_ID) {
+                return Some(edge);
+            }
+        }
+        None
+    }
+
+    /// Move the first linked peer screen to the given side of the self
+    /// screen (the arrangement UI). The change is validated: colliding with
+    /// another screen is refused instead of silently overlapping.
+    pub fn place_peer(&mut self, side: Edge) -> Result<(), String> {
+        let me = self
+            .self_screen
+            .and_then(|id| self.screen(id))
+            .ok_or_else(|| "layout has no local screen".to_string())?;
+        let (x, y) = match side {
+            Edge::Left => (me.x - 1, me.y),
+            Edge::Right => (me.x + 1, me.y),
+            Edge::Top => (me.x, me.y - 1),
+            Edge::Bottom => (me.x, me.y + 1),
+        };
+        if self
+            .screens
+            .iter()
+            .any(|screen| screen.id != FIRST_PEER_SCREEN_ID && screen.x == x && screen.y == y)
+        {
+            return Err("another screen already occupies that position".into());
+        }
+        let peer = self
+            .screens
+            .iter_mut()
+            .find(|screen| screen.id == FIRST_PEER_SCREEN_ID)
+            .ok_or_else(|| "layout has no linked peer screen".to_string())?;
+        peer.x = x;
+        peer.y = y;
+        Ok(())
     }
 
     /// Resolve a relative motion that would leave `screen_id`. This stateless
@@ -468,6 +571,15 @@ fn saturating_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
+fn display_name(name: &str, fallback: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        fallback.into()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,8 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn restores_saved_local_position_when_remote_handoff_fails() {
-        let layout = Layout {
+    fn restores_saved_local_position_when_remote_handoff_fails() {        let layout = Layout {
             screens: vec![screen(1, "main", 0, 0), screen(2, "right", 1, 0)],
             self_screen: Some(ScreenId(1)),
         };
@@ -573,6 +684,59 @@ mod tests {
         assert_eq!(router.restore_local(ScreenId(2)).unwrap(), saved);
         assert_eq!(router.cursor_position(), saved);
         assert_eq!(router.active_remote(), None);
+    }
+
+    #[test]
+    fn pair_default_puts_machine1_left_with_one_exit_edge() {
+        let layout = Layout::pair_default("laptop", "mint", &"ab".repeat(32));
+        assert_eq!(layout.validate(), Ok(()));
+        assert_eq!(layout.self_screen, Some(SELF_SCREEN_ID));
+        assert_eq!(layout.peer_exit_edge(), Some(Edge::Right));
+        // Facing edges agree across the pair: A pushes right into B.
+        let handoff = layout
+            .handoff_for_motion(SELF_SCREEN_ID, 1919, 540, 50, 0)
+            .expect("right edge must hand off");
+        assert_eq!(handoff.target, FIRST_PEER_SCREEN_ID);
+        assert_eq!(handoff.target_x, 0);
+        // Outer edges do nothing.
+        assert_eq!(layout.neighbor_for_edge(SELF_SCREEN_ID, Edge::Left), None);
+    }
+
+    #[test]
+    fn pair_mirror_puts_peer_left_with_one_exit_edge() {
+        let layout = Layout::pair_mirror("mint", "laptop", &"ab".repeat(32));
+        assert_eq!(layout.validate(), Ok(()));
+        assert_eq!(layout.peer_exit_edge(), Some(Edge::Left));
+        let handoff = layout
+            .handoff_for_motion(SELF_SCREEN_ID, 0, 540, -50, 0)
+            .expect("left edge must hand off");
+        assert_eq!(handoff.target, FIRST_PEER_SCREEN_ID);
+        assert_eq!(handoff.edge, Edge::Left);
+    }
+
+    #[test]
+    fn place_peer_moves_exit_edge_and_refuses_collisions() {
+        let mut layout = Layout::pair_default("a", "b", &"cd".repeat(32));
+        layout.place_peer(Edge::Top).expect("top must be free");
+        assert_eq!(layout.validate(), Ok(()));
+        assert_eq!(layout.peer_exit_edge(), Some(Edge::Top));
+        layout.place_peer(Edge::Right).expect("right must be free");
+        assert_eq!(layout.peer_exit_edge(), Some(Edge::Right));
+
+        // A third screen on the left blocks moving the peer there.
+        layout.screens.push(Screen {
+            id: ScreenId(9),
+            name: "third".into(),
+            x: -1,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            peer_fingerprint: None,
+        });
+        assert!(layout.place_peer(Edge::Left).is_err());
+        // And a layout without a peer screen cannot place one.
+        layout.screens.retain(|screen| screen.id != FIRST_PEER_SCREEN_ID);
+        assert!(layout.place_peer(Edge::Left).is_err());
     }
 }
 

@@ -352,6 +352,38 @@ where
                 }
             }
         }
+        ControlRequest::PinPeer {
+            fingerprint_hex,
+            node_name,
+            address,
+        } => {
+            if !is_fingerprint(&fingerprint_hex) {
+                ControlResponse::Error {
+                    message: "peer fingerprint must contain 64 hexadecimal characters".into(),
+                }
+            } else {
+                let fingerprint_hex = fingerprint_hex.to_ascii_lowercase();
+                let name = node_name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| format!("peer-{}", &fingerprint_hex[..8]));
+                match peers
+                    .write()
+                    .await
+                    .pin_with_address(name, fingerprint_hex.clone(), address)
+                {
+                    Ok(()) => {
+                        crate::service::audit_event(
+                            &data_dir,
+                            &format!("peer-pinned fingerprint={fingerprint_hex}"),
+                        );
+                        ControlResponse::Pinned { fingerprint_hex }
+                    }
+                    Err(error) => ControlResponse::Error {
+                        message: format!("pinning peer failed: {error}"),
+                    },
+                }
+            }
+        }
         ControlRequest::SetConfig {
             device_name,
             mode,

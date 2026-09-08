@@ -64,6 +64,18 @@ enum Command {
     Doctor,
     /// Revoke a trusted peer by its certificate fingerprint.
     Unpair { fingerprint: String },
+    /// Pin a peer directly into the running daemon's peer book (mirrors
+    /// trust established elsewhere, e.g. the desktop UI ceremony).
+    PinPeer {
+        /// Peer certificate fingerprint (64 hex characters).
+        fingerprint: String,
+        /// Display name; the existing name is kept when omitted.
+        #[arg(long)]
+        name: Option<String>,
+        /// Last known address; the existing address is kept when omitted.
+        #[arg(long)]
+        address: Option<String>,
+    },
     /// Send a test input event to a peer (for validating the pipeline).
     Send {
         address: String,
@@ -183,6 +195,13 @@ async fn async_main() -> Result<()> {
         }
         Command::Doctor => service::doctor(),
         Command::Unpair { fingerprint } => service::unpair(&fingerprint).await,
+        Command::PinPeer {
+            fingerprint,
+            name,
+            address,
+        } => {
+            service::pin_peer(&fingerprint, name.as_deref(), address.as_deref()).await
+        }
         Command::Send { address, keycode } => service::send_test(&address, keycode).await,
         Command::Capture { address } => service::capture(&address).await,
         Command::Connect { address } => service::connect(address.as_deref()).await,

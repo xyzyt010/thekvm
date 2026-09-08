@@ -288,6 +288,49 @@ fn valid_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Pin a peer into the running daemon's peer book, mirroring trust the
+/// local user established elsewhere (the desktop UI code ceremony). Falls
+/// back to the state file when the daemon is offline.
+pub async fn pin_peer(
+    fingerprint: &str,
+    name: Option<&str>,
+    address: Option<&str>,
+) -> Result<()> {
+    if !valid_fingerprint(fingerprint) {
+        bail!("peer fingerprint must contain 64 hexadecimal characters");
+    }
+    let fingerprint_hex = fingerprint.to_ascii_lowercase();
+    let clean_name = name.filter(|name| !name.trim().is_empty());
+    let clean_address = address.filter(|address| !address.trim().is_empty());
+    match crate::control::request(
+        data_dir(),
+        kvm_protocol::control::ControlRequest::PinPeer {
+            fingerprint_hex: fingerprint_hex.clone(),
+            node_name: clean_name.map(str::to_owned),
+            address: clean_address.map(str::to_owned),
+        },
+    )
+    .await
+    {
+        Ok(kvm_protocol::control::ControlResponse::Pinned { .. }) => {
+            println!("pinned {fingerprint_hex}");
+            return Ok(());
+        }
+        Ok(kvm_protocol::control::ControlResponse::Error { message }) => bail!("{message}"),
+        Ok(other) => bail!("unexpected daemon pin response: {other:?}"),
+        Err(_) => {}
+    }
+
+    let mut peers = PeerBook::load_or_create(&data_dir())?;
+    peers.pin_with_address(
+        clean_name.unwrap_or(&format!("peer-{}", &fingerprint_hex[..8])),
+        fingerprint_hex.clone(),
+        clean_address.map(str::to_owned),
+    )?;
+    println!("pinned {fingerprint_hex}");
+    Ok(())
+}
+
 pub async fn status() -> Result<()> {
     match crate::control::request(data_dir(), kvm_protocol::control::ControlRequest::Status).await?
     {
@@ -1055,9 +1098,36 @@ async fn run_windows_service_capture_stream(
 /// one stateful router.
 async fn connect_topology() -> Result<()> {
     let dir = data_dir();
-    let config = Config::load(&dir.join("config.json"))
-        .with_context(|| format!("loading topology config from {}", dir.display()))?;
-    let mut router = EdgeRouter::new(config.layout.clone()).map_err(anyhow::Error::msg)?;
+    // Machine-readable progress for a supervising UI (which pipes stderr):
+    // edge-ready when capture runs, driving <screen> while a peer owns the
+    // pointer, local when control is here, waiting <reason> while retrying,
+    // ended on shutdown. The UI must only claim edge mode is live after
+    // `edge-ready`; anything earlier is still starting.
+    eprintln!("THEKVM_STATUS dialing edge");
+    // The arrangement may not exist yet (fresh pairing): wait for it instead
+    // of exiting, reloading the config every few seconds, so starting edge
+    // mode and then arranging the screens just starts working with no
+    // restart and no extra click.
+    let (config, mut router) = loop {
+        let config = Config::load(&dir.join("config.json"))
+            .with_context(|| format!("loading topology config from {}", dir.display()))?;
+        match EdgeRouter::new(config.layout.clone()) {
+            Ok(router) => break (config, router),
+            Err(error) => {
+                tracing::warn!(%error, "topology has no screen arrangement yet; waiting for one");
+                eprintln!(
+                    "THEKVM_STATUS waiting no screen arrangement yet — arrange the linked screens first ({error})"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                    _ = tokio::signal::ctrl_c() => {
+                        eprintln!("THEKVM_STATUS ended interrupted");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    };
     match kvm_platform::capture::current_cursor_position() {
         Ok(Some((x, y))) => {
             if let Err(error) = router.set_local_cursor_position(x, y) {
@@ -1085,6 +1155,7 @@ async fn connect_topology() -> Result<()> {
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     tracing::info!(screen = ?router.current_screen(), "topology capture ready; move to a configured screen edge");
+    eprintln!("THEKVM_STATUS edge-ready");
     loop {
         tokio::select! {
             biased;
@@ -1126,6 +1197,7 @@ async fn connect_topology() -> Result<()> {
                         {
                             capture_control.warp_cursor(handoff_x, handoff_y)?;
                             tracing::info!(?target, "topology peer returned control locally");
+                            eprintln!("THEKVM_STATUS local");
                             continue;
                         }
                         let snapshot = capture_control.snapshot();
@@ -1156,13 +1228,19 @@ async fn connect_topology() -> Result<()> {
                             Ok(session) => {
                                 capture_control.set_exclusive(true)?;
                                 active = Some(session);
+                                let name = router
+                                    .screen(target)
+                                    .map(|screen| screen.name.clone())
+                                    .unwrap_or_else(|| format!("screen {}", target.0));
                                 tracing::info!(?target, "topology handoff continued to next peer");
+                                eprintln!("THEKVM_STATUS driving {name}");
                             }
                             Err(error) => {
                                 let _ = router.restore_local(target);
                                 let (x, y) = router.cursor_position();
                                 let _ = capture_control.warp_cursor(x, y);
                                 tracing::warn!(%error, ?target, "topology handoff target unavailable; returned control locally");
+                                eprintln!("THEKVM_STATUS local");
                             }
                         }
                     }
@@ -1190,6 +1268,7 @@ async fn connect_topology() -> Result<()> {
                             let (x, y) = router.cursor_position();
                             let _ = capture_control.warp_cursor(x, y);
                             tracing::warn!(?target, "topology peer closed; returned control locally");
+                            eprintln!("THEKVM_STATUS local");
                         }
                     }
                 }
@@ -1281,6 +1360,7 @@ async fn connect_topology() -> Result<()> {
                         let _ = router.restore_local(target);
                         let (x, y) = router.cursor_position();
                         let _ = capture_control.warp_cursor(x, y);
+                        eprintln!("THEKVM_STATUS local");
                     }
                 }
             }
@@ -1289,6 +1369,7 @@ async fn connect_topology() -> Result<()> {
                 if let Some(session) = active.take() {
                     session.finish().await;
                 }
+                eprintln!("THEKVM_STATUS ended stopped");
                 return Ok(());
             }
         }
@@ -1433,7 +1514,12 @@ async fn handle_topology_event(
                 Ok(session) => {
                     capture_control.set_exclusive(true)?;
                     *active = Some(session);
+                    let name = router
+                        .screen(target)
+                        .map(|screen| screen.name.clone())
+                        .unwrap_or_else(|| format!("screen {}", target.0));
                     tracing::info!(?target, "topology handoff activated");
+                    eprintln!("THEKVM_STATUS driving {name}");
                 }
                 Err(error) => {
                     let _ = capture_control.set_exclusive(false);

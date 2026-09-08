@@ -33,6 +33,22 @@ pub enum ControlRequest {
     Unpair {
         fingerprint_hex: String,
     },
+    /// Pin a peer directly into the daemon-owned peer book without a network
+    /// ceremony. This mirrors trust the local user already established (the
+    /// desktop UI's code ceremony, which pins the user book): only a local
+    /// control-socket caller — the logged-in user or an administrator — can
+    /// invoke it, and every pin lands in the audit trail. It exists so both
+    /// directions of an edge-control pair can open sessions: the initiator's
+    /// daemon book would otherwise stay empty forever.
+    PinPeer {
+        fingerprint_hex: String,
+        /// Display name; the existing name is kept when omitted.
+        #[serde(default)]
+        node_name: Option<String>,
+        /// Last known address; the existing address is kept when omitted.
+        #[serde(default)]
+        address: Option<String>,
+    },
     /// Return incoming network pairing requests waiting for local approval.
     ListPendingPairings,
     /// Approve one incoming pairing request by certificate fingerprint.
@@ -116,6 +132,7 @@ pub enum ControlResponse {
     PendingPairings(Vec<PendingPairing>),
     PairingApproved { fingerprint_hex: String },
     PairingRejected { fingerprint_hex: String },
+    Pinned { fingerprint_hex: String },
     Applied { restart_required: bool },
     Error { message: String },
 }

@@ -167,4 +167,28 @@ if json.loads(sys.argv[1])["peer_count"] != 0:
     raise SystemExit("uppercase fingerprint revocation was not applied immediately")
 ' "$status_b"
 
+run_b pin-peer "$fingerprint_a" --name "Integration A" --address "127.0.0.1:42120"
+status_b=$(run_b status)
+python3 -c '
+import json
+import sys
+if json.loads(sys.argv[1])["peer_count"] != 1:
+    raise SystemExit("pin-peer did not restore the revoked peer")
+' "$status_b"
+set +e
+bad_pin=$(run_b pin-peer not-a-fingerprint 2>&1)
+bad_pin_code=$?
+set -e
+if [ "$bad_pin_code" -eq 0 ]; then
+    echo "pin-peer unexpectedly accepted a malformed fingerprint" >&2
+    exit 1
+fi
+case "$bad_pin" in
+    *"64 hexadecimal"*) ;;
+    *)
+        echo "unexpected pin-peer rejection: $bad_pin" >&2
+        exit 1
+        ;;
+esac
+
 echo "LAN integration passed: two-sided approval, QUIC pairing, strict controller/receiver roles, configured names, status, and live revocation."

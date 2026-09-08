@@ -65,6 +65,10 @@ struct Session {
     child: std::process::Child,
     address: String,
     verified: Arc<std::sync::atomic::AtomicBool>,
+    /// True for edge-control mode (`connect` with no address: cursor
+    /// crossings drive linked screens) as opposed to fixed-peer takeover
+    /// (`connect <address>`: the whole local input drives one peer).
+    is_edge: bool,
 }
 
 fn main() -> Result<()> {
@@ -210,6 +214,15 @@ fn main() -> Result<()> {
                     ));
                 }
                 consecutive_failures = 0;
+                // Station-side default arrangement (Machine 2 mirrors: the
+                // connector goes on the left) and the Devices arrangement
+                // display both refresh here, from live daemon state.
+                maybe_mirror_station_arrangement(&status);
+                let edge_active = session_for_poll
+                    .lock()
+                    .ok()
+                    .is_some_and(|slot| slot.as_ref().is_some_and(|session| session.is_edge));
+                refresh_arrangement(&weak, edge_active);
                 let port = status.listen_port;
                 let fingerprint = status.fingerprint_hex.clone();
                 set_daemon_status(&weak, status);
@@ -380,8 +393,10 @@ fn main() -> Result<()> {
     });
 
     let weak = ui.as_weak();
+    let role_session = session_state.clone();
     ui.on_set_role(move |role| {
         let weak = weak.clone();
+        let role_session = role_session.clone();
         ui_log(&format!("role button pressed: {role}"));
         // Instant local feedback: the press always lands, even if the daemon
         // turns out to be unreachable. The result overwrites this below.
@@ -424,16 +439,36 @@ fn main() -> Result<()> {
                         requested,
                         current.allow_lock_screen_control,
                         current.clipboard_enabled,
+                        None,
                     );
                     ui_log(&format!("role applied: {}", role_name(requested)));
                     // Update the green role text from the authoritative
                     // Applied result now; the poll refreshes it again when
                     // healthy.
                     set_role_display(&weak, requested);
-                    set_status(
-                        &weak,
-                        format!("Role set: {}.", role_name(requested)),
-                    );
+                    // Edge control drives under a role contract: a role
+                    // change stops it rather than letting it drive under a
+                    // stale one (e.g. receiver-only still crossing).
+                    if role_session
+                        .lock()
+                        .ok()
+                        .is_some_and(|slot| slot.as_ref().is_some_and(|session| session.is_edge))
+                    {
+                        ui_log("role changed: stopping edge control; restart it for the new role");
+                        stop_session(&weak, &role_session, "Edge control stopped");
+                        set_status(
+                            &weak,
+                            format!(
+                                "Role set: {}. Edge control stopped — restart it for the new role.",
+                                role_name(requested)
+                            ),
+                        );
+                    } else {
+                        set_status(
+                            &weak,
+                            format!("Role set: {}.", role_name(requested)),
+                        );
+                    }
                 }
                 Ok(ControlResponse::Error { message }) => {
                     ui_log(&format!("role change refused: {message}"));
@@ -479,6 +514,34 @@ fn main() -> Result<()> {
     let disconnect_session = session_state.clone();
     ui.on_disconnect(move || {
         stop_session(&weak, &disconnect_session, "Disconnected");
+    });
+
+    let weak = ui.as_weak();
+    let edge_session = session_state.clone();
+    let edge_pending = pending_pair.clone();
+    let edge_data_dir = startup_dir.clone();
+    ui.on_set_edge_mode(move |enabled| {
+        let weak = weak.clone();
+        let edge_session = edge_session.clone();
+        let edge_pending = edge_pending.clone();
+        let edge_data_dir = edge_data_dir.clone();
+        std::thread::spawn(move || {
+            if enabled {
+                ui_log("edge: starting edge control from Devices");
+                spawn_edge(&weak, &edge_session, &edge_pending, &edge_data_dir);
+            } else {
+                ui_log("edge: stopping edge control from Devices");
+                stop_session(&weak, &edge_session, "Edge control stopped");
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_swap_sides(move || {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            arrange_swap(&weak);
+        });
     });
 
     let weak = ui.as_weak();
@@ -650,6 +713,7 @@ fn main() -> Result<()> {
             let weak = weak.clone();
             let device_name = device_name.to_string();
             let auto_address = auto_address.to_string();
+            let config_session = session_state.clone();
             std::thread::spawn(move || {
                 let requested_mode = match mode_index {
                     1 => Mode::ServerClient,
@@ -664,6 +728,7 @@ fn main() -> Result<()> {
                     requested_mode,
                     allow_lock_screen,
                     clipboard_enabled,
+                    None,
                 );
                 let mode = match mode_index {
                     1 => "server-client",
@@ -705,6 +770,16 @@ fn main() -> Result<()> {
                         // Same truth rule as the role buttons: the green
                         // role text follows the Applied result at once.
                         set_role_display(&weak, requested_mode);
+                        // Settings (role included) can invalidate a running
+                        // edge contract: stop it rather than drive stale.
+                        if config_session
+                            .lock()
+                            .ok()
+                            .is_some_and(|slot| slot.as_ref().is_some_and(|session| session.is_edge))
+                        {
+                            ui_log("settings saved: stopping edge control; restart it for the new settings");
+                            stop_session(&weak, &config_session, "Edge control stopped");
+                        }
                         set_status(
                             &weak,
                             if restart_required {
@@ -1061,7 +1136,16 @@ fn start_session_flow(
             *slot = None;
             set_session(weak, None);
         }
-        if slot.is_some() {
+        // Fixed takeover supersedes edge control (and launch_child stops
+        // whatever runs), so an active edge session must not wedge Connect
+        // behind "Already connected".
+        let edge_active = slot.as_ref().is_some_and(|session| session.is_edge);
+        let any_active = slot.is_some();
+        drop(slot);
+        if edge_active {
+            ui_log("pairing: fixed connect supersedes edge control; stopping it");
+            stop_session(weak, session, "Edge control stopped");
+        } else if any_active {
             set_status(weak, "Already connected — Disconnect first".into());
             return;
         }
@@ -1244,6 +1328,15 @@ fn run_pair_confirm(
                         set_pending(&weak, String::new(), String::new(), String::new());
                         set_status(&weak, format!("Paired with {peer_name}"));
                         ui_log(&format!("pairing: accepted by {peer_name}"));
+                        // Mirror the trust into the daemon book (reverse
+                        // sessions must open too) and take the Machine-1
+                        // default arrangement when none is saved yet.
+                        pin_daemon_peer(
+                            &pending.peer_fingerprint,
+                            &peer_name,
+                            Some(&pending.address),
+                        );
+                        ensure_default_arrangement(&peer_name, &pending.peer_fingerprint);
                         spawn_session(&weak, &confirm_session, &confirm_pending, &confirm_data_dir, pending.address);
                     }
                     Err(error) => {
@@ -1342,6 +1435,404 @@ fn pin_controller_peer(data_dir: &std::path::Path, pending: &PendingPair) -> Res
     Ok(())
 }
 
+/// Pin a peer into the USER book (the supervised edge child resolves peers
+/// from here). Upsert: re-pinning refreshes name/address, never duplicates.
+fn ensure_user_pin(fingerprint: &str, name: &str, address: Option<&str>) {
+    match kvm_protocol::pairing::PeerBook::load_or_create(&data_dir()) {
+        Ok(mut book) => {
+            let label = if name.trim().is_empty() {
+                address.unwrap_or(fingerprint)
+            } else {
+                name
+            };
+            if let Err(error) = book.pin_with_address(
+                label,
+                fingerprint.to_owned(),
+                address.map(str::to_owned),
+            ) {
+                ui_log(&format!("arrange: user pin failed: {error:#}"));
+            }
+        }
+        Err(error) => ui_log(&format!("arrange: cannot open user peer book: {error:#}")),
+    }
+}
+
+/// Mirror ceremony trust into the DAEMON book so the reverse direction can
+/// open sessions too (edge control drives both ways). Best effort and
+/// logged: a mirror failure never fails the pairing itself.
+fn pin_daemon_peer(fingerprint: &str, name: &str, address: Option<&str>) {
+    match control_request(ControlRequest::PinPeer {
+        fingerprint_hex: fingerprint.to_owned(),
+        node_name: Some(name.to_owned()),
+        address: address.map(str::to_owned),
+    }) {
+        Ok(ControlResponse::Pinned { .. }) => {
+            ui_log("pairing: mirrored trust into daemon peer book")
+        }
+        Ok(ControlResponse::Error { message }) => {
+            ui_log(&format!("pairing: daemon pin refused: {message}"))
+        }
+        Ok(other) => ui_log(&format!("pairing: daemon pin unexpected: {other:?}")),
+        Err(error) => ui_log(&format!("pairing: daemon pin failed: {error:#}")),
+    }
+}
+
+/// Persist a screen arrangement to BOTH configs the edge child and the
+/// daemon read (user config for the supervised child, daemon config for
+/// serving and display). Read-modify-write so arranging screens never
+/// clobbers any other setting. Saved arrangements are permanent: nothing
+/// here ever overwrites one except an explicit arrange action.
+fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
+    layout.validate().map_err(anyhow::Error::msg)?;
+    let current = match control_request(ControlRequest::GetConfig) {
+        Ok(ControlResponse::Config(config)) => config,
+        Ok(other) => anyhow::bail!("cannot read settings: {other:?}"),
+        Err(error) => anyhow::bail!("settings unreadable: {error:#}"),
+    };
+    match control_request(ControlRequest::SetConfig {
+        device_name: Some(current.device_name.clone()),
+        mode: Some(current.mode),
+        allow_lock_screen_control: Some(current.allow_lock_screen_control),
+        listen_port: None,
+        layout: Some(layout.clone()),
+        auto_connect_address: current.auto_connect_address.clone(),
+        clear_auto_connect: current.auto_connect_address.is_none(),
+        clipboard_enabled: Some(current.clipboard_enabled),
+    }) {
+        Ok(ControlResponse::Applied { .. }) => {}
+        Ok(ControlResponse::Error { message }) => anyhow::bail!("{message}"),
+        Ok(other) => anyhow::bail!("unexpected daemon response: {other:?}"),
+        Err(error) => anyhow::bail!("{error:#}"),
+    }
+    mirror_user_config(
+        &current.device_name,
+        current.mode,
+        current.allow_lock_screen_control,
+        current.clipboard_enabled,
+        Some(layout.clone()),
+    );
+    ui_log("arrange: screen arrangement saved");
+    Ok(layout)
+}
+
+/// Machine-1 default arrangement at pairing time: this machine left, the
+/// new peer right (one exit edge). Writes ONLY when no arrangement exists
+/// yet — a saved arrangement is never overwritten.
+fn ensure_default_arrangement(peer_name: &str, peer_fingerprint: &str) {
+    let current = match control_request(ControlRequest::GetConfig) {
+        Ok(ControlResponse::Config(config)) => config,
+        _ => return,
+    };
+    if !current.layout.screens.is_empty() {
+        return;
+    }
+    let layout =
+        kvm_core::Layout::pair_default(&current.device_name, peer_name, peer_fingerprint);
+    match write_arrangement(layout) {
+        Ok(_) => ui_log("arrange: default Machine-1 arrangement saved (peer on the right)"),
+        Err(error) => ui_log(&format!("arrange: default arrangement failed: {error:#}")),
+    }
+}
+
+/// Throttle for the station-side default arrangement check (seconds).
+static LAST_MIRROR_CHECK_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Station-side default (Machine 2 mirrors): when this machine trusts peers
+/// but never arranged its screens, put the first peer on the left (one exit
+/// edge). Checked at most once a minute, and only ever writes an EMPTY
+/// layout — a saved arrangement is sacred.
+fn maybe_mirror_station_arrangement(status: &DaemonStatus) {
+    if status.peer_count == 0 {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if LAST_MIRROR_CHECK_SECS.swap(now, std::sync::atomic::Ordering::Relaxed) + 60 > now {
+        return;
+    }
+    let config = match control_request(ControlRequest::GetConfig) {
+        Ok(ControlResponse::Config(config)) => config,
+        _ => return,
+    };
+    if !config.layout.screens.is_empty() {
+        return;
+    }
+    let peers = match control_request(ControlRequest::ListPeers) {
+        Ok(ControlResponse::Peers(peers)) => peers,
+        _ => return,
+    };
+    let Some(peer) = peers.first() else {
+        return;
+    };
+    let layout = kvm_core::Layout::pair_mirror(
+        &config.device_name,
+        &peer.name,
+        &peer.fingerprint_hex,
+    );
+    match write_arrangement(layout) {
+        Ok(_) => {
+            ensure_user_pin(
+                &peer.fingerprint_hex,
+                &peer.name,
+                peer.address.as_deref(),
+            );
+            ui_log("arrange: station default arrangement saved (peer on the left)");
+        }
+        Err(error) => ui_log(&format!("arrange: station default failed: {error:#}")),
+    }
+}
+
+/// One linked screen for the Devices arrangement section: the union of the
+/// daemon book (both sides pin there after 0.2.0 ceremonies) and the user
+/// book (initiator ceremonies pin there), with the arranged side from the
+/// daemon layout when present.
+struct LinkedPeer {
+    name: String,
+    fingerprint: String,
+    address: Option<String>,
+    side: Option<kvm_core::Edge>,
+}
+
+fn linked_peers() -> Vec<LinkedPeer> {
+    let mut ordered: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Ok(ControlResponse::Peers(peers)) = control_request(ControlRequest::ListPeers) {
+        for peer in peers {
+            if seen.insert(peer.fingerprint_hex.clone()) {
+                ordered.push((peer.name, peer.fingerprint_hex, peer.address));
+            }
+        }
+    }
+    if let Ok(book) =
+        kvm_protocol::pairing::PeerBook::load_or_create(&data_dir())
+    {
+        for peer in &book.peers {
+            if seen.insert(peer.fingerprint_hex.clone()) {
+                ordered.push((
+                    peer.name.clone(),
+                    peer.fingerprint_hex.clone(),
+                    peer.address.clone(),
+                ));
+            }
+        }
+    }
+    let layout = match control_request(ControlRequest::GetConfig) {
+        Ok(ControlResponse::Config(config)) => config.layout,
+        _ => kvm_core::Layout::default(),
+    };
+    ordered
+        .into_iter()
+        .map(|(name, fingerprint, address)| {
+            let side = layout_side(&layout, &fingerprint);
+            LinkedPeer {
+                name,
+                fingerprint,
+                address,
+                side,
+            }
+        })
+        .collect()
+}
+
+/// Where a peer screen sits relative to the self screen, if arranged.
+fn layout_side(layout: &kvm_core::Layout, fingerprint: &str) -> Option<kvm_core::Edge> {
+    let me = layout.self_screen.and_then(|id| layout.screen(id))?;
+    let peer = layout
+        .screens
+        .iter()
+        .find(|screen| screen.peer_fingerprint.as_deref() == Some(fingerprint))?;
+    if peer.x < me.x {
+        Some(kvm_core::Edge::Left)
+    } else if peer.x > me.x {
+        Some(kvm_core::Edge::Right)
+    } else if peer.y < me.y {
+        Some(kvm_core::Edge::Top)
+    } else if peer.y > me.y {
+        Some(kvm_core::Edge::Bottom)
+    } else {
+        None
+    }
+}
+
+fn side_name(side: kvm_core::Edge) -> &'static str {
+    match side {
+        kvm_core::Edge::Left => "LEFT",
+        kvm_core::Edge::Right => "RIGHT",
+        kvm_core::Edge::Top => "TOP",
+        kvm_core::Edge::Bottom => "BOTTOM",
+    }
+}
+
+/// Refresh the Devices arrangement display from live state. Runs on the
+/// poll worker; all blocking calls are fine there.
+fn refresh_arrangement(weak: &slint::Weak<AppWindow>, edge_active: bool) {
+    let peers = linked_peers();
+    let (peer_name, text, peer_on_right) = match peers.first() {
+        None => (
+            String::new(),
+            "No linked screens yet — pair a computer first, then place its screen here.".to_owned(),
+            true,
+        ),
+        Some(peer) => {
+            let label = if peer.name.trim().is_empty() {
+                peer.fingerprint.chars().take(8).collect()
+            } else {
+                peer.name.clone()
+            };
+            match peer.side {
+                Some(side) => (
+                    label.clone(),
+                    format!(
+                        "{label} is on your {} — push past the {} edge to drive it. Push back past the edge to return.",
+                        side_name(side),
+                        edge_name(side)
+                    ),
+                    !matches!(side, kvm_core::Edge::Left),
+                ),
+                None => (
+                    label.clone(),
+                    format!(
+                        "{label} is linked but has no screen yet — press Swap sides to place it."
+                    ),
+                    true,
+                ),
+            }
+        }
+    };
+    set_arrangement(&weak, peer_name, text, peer_on_right, edge_active);
+}
+
+fn set_arrangement(
+    weak: &slint::Weak<AppWindow>,
+    peer_name: String,
+    text: String,
+    peer_on_right: bool,
+    edge_active: bool,
+) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_linked_peer_name(SharedString::from(peer_name));
+                ui.set_arrangement_text(SharedString::from(text));
+                ui.set_peer_on_right(peer_on_right);
+                ui.set_edge_active(edge_active);
+            }
+        }
+    });
+}
+
+/// Resolve a peer's display name and address from either book.
+fn resolve_peer(fingerprint: &str) -> Option<(String, Option<String>)> {
+    for peer in linked_peers() {
+        if peer.fingerprint == fingerprint {
+            return Some((peer.name, peer.address));
+        }
+    }
+    None
+}
+
+/// Place one linked peer on the given side of this machine (the arrangement
+/// UI): pins both books (edge child reads the user book, the daemon serves
+/// the daemon book) and persists the layout to both configs. Saved
+/// arrangements survive restarts; this overwrites only the peer position.
+fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kvm_core::Edge) {
+    let Some((name, address)) = resolve_peer(fingerprint) else {
+        set_status(&weak, "Linked computer not found — pair it first.".into());
+        return;
+    };
+    let current = match control_request(ControlRequest::GetConfig) {
+        Ok(ControlResponse::Config(config)) => config,
+        Ok(other) => {
+            set_status(&weak, format!("Cannot read settings: {other:?}"));
+            return;
+        }
+        Err(error) => {
+            set_status(&weak, format!("Settings unreadable: {error:#}"));
+            return;
+        }
+    };
+    let mut layout = if current.layout.screens.is_empty() {
+        kvm_core::Layout::pair_default(&current.device_name, &name, fingerprint)
+    } else {
+        current.layout.clone()
+    };
+    // The layout may predate the peer screen (paired before arrangement
+    // existed): add it before placing.
+    if !layout
+        .screens
+        .iter()
+        .any(|screen| screen.peer_fingerprint.as_deref() == Some(fingerprint))
+    {
+        layout.screens.push(kvm_core::Screen {
+            id: kvm_core::FIRST_PEER_SCREEN_ID,
+            name: name.clone(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            peer_fingerprint: Some(fingerprint.to_ascii_lowercase()),
+        });
+    }
+    // Repair imports that never named a local screen: prefer a non-peer
+    // screen, else the first screen, so placement always has a "me".
+    let self_missing = layout
+        .self_screen
+        .map_or(true, |id| layout.screen(id).is_none());
+    if self_missing {
+        layout.self_screen = layout
+            .screens
+            .iter()
+            .find(|screen| screen.peer_fingerprint.is_none())
+            .or_else(|| layout.screens.first())
+            .map(|screen| screen.id);
+    }
+    if let Err(error) = layout.place_peer(side) {
+        set_status(&weak, format!("Cannot place the screen there: {error}"));
+        return;
+    }
+    match write_arrangement(layout) {
+        Ok(_) => {
+            ensure_user_pin(fingerprint, &name, address.as_deref());
+            pin_daemon_peer(fingerprint, &name, address.as_deref());
+            ui_log(&format!("arrange: {name} placed on the {}", edge_name(side)));
+            refresh_arrangement(&weak, false);
+            set_status(
+                &weak,
+                format!(
+                    "{} is on your {} — start edge control and push past the {} edge.",
+                    name,
+                    side_name(side),
+                    edge_name(side)
+                ),
+            );
+        }
+        Err(error) => set_status(&weak, format!("Arrangement failed: {error:#}")),
+    }
+}
+
+/// Swap the first linked peer to the opposite side (Left<->Right,
+/// Top<->Bottom). With no placed side yet, this places the peer on the
+/// right (Machine-1 default).
+fn arrange_swap(weak: &slint::Weak<AppWindow>) {
+    let peers = linked_peers();
+    let Some(peer) = peers.first() else {
+        set_status(&weak, "No linked computer to place — pair one first.".into());
+        return;
+    };
+    let next = match peer.side {
+        Some(kvm_core::Edge::Left) => kvm_core::Edge::Right,
+        Some(kvm_core::Edge::Right) => kvm_core::Edge::Left,
+        Some(kvm_core::Edge::Top) => kvm_core::Edge::Bottom,
+        Some(kvm_core::Edge::Bottom) => kvm_core::Edge::Top,
+        None => kvm_core::Edge::Right,
+    };
+    arrange_place_peer(&weak, &peer.fingerprint.clone(), next);
+}
+
 /// Start the supervised `connect` session.
 ///
 /// Identity contract (this was the connection bug): the pairing ceremony
@@ -1364,6 +1855,75 @@ fn spawn_session(
     data_dir: &std::path::Path,
     address: String,
 ) {
+    launch_child(
+        weak,
+        session,
+        pending,
+        data_dir,
+        Some(address.clone()),
+        address,
+        false,
+    );
+}
+
+/// Start edge control: the supervised `connect` child with no address, which
+/// watches the cursor and drives linked screens across the arranged exit
+/// edge. Local input stays local until an actual crossing — unlike fixed
+/// takeover — so starting it can never trap the local keyboard and mouse.
+fn spawn_edge(
+    weak: &slint::Weak<AppWindow>,
+    session: &Arc<Mutex<Option<Session>>>,
+    pending: &Arc<Mutex<Option<PendingPair>>>,
+    data_dir: &std::path::Path,
+) {
+    // A receiver-only machine must not drive others; the daemon would refuse
+    // every handoff. Refuse early with guidance instead of a mysterious
+    // edge mode that never crosses.
+    if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
+        if status.mode == kvm_core::Mode::ClientOnly {
+            set_status(
+                weak,
+                "This computer is set to 'Be controlled', so edge control cannot drive others. Press 'Control other' or 'Both ways' above, then start edge control again.".into(),
+            );
+            return;
+        }
+    }
+    launch_child(
+        weak,
+        session,
+        pending,
+        data_dir,
+        None,
+        "edge mode".to_owned(),
+        true,
+    );
+}
+
+/// Shared supervised-child launcher for fixed takeover (`connect <address>`)
+/// and edge control (`connect` with no address). The child reports
+/// THEKVM_STATUS progress on stderr; the relay turns it into truthful
+/// status. Exactly one supervised child runs at a time: starting one mode
+/// stops the other with a log line, so retries can never stack.
+fn launch_child(
+    weak: &slint::Weak<AppWindow>,
+    session: &Arc<Mutex<Option<Session>>>,
+    pending: &Arc<Mutex<Option<PendingPair>>>,
+    data_dir: &std::path::Path,
+    connect_address: Option<String>,
+    label: String,
+    is_edge: bool,
+) {
+    if session
+        .lock()
+        .ok()
+        .is_some_and(|slot| slot.as_ref().is_some())
+    {
+        ui_log(&format!(
+            "session: stopping the running {} before starting {label}",
+            if is_edge { "takeover" } else { "edge control" }
+        ));
+        stop_session(weak, session, "Previous session stopped");
+    }
     let binary = match daemon_binary() {
         Ok(binary) => binary,
         Err(error) => {
@@ -1372,7 +1932,10 @@ fn spawn_session(
         }
     };
     let mut command = std::process::Command::new(&binary);
-    command.arg("connect").arg(&address);
+    command.arg("connect");
+    if let Some(address) = &connect_address {
+        command.arg(address);
+    }
     command.env("THEKVM_DATA_DIR", data_dir);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
@@ -1392,16 +1955,21 @@ fn spawn_session(
             if let Ok(mut slot) = session.lock() {
                 *slot = Some(Session {
                     child,
-                    address: address.clone(),
+                    address: label.clone(),
                     verified: verified.clone(),
+                    is_edge,
                 });
             }
-            set_session(&weak, Some(address.clone()));
+            set_session(&weak, Some(label.clone()));
             set_status(
                 &weak,
-                format!(
-                    "Connecting to {address}… verifying the other side (a few seconds). Press Disconnect to stop."
-                ),
+                if is_edge {
+                    "Starting edge control… arrange the linked screens first if it keeps waiting.".into()
+                } else {
+                    format!(
+                        "Connecting to {label}… verifying the other side (a few seconds). Press Disconnect to stop."
+                    )
+                },
             );
             if let Some(stderr) = stderr {
                 let weak = weak.clone();
@@ -1409,7 +1977,7 @@ fn spawn_session(
                 let pending = pending.clone();
                 let data_dir = data_dir.to_owned();
                 std::thread::spawn(move || {
-                    relay_session_progress(&weak, stderr, &address, &verified, &session, &pending, data_dir)
+                    relay_session_progress(&weak, stderr, &label, &verified, &session, &pending, data_dir, is_edge)
                 });
             } else {
                 ui_log("session: child stderr unavailable; connection cannot be verified");
@@ -1439,6 +2007,7 @@ fn relay_session_progress(
     session: &Arc<Mutex<Option<Session>>>,
     pending: &Arc<Mutex<Option<PendingPair>>>,
     data_dir: std::path::PathBuf,
+    is_edge: bool,
 ) {
     use std::io::BufRead as _;
     let reader = std::io::BufReader::new(stderr);
@@ -1457,6 +2026,19 @@ fn relay_session_progress(
         if kind == "waiting" && detail.contains("peer is not paired") {
             not_paired_streak += 1;
             if not_paired_streak == 3 {
+                // Edge mode has no automatic re-pair path: it drives whatever
+                // the books trust, so a refusal means the arrangement outlived
+                // the trust. Stop honestly instead of looping or hijacking
+                // the fixed-takeover ceremony.
+                if is_edge {
+                    ui_log("edge: peer reports us unknown 3x; stopping edge mode for a fresh pairing");
+                    stop_session(weak, session, "Edge mode stopped");
+                    set_status(
+                        weak,
+                        format!("{address} doesn't recognize this computer — repeat the code check under Connect, then start edge control again."),
+                    );
+                    return;
+                }
                 if unpin_peer_by_address(&data_dir, address) {
                     ui_log(
                         "session: peer reports us unknown 3x; restarting pairing automatically",
@@ -1484,6 +2066,19 @@ fn relay_session_progress(
                     "Connected to {address} — your keyboard and mouse drive it now. It retries automatically until you Disconnect."
                 )
             }
+            "edge-ready" => {
+                verified.store(true, std::sync::atomic::Ordering::Relaxed);
+                set_driving(weak, String::new());
+                edge_ready_text()
+            }
+            "driving" => {
+                set_driving(weak, detail.to_owned());
+                format!("Driving {detail} — push back past the edge to return here. Stop anytime with Disconnect.")
+            }
+            "local" => {
+                set_driving(weak, String::new());
+                "Edge control is on — this computer. Push past the arranged edge to drive the other screen.".into()
+            }
             "waiting" => {
                 if detail.contains("peer is not paired") {
                     // Half-finished pairing: this computer pinned the peer
@@ -1502,7 +2097,13 @@ fn relay_session_progress(
                     format!("Still reaching {address}… ({detail})")
                 }
             }
-            "dialing" => format!("Contacting {address}…"),
+            "dialing" => {
+                if detail == "edge" {
+                    "Starting edge control…".into()
+                } else {
+                    format!("Contacting {address}…")
+                }
+            }
             "ended" => format!("Connection to {address} ended ({detail})"),
             _ => continue,
         };
@@ -1533,6 +2134,7 @@ fn stop_session(
         None => message.to_owned(),
     };
     set_session(&weak, None);
+    set_driving(&weak, String::new());
     set_status(&weak, message);
 }
 
@@ -2060,6 +2662,7 @@ fn mirror_user_config(
     mode: Mode,
     allow_lock_screen: bool,
     clipboard_enabled: bool,
+    layout: Option<kvm_core::Layout>,
 ) {
     let path = data_dir().join("config.json");
     let mut config = kvm_core::Config::load(&path).unwrap_or_default();
@@ -2070,6 +2673,12 @@ fn mirror_user_config(
     config.allow_lock_screen_control = allow_lock_screen;
     config.clipboard_enabled = clipboard_enabled;
     config.auto_connect_address = None;
+    // A supplied layout replaces the user's topology (arrangement UI,
+    // auto-layout); omission preserves whatever is there so role presses
+    // can never wipe the screen arrangement.
+    if let Some(layout) = layout {
+        config.layout = layout;
+    }
     let _ = config.save(&path);
 }
 
@@ -2090,6 +2699,52 @@ fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
                         ui.set_session_text(SharedString::from("Not connected"));
                     }
                 }
+            }
+        }
+    });
+}
+
+/// Plain-language edge direction for status text.
+fn edge_name(edge: kvm_core::Edge) -> &'static str {
+    match edge {
+        kvm_core::Edge::Left => "left",
+        kvm_core::Edge::Right => "right",
+        kvm_core::Edge::Top => "top",
+        kvm_core::Edge::Bottom => "bottom",
+    }
+}
+
+/// Status sentence when edge control becomes ready, naming the actual exit
+/// edge and peer from the live daemon config (this runs on a worker thread,
+/// so a blocking control call is fine). Never claims an edge that isn't
+/// arranged: without a layout it says exactly that.
+fn edge_ready_text() -> String {
+    match control_request(ControlRequest::GetConfig) {
+        Ok(ControlResponse::Config(config)) => {
+            let peer = config
+                .layout
+                .screens
+                .iter()
+                .find(|screen| screen.peer_fingerprint.is_some());
+            match (config.layout.peer_exit_edge(), peer) {
+                (Some(edge), Some(screen)) => format!(
+                    "Edge control is on — push past the {} edge to drive {}. Push back past the edge to return here.",
+                    edge_name(edge),
+                    screen.name
+                ),
+                _ => "Edge control is on, but no linked screen is arranged yet — open Devices, place the other screen, and push past an edge.".into(),
+            }
+        }
+        _ => "Edge control is on.".into(),
+    }
+}
+
+fn set_driving(weak: &slint::Weak<AppWindow>, text: String) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_driving_text(SharedString::from(text));
             }
         }
     });
@@ -2203,7 +2858,7 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::pair_status_text;
+    use super::{edge_name, layout_side, pair_status_text};
 
     #[test]
     fn compare_screen_names_peer_and_code() {
@@ -2218,6 +2873,26 @@ mod tests {
         let text = pair_status_text("mint", "862077", true);
         assert!(text.contains("not accepted"), "{text}");
         assert!(text.contains("862077"), "{text}");
+    }
+
+    #[test]
+    fn edge_names_are_plain_words() {
+        assert_eq!(edge_name(kvm_core::Edge::Left), "left");
+        assert_eq!(edge_name(kvm_core::Edge::Right), "right");
+        assert_eq!(edge_name(kvm_core::Edge::Top), "top");
+        assert_eq!(edge_name(kvm_core::Edge::Bottom), "bottom");
+    }
+
+    #[test]
+    fn layout_side_reports_peer_position() {
+        let fp = "ee".repeat(32);
+        let layout = kvm_core::Layout::pair_default("me", "peer", &fp);
+        assert_eq!(layout_side(&layout, &fp), Some(kvm_core::Edge::Right));
+        assert_eq!(layout_side(&layout, &"ff".repeat(32)), None);
+        let mirror = kvm_core::Layout::pair_mirror("me", "peer", &fp);
+        assert_eq!(layout_side(&mirror, &fp), Some(kvm_core::Edge::Left));
+        let empty = kvm_core::Layout::default();
+        assert_eq!(layout_side(&empty, &fp), None);
     }
 }
 

@@ -15,6 +15,11 @@ export component AppWindow inherits Window {
     in property <bool> session-active: false;
     in-out property <string> fingerprint: "…";
     in-out property <string> peer-list: "No trusted computers";
+    in-out property <string> linked-peer-name: "";
+    in-out property <string> arrangement-text: "No linked screens yet — pair a computer first.";
+    in-out property <bool> peer-on-right: true;
+    in-out property <bool> edge-active: false;
+    in-out property <string> driving-text: "";
     in-out property <string> revoke-fingerprint: "";
     in-out property <string> pending-peer-fingerprint: "";
     in-out property <string> pending-peer-name: "";
@@ -55,6 +60,8 @@ export component AppWindow inherits Window {
     callback approve-incoming-pairing(string);
     callback reject-incoming-pairing(string);
     callback revoke-peer(string);
+    callback swap-sides();
+    callback set-edge-mode(bool);
     callback open-log-folder();
     callback apply-config(bool, int, string, string, bool);
     callback import-layout(string);
@@ -416,6 +423,105 @@ export component AppWindow inherits Window {
                             enabled: revoke.text != "";
                             clicked => { revoke-peer(revoke.text); }
                         }
+                    }
+                    Rectangle { height: 1px; background: #262626; }
+                    Text { text: "Linked screens (edge control)"; color: white; font-size: 16px; font-weight: 700; }
+                    Text {
+                        text: arrangement-text;
+                        color: #9ca3af;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    // Screen icons with names: this computer and the linked
+                    // peer, placed left/right as arranged. The exit edge is
+                    // the facing edge — the outer edges do nothing.
+                    HorizontalLayout {
+                        spacing: 12px;
+                        visible: peer-on-right;
+                        Rectangle {
+                            width: 130px;
+                            height: 92px;
+                            background: #14532d;
+                            border-radius: 8px;
+                            border-width: 2px;
+                            border-color: #22c55e;
+                            VerticalLayout {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "THIS PC"; color: #bbf7d0; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
+                                Text { text: device-name == "" ? "…" : device-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
+                            }
+                        }
+                        Text { text: "▶"; color: #22c55e; font-size: 20px; font-weight: 800; vertical-alignment: center; }
+                        Rectangle {
+                            width: 130px;
+                            height: 92px;
+                            background: #1c1917;
+                            border-radius: 8px;
+                            border-width: 2px;
+                            border-color: #57534e;
+                            VerticalLayout {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "LINKED"; color: #d6d3d1; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
+                                Text { text: linked-peer-name == "" ? "…" : linked-peer-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        visible: !peer-on-right;
+                        Rectangle {
+                            width: 130px;
+                            height: 92px;
+                            background: #1c1917;
+                            border-radius: 8px;
+                            border-width: 2px;
+                            border-color: #57534e;
+                            VerticalLayout {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "LINKED"; color: #d6d3d1; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
+                                Text { text: linked-peer-name == "" ? "…" : linked-peer-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
+                            }
+                        }
+                        Text { text: "◀"; color: #22c55e; font-size: 20px; font-weight: 800; vertical-alignment: center; }
+                        Rectangle {
+                            width: 130px;
+                            height: 92px;
+                            background: #14532d;
+                            border-radius: 8px;
+                            border-width: 2px;
+                            border-color: #22c55e;
+                            VerticalLayout {
+                                padding: 6px;
+                                spacing: 2px;
+                                Text { text: "THIS PC"; color: #bbf7d0; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
+                                Text { text: device-name == "" ? "…" : device-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Button {
+                            text: "Swap sides";
+                            enabled: linked-peer-name != "";
+                            clicked => { swap-sides(); }
+                        }
+                        Button {
+                            text: edge-active ? "Stop edge control" : "Start edge control";
+                            primary: true;
+                            enabled: linked-peer-name != "";
+                            clicked => { set-edge-mode(!edge-active); }
+                        }
+                    }
+                    Text {
+                        visible: driving-text != "";
+                        text: driving-text;
+                        color: #22c55e;
+                        font-size: 13px;
+                        font-weight: 700;
+                        wrap: word-wrap;
                     }
                 }
             }
