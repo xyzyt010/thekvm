@@ -373,6 +373,11 @@ where
                 }
             }
         }
+        ControlRequest::EndLink { link_id } => {
+            crate::service::end_link(link_id);
+            crate::service::audit_event(&data_dir, &format!("link-ended link_id={link_id}"));
+            ControlResponse::LinkEnded { link_id }
+        }
         ControlRequest::PinPeer {
             fingerprint_hex,
             node_name,

@@ -169,6 +169,14 @@ pub struct Hello {
     /// ever see downgraded detent `Wheel` events.
     #[serde(default)]
     pub smooth_scroll: bool,
+    /// Administrative link epoch both sides share for this link: the UI that
+    /// the user pressed Connect on mints it, and the station side learns it
+    /// from the inbound session and dials back with the same value. Either
+    /// side's Disconnect bans the epoch locally, so a stale redial is
+    /// rejected instead of resurrecting a dead link as a zombie. Absent on
+    /// older peers (no banning possible across versions).
+    #[serde(default)]
+    pub link_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -627,6 +635,33 @@ mod tests {
     }
 
     #[test]
+    fn link_epoch_defaults_for_older_hello_frames() {
+        let hello: WireMessage = serde_json::from_str(
+            r#"{"Hello":{"node_name":"legacy","mode":"Bidirectional","lock_screen_requested":false,"clipboard_enabled":false,"smooth_scroll":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            hello,
+            WireMessage::Hello(Hello {
+                smooth_scroll: true,
+                link_id: None,
+                ..
+            })
+        ));
+        let linked: WireMessage = serde_json::from_str(
+            r#"{"Hello":{"node_name":"n","mode":"Bidirectional","lock_screen_requested":false,"link_id":12345}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            linked,
+            WireMessage::Hello(Hello {
+                link_id: Some(12345),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn invalid_geometry_is_rejected_before_transport() {
         assert!(validate_message(&WireMessage::Hello(Hello {
             node_name: "node".into(),
@@ -639,6 +674,7 @@ mod tests {
                 height: 1080,
             }),
             smooth_scroll: false,
+            link_id: None,
         }))
         .is_err());
     }
@@ -652,6 +688,7 @@ mod tests {
             clipboard_enabled: false,
             screen_geometry: None,
             smooth_scroll: false,
+            link_id: None,
         }))
         .is_err());
         assert!(validate_message(&WireMessage::PairRequest {

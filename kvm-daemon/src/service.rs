@@ -41,6 +41,8 @@ pub(crate) struct InboundLink {
     pub fingerprint_hex: String,
     pub node_name: String,
     pub address: String,
+    /// Administrative epoch from the dialer's Hello (None for older peers).
+    pub link_id: Option<u64>,
 }
 
 type LinkRegistry = Arc<std::sync::Mutex<HashMap<String, (InboundLink, tokio::sync::watch::Sender<bool>)>>>;
@@ -62,6 +64,7 @@ pub(crate) fn register_inbound_link(
     fingerprint_hex: &str,
     node_name: &str,
     address: &str,
+    link_id: Option<u64>,
 ) -> (u64, tokio::sync::watch::Receiver<bool>) {
     let id = LINK_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (drop_tx, drop_rx) = tokio::sync::watch::channel(false);
@@ -74,6 +77,7 @@ pub(crate) fn register_inbound_link(
                     fingerprint_hex: fingerprint_hex.to_owned(),
                     node_name: node_name.to_owned(),
                     address: address.to_owned(),
+                    link_id,
                 },
                 drop_tx,
             ),
@@ -115,11 +119,63 @@ pub(crate) fn list_inbound_links() -> Vec<kvm_protocol::control::ActiveSession> 
                 fingerprint_hex: link.fingerprint_hex.clone(),
                 node_name: link.node_name.clone(),
                 address: link.address.clone(),
+                link_id: link.link_id,
             })
             .collect()
     } else {
         Vec::new()
     }
+}
+
+/// Panic-safe inbound registration: dropping the guard unregisters, so even
+/// a panicking session task can never leave a ghost entry behind. A ghost
+/// fools the station UI into dialling a dead link (and showing it) forever.
+struct InboundLinkGuard {
+    fingerprint_hex: String,
+    id: u64,
+}
+
+impl Drop for InboundLinkGuard {
+    fn drop(&mut self) {
+        remove_inbound_link(&self.fingerprint_hex, self.id);
+    }
+}
+
+/// Link epochs the local user ended via Disconnect. A dial carrying a
+/// banned epoch is rejected instead of served, so a stale redial can never
+/// resurrect a dead link as a zombie. Bounded: past 32 the set resets (a
+/// fresh Connect always mints a fresh epoch, so old bans are worthless).
+static ENDED_LINKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+fn ended_link_ids() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
+    ENDED_LINKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+pub(crate) fn end_link(link_id: u64) {
+    if let Ok(mut ended) = ended_link_ids().lock() {
+        if ended.len() >= 32 {
+            ended.clear();
+        }
+        ended.insert(link_id);
+    }
+}
+
+fn link_ended(link_id: u64) -> bool {
+    ended_link_ids()
+        .lock()
+        .ok()
+        .is_some_and(|ended| ended.contains(&link_id))
+}
+
+/// True when the dial failed because the peer deliberately ended this link
+/// epoch (Disconnect there). Callers exit instead of retrying: a banned
+/// link must stay dead. Matches only our own ban wording (lowercase), never
+/// the UI's display texts.
+fn is_link_ended_rejection(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("link ended"))
 }
 
 /// Wait for a process-level stop request when the daemon is running outside a
@@ -842,6 +898,7 @@ pub async fn send_test(address: &str, usage: u16) -> Result<()> {
             mode: config.mode,
             clipboard_enabled: false,
             screen_geometry: local_screen_geometry(&config.layout),
+            link_id: None,
         },
         None,
     )
@@ -893,6 +950,7 @@ pub async fn capture(address: &str) -> Result<()> {
             mode: config.mode,
             clipboard_enabled: config.clipboard_enabled,
             screen_geometry: local_screen_geometry(&config.layout),
+            link_id: None,
         },
         None,
         &data_dir(),
@@ -933,7 +991,12 @@ pub async fn capture(address: &str) -> Result<()> {
 /// edge is crossed, and crossings drive the linked peer. Nothing ever
 /// freezes: both computers stay usable, both directions, one shared cursor
 /// each way. Drive episodes dial fresh per crossing over the verified link.
-pub async fn connect(address: Option<&str>) -> Result<()> {
+///
+/// `link_id` is the administrative epoch both sides share (minted by the UI
+/// that the user pressed Connect on; the station side dials back with the
+/// same value). A rejection naming a banned epoch ends the child instead of
+/// retrying: the other side ended the link on purpose.
+pub async fn connect(address: Option<&str>, link_id: Option<u64>) -> Result<()> {
     let Some(address) = address else {
         return connect_topology(None).await;
     };
@@ -957,6 +1020,7 @@ pub async fn connect(address: Option<&str>) -> Result<()> {
                 mode: config.mode,
                 clipboard_enabled: config.clipboard_enabled,
                 screen_geometry: local_screen_geometry(&config.layout),
+                link_id,
             },
             None,
             &data_dir(),
@@ -970,12 +1034,20 @@ pub async fn connect(address: Option<&str>) -> Result<()> {
                 let link = TopologyLink {
                     fingerprint: peer_fingerprint(&conn)?.to_ascii_lowercase(),
                     address: address.clone(),
+                    link_id,
                 };
                 tracing::info!(peer = %address, "linked input session");
                 eprintln!("THEKVM_STATUS established {address}");
                 return connect_topology(Some(link)).await;
             }
             Err(error) => {
+                // A banned epoch is a deliberate remote Disconnect, not an
+                // outage: exit instead of retrying forever, or the dead link
+                // resurrects as a zombie the moment the peer comes back.
+                if is_link_ended_rejection(&error) {
+                    eprintln!("THEKVM_STATUS ended link ended by the other side");
+                    return Ok(());
+                }
                 tracing::warn!(%error, peer = %address, "peer unavailable; retrying");
                 eprintln!("THEKVM_STATUS waiting {error:#}");
             }
@@ -1038,6 +1110,7 @@ async fn run_windows_service_controller(
                     mode,
                     clipboard_enabled: false,
                     screen_geometry,
+                    link_id: None,
                 },
                 None,
             )
@@ -1268,6 +1341,7 @@ async fn connect_topology(link: Option<TopologyLink>) -> Result<()> {
     let mut latest_clipboard: Option<String> = None;
     let mut discarded_event_barrier = 0u64;
     let mut last_transfer: Option<std::time::Instant> = None;
+    let mut last_failed_episode: Option<std::time::Instant> = None;
     let mut sequence = 0u64;
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1376,6 +1450,7 @@ async fn connect_topology(link: Option<TopologyLink>) -> Result<()> {
                             sequence: &mut sequence,
                             clipboard_revision: &mut clipboard_revision,
                             dir: &dir,
+                            link_id: link.as_ref().and_then(|link| link.link_id),
                         }).await {
                             Ok(session) => {
                                 capture_control.set_exclusive(true)?;
@@ -1388,6 +1463,13 @@ async fn connect_topology(link: Option<TopologyLink>) -> Result<()> {
                                 eprintln!("THEKVM_STATUS driving {name}");
                             }
                             Err(error) => {
+                                // A banned epoch ends the child (the peer
+                                // disconnected on purpose); anything else
+                                // just returns control locally.
+                                if is_link_ended_rejection(&error) {
+                                    eprintln!("THEKVM_STATUS ended link ended by the other side");
+                                    return Err(error);
+                                }
                                 let _ = router.restore_local(target);
                                 let (x, y) = router.cursor_position();
                                 let _ = capture_control.warp_cursor(x, y);
@@ -1442,6 +1524,7 @@ async fn connect_topology(link: Option<TopologyLink>) -> Result<()> {
                     active: &mut active,
                     link: link.as_ref(),
                     last_transfer: &mut last_transfer,
+                    last_failed_episode: &mut last_failed_episode,
                     node_name: &config.device_name,
                     sequence: &mut sequence,
                     request_lock_screen: config.allow_lock_screen_control,
@@ -1472,6 +1555,7 @@ async fn connect_topology(link: Option<TopologyLink>) -> Result<()> {
                     active: &mut active,
                     link: link.as_ref(),
                     last_transfer: &mut last_transfer,
+                    last_failed_episode: &mut last_failed_episode,
                     node_name: &config.device_name,
                     sequence: &mut sequence,
                     request_lock_screen: config.allow_lock_screen_control,
@@ -1587,6 +1671,9 @@ impl TopologySession {
 struct TopologyLink {
     fingerprint: String,
     address: String,
+    /// Administrative epoch both sides share (None for legacy topology
+    /// children: no banning applies to them).
+    link_id: Option<u64>,
 }
 
 /// One warm, verified QUIC association to the linked peer, kept across
@@ -1634,11 +1721,38 @@ fn store_warm_link(connection: &quinn::Connection, fingerprint: &str) {
     }
 }
 
-/// MWB lastJump parity: ignore a new edge transfer within 150ms of the last
+/// MWB lastJump parity: ignore a new edge transfer within 100ms of the last
 /// completed one, so two facing edges can never ping-pong the cursor
 /// forever. Pure so the determinism is unit-tested.
 fn transfer_debounced(last_transfer: Option<std::time::Instant>) -> bool {
-    last_transfer.is_some_and(|when| when.elapsed() < Duration::from_millis(150))
+    last_transfer.is_some_and(|when| when.elapsed() < Duration::from_millis(100))
+}
+
+/// Cooldown after a FAILED episode dial: the peer is unreachable, busy, or
+/// gone, and the cursor sits at the edge pouring motion events in — without
+/// a pause every one of them would open a full QUIC handshake (the dial
+/// storm that flapped control and stuttered the cursor). Pure so the
+/// determinism is unit-tested.
+fn episode_cooling_down(last_failed_episode: Option<std::time::Instant>) -> bool {
+    last_failed_episode.is_some_and(|when| when.elapsed() < Duration::from_secs(1))
+}
+
+/// Step the router cursor a few pixels inside the screen after a refused
+/// handoff (Deskflow `avoidJumpZone` parity): without it the cursor rests
+/// one pixel from the edge and the very next motion event re-crosses, so a
+/// dead peer flaps control local→driving→local at event rate. With it the
+/// user simply keeps pushing — a fresh, deliberate crossing retries.
+fn park_inside(router: &mut EdgeRouter, edge: kvm_core::Edge) {
+    const PARK_PX: u32 = 8;
+    let (mut x, mut y) = router.cursor_position();
+    match edge {
+        kvm_core::Edge::Left => x = x.saturating_add(PARK_PX),
+        kvm_core::Edge::Right => x = x.saturating_sub(PARK_PX),
+        kvm_core::Edge::Top => y = y.saturating_add(PARK_PX),
+        kvm_core::Edge::Bottom => y = y.saturating_sub(PARK_PX),
+    }
+    // Best effort: a failure here just leaves the cursor where it was.
+    let _ = router.set_local_cursor_position(x, y);
 }
 
 struct TopologyEventContext<'a> {
@@ -1649,6 +1763,7 @@ struct TopologyEventContext<'a> {
     active: &'a mut Option<TopologySession>,
     link: Option<&'a TopologyLink>,
     last_transfer: &'a mut Option<std::time::Instant>,
+    last_failed_episode: &'a mut Option<std::time::Instant>,
     node_name: &'a str,
     sequence: &'a mut u64,
     request_lock_screen: bool,
@@ -1673,6 +1788,7 @@ async fn handle_topology_event(
         active,
         link,
         last_transfer,
+        last_failed_episode,
         node_name,
         sequence,
         request_lock_screen,
@@ -1754,6 +1870,7 @@ async fn handle_topology_event(
             target_x,
             target_y,
             event,
+            edge,
             ..
         } => {
             if active.is_some() {
@@ -1769,16 +1886,23 @@ async fn handle_topology_event(
                 if !linked {
                     tracing::debug!(?target, "edge faces an unlinked screen; staying local");
                     let _ = router.restore_local(target);
-                    let (x, y) = router.cursor_position();
-                    let _ = capture_control.warp_cursor(x, y);
+                    park_inside(router, edge);
                     return Ok(());
                 }
             }
             // MWB lastJump debounce: let the last transfer settle first.
             if transfer_debounced(*last_transfer) {
                 let _ = router.restore_local(target);
-                let (x, y) = router.cursor_position();
-                let _ = capture_control.warp_cursor(x, y);
+                park_inside(router, edge);
+                return Ok(());
+            }
+            // Cooldown after a failed episode: the cursor sits at the edge
+            // pouring motion in, and every event would otherwise open a
+            // full QUIC handshake — the dial storm that flapped control.
+            // The user simply keeps pushing; a fresh crossing retries.
+            if episode_cooling_down(*last_failed_episode) {
+                let _ = router.restore_local(target);
+                park_inside(router, edge);
                 return Ok(());
             }
             let snapshot = capture_control.snapshot();
@@ -1801,6 +1925,7 @@ async fn handle_topology_event(
                 clipboard_revision,
                 sequence,
                 dir,
+                link_id: link.and_then(|link| link.link_id),
             })
             .await
             {
@@ -1816,10 +1941,17 @@ async fn handle_topology_event(
                     eprintln!("THEKVM_STATUS driving {name}");
                 }
                 Err(error) => {
+                    // A banned epoch is a deliberate remote Disconnect: end
+                    // the child so the UI reports it, instead of warning
+                    // locally and retrying a dead link forever.
+                    if is_link_ended_rejection(&error) {
+                        eprintln!("THEKVM_STATUS ended link ended by the other side");
+                        return Err(error);
+                    }
+                    *last_failed_episode = Some(std::time::Instant::now());
                     let _ = capture_control.set_exclusive(false);
                     let _ = router.restore_local(target);
-                    let (x, y) = router.cursor_position();
-                    let _ = capture_control.warp_cursor(x, y);
+                    park_inside(router, edge);
                     tracing::warn!(%error, ?target, "topology target unavailable; control remains local");
                 }
             }
@@ -1847,6 +1979,8 @@ struct TopologyOpen<'a> {
     clipboard_revision: &'a mut u64,
     sequence: &'a mut u64,
     dir: &'a std::path::Path,
+    /// Administrative epoch both sides share (None for legacy children).
+    link_id: Option<u64>,
 }
 
 async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySession> {
@@ -1869,6 +2003,7 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         clipboard_revision,
         sequence,
         dir,
+        link_id,
     } = request;
     let screen = router
         .screen(target)
@@ -1884,6 +2019,7 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         mode,
         clipboard_enabled,
         screen_geometry: local_geometry,
+        link_id,
     };
     // Warm first: an episode on the live association skips endpoint setup
     // and the QUIC handshake, so the crossing feels instant. A stale
@@ -2800,6 +2936,25 @@ async fn handle_connection(
                 reject(&mut send, "peer is not paired").await?;
                 bail!("untrusted peer fingerprint {peer_fingerprint}");
             }
+            // A banned epoch is a deliberate local Disconnect: reject the
+            // stale redial so the dead link stays dead instead of
+            // resurrecting as a zombie. The dialer's child exits on this
+            // (it never retries a ban).
+            if hello.link_id.is_some_and(link_ended) {
+                reject(
+                    &mut send,
+                    "link ended by this computer; press Connect for a fresh link",
+                )
+                .await?;
+                audit_event(
+                    audit_dir,
+                    &format!(
+                        "session-rejected peer={peer_fingerprint} remote={} reason=link_ended",
+                        conn.remote_address(),
+                    ),
+                );
+                bail!("peer dialed banned link epoch {:?}", hello.link_id);
+            }
             if !mode_allows_incoming(config.mode) {
                 reject(&mut send, "this node is configured as controller-only").await?;
                 bail!("incoming control is disabled by controller-only mode");
@@ -2908,11 +3063,23 @@ async fn handle_connection(
                     &hello.node_name,
                     conn.remote_address(),
                 ),
+                hello.link_id,
             );
             drop(peer_book);
+            // Panic-safe: the guard unregisters even when the session below
+            // dies abnormally, so no ghost entry can fool the station UI.
+            let _link_guard = InboundLinkGuard {
+                fingerprint_hex: peer_fingerprint.clone(),
+                id: link_id,
+            };
             let mut seen_sequences = BTreeSet::new();
             let mut motion_sequence = MotionSequence::default();
             let mut last_activity = Instant::now();
+            // Per-session input census for the end-of-session journal line:
+            // proves what actually arrived (motion vs detent vs smooth).
+            let mut motion_count = 0u64;
+            let mut wheel_count = 0u64;
+            let mut smooth_count = 0u64;
             let mut remote_screen = None;
             let mut remote_cursor = None;
             let mut clipboard_revision = 0u64;
@@ -2931,6 +3098,12 @@ async fn handle_connection(
                                 injector.sync_state(&state)?;
                             }
                             WireMessage::Input(packet) => {
+                                match packet.event {
+                                    InputEvent::MouseMove { .. } => motion_count += 1,
+                                    InputEvent::Wheel(_) => wheel_count += 1,
+                                    InputEvent::SmoothWheel { .. } => smooth_count += 1,
+                                    _ => {}
+                                }
                                 if process_remote_input(
                                     DatagramInput {
                                         sequence: packet.sequence,
@@ -3010,6 +3183,12 @@ async fn handle_connection(
                         last_activity = Instant::now();
                         injector.ensure_session()?;
                         let packet = decode_input_datagram(&payload)?;
+                        match packet.event {
+                            InputEvent::MouseMove { .. } => motion_count += 1,
+                            InputEvent::Wheel(_) => wheel_count += 1,
+                            InputEvent::SmoothWheel { .. } => smooth_count += 1,
+                            _ => {}
+                        }
                         if process_remote_input(
                             packet,
                             &config,
@@ -3076,7 +3255,16 @@ async fn handle_connection(
                     }
                 }
             };
-            remove_inbound_link(&peer_fingerprint, link_id);
+            // The guard below unregisters (panic-safe); the census names
+            // what actually arrived over the wire this session.
+            tracing::info!(
+                peer = %peer_fingerprint,
+                motion = motion_count,
+                wheel = wheel_count,
+                smooth = smooth_count,
+                "input session ended",
+            );
+            drop(_link_guard);
             if let Err(error) = session_result {
                 let _ = injector.release_all();
                 return Err(error);
@@ -3572,6 +3760,9 @@ struct ConnectPolicy<'a> {
     mode: Mode,
     clipboard_enabled: bool,
     screen_geometry: Option<ScreenGeometry>,
+    /// Administrative link epoch both sides share (None for the fixed-peer
+    /// diagnostic commands and older callers: no banning applies to them).
+    link_id: Option<u64>,
 }
 
 impl Clone for ConnectPolicy<'_> {
@@ -3811,6 +4002,7 @@ async fn open_episode_stream(
         mode,
         clipboard_enabled,
         screen_geometry,
+        link_id,
     } = policy;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(
@@ -3823,6 +4015,7 @@ async fn open_episode_stream(
             screen_geometry,
             // This side captures and understands touchpad smooth scroll.
             smooth_scroll: true,
+            link_id,
         }),
     )
     .await?;
@@ -4201,7 +4394,49 @@ mod tests {
     }
 
     #[test]
-    fn transfer_debounce_settles_facing_edges() {
+    fn ended_link_epochs_are_banned_until_replaced() {
+        let id = 0xC0FF_EE00_u64;
+        assert!(!link_ended(id));
+        end_link(id);
+        assert!(link_ended(id));
+        assert!(!link_ended(id + 1));
+        assert!(is_link_ended_rejection(&anyhow::anyhow!(
+            "peer rejected session: link ended by this computer; press Connect for a fresh link"
+        )));
+        assert!(!is_link_ended_rejection(&anyhow::anyhow!(
+            "peer rejected session: peer is not paired"
+        )));
+        // Display-case text never matches (the matcher is lowercase-only).
+        assert!(!is_link_ended_rejection(&anyhow::anyhow!("Link ended")));
+    }
+
+    #[test]
+    fn failed_handoff_parks_the_cursor_inside_and_cools_down() {
+        use kvm_core::{InputEvent, RoutedEvent};
+        let mut router = EdgeRouter::new(kvm_core::Layout::pair_default(
+            "me",
+            "peer",
+            &"ab".repeat(32),
+        ))
+        .unwrap();
+        let handoff = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(matches!(handoff, RoutedEvent::Handoff { .. }));
+        let target = router.active_remote().unwrap();
+        router.restore_local(target).unwrap();
+        let (x_before, y_before) = router.cursor_position();
+        park_inside(&mut router, kvm_core::Edge::Right);
+        let (x_after, y_after) = router.cursor_position();
+        assert_eq!(x_after + 8, x_before);
+        assert_eq!(y_after, y_before);
+        assert!(!episode_cooling_down(None));
+        assert!(episode_cooling_down(Some(std::time::Instant::now())));
+        assert!(!episode_cooling_down(Some(
+            std::time::Instant::now() - Duration::from_secs(2)
+        )));
+    }
+
+    #[test]
+    fn transfer_debounce_matches_mwb_last_jump() {
         // No transfer yet: drive.
         assert!(!transfer_debounced(None));
         let just = std::time::Instant::now();
@@ -4220,7 +4455,7 @@ mod tests {
         assert!(!drop_inbound_link(&fp));
         assert!(list_inbound_links().iter().all(|s| s.fingerprint_hex != fp));
         // Register: listed with name and address, droppable.
-        let (id, _rx) = register_inbound_link(&fp, "mint", "192.168.1.7:42110");
+        let (id, _rx) = register_inbound_link(&fp, "mint", "192.168.1.7:42110", Some(7));
         let listed: Vec<_> = list_inbound_links()
             .into_iter()
             .filter(|s| s.fingerprint_hex == fp)
@@ -4228,6 +4463,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].node_name, "mint");
         assert_eq!(listed[0].address, "192.168.1.7:42110");
+        assert_eq!(listed[0].link_id, Some(7));
         assert!(drop_inbound_link(&fp));
         // Wrong id must not unregister (a redialed successor survives).
         remove_inbound_link(&fp, id + 999);

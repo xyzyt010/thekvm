@@ -66,6 +66,13 @@ pub enum ControlRequest {
     DropSession {
         fingerprint_hex: String,
     },
+    /// Ban one administrative link epoch: afterwards this daemon rejects
+    /// every session carrying that `link_id` (see `Hello`), so a stale
+    /// redial can never resurrect a link the local user ended. Trust is
+    /// untouched — a fresh Connect mints a fresh epoch and works. One side's
+    /// Disconnect bans + drops; the peer learns from the rejection and its
+    /// child exits instead of retrying forever.
+    EndLink { link_id: u64 },
     SetConfig {
         /// Optional for compatibility with older desktop UIs. When supplied,
         /// it becomes the node name advertised and sent in handshakes.
@@ -126,6 +133,10 @@ pub struct ActiveSession {
     pub fingerprint_hex: String,
     pub node_name: String,
     pub address: String,
+    /// Administrative link epoch from the dialer's Hello. The station UI
+    /// dials its half back with the same value; absent on older daemons.
+    #[serde(default)]
+    pub link_id: Option<u64>,
 }
 
 /// A remote identity that completed the network half of pairing and is
@@ -155,6 +166,7 @@ pub enum ControlResponse {
     Pinned { fingerprint_hex: String },
     Applied { restart_required: bool },
     SessionDropped { fingerprint_hex: String },
+    LinkEnded { link_id: u64 },
     Error { message: String },
 }
 

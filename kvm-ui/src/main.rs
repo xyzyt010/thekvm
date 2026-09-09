@@ -70,6 +70,26 @@ struct Session {
     /// A user Connect always supersedes a dial-back; a dial-back never
     /// blocks one.
     dialback: bool,
+    /// Administrative link epoch both sides share: minted fresh on every
+    /// user Connect, learned from the inbound session on dial-back. Our
+    /// Disconnect bans it locally so a stale redial can never resurrect
+    /// the dead link as a zombie.
+    link_id: Option<u64>,
+}
+
+/// Mint one administrative link epoch: nanos since the Unix epoch folded
+/// with the process id and a salt counter. Uniqueness only needs to beat
+/// the daemon's small ended-set, so wall-clock entropy is plenty — no rng
+/// dependency. The counter covers two mints inside one clock tick.
+fn mint_link_id() -> u64 {
+    static SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let salt = SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    nanos ^ ((std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        ^ salt.wrapping_mul(0xBF58_476D_1CE4_E5B9)
 }
 
 fn main() -> Result<()> {
@@ -538,17 +558,31 @@ fn main() -> Result<()> {
     let weak = ui.as_weak();
     let disconnect_session = session_state.clone();
     ui.on_disconnect(move || {
+        // Ban our epoch FIRST so nothing can resurrect the link while we
+        // tear it down: a stale redial (either direction) is rejected by
+        // the daemon instead of rebuilding a zombie. Trust is untouched —
+        // the next Connect mints a fresh epoch.
+        let outbound_link = disconnect_session
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(|session| session.link_id));
         stop_session(&weak, &disconnect_session, "Disconnected");
         // Hanging up a link we never dialed needs the daemon's help: drop
         // every live inbound session (trust untouched). The dialer's side
         // sees its connection close and tears down with it, so one
         // Disconnect ends the whole link on both computers.
-        std::thread::spawn(|| {
+        std::thread::spawn(move || {
             let sessions = match control_request(ControlRequest::Status) {
                 Ok(ControlResponse::Status(status)) => status.sessions,
                 _ => Vec::new(),
             };
+            if let Some(link_id) = outbound_link {
+                end_link(link_id);
+            }
             for link in &sessions {
+                if let Some(link_id) = link.link_id {
+                    end_link(link_id);
+                }
                 match control_request(ControlRequest::DropSession {
                     fingerprint_hex: link.fingerprint_hex.clone(),
                 }) {
@@ -1956,6 +1990,10 @@ fn spawn_session(
     data_dir: &std::path::Path,
     address: String,
 ) {
+    // Every user Connect mints a FRESH epoch: a previous Disconnect banned
+    // the old one, so reusing it would be rejected as a stale redial.
+    let link_id = Some(mint_link_id());
+    ui_log(&format!("link: minted fresh link epoch {}", link_id.unwrap_or(0)));
     launch_child(
         weak,
         session,
@@ -1964,6 +2002,7 @@ fn spawn_session(
         address.clone(),
         address,
         false,
+        link_id,
     );
 }
 
@@ -1981,10 +2020,14 @@ fn should_dial_back(mode: kvm_core::Mode, ceremony_open: bool) -> bool {
 /// Outbound links (user pressed Connect) are owned by the session flow and
 /// the reaper; this owns the station side:
 /// - an inbound link appears and nothing runs: adopt its live fingerprint,
-///   announce it, and dial our half back over the verified trust (no
-///   button, no code) so edge works both ways at once;
-/// - the inbound link vanishes: stop our dial-back (if any) and report
-///   Not connected.
+///   announce it, and dial our half back with the SAME link epoch over the
+///   verified trust (no button, no code) so edge works both ways at once;
+/// - the dial-back child then STAYS running even when no episode is open
+///   (the peer sitting idle is not a dead link): its own capture is what
+///   lets this computer drive back, and its redial is what auto-restores
+///   the link after an outage. It ends on user Disconnect, on a banned
+///   epoch (the peer disconnected on purpose), or when its process dies
+///   (the reaper reports that).
 /// Display is touched on transitions only, so the relay owns the status
 /// line the rest of the time. Dial-back attempts are throttled (30s) so a
 /// peer that accepts but never answers our dial cannot fork-bomb us.
@@ -2028,16 +2071,10 @@ fn follow_link(
                     ),
                 );
             }
-            (Some(_), None) => {
-                let dialback_running = session
-                    .lock()
-                    .ok()
-                    .is_some_and(|slot| {
-                        slot.as_ref().is_some_and(|session| session.dialback)
-                    });
-                if dialback_running {
-                    stop_session(&weak, session, "Link ended");
-                }
+            // No live inbound AND no child at all: genuinely unlinked.
+            // (A running dial-back owns the display from here on — the
+            // peer merely sitting idle must not blank it.)
+            (Some(_), None) if !child_running(session) => {
                 set_session(&weak, None);
                 set_status(&weak, "Not connected".into());
             }
@@ -2061,22 +2098,39 @@ fn follow_link(
                     "link: dialling back {} at {} for two-way edge",
                     link.node_name, link.address
                 ));
-                spawn_dial_back(&weak, session, pending, data_dir, link.address);
+                spawn_dial_back(
+                    &weak,
+                    session,
+                    pending,
+                    data_dir,
+                    link.address,
+                    link.link_id,
+                );
             }
         }
     }
 }
 
+/// True while any supervised child (outbound or dial-back) is alive.
+fn child_running(session: &Arc<Mutex<Option<Session>>>) -> bool {
+    session
+        .lock()
+        .ok()
+        .is_some_and(|slot| slot.is_some())
+}
+
 /// Start the supervised station dial-back: the daemon accepted an inbound
 /// link we never dialed, so arm our half automatically over the verified
-/// trust — no button, no code. The link's death tears this down (see
-/// follow_link); a user Connect supersedes it.
+/// trust — no button, no code — with the SAME link epoch, so either side's
+/// Disconnect bans us both instead of resurrecting a zombie. A user
+/// Connect supersedes it.
 fn spawn_dial_back(
     weak: &slint::Weak<AppWindow>,
     session: &Arc<Mutex<Option<Session>>>,
     pending: &Arc<Mutex<Option<PendingPair>>>,
     data_dir: &std::path::Path,
     address: String,
+    link_id: Option<u64>,
 ) {
     launch_child(
         weak,
@@ -2086,6 +2140,7 @@ fn spawn_dial_back(
         address.clone(),
         address,
         true,
+        link_id,
     );
 }
 
@@ -2103,6 +2158,7 @@ fn launch_child(
     connect_address: String,
     label: String,
     dialback: bool,
+    link_id: Option<u64>,
 ) {
     if session
         .lock()
@@ -2124,6 +2180,13 @@ fn launch_child(
     let mut command = std::process::Command::new(&binary);
     command.arg("connect");
     command.arg(&connect_address);
+    // The shared administrative epoch (fresh per user Connect, learned per
+    // dial-back): the child offers it in every Hello, and a rejection
+    // naming a banned epoch ends the child instead of retrying.
+    if let Some(link_id) = link_id {
+        command.arg("--link-id");
+        command.arg(link_id.to_string());
+    }
     command.env("THEKVM_DATA_DIR", data_dir);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
@@ -2146,6 +2209,7 @@ fn launch_child(
                     address: label.clone(),
                     verified: verified.clone(),
                     dialback,
+                    link_id,
                 });
             }
             set_session(&weak, Some(label.clone()));
@@ -2646,6 +2710,20 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Runtime::new().expect("start UI background runtime")
     })
+}
+
+/// Ban one link epoch in the local daemon (Disconnect path): afterwards a
+/// stale redial carrying the epoch is rejected instead of resurrecting the
+/// dead link. Best effort and quiet on failure — the child teardown already
+/// ended our side; a missed ban only risks one rejected redial round-trip.
+fn end_link(link_id: u64) {
+    match control_request(ControlRequest::EndLink { link_id }) {
+        Ok(ControlResponse::LinkEnded { .. }) => {
+            ui_log(&format!("link: banned epoch {link_id}"))
+        }
+        Ok(other) => ui_log(&format!("link: end link unexpected: {other:?}")),
+        Err(error) => ui_log(&format!("link: end link failed: {error:#}")),
+    }
 }
 
 fn control_request(request: ControlRequest) -> Result<ControlResponse> {

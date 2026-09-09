@@ -92,6 +92,13 @@ mod linux_uinput {
         pressed_buttons: BTreeSet<u16>,
         mouse_created: bool,
         keyboard_created: bool,
+        /// Banked 120ths per scroll axis for the legacy detent axis: a
+        /// hi-res-only stack scrolls from HI_RES alone, but a legacy-only
+        /// stack (no HI_RES support) would see nothing but zeroes for
+        /// sub-detent touchpad motion — the debt turns it into whole
+        /// detents instead of dropping it.
+        wheel_debt_x: i32,
+        wheel_debt_y: i32,
     }
 
     impl UinputDevice {
@@ -153,6 +160,8 @@ mod linux_uinput {
                 pressed_buttons: BTreeSet::new(),
                 mouse_created,
                 keyboard_created: true,
+                wheel_debt_x: 0,
+                wheel_debt_y: 0,
             })
         }
 
@@ -210,11 +219,16 @@ mod linux_uinput {
                 }
                 InputEvent::SmoothWheel { x, y } => {
                     // Touchpad smooth scroll in 120ths: hi-res always, plus
-                    // the whole-detent legacy quotient for stacks without
+                    // whole detents from the banked debt for stacks without
                     // hi-res support. Sub-detent motion reports legacy zero
-                    // (no double-scroll anywhere) while hi-res carries it.
+                    // (no double-scroll anywhere) while hi-res carries it;
+                    // slow scrolling still arrives as detents instead of
+                    // vanishing. Truncation toward zero keeps both
+                    // directions symmetric.
                     if y != 0 {
-                        let detents = y / 120;
+                        self.wheel_debt_y = self.wheel_debt_y.saturating_add(y);
+                        let detents = self.wheel_debt_y / 120;
+                        self.wheel_debt_y -= detents.saturating_mul(120);
                         if detents != 0 {
                             Self::emit(&mut self.mouse, EV_REL, REL_WHEEL, detents)
                                 .map_err(io_error)?;
@@ -223,7 +237,9 @@ mod linux_uinput {
                             .map_err(io_error)?;
                     }
                     if x != 0 {
-                        let detents = x / 120;
+                        self.wheel_debt_x = self.wheel_debt_x.saturating_add(x);
+                        let detents = self.wheel_debt_x / 120;
+                        self.wheel_debt_x -= detents.saturating_mul(120);
                         if detents != 0 {
                             Self::emit(&mut self.mouse, EV_REL, REL_HWHEEL, detents)
                                 .map_err(io_error)?;

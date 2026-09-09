@@ -89,6 +89,11 @@ enum Command {
     Connect {
         /// Fixed peer address. Omit it to use the configured screen topology.
         address: Option<String>,
+        /// Administrative link epoch both sides share (minted by the UI).
+        /// A rejection naming a banned epoch ends the child (the peer
+        /// disconnected on purpose) instead of retrying forever.
+        #[arg(long)]
+        link_id: Option<u64>,
     },
     /// Update persistent daemon configuration.
     Configure {
@@ -204,7 +209,7 @@ async fn async_main() -> Result<()> {
         }
         Command::Send { address, keycode } => service::send_test(&address, keycode).await,
         Command::Capture { address } => service::capture(&address).await,
-        Command::Connect { address } => service::connect(address.as_deref()).await,
+        Command::Connect { address, link_id } => service::connect(address.as_deref(), link_id).await,
         Command::Configure {
             device_name,
             mode,

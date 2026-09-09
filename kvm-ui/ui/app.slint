@@ -178,12 +178,6 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 1px; background: #262626; }
                     Text { text: "Connect to the other computer:"; color: white; font-size: 16px; font-weight: 700; }
-                    Text {
-                        text: "Connect links the two computers: the shared cursor goes live both ways at once — push past any edge to drive the other screen, push back to return. Both computers stay usable. Disconnect ends the link.";
-                        color: #9ca3af;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
                     Text { text: "Other computer's address:"; color: white; font-size: 16px; font-weight: 700; }
                     HorizontalLayout {
                         spacing: 12px;
@@ -219,12 +213,6 @@ export component AppWindow inherits Window {
                         font-size: 13px;
                         wrap: word-wrap;
                     }
-                    Text {
-                        text: "Linking two computers takes two sides. STATION (waits): choose 'Be controlled' or 'Both ways' and read this computer's address and pairing code above. NODE (dials): choose 'Control other' or 'Both ways', type the station's address and its code above, press Connect — no click needed on the station. Without a code, both sides compare the 6-digit code before anything connects. The shared cursor switches on by itself once the computers are linked, both ways at once — there is no button for it. Either side can Disconnect and reconnect at any time.";
-                        color: #9ca3af;
-                        font-size: 12px;
-                        wrap: word-wrap;
-                    }
                     Rectangle { height: 1px; background: #262626; }
                     Text {
                         text: "Your pairing code — the other computer types this instead of waiting for a popup:";
@@ -247,13 +235,6 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
                     Rectangle { height: 1px; background: #262626; }
-                    Text { text: "Edge control (shared cursor): on while connected"; color: white; font-size: 16px; font-weight: 700; }
-                    Text {
-                        text: "No button — it switches on by itself inside a link, both ways at once, and switches off with Disconnect. Both computers stay usable; only cursor crossings move control. Arrange the screens under Devices first.";
-                        color: #9ca3af;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
                     Text {
                         visible: driving-text != "";
                         text: driving-text;
