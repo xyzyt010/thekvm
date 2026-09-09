@@ -168,6 +168,12 @@ fn main() -> Result<()> {
         "UI started; user state at {}",
         startup_dir.display()
     ));
+    // Throttle for automatic edge starts: at most one attempt per window so
+    // a child that dies instantly cannot fork-bomb the machine.
+    let last_edge_auto = Arc::new(Mutex::new(None::<std::time::Instant>));
+    let last_edge_auto_state = last_edge_auto.clone();
+    let pending_for_poll = pending_pair.clone();
+    let edge_dir = startup_dir.clone();
     let poll_weak = weak.clone();
     std::thread::spawn(move || {
         let weak = poll_weak;
@@ -223,6 +229,33 @@ fn main() -> Result<()> {
                     .ok()
                     .is_some_and(|slot| slot.as_ref().is_some_and(|session| session.is_edge));
                 refresh_arrangement(&weak, edge_active);
+                // Edge control is always on — no button starts it. The
+                // moment the daemon is reachable, no session runs, and no
+                // pairing ceremony is in flight, the edge child must be
+                // running. This one place restores it after Disconnect,
+                // role/settings changes, child crashes, and cold starts
+                // alike, so the behavior is deterministic: if this computer
+                // may drive, edge is on. Period.
+                if should_auto_start_edge(
+                    status.mode,
+                    session_for_poll.lock().ok().is_some_and(|slot| slot.is_some()),
+                    pending_for_poll.lock().ok().is_some_and(|slot| slot.is_some()),
+                ) {
+                    let mut attempt = false;
+                    if let Ok(mut slot) = last_edge_auto_state.lock() {
+                        let due = slot
+                            .map(|last| last.elapsed() >= std::time::Duration::from_secs(15))
+                            .unwrap_or(true);
+                        if due {
+                            *slot = Some(std::time::Instant::now());
+                            attempt = true;
+                        }
+                    }
+                    if attempt {
+                        ui_log("edge: auto-starting edge control (always-on)");
+                        spawn_edge(&weak, &session_for_poll, &pending_for_poll, &edge_dir);
+                    }
+                }
                 let port = status.listen_port;
                 let fingerprint = status.fingerprint_hex.clone();
                 set_daemon_status(&weak, status);
@@ -454,12 +487,12 @@ fn main() -> Result<()> {
                         .ok()
                         .is_some_and(|slot| slot.as_ref().is_some_and(|session| session.is_edge))
                     {
-                        ui_log("role changed: stopping edge control; restart it for the new role");
+                        ui_log("role changed: stopping edge control; it restarts by itself for the new role");
                         stop_session(&weak, &role_session, "Edge control stopped");
                         set_status(
                             &weak,
                             format!(
-                                "Role set: {}. Edge control stopped — restart it for the new role.",
+                                "Role set: {}. Edge control restarting automatically.",
                                 role_name(requested)
                             ),
                         );
@@ -514,26 +547,6 @@ fn main() -> Result<()> {
     let disconnect_session = session_state.clone();
     ui.on_disconnect(move || {
         stop_session(&weak, &disconnect_session, "Disconnected");
-    });
-
-    let weak = ui.as_weak();
-    let edge_session = session_state.clone();
-    let edge_pending = pending_pair.clone();
-    let edge_data_dir = startup_dir.clone();
-    ui.on_set_edge_mode(move |enabled| {
-        let weak = weak.clone();
-        let edge_session = edge_session.clone();
-        let edge_pending = edge_pending.clone();
-        let edge_data_dir = edge_data_dir.clone();
-        std::thread::spawn(move || {
-            if enabled {
-                ui_log("edge: starting edge control from Devices");
-                spawn_edge(&weak, &edge_session, &edge_pending, &edge_data_dir);
-            } else {
-                ui_log("edge: stopping edge control from Devices");
-                stop_session(&weak, &edge_session, "Edge control stopped");
-            }
-        });
     });
 
     let weak = ui.as_weak();
@@ -791,7 +804,7 @@ fn main() -> Result<()> {
                             .ok()
                             .is_some_and(|slot| slot.as_ref().is_some_and(|session| session.is_edge))
                         {
-                            ui_log("settings saved: stopping edge control; restart it for the new settings");
+                            ui_log("settings saved: stopping edge control; it restarts by itself for the new settings");
                             stop_session(&weak, &config_session, "Edge control stopped");
                         }
                         set_status(
@@ -1957,6 +1970,18 @@ fn spawn_session(
     );
 }
 
+/// Always-on edge predicate: edge must be (re)started when this computer
+/// may drive (anything but receiver-only), no session runs, and no pairing
+/// ceremony is open. Pure so the determinism is unit-tested, not hoped
+/// for — the poll loop only adds the 15s spawn throttle around this.
+fn should_auto_start_edge(
+    mode: kvm_core::Mode,
+    session_running: bool,
+    ceremony_open: bool,
+) -> bool {
+    mode != kvm_core::Mode::ClientOnly && !session_running && !ceremony_open
+}
+
 /// Start edge control: the supervised `connect` child with no address, which
 /// watches the cursor and drives linked screens across the arranged exit
 /// edge. Local input stays local until an actual crossing — unlike fixed
@@ -1974,7 +1999,7 @@ fn spawn_edge(
         if status.mode == kvm_core::Mode::ClientOnly {
             set_status(
                 weak,
-                "This computer is set to 'Be controlled', so edge control cannot drive others. Press 'Control other' or 'Both ways' above, then start edge control again.".into(),
+                "This computer is set to 'Be controlled', so edge control cannot drive others. Press 'Control other' or 'Both ways' above — edge control starts by itself once allowed.".into(),
             );
             return;
         }
@@ -2126,7 +2151,7 @@ fn relay_session_progress(
                     stop_session(weak, session, "Edge mode stopped");
                     set_status(
                         weak,
-                        format!("{address} doesn't recognize this computer — repeat the code check under Connect, then start edge control again."),
+                        format!("{address} doesn't recognize this computer — repeat the code check under Connect; edge control restarts by itself afterwards."),
                     );
                     return;
                 }
@@ -2164,7 +2189,7 @@ fn relay_session_progress(
             }
             "driving" => {
                 set_driving(weak, detail.to_owned());
-                format!("Driving {detail} — push back past the edge to return here. Stop anytime with Disconnect.")
+                format!("Driving {detail} — push back past the edge to return here.")
             }
             "local" => {
                 set_driving(weak, String::new());
@@ -2958,7 +2983,7 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{edge_name, pair_status_text};
+    use super::{edge_name, pair_status_text, should_auto_start_edge};
 
     #[test]
     fn compare_screen_names_peer_and_code() {
@@ -2981,6 +3006,22 @@ mod tests {
         assert_eq!(edge_name(kvm_core::Edge::Right), "right");
         assert_eq!(edge_name(kvm_core::Edge::Top), "top");
         assert_eq!(edge_name(kvm_core::Edge::Bottom), "bottom");
+    }
+
+    #[test]
+    fn edge_is_always_on_unless_driving_is_forbidden_or_busy() {
+        use kvm_core::Mode::{Bidirectional, ClientOnly, ServerClient};
+        // May drive + idle + no ceremony: start.
+        assert!(should_auto_start_edge(Bidirectional, false, false));
+        assert!(should_auto_start_edge(ServerClient, false, false));
+        // Receiver-only must never drive.
+        assert!(!should_auto_start_edge(ClientOnly, false, false));
+        // A running session (takeover or edge) is never disturbed.
+        assert!(!should_auto_start_edge(Bidirectional, true, false));
+        assert!(!should_auto_start_edge(ServerClient, true, false));
+        // An open pairing ceremony is never hijacked.
+        assert!(!should_auto_start_edge(Bidirectional, false, true));
+        assert!(!should_auto_start_edge(ClientOnly, true, true));
     }
 
     #[test]

@@ -61,7 +61,6 @@ export component AppWindow inherits Window {
     callback reject-incoming-pairing(string);
     callback revoke-peer(string);
     callback swap-sides();
-    callback set-edge-mode(bool);
     callback open-log-folder();
     callback apply-config(bool, int, string, string, bool);
     callback import-layout(string);
@@ -135,6 +134,11 @@ export component AppWindow inherits Window {
         TabWidget {
             Tab {
                 title: "Connect";
+                // Scrollable: tab content is taller than the window, and a
+                // plain VerticalLayout silently CLIPS everything past the
+                // bottom — which once hid the whole address/code/connect
+                // row with no way to reach it. Never clip again.
+                Flickable {
                 VerticalLayout {
                     padding: 12px;
                     spacing: 10px;
@@ -172,61 +176,10 @@ export component AppWindow inherits Window {
                         font-size: 12px;
                         wrap: word-wrap;
                     }
-                    Text {
-                        text: "Linking two computers takes two sides. STATION (waits): choose 'Be controlled' or 'Both ways' and read this computer's address and pairing code above. NODE (dials): choose 'Control other' or 'Both ways', type the station's address and its pairing code, press Take over — no click needed on the station. Without a code, both sides compare the 6-digit code before anything connects. For daily shared-cursor use, start edge control above instead of taking over. Either side can Disconnect and reconnect at any time.";
-                        color: #9ca3af;
-                        font-size: 12px;
-                        wrap: word-wrap;
-                    }
                     Rectangle { height: 1px; background: #262626; }
+                    Text { text: "Connect to the other computer:"; color: white; font-size: 16px; font-weight: 700; }
                     Text {
-                        text: "Your pairing code — the other computer types this instead of waiting for a popup:";
-                        color: white;
-                        font-size: 16px;
-                        font-weight: 700;
-                    }
-                    Text {
-                        text: pairing-code == "" ? "starting…" : pairing-code;
-                        color: #22c55e;
-                        font-size: 32px;
-                        font-weight: 800;
-                        letter-spacing: 6px;
-                        horizontal-alignment: center;
-                    }
-                    Text {
-                        text: "Read it over once (phone, chat, sticky note). Whoever types it can pair — no approval click needed here, and it changes every 30 minutes.";
-                        color: #9ca3af;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
-                    Rectangle { height: 1px; background: #262626; }
-                    Text { text: "Edge control (shared cursor):"; color: white; font-size: 16px; font-weight: 700; }
-                    Text {
-                        text: "Both computers stay usable — only cursor crossings move control. Arrange the screens under Devices first.";
-                        color: #9ca3af;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Button {
-                            text: edge-active ? "Stop edge control" : "Start edge control";
-                            primary: true;
-                            clicked => { set-edge-mode(!edge-active); }
-                        }
-                    }
-                    Text {
-                        visible: driving-text != "";
-                        text: driving-text;
-                        color: #22c55e;
-                        font-size: 13px;
-                        font-weight: 700;
-                        wrap: word-wrap;
-                    }
-                    Rectangle { height: 1px; background: #262626; }
-                    Text { text: "Take over one computer (full control):"; color: white; font-size: 16px; font-weight: 700; }
-                    Text {
-                        text: "The other computer gets your whole keyboard and mouse and this screen freezes until Disconnect. For daily use, prefer edge control above.";
+                        text: "Take over gives this side the whole keyboard and mouse and the other screen freezes until Disconnect.";
                         color: #9ca3af;
                         font-size: 11px;
                         wrap: word-wrap;
@@ -256,7 +209,7 @@ export component AppWindow inherits Window {
                         spacing: 12px;
                         code-field := LineEdit {
                             text <=> root.pair-code;
-                            placeholder-text: "code shown on the other computer (recommended — skips its popup)";
+                            placeholder-text: "6-digit code shown on the other computer (recommended — skips its popup)";
                             enabled: !session-active;
                         }
                     }
@@ -266,6 +219,50 @@ export component AppWindow inherits Window {
                         font-size: 13px;
                         wrap: word-wrap;
                     }
+                    Text {
+                        text: "Linking two computers takes two sides. STATION (waits): choose 'Be controlled' or 'Both ways' and read this computer's address and pairing code above. NODE (dials): choose 'Control other' or 'Both ways', type the station's address and its code above, press Take over — no click needed on the station. Without a code, both sides compare the 6-digit code before anything connects. Edge control (shared cursor) switches on by itself once the computers are linked — there is no button for it. Either side can Disconnect and reconnect at any time.";
+                        color: #9ca3af;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    Rectangle { height: 1px; background: #262626; }
+                    Text {
+                        text: "Your pairing code — the other computer types this instead of waiting for a popup:";
+                        color: white;
+                        font-size: 16px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: pairing-code == "" ? "starting…" : pairing-code;
+                        color: #22c55e;
+                        font-size: 32px;
+                        font-weight: 800;
+                        letter-spacing: 6px;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Read it over once (phone, chat, sticky note). Whoever types it can pair — no approval click needed here, and it changes every 30 minutes.";
+                        color: #9ca3af;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    Rectangle { height: 1px; background: #262626; }
+                    Text { text: "Edge control (shared cursor): always on"; color: white; font-size: 16px; font-weight: 700; }
+                    Text {
+                        text: "No button — it starts by itself and stays on. Both computers stay usable — only cursor crossings move control. Arrange the screens under Devices first.";
+                        color: #9ca3af;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        visible: driving-text != "";
+                        text: driving-text;
+                        color: #22c55e;
+                        font-size: 13px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                    }
+                    Rectangle { height: 1px; background: #262626; }
                     Button {
                         visible: !connected;
                         text: "Start background service";
@@ -363,10 +360,12 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                }
             }
 
             Tab {
                 title: "Devices";
+                Flickable {
                 VerticalLayout {
                     padding: 12px;
                     spacing: 10px;
@@ -539,12 +538,6 @@ export component AppWindow inherits Window {
                             enabled: linked-peer-name != "";
                             clicked => { swap-sides(); }
                         }
-                        Button {
-                            text: edge-active ? "Stop edge control" : "Start edge control";
-                            primary: true;
-                            enabled: linked-peer-name != "";
-                            clicked => { set-edge-mode(!edge-active); }
-                        }
                     }
                     Text {
                         visible: driving-text != "";
@@ -555,10 +548,12 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
                 }
+                }
             }
 
             Tab {
                 title: "Settings";
+                Flickable {
                 VerticalLayout {
                     padding: 12px;
                     spacing: 10px;
@@ -651,6 +646,7 @@ export component AppWindow inherits Window {
                         text: "Open log folder";
                         clicked => { open-log-folder(); }
                     }
+                }
                 }
             }
         }
