@@ -53,7 +53,8 @@ fn is_own_device_name(name: &[u8]) -> bool {
 /// capture never degrades because one query hiccuped.
 fn query_own_sources(connection: &RustConnection) -> Option<Vec<xinput::DeviceId>> {
     let reply = connection
-        .xinput_xi_query_device(0)
+        // 0 is XIAllDevices: enumerate every slave device on the server.
+        .xinput_xi_query_device(0u16)
         .map_err(|error| format!("query XInput2 devices: {error}"))
         .and_then(|cookie| {
             cookie
