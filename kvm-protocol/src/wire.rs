@@ -212,8 +212,20 @@ pub enum WireMessage {
     /// Establish the logical pointer position when control crosses a screen
     /// edge. The receiver may use this for a future absolute-pointer backend;
     /// relative input remains the authoritative event stream in this slice.
+    ///
+    /// MWB parity: screens are named by DEVICE NAME, never by number.
+    /// Both sides number their own screens locally (self is always 1, first
+    /// peer 2, …) and those numbers must never cross the wire as identity —
+    /// one mirrored config once made every handoff in both directions fail
+    /// closed with "peer handed off to screen 1, but this node is 2".
+    /// `target_name` is authoritative; `screen_id` stays populated for
+    /// debuggability and mixed-version fallback.
     PointerHandoff {
         screen_id: u32,
+        /// Device name of the machine being driven (its own device_name).
+        /// Empty on frames from older peers, which fall back to screen_id.
+        #[serde(default)]
+        target_name: String,
         x: u32,
         y: u32,
         /// Coordinate space in which x/y were calculated. The receiver maps
@@ -223,8 +235,13 @@ pub enum WireMessage {
     },
     /// Ask the controller to activate the screen reached from the receiver's
     /// edge. The controller may return locally when this is its self screen.
+    /// Named like PointerHandoff: `target_name` (the controller-side screen
+    /// name) is authoritative, `screen_id` is fallback for older peers.
     HandoffRequest {
         screen_id: u32,
+        /// Screen name on the controller side to activate.
+        #[serde(default)]
+        target_name: String,
         x: u32,
         y: u32,
         /// Relative motion that crossed the edge, to be applied after the
@@ -444,6 +461,42 @@ mod tests {
         sender.await.unwrap();
         assert!(
             matches!(actual, WireMessage::StateSync(state) if state.pressed_keys == vec![0xe0, 0x04] && state.pressed_buttons == vec![MouseButton::Left])
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_frames_carry_the_target_device_name() {
+        let (mut left, mut right) = tokio::io::duplex(2048);
+        let expected = WireMessage::PointerHandoff {
+            screen_id: 99, // meaningless number: the name decides
+            target_name: "hs01-Lenovo-YOGA-730-15IKB".into(),
+            x: 10,
+            y: 20,
+            screen_geometry: None,
+        };
+        let sender = tokio::spawn(async move {
+            write_frame(&mut left, &expected).await.unwrap();
+        });
+        let actual = read_frame(&mut right).await.unwrap().unwrap();
+        sender.await.unwrap();
+        assert!(
+            matches!(actual, WireMessage::PointerHandoff { target_name, x: 10, y: 20, .. } if target_name == "hs01-Lenovo-YOGA-730-15IKB")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_handoff_frames_without_a_name_still_decode() {
+        // Mixed-version grace: an older peer sends no target_name; the
+        // field defaults to empty and the numeric fallback applies.
+        let raw = r#"{"PointerHandoff":{"screen_id":1,"x":5,"y":6}}"#;
+        let message: WireMessage = serde_json::from_str(raw).unwrap();
+        assert!(
+            matches!(message, WireMessage::PointerHandoff { screen_id: 1, ref target_name, .. } if target_name.is_empty())
+        );
+        let raw = r#"{"HandoffRequest":{"screen_id":2,"x":7,"y":8}}"#;
+        let message: WireMessage = serde_json::from_str(raw).unwrap();
+        assert!(
+            matches!(message, WireMessage::HandoffRequest { screen_id: 2, ref target_name, .. } if target_name.is_empty())
         );
     }
 

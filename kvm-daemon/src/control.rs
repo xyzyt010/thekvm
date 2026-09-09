@@ -264,6 +264,7 @@ where
                 clipboard_enabled: current.clipboard_enabled,
                 peer_count,
                 active_session_count: active_sessions.load(std::sync::atomic::Ordering::Relaxed),
+                sessions: crate::service::list_inbound_links(),
                 uptime_seconds: started.elapsed().as_secs(),
             })
         }
@@ -352,12 +353,31 @@ where
                 }
             }
         }
+        ControlRequest::DropSession { fingerprint_hex } => {
+            if !is_fingerprint(&fingerprint_hex) {
+                ControlResponse::Error {
+                    message: "peer fingerprint must contain 64 hexadecimal characters".into(),
+                }
+            } else {
+                let fingerprint_hex = fingerprint_hex.to_ascii_lowercase();
+                if crate::service::drop_inbound_link(&fingerprint_hex) {
+                    crate::service::audit_event(
+                        &data_dir,
+                        &format!("session-dropped fingerprint={fingerprint_hex}"),
+                    );
+                    ControlResponse::SessionDropped { fingerprint_hex }
+                } else {
+                    ControlResponse::Error {
+                        message: "no live inbound session for that peer".into(),
+                    }
+                }
+            }
+        }
         ControlRequest::PinPeer {
             fingerprint_hex,
             node_name,
             address,
-        } => {
-            if !is_fingerprint(&fingerprint_hex) {
+        } => {            if !is_fingerprint(&fingerprint_hex) {
                 ControlResponse::Error {
                     message: "peer fingerprint must contain 64 hexadecimal characters".into(),
                 }

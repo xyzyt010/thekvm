@@ -59,6 +59,13 @@ pub enum ControlRequest {
     RejectPairing {
         fingerprint_hex: String,
     },
+    /// Drop one live INBOUND input session by peer fingerprint, without
+    /// touching trust. The dialer's side notices the closed connection and
+    /// tears down with it, so one Disconnect ends the whole link — this is
+    /// how the station side hangs up a link it never dialed.
+    DropSession {
+        fingerprint_hex: String,
+    },
     SetConfig {
         /// Optional for compatibility with older desktop UIs. When supplied,
         /// it becomes the node name advertised and sent in handshakes.
@@ -106,6 +113,19 @@ pub struct DaemonStatus {
     /// predates this field.
     #[serde(default)]
     pub pairing_code: String,
+    /// Live INBOUND input sessions right now (verified, driving-capable).
+    /// The station UI watches this to arm its side of a link it never
+    /// dialed — and to hang it up. Empty on older daemons.
+    #[serde(default)]
+    pub sessions: Vec<ActiveSession>,
+}
+
+/// One live inbound input session: who dialed in, from where.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveSession {
+    pub fingerprint_hex: String,
+    pub node_name: String,
+    pub address: String,
 }
 
 /// A remote identity that completed the network half of pairing and is
@@ -134,6 +154,7 @@ pub enum ControlResponse {
     PairingRejected { fingerprint_hex: String },
     Pinned { fingerprint_hex: String },
     Applied { restart_required: bool },
+    SessionDropped { fingerprint_hex: String },
     Error { message: String },
 }
 

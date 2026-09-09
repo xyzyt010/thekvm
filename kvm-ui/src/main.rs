@@ -65,10 +65,11 @@ struct Session {
     child: std::process::Child,
     address: String,
     verified: Arc<std::sync::atomic::AtomicBool>,
-    /// True for edge-control mode (`connect` with no address: cursor
-    /// crossings drive linked screens) as opposed to fixed-peer takeover
-    /// (`connect <address>`: the whole local input drives one peer).
-    is_edge: bool,
+    /// True when this child is the automatic station dial-back (link half
+    /// we never dialed ourselves) as opposed to the user's own Connect.
+    /// A user Connect always supersedes a dial-back; a dial-back never
+    /// blocks one.
+    dialback: bool,
 }
 
 fn main() -> Result<()> {
@@ -160,6 +161,14 @@ fn main() -> Result<()> {
     // per poll window so a broken install cannot fork-bomb the machine.
     let last_autostart = Arc::new(Mutex::new(None::<std::time::Instant>));
     let autostart_state = last_autostart.clone();
+    // Link-following state: last seen inbound fingerprint (transition
+    // detection) and last dial-back attempt (30s throttle).
+    let last_inbound = Arc::new(Mutex::new(None::<String>));
+    let last_inbound_state = last_inbound.clone();
+    let last_dialback = Arc::new(Mutex::new(None::<std::time::Instant>));
+    let last_dialback_state = last_dialback.clone();
+    let pending_for_poll = pending_pair.clone();
+    let link_dir = startup_dir.clone();
     // Local LAN address is shown even while the daemon is unreachable so the
     // Status tab never reads "unknown" for something the UI can compute
     // itself.
@@ -168,12 +177,8 @@ fn main() -> Result<()> {
         "UI started; user state at {}",
         startup_dir.display()
     ));
-    // Throttle for automatic edge starts: at most one attempt per window so
-    // a child that dies instantly cannot fork-bomb the machine.
-    let last_edge_auto = Arc::new(Mutex::new(None::<std::time::Instant>));
-    let last_edge_auto_state = last_edge_auto.clone();
-    let pending_for_poll = pending_pair.clone();
-    let edge_dir = startup_dir.clone();
+    // Poll thread owns no UI handles (see NOTE inside the loop); everything
+    // it needs is cloned here.
     let poll_weak = weak.clone();
     std::thread::spawn(move || {
         let weak = poll_weak;
@@ -220,42 +225,29 @@ fn main() -> Result<()> {
                     ));
                 }
                 consecutive_failures = 0;
-                // Station-side default arrangement (Machine 2 mirrors: the
-                // connector goes on the left) and the Devices arrangement
-                // display both refresh here, from live daemon state.
-                maybe_mirror_station_arrangement(&status);
-                let edge_active = session_for_poll
+                // Station-side default arrangement (both sides number
+                // themselves 1 — see ensure_link_arrangement) and the
+                // Devices arrangement display both refresh here, from live
+                // daemon state.
+                ensure_link_arrangement();
+                let link_running = session_for_poll
                     .lock()
                     .ok()
-                    .is_some_and(|slot| slot.as_ref().is_some_and(|session| session.is_edge));
-                refresh_arrangement(&weak, edge_active);
-                // Edge control is always on — no button starts it. The
-                // moment the daemon is reachable, no session runs, and no
-                // pairing ceremony is in flight, the edge child must be
-                // running. This one place restores it after Disconnect,
-                // role/settings changes, child crashes, and cold starts
-                // alike, so the behavior is deterministic: if this computer
-                // may drive, edge is on. Period.
-                if should_auto_start_edge(
-                    status.mode,
-                    session_for_poll.lock().ok().is_some_and(|slot| slot.is_some()),
-                    pending_for_poll.lock().ok().is_some_and(|slot| slot.is_some()),
-                ) {
-                    let mut attempt = false;
-                    if let Ok(mut slot) = last_edge_auto_state.lock() {
-                        let due = slot
-                            .map(|last| last.elapsed() >= std::time::Duration::from_secs(15))
-                            .unwrap_or(true);
-                        if due {
-                            *slot = Some(std::time::Instant::now());
-                            attempt = true;
-                        }
-                    }
-                    if attempt {
-                        ui_log("edge: auto-starting edge control (always-on)");
-                        spawn_edge(&weak, &session_for_poll, &pending_for_poll, &edge_dir);
-                    }
-                }
+                    .is_some_and(|slot| slot.is_some());
+                refresh_arrangement(&weak, link_running);
+                // Link-following (MWB arming): children run only inside a
+                // live link — never at boot, never unprompted. Outbound
+                // links belong to the session flow; this arms (and tears
+                // down) the station half of an inbound link automatically.
+                follow_link(
+                    &weak,
+                    &status,
+                    &session_for_poll,
+                    &pending_for_poll,
+                    &link_dir,
+                    &last_inbound_state,
+                    &last_dialback_state,
+                );
                 let port = status.listen_port;
                 let fingerprint = status.fingerprint_hex.clone();
                 set_daemon_status(&weak, status);
@@ -485,14 +477,14 @@ fn main() -> Result<()> {
                     if role_session
                         .lock()
                         .ok()
-                        .is_some_and(|slot| slot.as_ref().is_some_and(|session| session.is_edge))
+                        .is_some_and(|slot| slot.as_ref().is_some())
                     {
-                        ui_log("role changed: stopping edge control; it restarts by itself for the new role");
-                        stop_session(&weak, &role_session, "Edge control stopped");
+                        ui_log("role changed: stopping the link; it re-arms by itself when a link is live");
+                        stop_session(&weak, &role_session, "Link stopped");
                         set_status(
                             &weak,
                             format!(
-                                "Role set: {}. Edge control restarting automatically.",
+                                "Role set: {}. Link stopped — Connect again to re-link.",
                                 role_name(requested)
                             ),
                         );
@@ -547,6 +539,27 @@ fn main() -> Result<()> {
     let disconnect_session = session_state.clone();
     ui.on_disconnect(move || {
         stop_session(&weak, &disconnect_session, "Disconnected");
+        // Hanging up a link we never dialed needs the daemon's help: drop
+        // every live inbound session (trust untouched). The dialer's side
+        // sees its connection close and tears down with it, so one
+        // Disconnect ends the whole link on both computers.
+        std::thread::spawn(|| {
+            let sessions = match control_request(ControlRequest::Status) {
+                Ok(ControlResponse::Status(status)) => status.sessions,
+                _ => Vec::new(),
+            };
+            for link in &sessions {
+                match control_request(ControlRequest::DropSession {
+                    fingerprint_hex: link.fingerprint_hex.clone(),
+                }) {
+                    Ok(ControlResponse::SessionDropped { .. }) => {
+                        ui_log(&format!("link: dropped inbound session from {}", link.node_name))
+                    }
+                    Ok(other) => ui_log(&format!("link: drop session unexpected: {other:?}")),
+                    Err(error) => ui_log(&format!("link: drop session failed: {error:#}")),
+                }
+            }
+        });
     });
 
     let weak = ui.as_weak();
@@ -798,14 +811,14 @@ fn main() -> Result<()> {
                         // role text follows the Applied result at once.
                         set_role_display(&weak, requested_mode);
                         // Settings (role included) can invalidate a running
-                        // edge contract: stop it rather than drive stale.
+                        // link contract: stop it rather than drive stale.
                         if config_session
                             .lock()
                             .ok()
-                            .is_some_and(|slot| slot.as_ref().is_some_and(|session| session.is_edge))
+                            .is_some_and(|slot| slot.as_ref().is_some())
                         {
-                            ui_log("settings saved: stopping edge control; it restarts by itself for the new settings");
-                            stop_session(&weak, &config_session, "Edge control stopped");
+                            ui_log("settings saved: stopping the link; it re-arms by itself when a link is live");
+                            stop_session(&weak, &config_session, "Link stopped");
                         }
                         set_status(
                             &weak,
@@ -1163,15 +1176,14 @@ fn start_session_flow(
             *slot = None;
             set_session(weak, None);
         }
-        // Fixed takeover supersedes edge control (and launch_child stops
-        // whatever runs), so an active edge session must not wedge Connect
-        // behind "Already connected".
-        let edge_active = slot.as_ref().is_some_and(|session| session.is_edge);
+        // A user Connect always supersedes the automatic station
+        // dial-back; anything else already running blocks with guidance.
+        let dialback_active = slot.as_ref().is_some_and(|session| session.dialback);
         let any_active = slot.is_some();
         drop(slot);
-        if edge_active {
-            ui_log("pairing: fixed connect supersedes edge control; stopping it");
-            stop_session(weak, session, "Edge control stopped");
+        if dialback_active {
+            ui_log("pairing: user Connect supersedes the automatic dial-back");
+            stop_session(weak, session, "Previous session stopped");
         } else if any_active {
             set_status(weak, "Already connected — Disconnect first".into());
             return;
@@ -1484,6 +1496,54 @@ fn ensure_user_pin(fingerprint: &str, name: &str, address: Option<&str>) {
     }
 }
 
+/// Adopt the live fingerprint for one arranged screen name: rewrite the
+/// screen's pinned fingerprint when it differs. Ghost pins (an older
+/// identity of the same machine, kept by re-pairing) misroute every
+/// handoff, so the arrangement must follow the identity that actually
+/// verifies — never the other way round. Never adds screens (pairing and
+/// the default arrangement own that); never touches anything else.
+fn adopt_layout_fingerprint(peer_name: &str, fingerprint_hex: &str) {
+    let config = match control_request(ControlRequest::GetConfig) {
+        Ok(ControlResponse::Config(config)) => config,
+        _ => return,
+    };
+    let mut layout = config.layout.clone();
+    let mut changed = false;
+    for screen in &mut layout.screens {
+        if screen.name == peer_name
+            && screen.peer_fingerprint.as_deref() != Some(fingerprint_hex)
+        {
+            screen.peer_fingerprint = Some(fingerprint_hex.to_owned());
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+    match write_arrangement(layout) {
+        Ok(_) => ui_log(&format!(
+            "arrange: adopted live fingerprint for {peer_name}; ghost pins healed"
+        )),
+        Err(error) => ui_log(&format!("arrange: fingerprint adopt failed: {error:#}")),
+    }
+}
+
+/// Adopt by dial address: resolve the live (name, fingerprint) from the
+/// peer-book entry carrying this address, then adopt by name.
+fn adopt_link_fingerprint(data_dir: &std::path::Path, address: &str) {
+    let Ok(book) = kvm_protocol::pairing::PeerBook::load_or_create(data_dir) else {
+        return;
+    };
+    let Some(peer) = book
+        .peers
+        .iter()
+        .find(|peer| peer.address.as_deref() == Some(address))
+    else {
+        return;
+    };
+    adopt_layout_fingerprint(&peer.name.clone(), &peer.fingerprint_hex.clone());
+}
+
 /// Mirror ceremony trust into the DAEMON book so the reverse direction can
 /// open sessions too (edge control drives both ways). Best effort and
 /// logged: a mirror failure never fails the pairing itself.
@@ -1562,65 +1622,26 @@ fn ensure_default_arrangement(peer_name: &str, peer_fingerprint: &str) {
 }
 
 /// Throttle for the automatic arrangement/trust setup check (seconds).
-static LAST_MIRROR_CHECK_SECS: std::sync::atomic::AtomicU64 =
+static LAST_ARRANGE_CHECK_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Rewrite a 0.2.0 station-mirror layout (self=1, peer=2 on the left) into
-/// the global-id convention (self=2, peer=1). 0.2.0 sessions could never
-/// open with the old ids — the receiver only accepts its own self screen —
-/// so any exact-shape match is provably pre-fix and safe to rewrite.
-/// Returns None for anything else (including already-correct layouts).
-fn migrate_020_mirror(layout: &kvm_core::Layout) -> Option<kvm_core::Layout> {
-    if layout.self_screen != Some(kvm_core::SELF_SCREEN_ID) || layout.screens.len() != 2 {
-        return None;
-    }
-    let me = layout.screen(kvm_core::SELF_SCREEN_ID)?;
-    let peer = layout
-        .screens
-        .iter()
-        .find(|screen| screen.id == kvm_core::FIRST_PEER_SCREEN_ID)?;
-    let peer_fp = peer.peer_fingerprint.clone()?;
-    if peer.x >= me.x || peer.y != me.y {
-        return None;
-    }
-    Some(kvm_core::Layout {
-        screens: vec![
-            kvm_core::Screen {
-                id: kvm_core::MIRROR_SELF_SCREEN_ID,
-                name: me.name.clone(),
-                x: 0,
-                y: 0,
-                width: me.width,
-                height: me.height,
-                peer_fingerprint: None,
-            },
-            kvm_core::Screen {
-                id: kvm_core::MIRROR_PEER_SCREEN_ID,
-                name: peer.name.clone(),
-                x: -1,
-                y: 0,
-                width: peer.width,
-                height: peer.height,
-                peer_fingerprint: Some(peer_fp),
-            },
-        ],
-        self_screen: Some(kvm_core::MIRROR_SELF_SCREEN_ID),
-    })
-}
-
-/// Automatic first-time setup (at most once a minute, never overwriting):
-/// 1. migrate any 0.2.0 mirror layout into global screen ids;
-/// 2. station side (daemon trusts peers, nothing arranged): mirror Machine 1
-///    onto the left, pin the user book, link the daemon book;
-/// 3. initiator side (user book trusts peers, daemon empty, nothing
-///    arranged): take the Machine-1 default (peer on the right), link the
-///    daemon book so the reverse direction can open sessions too.
-fn maybe_mirror_station_arrangement(status: &DaemonStatus) {
+/// Automatic first-time setup (at most once a minute, never overwriting an
+/// existing arrangement): when a peer is known (either book) but no screens
+/// are arranged yet, write the single canonical default — self=1, first
+/// peer=2 on the right — on EVERY machine, and link both peer books so
+/// sessions open in both directions.
+///
+/// Deliberately the same shape on both sides, never mirrored: the old code
+/// raced the two peer books and dealt a mirrored layout (self=2) to the
+/// dialing machine, after which every handoff in BOTH directions failed
+/// closed. Numbers are local-only now (handoffs travel by device name), so
+/// both sides numbering themselves 1 is the deterministic convention.
+fn ensure_link_arrangement() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if LAST_MIRROR_CHECK_SECS.swap(now, std::sync::atomic::Ordering::Relaxed) + 60 > now {
+    if LAST_ARRANGE_CHECK_SECS.swap(now, std::sync::atomic::Ordering::Relaxed) + 60 > now {
         return;
     }
     let config = match control_request(ControlRequest::GetConfig) {
@@ -1628,49 +1649,20 @@ fn maybe_mirror_station_arrangement(status: &DaemonStatus) {
         _ => return,
     };
     if !config.layout.screens.is_empty() {
-        if let Some(fixed) = migrate_020_mirror(&config.layout) {
-            match write_arrangement(fixed) {
-                Ok(_) => ui_log("arrange: migrated 0.2.0 mirror layout to shared screen ids"),
-                Err(error) => ui_log(&format!("arrange: layout migration failed: {error:#}")),
-            }
-        }
         return;
     }
-    if status.peer_count > 0 {
-        let peers = match control_request(ControlRequest::ListPeers) {
-            Ok(ControlResponse::Peers(peers)) => peers,
-            _ => return,
-        };
-        let Some(peer) = peers.first() else {
-            return;
-        };
-        let layout = kvm_core::Layout::pair_mirror(
-            &config.device_name,
-            &peer.name,
-            &peer.fingerprint_hex,
-        );
-        match write_arrangement(layout) {
-            Ok(_) => {
-                ensure_user_pin(
-                    &peer.fingerprint_hex,
-                    &peer.name,
-                    peer.address.as_deref(),
-                );
-                ui_log("arrange: station default arrangement saved (peer on the left)");
-            }
-            Err(error) => ui_log(&format!("arrange: station default failed: {error:#}")),
-        }
-        return;
+    // First known peer wins: daemon book, else user book. Either proves a
+    // pairing happened; the arrangement just never got written.
+    let peer = match control_request(ControlRequest::ListPeers) {
+        Ok(ControlResponse::Peers(peers)) => peers.into_iter().next(),
+        _ => None,
     }
-    // Initiator side of an older pairing: the user book already trusts the
-    // peer (ceremony pin) but the daemon book is empty, so the reverse
-    // direction cannot open sessions. Arrange Machine-1 default and link
-    // the daemon book — initiation from the other side starts working.
-    let user_peers = match kvm_protocol::pairing::PeerBook::load_or_create(&data_dir()) {
-        Ok(book) => book.peers,
-        Err(_) => return,
-    };
-    let Some(peer) = user_peers.first() else {
+    .or_else(|| {
+        kvm_protocol::pairing::PeerBook::load_or_create(&data_dir())
+            .ok()
+            .and_then(|book| book.peers.into_iter().next())
+    });
+    let Some(peer) = peer else {
         return;
     };
     let layout = kvm_core::Layout::pair_default(
@@ -1680,14 +1672,19 @@ fn maybe_mirror_station_arrangement(status: &DaemonStatus) {
     );
     match write_arrangement(layout) {
         Ok(_) => {
+            ensure_user_pin(
+                &peer.fingerprint_hex,
+                &peer.name,
+                peer.address.as_deref(),
+            );
             pin_daemon_peer(
                 &peer.fingerprint_hex,
                 &peer.name,
                 peer.address.as_deref(),
             );
-            ui_log("arrange: linked existing pairing for both directions (peer on the right)");
+            ui_log("arrange: default arrangement saved (peer on the right), both books linked");
         }
-        Err(error) => ui_log(&format!("arrange: existing-pairing setup failed: {error:#}")),
+        Err(error) => ui_log(&format!("arrange: default arrangement failed: {error:#}")),
     }
 }
 
@@ -1964,70 +1961,148 @@ fn spawn_session(
         session,
         pending,
         data_dir,
-        Some(address.clone()),
+        address.clone(),
         address,
         false,
     );
 }
 
-/// Always-on edge predicate: edge must be (re)started when this computer
-/// may drive (anything but receiver-only), no session runs, and no pairing
-/// ceremony is open. Pure so the determinism is unit-tested, not hoped
-/// for — the poll loop only adds the 15s spawn throttle around this.
-fn should_auto_start_edge(
-    mode: kvm_core::Mode,
-    session_running: bool,
-    ceremony_open: bool,
-) -> bool {
-    mode != kvm_core::Mode::ClientOnly && !session_running && !ceremony_open
+/// Link-following dial-back predicate: arm the station half of a live
+/// inbound link exactly when this computer may drive (anything but
+/// receiver-only) and no pairing ceremony is open. The caller additionally
+/// requires a live inbound session and no running child. Pure so the
+/// determinism is unit-tested, not hoped for.
+fn should_dial_back(mode: kvm_core::Mode, ceremony_open: bool) -> bool {
+    mode != kvm_core::Mode::ClientOnly && !ceremony_open
 }
 
-/// Start edge control: the supervised `connect` child with no address, which
-/// watches the cursor and drives linked screens across the arranged exit
-/// edge. Local input stays local until an actual crossing — unlike fixed
-/// takeover — so starting it can never trap the local keyboard and mouse.
-fn spawn_edge(
+/// Link-following (MWB arming), run on every healthy poll tick: this UI
+/// runs a child ONLY inside a live link — never at boot, never unprompted.
+/// Outbound links (user pressed Connect) are owned by the session flow and
+/// the reaper; this owns the station side:
+/// - an inbound link appears and nothing runs: adopt its live fingerprint,
+///   announce it, and dial our half back over the verified trust (no
+///   button, no code) so edge works both ways at once;
+/// - the inbound link vanishes: stop our dial-back (if any) and report
+///   Not connected.
+/// Display is touched on transitions only, so the relay owns the status
+/// line the rest of the time. Dial-back attempts are throttled (30s) so a
+/// peer that accepts but never answers our dial cannot fork-bomb us.
+#[allow(clippy::too_many_arguments)]
+fn follow_link(
+    weak: &slint::Weak<AppWindow>,
+    status: &kvm_protocol::control::DaemonStatus,
+    session: &Arc<Mutex<Option<Session>>>,
+    pending: &Arc<Mutex<Option<PendingPair>>>,
+    data_dir: &std::path::Path,
+    last_inbound: &Arc<Mutex<Option<String>>>,
+    last_attempt: &Arc<Mutex<Option<std::time::Instant>>>,
+) {
+    let outbound_running = session
+        .lock()
+        .ok()
+        .is_some_and(|slot| slot.is_some());
+    let ceremony_open = pending
+        .lock()
+        .ok()
+        .is_some_and(|slot| slot.is_some());
+    let inbound = status.sessions.first().cloned();
+    let inbound_fp = inbound
+        .as_ref()
+        .map(|link| link.fingerprint_hex.clone());
+    let previous = last_inbound.lock().ok().and_then(|mut slot| {
+        let prev = slot.clone();
+        *slot = inbound_fp.clone();
+        prev
+    });
+    if !outbound_running {
+        match (&previous, &inbound) {
+            (old, Some(link)) if old.as_deref() != Some(link.fingerprint_hex.as_str()) => {
+                adopt_layout_fingerprint(&link.node_name, &link.fingerprint_hex);
+                set_session(&weak, Some(link.node_name.clone()));
+                set_status(
+                    &weak,
+                    format!(
+                        "{} is linked — push past any edge to take control. Both computers stay usable; Disconnect ends the link.",
+                        link.node_name
+                    ),
+                );
+            }
+            (Some(_), None) => {
+                let dialback_running = session
+                    .lock()
+                    .ok()
+                    .is_some_and(|slot| {
+                        slot.as_ref().is_some_and(|session| session.dialback)
+                    });
+                if dialback_running {
+                    stop_session(&weak, session, "Link ended");
+                }
+                set_session(&weak, None);
+                set_status(&weak, "Not connected".into());
+            }
+            _ => {}
+        }
+    }
+    if inbound.is_some() && !outbound_running && should_dial_back(status.mode, ceremony_open) {
+        let mut attempt = false;
+        if let Ok(mut slot) = last_attempt.lock() {
+            let due = slot
+                .map(|last| last.elapsed() >= std::time::Duration::from_secs(30))
+                .unwrap_or(true);
+            if due {
+                *slot = Some(std::time::Instant::now());
+                attempt = true;
+            }
+        }
+        if attempt {
+            if let Some(link) = inbound {
+                ui_log(&format!(
+                    "link: dialling back {} at {} for two-way edge",
+                    link.node_name, link.address
+                ));
+                spawn_dial_back(&weak, session, pending, data_dir, link.address);
+            }
+        }
+    }
+}
+
+/// Start the supervised station dial-back: the daemon accepted an inbound
+/// link we never dialed, so arm our half automatically over the verified
+/// trust — no button, no code. The link's death tears this down (see
+/// follow_link); a user Connect supersedes it.
+fn spawn_dial_back(
     weak: &slint::Weak<AppWindow>,
     session: &Arc<Mutex<Option<Session>>>,
     pending: &Arc<Mutex<Option<PendingPair>>>,
     data_dir: &std::path::Path,
+    address: String,
 ) {
-    // A receiver-only machine must not drive others; the daemon would refuse
-    // every handoff. Refuse early with guidance instead of a mysterious
-    // edge mode that never crosses.
-    if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
-        if status.mode == kvm_core::Mode::ClientOnly {
-            set_status(
-                weak,
-                "This computer is set to 'Be controlled', so edge control cannot drive others. Press 'Control other' or 'Both ways' above — edge control starts by itself once allowed.".into(),
-            );
-            return;
-        }
-    }
     launch_child(
         weak,
         session,
         pending,
         data_dir,
-        None,
-        "edge mode".to_owned(),
+        address.clone(),
+        address,
         true,
     );
 }
 
-/// Shared supervised-child launcher for fixed takeover (`connect <address>`)
-/// and edge control (`connect` with no address). The child reports
-/// THEKVM_STATUS progress on stderr; the relay turns it into truthful
-/// status. Exactly one supervised child runs at a time: starting one mode
-/// stops the other with a log line, so retries can never stack.
+/// Shared supervised-child launcher: every child dials one link address,
+/// then routes topologically (shared cursor both directions, nothing
+/// freezes). The child reports THEKVM_STATUS progress on stderr; the relay
+/// turns it into truthful status. Exactly one supervised child runs at a
+/// time: starting one stops the other with a log line, so retries can never
+/// stack.
 fn launch_child(
     weak: &slint::Weak<AppWindow>,
     session: &Arc<Mutex<Option<Session>>>,
     pending: &Arc<Mutex<Option<PendingPair>>>,
     data_dir: &std::path::Path,
-    connect_address: Option<String>,
+    connect_address: String,
     label: String,
-    is_edge: bool,
+    dialback: bool,
 ) {
     if session
         .lock()
@@ -2035,8 +2110,7 @@ fn launch_child(
         .is_some_and(|slot| slot.as_ref().is_some())
     {
         ui_log(&format!(
-            "session: stopping the running {} before starting {label}",
-            if is_edge { "takeover" } else { "edge control" }
+            "session: stopping the running link before starting {label}"
         ));
         stop_session(weak, session, "Previous session stopped");
     }
@@ -2049,9 +2123,7 @@ fn launch_child(
     };
     let mut command = std::process::Command::new(&binary);
     command.arg("connect");
-    if let Some(address) = &connect_address {
-        command.arg(address);
-    }
+    command.arg(&connect_address);
     command.env("THEKVM_DATA_DIR", data_dir);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
@@ -2073,19 +2145,15 @@ fn launch_child(
                     child,
                     address: label.clone(),
                     verified: verified.clone(),
-                    is_edge,
+                    dialback,
                 });
             }
             set_session(&weak, Some(label.clone()));
             set_status(
                 &weak,
-                if is_edge {
-                    "Starting edge control… arrange the linked screens first if it keeps waiting.".into()
-                } else {
-                    format!(
-                        "Connecting to {label}… verifying the other side (a few seconds). Press Disconnect to stop."
-                    )
-                },
+                format!(
+                    "Connecting to {label}… verifying the other side (a few seconds). Press Disconnect to stop."
+                ),
             );
             if let Some(stderr) = stderr {
                 let weak = weak.clone();
@@ -2093,7 +2161,7 @@ fn launch_child(
                 let pending = pending.clone();
                 let data_dir = data_dir.to_owned();
                 std::thread::spawn(move || {
-                    relay_session_progress(&weak, stderr, &label, &verified, &session, &pending, data_dir, is_edge)
+                    relay_session_progress(&weak, stderr, &label, &verified, &session, &pending, data_dir, dialback)
                 });
             } else {
                 ui_log("session: child stderr unavailable; connection cannot be verified");
@@ -2110,11 +2178,10 @@ fn launch_child(
 ///
 /// Self-healing trust: when the peer reports "not paired" three times in a
 /// row, the local pin is provably one-sided (the ceremony completed here
-/// but never there). Instead of retrying forever, the relay removes the
-/// stale local pin, stops the hopeless child, and restarts the full code
-/// ceremony automatically — the user only watches two code screens match.
-/// This is safe: the refusal arrives over the peer's authenticated channel,
-/// and the fresh ceremony still needs both sides to approve the codes.
+/// but never there). A user-dialed child restarts the full code ceremony
+/// automatically; a station dial-back just stops honestly (its inbound link
+/// persists, so the poll re-arms it once trust is repaired) — it must never
+/// hijack the ceremony with an unprompted outbound dial.
 fn relay_session_progress(
     weak: &slint::Weak<AppWindow>,
     stderr: std::process::ChildStderr,
@@ -2123,7 +2190,7 @@ fn relay_session_progress(
     session: &Arc<Mutex<Option<Session>>>,
     pending: &Arc<Mutex<Option<PendingPair>>>,
     data_dir: std::path::PathBuf,
-    is_edge: bool,
+    dialback: bool,
 ) {
     use std::io::BufRead as _;
     let reader = std::io::BufReader::new(stderr);
@@ -2142,16 +2209,17 @@ fn relay_session_progress(
         if kind == "waiting" && detail.contains("peer is not paired") {
             not_paired_streak += 1;
             if not_paired_streak == 3 {
-                // Edge mode has no automatic re-pair path: it drives whatever
-                // the books trust, so a refusal means the arrangement outlived
-                // the trust. Stop honestly instead of looping or hijacking
-                // the fixed-takeover ceremony.
-                if is_edge {
-                    ui_log("edge: peer reports us unknown 3x; stopping edge mode for a fresh pairing");
-                    stop_session(weak, session, "Edge mode stopped");
+                // A station dial-back drives whatever the books trust, so a
+                // refusal means the trust itself is one-sided. Stop honestly
+                // instead of looping or hijacking the ceremony with an
+                // unprompted outbound dial; the poll re-arms the dial-back
+                // once trust is repaired.
+                if dialback {
+                    ui_log("link: dial-back peer reports us unknown 3x; stopping for a fresh pairing");
+                    stop_session(weak, session, "Link stopped");
                     set_status(
                         weak,
-                        format!("{address} doesn't recognize this computer — repeat the code check under Connect; edge control restarts by itself afterwards."),
+                        format!("{address} doesn't recognize this computer — repeat the code check under Connect."),
                     );
                     return;
                 }
@@ -2178,8 +2246,12 @@ fn relay_session_progress(
         let text = match kind {
             "established" => {
                 verified.store(true, std::sync::atomic::Ordering::Relaxed);
+                // Adopt the live fingerprint for this address: the peer may
+                // have re-paired under a new identity since the screens were
+                // arranged (ghost pins misroute every handoff).
+                adopt_link_fingerprint(&data_dir, address);
                 format!(
-                    "Connected to {address} — your whole keyboard and mouse drive it now (this screen is frozen). Disconnect to take it back. It retries automatically until you Disconnect."
+                    "Connected to {address} — shared cursor is live both ways: push past any edge to drive the other screen, push back to return. Both computers stay usable. Disconnect ends the link."
                 )
             }
             "edge-ready" => {
@@ -2983,7 +3055,7 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{edge_name, pair_status_text, should_auto_start_edge};
+    use super::{edge_name, pair_status_text, should_dial_back};
 
     #[test]
     fn compare_screen_names_peer_and_code() {
@@ -3009,19 +3081,16 @@ mod tests {
     }
 
     #[test]
-    fn edge_is_always_on_unless_driving_is_forbidden_or_busy() {
+    fn dial_back_arms_only_live_links_we_may_drive() {
         use kvm_core::Mode::{Bidirectional, ClientOnly, ServerClient};
-        // May drive + idle + no ceremony: start.
-        assert!(should_auto_start_edge(Bidirectional, false, false));
-        assert!(should_auto_start_edge(ServerClient, false, false));
-        // Receiver-only must never drive.
-        assert!(!should_auto_start_edge(ClientOnly, false, false));
-        // A running session (takeover or edge) is never disturbed.
-        assert!(!should_auto_start_edge(Bidirectional, true, false));
-        assert!(!should_auto_start_edge(ServerClient, true, false));
+        // May drive + no ceremony: arm.
+        assert!(should_dial_back(Bidirectional, false));
+        assert!(should_dial_back(ServerClient, false));
+        // Receiver-only must never drive back.
+        assert!(!should_dial_back(ClientOnly, false));
         // An open pairing ceremony is never hijacked.
-        assert!(!should_auto_start_edge(Bidirectional, false, true));
-        assert!(!should_auto_start_edge(ClientOnly, true, true));
+        assert!(!should_dial_back(Bidirectional, true));
+        assert!(!should_dial_back(ClientOnly, true));
     }
 
     #[test]
@@ -3030,49 +3099,22 @@ mod tests {
         let layout = kvm_core::Layout::pair_default("me", "peer", &fp);
         assert_eq!(layout.side_of_peer(&fp), Some(kvm_core::Edge::Right));
         assert_eq!(layout.side_of_peer(&"ff".repeat(32)), None);
-        let mirror = kvm_core::Layout::pair_mirror("me", "peer", &fp);
-        assert_eq!(mirror.side_of_peer(&fp), Some(kvm_core::Edge::Left));
         let empty = kvm_core::Layout::default();
         assert_eq!(empty.side_of_peer(&fp), None);
     }
 
     #[test]
-    fn migrate_020_mirror_rewrites_ids_only() {
+    fn canonical_default_numbers_self_one_on_every_machine() {
+        // Both sides write the same shape; routing is by name, so no
+        // mirror/migration step exists anymore.
         let fp = "ee".repeat(32);
-        // 0.2.0 wrote the mirror with self=1: rebuild that exact shape.
-        let old = kvm_core::Layout {
-            screens: vec![
-                kvm_core::Screen {
-                    id: kvm_core::SELF_SCREEN_ID,
-                    name: "me".into(),
-                    x: 0,
-                    y: 0,
-                    width: 1920,
-                    height: 1080,
-                    peer_fingerprint: None,
-                },
-                kvm_core::Screen {
-                    id: kvm_core::FIRST_PEER_SCREEN_ID,
-                    name: "peer".into(),
-                    x: -1,
-                    y: 0,
-                    width: 1920,
-                    height: 1080,
-                    peer_fingerprint: Some(fp.clone()),
-                },
-            ],
-            self_screen: Some(kvm_core::SELF_SCREEN_ID),
-        };
-        let fixed = super::migrate_020_mirror(&old).expect("exact 0.2.0 shape must migrate");
-        assert_eq!(fixed.self_screen, Some(kvm_core::MIRROR_SELF_SCREEN_ID));
-        assert_eq!(fixed.side_of_peer(&fp), Some(kvm_core::Edge::Left));
-        assert_eq!(fixed.validate(), Ok(()));
-        // Anything else is left alone: fresh defaults, empty, multi-screen.
-        assert!(super::migrate_020_mirror(
-            &kvm_core::Layout::pair_default("me", "peer", &fp)
-        )
-        .is_none());
-        assert!(super::migrate_020_mirror(&kvm_core::Layout::default()).is_none());
+        let layout = kvm_core::Layout::pair_default("me", "peer", &fp);
+        assert_eq!(layout.self_screen, Some(kvm_core::SELF_SCREEN_ID));
+        assert_eq!(
+            layout.screen_by_name("peer").and_then(|s| s.peer_fingerprint.clone()),
+            Some(fp)
+        );
+        assert_eq!(layout.validate(), Ok(()));
     }
 }
 

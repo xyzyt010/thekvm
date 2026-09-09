@@ -14,6 +14,7 @@ use kvm_protocol::wire::{
 };
 use kvm_protocol::DEFAULT_PORT;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,6 +28,98 @@ static SHUTDOWN: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock:
 
 pub(crate) fn shutdown_notifier() -> &'static tokio::sync::Notify {
     SHUTDOWN.get_or_init(tokio::sync::Notify::new)
+}
+
+/// One live INBOUND input session: a verified peer drives this machine right
+/// now. The station-side desktop UI watches this registry (via Status) to
+/// arm its own half of a link it never dialed — MWB arming — and to hang
+/// the link up again. Keyed by peer fingerprint; the id guards removal so a
+/// dying task can never unregister its own successor's fresh session.
+#[derive(Debug, Clone)]
+pub(crate) struct InboundLink {
+    pub id: u64,
+    pub fingerprint_hex: String,
+    pub node_name: String,
+    pub address: String,
+}
+
+type LinkRegistry = Arc<std::sync::Mutex<HashMap<String, (InboundLink, tokio::sync::watch::Sender<bool>)>>>;
+
+static INBOUND_LINKS: std::sync::OnceLock<LinkRegistry> = std::sync::OnceLock::new();
+static LINK_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn inbound_link_registry() -> LinkRegistry {
+    INBOUND_LINKS
+        .get_or_init(|| Arc::new(std::sync::Mutex::new(HashMap::new())))
+        .clone()
+}
+
+/// Record a verified inbound session; returns its registration id and a
+/// drop-watch the serve loop selects on. Replaces any stale entry for the
+/// same peer (the old task is already gone — only one input session holds
+/// the slot at a time).
+pub(crate) fn register_inbound_link(
+    fingerprint_hex: &str,
+    node_name: &str,
+    address: &str,
+) -> (u64, tokio::sync::watch::Receiver<bool>) {
+    let id = LINK_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (drop_tx, drop_rx) = tokio::sync::watch::channel(false);
+    if let Ok(mut links) = inbound_link_registry().lock() {
+        links.insert(
+            fingerprint_hex.to_owned(),
+            (
+                InboundLink {
+                    id,
+                    fingerprint_hex: fingerprint_hex.to_owned(),
+                    node_name: node_name.to_owned(),
+                    address: address.to_owned(),
+                },
+                drop_tx,
+            ),
+        );
+    }
+    (id, drop_rx)
+}
+
+/// Remove a registration, but only when the id still matches — a redialed
+/// successor must survive its predecessor's cleanup.
+pub(crate) fn remove_inbound_link(fingerprint_hex: &str, id: u64) {
+    if let Ok(mut links) = inbound_link_registry().lock() {
+        if links
+            .get(fingerprint_hex)
+            .is_some_and(|(link, _)| link.id == id)
+        {
+            links.remove(fingerprint_hex);
+        }
+    }
+}
+
+/// Ask the serve loop of one inbound session to end (station hang-up). The
+/// dialer's side sees the closed connection and tears down with it, so one
+/// Disconnect ends the whole link. Trust is untouched.
+pub(crate) fn drop_inbound_link(fingerprint_hex: &str) -> bool {
+    if let Ok(links) = inbound_link_registry().lock() {
+        if let Some((_, drop_tx)) = links.get(fingerprint_hex) {
+            return drop_tx.send(true).is_ok();
+        }
+    }
+    false
+}
+
+pub(crate) fn list_inbound_links() -> Vec<kvm_protocol::control::ActiveSession> {
+    if let Ok(links) = inbound_link_registry().lock() {
+        links
+            .values()
+            .map(|(link, _)| kvm_protocol::control::ActiveSession {
+                fingerprint_hex: link.fingerprint_hex.clone(),
+                node_name: link.node_name.clone(),
+                address: link.address.clone(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Wait for a process-level stop request when the daemon is running outside a
@@ -832,27 +925,31 @@ pub async fn capture(address: &str) -> Result<()> {
 /// is the command intended for a user-session startup entry on the controller
 /// machine; the target daemon may boot earlier, reboot independently, or be
 /// temporarily absent from the LAN.
+///
+/// MWB node semantics: the upfront dial proves reachability and mutual trust
+/// (the status only claims `established` after the handshake accepts), then
+/// the child routes topologically — local input stays local until a screen
+/// edge is crossed, and crossings drive the linked peer. Nothing ever
+/// freezes: both computers stay usable, both directions, one shared cursor
+/// each way. Drive episodes dial fresh per crossing over the verified link.
 pub async fn connect(address: Option<&str>) -> Result<()> {
     let Some(address) = address else {
-        return connect_topology().await;
+        return connect_topology(None).await;
     };
-    let identity = Identity::load_or_create(&data_dir())?;
-    let peers = PeerBook::load_or_create(&data_dir())?;
-    let config = load_local_config()?;
-    let (mut priority_rx, mut motion_rx, capture_control) = start_capture(false, false)?;
-    let mut clipboard = start_clipboard_agent(config.clipboard_enabled);
-    let mut clipboard_revision = 0;
-
+    let address = address.to_owned();
     // Machine-readable progress for a supervising UI (which pipes stderr):
     // dialing -> waiting <reason> (retries) -> established <peer>, and ended
     // on a clean shutdown. The UI must only claim "Connected" after
     // `established`; anything earlier is still connecting.
     eprintln!("THEKVM_STATUS dialing {address}");
     loop {
+        let identity = Identity::load_or_create(&data_dir())?;
+        let peers = PeerBook::load_or_create(&data_dir())?;
+        let config = load_local_config()?;
         match dial_session(
             &identity,
             &peers,
-            address,
+            &address,
             ConnectPolicy {
                 node_name: &config.device_name,
                 request_lock_screen: config.allow_lock_screen_control,
@@ -865,37 +962,17 @@ pub async fn connect(address: Option<&str>) -> Result<()> {
         )
         .await
         {
-            Ok((conn, send, recv, capabilities)) => {
-                let mut send = send;
-                let clipboard_enabled = capabilities.clipboard_enabled;
-                let snapshot = capture_control.snapshot();
-                send_state_sync(&mut send, snapshot.state).await?;
-                capture_control.set_exclusive(true)?;
-                tracing::info!(peer = %address, "connected input session");
+            Ok((conn, _send, _recv, _capabilities)) => {
+                // Verified logical link: this is the LIVE fingerprint — ghost
+                // pins elsewhere can no longer misroute. Episodes dial fresh
+                // per crossing, so the handshake connection itself is done.
+                let link = TopologyLink {
+                    fingerprint: peer_fingerprint(&conn)?.to_ascii_lowercase(),
+                    address: address.clone(),
+                };
+                tracing::info!(peer = %address, "linked input session");
                 eprintln!("THEKVM_STATUS established {address}");
-                let result = run_capture_stream(
-                    conn,
-                    send,
-                    recv,
-                    &mut priority_rx,
-                    &mut motion_rx,
-                    snapshot.last_event_id,
-                    &mut clipboard,
-                    clipboard_enabled,
-                    &mut clipboard_revision,
-                )
-                .await;
-                capture_control.set_exclusive(false)?;
-                match result {
-                    Ok(()) => {
-                        eprintln!("THEKVM_STATUS ended clean");
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, peer = %address, "input session lost; retrying");
-                        eprintln!("THEKVM_STATUS waiting {error:#}");
-                    }
-                }
+                return connect_topology(Some(link)).await;
             }
             Err(error) => {
                 tracing::warn!(%error, peer = %address, "peer unavailable; retrying");
@@ -903,12 +980,6 @@ pub async fn connect(address: Option<&str>) -> Result<()> {
             }
         }
 
-        // Drop events gathered while the peer was unavailable. Replaying stale
-        // pointer motion or key transitions after reconnect is worse than
-        // losing those transitions; the receiver's release-all cleanup gives
-        // the next session a known state.
-        while priority_rx.try_recv().is_ok() {}
-        while motion_rx.try_recv().is_ok() {}
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(2)) => {},
             _ = tokio::signal::ctrl_c() => {
@@ -1111,7 +1182,12 @@ async fn run_windows_service_capture_stream(
 /// separate path from the fixed-peer diagnostic command: it keeps connection
 /// establishment out of the capture backend and makes topology decisions in
 /// one stateful router.
-async fn connect_topology() -> Result<()> {
+///
+/// `link` carries a verified logical link (from an upfront dial): the child
+/// then drives ONLY that peer — MWB switches solely to connected machines.
+/// Without a link the child dials whatever the arrangement names (legacy
+/// standalone use; the desktop UI always links).
+async fn connect_topology(link: Option<TopologyLink>) -> Result<()> {
     let dir = data_dir();
     // Machine-readable progress for a supervising UI (which pipes stderr):
     // edge-ready when capture runs, driving <screen> while a peer owns the
@@ -1122,24 +1198,38 @@ async fn connect_topology() -> Result<()> {
     // The arrangement may not exist yet (fresh pairing): wait for it instead
     // of exiting, reloading the config every few seconds, so starting edge
     // mode and then arranging the screens just starts working with no
-    // restart and no extra click.
+    // restart and no extra click. A linked child additionally waits for the
+    // linked peer's screen (the supervisor adopts the live fingerprint on
+    // `established`, healing ghost pins with no restart either).
     let (config, mut router) = loop {
         let config = Config::load(&dir.join("config.json"))
             .with_context(|| format!("loading topology config from {}", dir.display()))?;
+        let linked = link.as_ref().is_none_or(|link| {
+            config.layout.screens.iter().any(|screen| {
+                screen.peer_fingerprint.as_deref() == Some(link.fingerprint.as_str())
+            })
+        });
         match EdgeRouter::new(config.layout.clone()) {
-            Ok(router) => break (config, router),
+            Ok(router) if linked => break (config, router),
+            Ok(_) => {
+                let waiting_for = link.as_ref().map(|link| link.address.as_str()).unwrap_or("?");
+                tracing::info!(%waiting_for, "topology waiting for the linked screen to be arranged");
+                eprintln!(
+                    "THEKVM_STATUS waiting linked computer not arranged yet — adopting it…"
+                );
+            }
             Err(error) => {
                 tracing::warn!(%error, "topology has no screen arrangement yet; waiting for one");
                 eprintln!(
                     "THEKVM_STATUS waiting no screen arrangement yet — arrange the linked screens first ({error})"
                 );
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {},
-                    _ = tokio::signal::ctrl_c() => {
-                        eprintln!("THEKVM_STATUS ended interrupted");
-                        return Ok(());
-                    }
-                }
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("THEKVM_STATUS ended interrupted");
+                return Ok(());
             }
         }
     };
@@ -1165,6 +1255,7 @@ async fn connect_topology() -> Result<()> {
     let mut clipboard_revision = 0u64;
     let mut latest_clipboard: Option<String> = None;
     let mut discarded_event_barrier = 0u64;
+    let mut last_transfer: Option<std::time::Instant> = None;
     let mut sequence = 0u64;
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1190,6 +1281,23 @@ async fn connect_topology() -> Result<()> {
                                 .max(capture_control.snapshot().last_event_id);
                         }
                         let target = ScreenId(handoff.screen_id);
+                        // Named routing first: the peer names the screen it
+                        // reached, and names agree across machines while local
+                        // numbers never do. The bare number is only a
+                        // mixed-version fallback. An unknown name stays
+                        // local — never drive blind.
+                        let target = if handoff.target_name.is_empty() {
+                            target
+                        } else {
+                            match router.layout().screen_by_name(&handoff.target_name) {
+                                Some(screen) => screen.id,
+                                None => {
+                                    tracing::warn!(name = %handoff.target_name, "handoff names an unknown screen; staying local");
+                                    eprintln!("THEKVM_STATUS local");
+                                    continue;
+                                }
+                            }
+                        };
                         let (handoff_x, handoff_y) = router
                             .screen(target)
                             .map(|screen| {
@@ -1320,6 +1428,8 @@ async fn connect_topology() -> Result<()> {
                     peers: &peers,
                     capture_control: &capture_control,
                     active: &mut active,
+                    link: link.as_ref(),
+                    last_transfer: &mut last_transfer,
                     node_name: &config.device_name,
                     sequence: &mut sequence,
                     request_lock_screen: config.allow_lock_screen_control,
@@ -1348,6 +1458,8 @@ async fn connect_topology() -> Result<()> {
                     peers: &peers,
                     capture_control: &capture_control,
                     active: &mut active,
+                    link: link.as_ref(),
+                    last_transfer: &mut last_transfer,
                     node_name: &config.device_name,
                     sequence: &mut sequence,
                     request_lock_screen: config.allow_lock_screen_control,
@@ -1423,9 +1535,10 @@ struct TopologySession {
     remote_clipboard_revision: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RemoteHandoff {
     screen_id: u32,
+    target_name: String,
     x: u32,
     y: u32,
     dx: i32,
@@ -1448,12 +1561,32 @@ impl TopologySession {
     }
 }
 
+/// A verified logical link to one peer: the upfront dial proved
+/// reachability and mutual trust (and yielded the LIVE fingerprint —
+/// ghost pins in the book can no longer misroute). Drive episodes dial
+/// fresh per crossing (cheap on LAN) and only ever to this peer: MWB
+/// switches solely to connected machines, never to a stranger in a field.
+#[derive(Debug, Clone)]
+struct TopologyLink {
+    fingerprint: String,
+    address: String,
+}
+
+/// MWB lastJump parity: ignore a new edge transfer within 150ms of the last
+/// completed one, so two facing edges can never ping-pong the cursor
+/// forever. Pure so the determinism is unit-tested.
+fn transfer_debounced(last_transfer: Option<std::time::Instant>) -> bool {
+    last_transfer.is_some_and(|when| when.elapsed() < Duration::from_millis(150))
+}
+
 struct TopologyEventContext<'a> {
     router: &'a mut EdgeRouter,
     identity: &'a Identity,
     peers: &'a PeerBook,
     capture_control: &'a CaptureGuard,
     active: &'a mut Option<TopologySession>,
+    link: Option<&'a TopologyLink>,
+    last_transfer: &'a mut Option<std::time::Instant>,
     node_name: &'a str,
     sequence: &'a mut u64,
     request_lock_screen: bool,
@@ -1476,6 +1609,8 @@ async fn handle_topology_event(
         peers,
         capture_control,
         active,
+        link,
+        last_transfer,
         node_name,
         sequence,
         request_lock_screen,
@@ -1554,6 +1689,28 @@ async fn handle_topology_event(
             if active.is_some() {
                 bail!("topology router attempted a second active handoff");
             }
+            // MWB connected-guard: a linked child drives ONLY its verified
+            // linked peer. Anything else is a stranger — clamp back local.
+            if let Some(link) = link {
+                let linked = router
+                    .screen(target)
+                    .and_then(|screen| screen.peer_fingerprint.as_deref())
+                    == Some(link.fingerprint.as_str());
+                if !linked {
+                    tracing::debug!(?target, "edge faces an unlinked screen; staying local");
+                    let _ = router.restore_local(target);
+                    let (x, y) = router.cursor_position();
+                    let _ = capture_control.warp_cursor(x, y);
+                    return Ok(());
+                }
+            }
+            // MWB lastJump debounce: let the last transfer settle first.
+            if transfer_debounced(*last_transfer) {
+                let _ = router.restore_local(target);
+                let (x, y) = router.cursor_position();
+                let _ = capture_control.warp_cursor(x, y);
+                return Ok(());
+            }
             let snapshot = capture_control.snapshot();
             match open_topology_session(TopologyOpen {
                 router,
@@ -1579,6 +1736,7 @@ async fn handle_topology_event(
             {
                 Ok(session) => {
                     capture_control.set_exclusive(true)?;
+                    *last_transfer = Some(std::time::Instant::now());
                     *active = Some(session);
                     let name = router
                         .screen(target)
@@ -1695,6 +1853,7 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         &mut send,
         &WireMessage::PointerHandoff {
             screen_id: target.0,
+            target_name: screen.name.clone(),
             x: target_x,
             y: target_y,
             screen_geometry: wire_geometry,
@@ -1754,6 +1913,7 @@ async fn drain_peer_responses(
         match message {
             WireMessage::HandoffRequest {
                 screen_id,
+                target_name,
                 x,
                 y,
                 dx,
@@ -1762,6 +1922,7 @@ async fn drain_peer_responses(
             } => {
                 let _ = signal.send(RemoteSignal::Handoff(RemoteHandoff {
                     screen_id,
+                    target_name,
                     x,
                     y,
                     dx,
@@ -2594,6 +2755,14 @@ async fn handle_connection(
                     hello.lock_screen_requested
                 ),
             );
+            // Publish the live inbound link: the station-side UI arms its
+            // own half of the link from here (it never dialed), and hangs
+            // the link up from here too.
+            let (link_id, mut link_drop) = register_inbound_link(
+                &peer_fingerprint,
+                &hello.node_name,
+                &conn.remote_address().to_string(),
+            );
             let mut seen_sequences = BTreeSet::new();
             let mut motion_sequence = MotionSequence::default();
             let mut last_activity = Instant::now();
@@ -2636,15 +2805,30 @@ async fn handle_connection(
                             }
                             WireMessage::PointerHandoff {
                                 screen_id,
+                                target_name,
                                 x,
                                 y,
                                 screen_geometry,
                             } => {
-                                let expected = config.layout.self_screen;
-                                if expected != Some(ScreenId(screen_id)) {
-                                    bail!("peer handed off to screen {screen_id}, but this node is {:?}", expected);
-                                }
-                                let target = ScreenId(screen_id);
+                                // Named acceptance: the sender names THIS
+                                // machine, and names agree across machines.
+                                // Local screen numbers never cross the wire
+                                // as identity (one mirrored config broke
+                                // every handoff in both directions).
+                                let target = if !target_name.is_empty() {
+                                    if target_name != config.device_name {
+                                        bail!("peer handed off to '{target_name}', but this node is '{}'", config.device_name);
+                                    }
+                                    config.layout.self_screen.context(
+                                        "handoff accepted by name but no local screen is arranged",
+                                    )?
+                                } else {
+                                    let expected = config.layout.self_screen;
+                                    if expected != Some(ScreenId(screen_id)) {
+                                        bail!("peer handed off to screen {screen_id}, but this node is {:?}", expected);
+                                    }
+                                    ScreenId(screen_id)
+                                };
                                 let target_geometry = screen_geometry_for(&config.layout, target)
                                     .context("local screen geometry is unavailable")?;
                                 let (x, y) = remap_position(
@@ -2727,8 +2911,25 @@ async fn handle_connection(
                             bail!("trusted peer was revoked during the input session");
                         }
                     }
+                    _ = async {
+                        // Station hang-up: set by DropSession, read here.
+                        // (`changed`, not `wait_for`: the watch Ref guard is
+                        // not Send and this task is spawned.)
+                        loop {
+                            if *link_drop.borrow_and_update() {
+                                break;
+                            }
+                            if link_drop.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    } => {
+                        tracing::info!(peer = %peer_fingerprint, "station user dropped the input session");
+                        break Ok(());
+                    }
                 }
             };
+            remove_inbound_link(&peer_fingerprint, link_id);
             if let Err(error) = session_result {
                 let _ = injector.release_all();
                 return Err(error);
@@ -2806,6 +3007,11 @@ async fn process_remote_input(
             };
             let configured_target_geometry = screen_geometry_for(&config.layout, handoff.target)
                 .context("handoff target screen disappeared")?;
+            let target_name = config
+                .layout
+                .screen(handoff.target)
+                .map(|screen| screen.name.clone())
+                .unwrap_or_default();
             let (target_x, target_y, screen_geometry) = match peer_screen_geometry
                 .filter(|geometry| geometry.screen_id == handoff.target.0)
             {
@@ -2824,6 +3030,7 @@ async fn process_remote_input(
                 send,
                 &WireMessage::HandoffRequest {
                     screen_id: handoff.target.0,
+                    target_name,
                     x: target_x,
                     y: target_y,
                     dx: remainder_dx,
@@ -3758,6 +3965,43 @@ mod tests {
             assert!(validate_input_capability(&locked_on, false).is_ok());
             assert!(validate_input_capability(&locked_on, true).is_ok());
         }
+    }
+
+    #[test]
+    fn transfer_debounce_settles_facing_edges() {
+        // No transfer yet: drive.
+        assert!(!transfer_debounced(None));
+        let just = std::time::Instant::now();
+        // A transfer that just finished: hold.
+        assert!(transfer_debounced(Some(just)));
+        // An old transfer: drive again.
+        let old = just - Duration::from_secs(1);
+        assert!(!transfer_debounced(Some(old)));
+    }
+
+    #[test]
+    fn inbound_link_registry_tracks_and_drops_live_sessions() {
+        let fp = "dd".repeat(32);
+        // No session: nothing listed, nothing to drop.
+        remove_inbound_link(&fp, 1);
+        assert!(!drop_inbound_link(&fp));
+        assert!(list_inbound_links().iter().all(|s| s.fingerprint_hex != fp));
+        // Register: listed with name and address, droppable.
+        let (id, _rx) = register_inbound_link(&fp, "mint", "192.168.1.7:42110");
+        let listed: Vec<_> = list_inbound_links()
+            .into_iter()
+            .filter(|s| s.fingerprint_hex == fp)
+            .collect();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].node_name, "mint");
+        assert_eq!(listed[0].address, "192.168.1.7:42110");
+        assert!(drop_inbound_link(&fp));
+        // Wrong id must not unregister (a redialed successor survives).
+        remove_inbound_link(&fp, id + 999);
+        assert!(list_inbound_links().iter().any(|s| s.fingerprint_hex == fp));
+        // Right id unregisters.
+        remove_inbound_link(&fp, id);
+        assert!(list_inbound_links().iter().all(|s| s.fingerprint_hex != fp));
     }
 
     #[test]

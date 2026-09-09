@@ -3,13 +3,10 @@ use serde::{Deserialize, Serialize};
 
 /// Screen arrangement, like MWB's topology grid / Deskflow's layout editor.
 ///
-/// Screen ids are GLOBALLY unique across a linked set: each machine's own
-/// screen keeps its own id, and handoff requests name screens in this shared
-/// numbering so both ends resolve them without an id-exchange protocol. The
-/// pairing convention is Machine 1 (the connector): self=1, peer=2; Machine 2
-/// (the station mirror): self=2, peer=1. The receiver only accepts a session
-/// naming its own self screen, so both sides must follow the convention —
-/// two self=1 layouts can pair but can never open edge sessions.
+/// Screen ids are LOCAL ONLY: each machine numbers itself 1 and its first
+/// peer 2 (Swap sides only moves grid positions, never ids). Handoffs name
+/// screens by device name across the wire — numbers must never decide
+/// identity, because one side's numbering says nothing about the other's.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Layout {
     pub screens: Vec<Screen>,
@@ -20,13 +17,11 @@ pub struct Layout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScreenId(pub u32);
 
-/// Screen-id convention for paired machines (see [`Layout`]): ids are
-/// globally unique per linked set; each side's self screen keeps its own id.
+/// Screen-id convention for a fresh pairing: self is always 1, first peer
+/// is always 2, on EVERY machine. Positions (left/right) are per-machine
+/// user arrangement and carry no identity.
 pub const SELF_SCREEN_ID: ScreenId = ScreenId(1);
 pub const FIRST_PEER_SCREEN_ID: ScreenId = ScreenId(2);
-/// Machine-2 self id in the pairing convention (its peer screen is 1).
-pub const MIRROR_SELF_SCREEN_ID: ScreenId = ScreenId(2);
-pub const MIRROR_PEER_SCREEN_ID: ScreenId = ScreenId(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Screen {
@@ -142,14 +137,21 @@ impl Layout {
         self.screens.iter().find(|screen| screen.id == id)
     }
 
+    /// Look a screen up by device name. Handoff routing uses this — never a
+    /// bare number — so both sides agree on WHO is driven even when their
+    /// local numbering differs.
+    pub fn screen_by_name(&self, name: &str) -> Option<&Screen> {
+        self.screens.iter().find(|screen| screen.name == name)
+    }
+
     pub fn self_screen(&self) -> Option<&Screen> {
         self.self_screen.and_then(|id| self.screen(id))
     }
 
-    /// Default two-screen arrangement for a fresh pairing, Machine 1 on the
-    /// left: this machine at (0,0), the peer at (1,0) — one exit edge
-    /// (Right). The connector (the machine whose user typed the code)
-    /// writes this at pairing time.
+    /// Default two-screen arrangement for a fresh pairing: this machine at
+    /// (0,0), the peer at (1,0). Every machine writes this same shape —
+    /// self=1, peer=2 — because handoffs travel by device name and numbers
+    /// are local-only.
     pub fn pair_default(
         self_name: &str,
         peer_name: &str,
@@ -177,40 +179,6 @@ impl Layout {
                 },
             ],
             self_screen: Some(SELF_SCREEN_ID),
-        }
-    }
-
-    /// Mirror image for the station side (Machine 2): this machine on the
-    /// right, the peer on the left — one exit edge (Left). Global ids are
-    /// swapped (self=2, peer=1) so the receiver check — which only accepts
-    /// sessions naming its own self screen — passes in both directions.
-    pub fn pair_mirror(
-        self_name: &str,
-        peer_name: &str,
-        peer_fingerprint: &str,
-    ) -> Self {
-        Self {
-            screens: vec![
-                Screen {
-                    id: MIRROR_SELF_SCREEN_ID,
-                    name: display_name(self_name, "This computer"),
-                    x: 0,
-                    y: 0,
-                    width: default_screen_width(),
-                    height: default_screen_height(),
-                    peer_fingerprint: None,
-                },
-                Screen {
-                    id: MIRROR_PEER_SCREEN_ID,
-                    name: display_name(peer_name, "Other computer"),
-                    x: -1,
-                    y: 0,
-                    width: default_screen_width(),
-                    height: default_screen_height(),
-                    peer_fingerprint: Some(peer_fingerprint.to_ascii_lowercase()),
-                },
-            ],
-            self_screen: Some(MIRROR_SELF_SCREEN_ID),
         }
     }
 
@@ -802,8 +770,8 @@ mod tests {
 
     #[test]
     fn next_screen_id_never_collides() {
-        let mirror = Layout::pair_mirror("me", "peer", &"ab".repeat(32));
-        assert_eq!(mirror.next_screen_id(), ScreenId(3));
+        let paired = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        assert_eq!(paired.next_screen_id(), ScreenId(3));
         assert_eq!(Layout::default().next_screen_id(), ScreenId(1));
     }
 
@@ -892,29 +860,29 @@ mod tests {
     }
 
     #[test]
-    fn pair_mirror_puts_peer_left_with_global_ids() {
-        let layout = Layout::pair_mirror("mint", "laptop", &"ab".repeat(32));
-        assert_eq!(layout.validate(), Ok(()));
-        // Global ids are swapped on the mirror side: self=2, peer=1, so the
-        // receiver check (which only accepts its own self screen) passes in
-        // both directions.
-        assert_eq!(layout.self_screen, Some(MIRROR_SELF_SCREEN_ID));
-        assert_eq!(layout.peer_exit_edge(), Some(Edge::Left));
+    fn both_sides_number_themselves_one_and_route_by_name() {
+        // The deterministic convention: both machines are self=1, peer=2.
+        // Handoffs name the device, so the numbering never has to agree —
+        // this is what the old mirror heuristic (self=2 on one side, dealt
+        // by a peer-book race) broke in both directions at once.
+        let laptop = Layout::pair_default("laptop", "mint", &"cd".repeat(32));
+        let mint = Layout::pair_default("mint", "laptop", &"ef".repeat(32));
+        assert_eq!(laptop.self_screen, Some(SELF_SCREEN_ID));
+        assert_eq!(mint.self_screen, Some(SELF_SCREEN_ID));
+        assert_eq!(laptop.screen_by_name("mint").map(|s| s.id), Some(FIRST_PEER_SCREEN_ID));
+        assert_eq!(mint.screen_by_name("laptop").map(|s| s.id), Some(FIRST_PEER_SCREEN_ID));
+    }
+
+    #[test]
+    fn screens_resolve_by_device_name_for_handoff_routing() {
+        let fp = "ee".repeat(32);
+        let layout = Layout::pair_default("me", "peer", &fp);
+        assert_eq!(layout.screen_by_name("me").map(|s| s.id), Some(SELF_SCREEN_ID));
         assert_eq!(
-            layout.side_of_peer(&"ab".repeat(32)),
-            Some(Edge::Left)
+            layout.screen_by_name("peer").and_then(|s| s.peer_fingerprint.clone()),
+            Some(fp)
         );
-        let handoff = layout
-            .handoff_for_motion(MIRROR_SELF_SCREEN_ID, 0, 540, -50, 0)
-            .expect("left edge must hand off");
-        assert_eq!(handoff.target, MIRROR_PEER_SCREEN_ID);
-        assert_eq!(handoff.edge, Edge::Left);
-        // The pair agrees end to end: default names 2, mirror accepts 2 as
-        // self; mirror names 1, default accepts 1 as self.
-        let default = Layout::pair_default("laptop", "mint", &"cd".repeat(32));
-        assert_eq!(default.self_screen, Some(SELF_SCREEN_ID));
-        assert!(default.screen(MIRROR_SELF_SCREEN_ID).is_some());
-        assert!(layout.screen(SELF_SCREEN_ID).is_some());
+        assert!(layout.screen_by_name("stranger").is_none());
     }
 
     #[test]
