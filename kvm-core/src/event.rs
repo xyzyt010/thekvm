@@ -14,6 +14,15 @@ pub enum InputEvent {
     MouseMove { dx: i32, dy: i32 },
     MouseButton { button: MouseButton, pressed: bool },
     Wheel(WheelDelta),
+    /// High-resolution scroll in 1/120-detent units (one Windows WHEEL_DELTA,
+    /// one Linux REL_WHEEL_HI_RES step). Precision touchpads report smooth
+    /// sub-detent motion that the detent-only `Wheel` truncates to zero —
+    /// which is why two-finger scroll never arrived remotely on any legacy
+    /// KVM. New peers negotiate this via Hello/Accepted; capture backends
+    /// emit it canonically and the sender downgrades to `Wheel` for older
+    /// peers. Sign convention matches `WheelDelta`: positive is away from
+    /// the user.
+    SmoothWheel { x: i32, y: i32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

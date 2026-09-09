@@ -192,7 +192,7 @@ pub fn create_capture(
 #[cfg(target_os = "windows")]
 mod win32_hooks {
     use super::{CaptureBackend, InputEvent, PlatformError};
-    use kvm_core::{KeyEvent, MouseButton, WheelDelta};
+    use kvm_core::{KeyEvent, MouseButton};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Mutex, OnceLock};
@@ -495,19 +495,25 @@ mod win32_hooks {
                         }
                     }
                     WM_MOUSEWHEEL => {
-                        send(InputEvent::Wheel(WheelDelta {
+                        // Forward the raw 120ths (one WHEEL_DELTA) untouched:
+                        // precision touchpads report smooth sub-detent motion
+                        // and the old `/ 120` detent truncation rounded all
+                        // of it to zero, so two-finger scroll never arrived
+                        // remotely on any legacy KVM. The sender downgrades
+                        // to detents for older peers.
+                        send(InputEvent::SmoothWheel {
                             x: 0,
-                            y: (info.mouseData >> 16) as i16 / 120,
-                        }));
+                            y: (info.mouseData >> 16) as i16 as i32,
+                        });
                         if BLOCK_LOCAL.load(Ordering::Acquire) {
                             return LRESULT(1);
                         }
                     }
                     WM_MOUSEHWHEEL => {
-                        send(InputEvent::Wheel(WheelDelta {
-                            x: (info.mouseData >> 16) as i16 / 120,
+                        send(InputEvent::SmoothWheel {
+                            x: (info.mouseData >> 16) as i16 as i32,
                             y: 0,
-                        }));
+                        });
                         if BLOCK_LOCAL.load(Ordering::Acquire) {
                             return LRESULT(1);
                         }

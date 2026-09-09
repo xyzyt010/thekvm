@@ -5,7 +5,7 @@
 //! cannot form an event loop.
 
 use crate::{capture::CaptureBackend, PlatformError};
-use kvm_core::{InputEvent, KeyEvent, MouseButton, WheelDelta};
+use kvm_core::{InputEvent, KeyEvent, MouseButton};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs::{read_dir, File, OpenOptions};
 use std::io;
@@ -28,6 +28,8 @@ const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
 const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
+const REL_WHEEL_HI_RES: u16 = 0x0b;
+const REL_HWHEEL_HI_RES: u16 = 0x0c;
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
@@ -53,8 +55,11 @@ struct Device {
     is_mouse: bool,
     dx: i32,
     dy: i32,
-    wheel_x: i16,
-    wheel_y: i16,
+    /// Accumulated scroll in 120ths (one REL_WHEEL_HI_RES step), flushed as
+    /// one `SmoothWheel` per SYN. Legacy detent ticks count 120 each, so a
+    /// notched wheel and a smooth touchpad share one canonical unit.
+    scroll_x_120ths: i32,
+    scroll_y_120ths: i32,
     queue: VecDeque<InputEvent>,
     pressed_keys: BTreeSet<u16>,
     pressed_buttons: BTreeSet<MouseButton>,
@@ -97,8 +102,8 @@ impl Device {
             is_mouse,
             dx: 0,
             dy: 0,
-            wheel_x: 0,
-            wheel_y: 0,
+            scroll_x_120ths: 0,
+            scroll_y_120ths: 0,
             queue: VecDeque::new(),
             pressed_keys: BTreeSet::new(),
             pressed_buttons: BTreeSet::new(),
@@ -133,8 +138,22 @@ impl Device {
             EV_REL if self.is_mouse => match event.code {
                 REL_X => self.dx = self.dx.saturating_add(event.value),
                 REL_Y => self.dy = self.dy.saturating_add(event.value),
-                REL_WHEEL => self.wheel_y = self.wheel_y.saturating_add(event.value as i16),
-                REL_HWHEEL => self.wheel_x = self.wheel_x.saturating_add(event.value as i16),
+                REL_WHEEL => {
+                    self.scroll_y_120ths = self
+                        .scroll_y_120ths
+                        .saturating_add(event.value.saturating_mul(120))
+                }
+                REL_HWHEEL => {
+                    self.scroll_x_120ths = self
+                        .scroll_x_120ths
+                        .saturating_add(event.value.saturating_mul(120))
+                }
+                REL_WHEEL_HI_RES => {
+                    self.scroll_y_120ths = self.scroll_y_120ths.saturating_add(event.value)
+                }
+                REL_HWHEEL_HI_RES => {
+                    self.scroll_x_120ths = self.scroll_x_120ths.saturating_add(event.value)
+                }
                 _ => {}
             },
             EV_SYN if event.code == SYN_REPORT => {
@@ -144,16 +163,16 @@ impl Device {
                         dy: self.dy,
                     });
                 }
-                if self.wheel_x != 0 || self.wheel_y != 0 {
-                    output.push(InputEvent::Wheel(WheelDelta {
-                        x: self.wheel_x,
-                        y: self.wheel_y,
-                    }));
+                if self.scroll_x_120ths != 0 || self.scroll_y_120ths != 0 {
+                    output.push(InputEvent::SmoothWheel {
+                        x: self.scroll_x_120ths,
+                        y: self.scroll_y_120ths,
+                    });
                 }
                 self.dx = 0;
                 self.dy = 0;
-                self.wheel_x = 0;
-                self.wheel_y = 0;
+                self.scroll_x_120ths = 0;
+                self.scroll_y_120ths = 0;
             }
             _ => {}
         }
@@ -689,8 +708,8 @@ mod tests {
             is_mouse: true,
             dx: 0,
             dy: 0,
-            wheel_x: 0,
-            wheel_y: 0,
+            scroll_x_120ths: 0,
+            scroll_y_120ths: 0,
             queue: VecDeque::new(),
             pressed_keys: BTreeSet::new(),
             pressed_buttons: BTreeSet::new(),
@@ -698,6 +717,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scroll_reports_smooth_120ths_for_detents_and_hi_res() {
+        use super::{REL_HWHEEL, REL_HWHEEL_HI_RES, REL_WHEEL, REL_WHEEL_HI_RES};
+        let mut device = test_device();
+        let rel = |code, value| RawInputEvent {
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_: EV_REL,
+            code,
+            value,
+        };
+        let syn = RawInputEvent {
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_: EV_SYN,
+            code: SYN_REPORT,
+            value: 0,
+        };
+        // One legacy detent tick plus a sub-detent hi-res touchpad motion.
+        assert!(device.process(rel(REL_WHEEL, 1)).is_empty());
+        assert!(device.process(rel(REL_WHEEL_HI_RES, 30)).is_empty());
+        assert!(device.process(rel(REL_HWHEEL_HI_RES, -15)).is_empty());
+        // Legacy horizontal detent counts 120.
+        assert!(device.process(rel(REL_HWHEEL, -1)).is_empty());
+        assert_eq!(
+            device.process(syn),
+            vec![InputEvent::SmoothWheel { x: -135, y: 150 }]
+        );
+    }
     #[test]
     fn filters_kernel_key_autorepeat() {
         assert_eq!(key_pressed(0), Some(false));

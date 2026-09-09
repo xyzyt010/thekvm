@@ -15,7 +15,7 @@ use crate::{capture::CaptureBackend, PlatformError};
 use futures::StreamExt;
 use input_capture::{Backend, CaptureEvent, InputCapture, Position};
 use input_event::{Event, KeyboardEvent, PointerEvent};
-use kvm_core::{InputEvent, KeyEvent, MouseButton, WheelDelta};
+use kvm_core::{InputEvent, KeyEvent, MouseButton};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
@@ -26,7 +26,6 @@ use tokio::task::LocalSet;
 
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
-const SCROLL_UNIT: f64 = 120.0;
 
 enum Command {
     SetExclusive(bool),
@@ -287,28 +286,24 @@ fn translate_event(event: Event, accumulator: &mut EventAccumulator) -> Option<I
             })
         }
         Event::Pointer(PointerEvent::Axis { axis, value, .. }) => {
-            let value = value / SCROLL_UNIT;
+            // libei axis values are already in 120ths; keep sub-detent
+            // touchpad motion (take_integer banks the fraction) and emit
+            // smooth units, never truncated detents.
             let (x, y) = match axis {
                 0 => (0, take_integer(&mut accumulator.wheel_y, value)),
                 1 => (take_integer(&mut accumulator.wheel_x, value), 0),
                 _ => return None,
             };
-            (x != 0 || y != 0).then_some(InputEvent::Wheel(WheelDelta {
-                x: clamp_i16(x),
-                y: clamp_i16(y),
-            }))
+            (x != 0 || y != 0).then_some(InputEvent::SmoothWheel { x, y })
         }
         Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value }) => {
-            let value = f64::from(value) / SCROLL_UNIT;
+            let value = f64::from(value);
             let (x, y) = match axis {
                 0 => (0, take_integer(&mut accumulator.wheel_y, value)),
                 1 => (take_integer(&mut accumulator.wheel_x, value), 0),
                 _ => return None,
             };
-            (x != 0 || y != 0).then_some(InputEvent::Wheel(WheelDelta {
-                x: clamp_i16(x),
-                y: clamp_i16(y),
-            }))
+            (x != 0 || y != 0).then_some(InputEvent::SmoothWheel { x, y })
         }
     }
 }
@@ -321,10 +316,6 @@ fn take_integer(remainder: &mut f64, value: f64) -> i32 {
     let whole = total.trunc();
     *remainder = total - whole;
     whole as i32
-}
-
-fn clamp_i16(value: i32) -> i16 {
-    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
 fn mouse_button(button: u32) -> Option<MouseButton> {
@@ -400,19 +391,21 @@ mod tests {
             ),
             Some(InputEvent::MouseMove { dx: 1, dy: -1 })
         );
+        // Sub-detent touchpad motion is forwarded raw, not banked: 60
+        // 120ths arrives as 60 120ths (old code truncated it to zero).
         assert_eq!(
             translate_event(
                 Event::Pointer(PointerEvent::AxisDiscrete120 { axis: 0, value: 60 }),
                 &mut accumulator,
             ),
-            None
+            Some(InputEvent::SmoothWheel { x: 0, y: 60 })
         );
         assert_eq!(
             translate_event(
-                Event::Pointer(PointerEvent::AxisDiscrete120 { axis: 0, value: 60 }),
+                Event::Pointer(PointerEvent::AxisDiscrete120 { axis: 1, value: -30 }),
                 &mut accumulator,
             ),
-            Some(InputEvent::Wheel(WheelDelta { x: 0, y: 1 }))
+            Some(InputEvent::SmoothWheel { x: -30, y: 0 })
         );
     }
 

@@ -23,6 +23,8 @@ mod linux_uinput {
     const REL_Y: u16 = 0x01;
     const REL_HWHEEL: u16 = 0x06;
     const REL_WHEEL: u16 = 0x08;
+    const REL_WHEEL_HI_RES: u16 = 0x0b;
+    const REL_HWHEEL_HI_RES: u16 = 0x0c;
     const BTN_LEFT: u16 = 0x110;
     const BTN_RIGHT: u16 = 0x111;
     const BTN_MIDDLE: u16 = 0x112;
@@ -107,7 +109,14 @@ mod linux_uinput {
             for event_type in [EV_KEY, EV_REL, EV_SYN] {
                 ioctl_value(&mouse, UI_SET_EVBIT, event_type as i32)?;
             }
-            for relative in [REL_X, REL_Y, REL_WHEEL, REL_HWHEEL] {
+            for relative in [
+                REL_X,
+                REL_Y,
+                REL_WHEEL,
+                REL_HWHEEL,
+                REL_WHEEL_HI_RES,
+                REL_HWHEEL_HI_RES,
+            ] {
                 ioctl_value(&mouse, UI_SET_RELBIT, relative as i32)?;
             }
             for button in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA] {
@@ -173,12 +182,53 @@ mod linux_uinput {
                     }
                 }
                 InputEvent::Wheel(delta) => {
+                    // Detent wheel dual-reports legacy + hi-res, exactly like
+                    // real high-resolution hardware: modern stacks (libinput)
+                    // consume the hi-res axis, legacy-only stacks the detent.
                     if delta.y != 0 {
                         Self::emit(&mut self.mouse, EV_REL, REL_WHEEL, i32::from(delta.y))
                             .map_err(io_error)?;
+                        Self::emit(
+                            &mut self.mouse,
+                            EV_REL,
+                            REL_WHEEL_HI_RES,
+                            i32::from(delta.y).saturating_mul(120),
+                        )
+                        .map_err(io_error)?;
                     }
                     if delta.x != 0 {
                         Self::emit(&mut self.mouse, EV_REL, REL_HWHEEL, i32::from(delta.x))
+                            .map_err(io_error)?;
+                        Self::emit(
+                            &mut self.mouse,
+                            EV_REL,
+                            REL_HWHEEL_HI_RES,
+                            i32::from(delta.x).saturating_mul(120),
+                        )
+                        .map_err(io_error)?;
+                    }
+                }
+                InputEvent::SmoothWheel { x, y } => {
+                    // Touchpad smooth scroll in 120ths: hi-res always, plus
+                    // the whole-detent legacy quotient for stacks without
+                    // hi-res support. Sub-detent motion reports legacy zero
+                    // (no double-scroll anywhere) while hi-res carries it.
+                    if y != 0 {
+                        let detents = y / 120;
+                        if detents != 0 {
+                            Self::emit(&mut self.mouse, EV_REL, REL_WHEEL, detents)
+                                .map_err(io_error)?;
+                        }
+                        Self::emit(&mut self.mouse, EV_REL, REL_WHEEL_HI_RES, y)
+                            .map_err(io_error)?;
+                    }
+                    if x != 0 {
+                        let detents = x / 120;
+                        if detents != 0 {
+                            Self::emit(&mut self.mouse, EV_REL, REL_HWHEEL, detents)
+                                .map_err(io_error)?;
+                        }
+                        Self::emit(&mut self.mouse, EV_REL, REL_HWHEEL_HI_RES, x)
                             .map_err(io_error)?;
                     }
                 }
@@ -445,8 +495,11 @@ mod win32_inject {
         }
 
         pub fn send(&self, event: InputEvent) -> Result<(), PlatformError> {
-            let input = match event {
-                InputEvent::MouseMove { dx, dy } => INPUT {
+            // Wheel events fan out to up to two INPUTs (vertical +
+            // horizontal): the old code sent only one axis and dropped the
+            // other, losing diagonal trackpad scroll.
+            let inputs: Vec<INPUT> = match event {
+                InputEvent::MouseMove { dx, dy } => vec![INPUT {
                     r#type: INPUT_MOUSE,
                     Anonymous: INPUT_0 {
                         mi: MOUSEINPUT {
@@ -458,10 +511,10 @@ mod win32_inject {
                             dwExtraInfo: 0,
                         },
                     },
-                },
+                }],
                 InputEvent::MouseButton { button, pressed } => {
                     let (flags, mouse_data) = mouse_button_flags(button, pressed);
-                    INPUT {
+                    vec![INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
                             mi: MOUSEINPUT {
@@ -473,28 +526,16 @@ mod win32_inject {
                                 dwExtraInfo: 0,
                             },
                         },
-                    }
+                    }]
                 }
-                InputEvent::Wheel(delta) => {
-                    let (flags, amount) = if delta.y != 0 {
-                        (MOUSEEVENTF_WHEEL, delta.y as i32 * 120)
-                    } else {
-                        (MOUSEEVENTF_HWHEEL, delta.x as i32 * 120)
-                    };
-                    INPUT {
-                        r#type: INPUT_MOUSE,
-                        Anonymous: INPUT_0 {
-                            mi: MOUSEINPUT {
-                                dx: 0,
-                                dy: 0,
-                                mouseData: amount as u32,
-                                dwFlags: flags,
-                                time: 0,
-                                dwExtraInfo: 0,
-                            },
-                        },
-                    }
-                }
+                // Detent wheel: one WHEEL_DELTA (120) per detent, both axes.
+                InputEvent::Wheel(delta) => wheel_inputs(
+                    delta.y as i32 * 120,
+                    delta.x as i32 * 120,
+                ),
+                // Touchpad smooth scroll: already in 120ths, injected raw so
+                // apps receive the same fine motion as local scrolling.
+                InputEvent::SmoothWheel { x, y } => wheel_inputs(y, x),
                 InputEvent::Key(key) => {
                     // Pause has an E1-prefixed make code that SendInput does
                     // not represent through KEYEVENTF_SCANCODE; VK_PAUSE is
@@ -522,7 +563,7 @@ mod win32_inject {
                     if extended {
                         flags |= KEYEVENTF_EXTENDEDKEY;
                     }
-                    INPUT {
+                    vec![INPUT {
                         r#type: INPUT_KEYBOARD,
                         Anonymous: INPUT_0 {
                             ki: KEYBDINPUT {
@@ -533,11 +574,14 @@ mod win32_inject {
                                 dwExtraInfo: 0,
                             },
                         },
-                    }
+                    }]
                 }
             };
-            let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-            if sent != 1 {
+            if inputs.is_empty() {
+                return Ok(());
+            }
+            let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            if sent as usize != inputs.len() {
                 return Err(PlatformError::Win32(format!(
                     "SendInput failed: {}",
                     unsafe { GetLastError().0 }
@@ -607,14 +651,51 @@ mod win32_inject {
         }
     }
 
+    /// One INPUT per non-zero scroll axis, in 120ths (WHEEL_DELTA units).
+    /// A zero axis sends nothing: a zero-amount wheel INPUT is wire noise
+    /// that some apps still scroll on.
+    fn wheel_inputs(vertical_120ths: i32, horizontal_120ths: i32) -> Vec<INPUT> {
+        let mut inputs = Vec::with_capacity(2);
+        if vertical_120ths != 0 {
+            inputs.push(INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: vertical_120ths as u32,
+                        dwFlags: MOUSEEVENTF_WHEEL,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+        if horizontal_120ths != 0 {
+            inputs.push(INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: horizontal_120ths as u32,
+                        dwFlags: MOUSEEVENTF_HWHEEL,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+        inputs
+    }
+
     fn mouse_button_flags(
         button: MouseButton,
         pressed: bool,
     ) -> (
         windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
         u32,
-    ) {
-        match (button, pressed) {
+    ) {        match (button, pressed) {
             (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
             (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
             (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0),

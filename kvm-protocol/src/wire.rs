@@ -18,9 +18,11 @@ pub const MAX_DATAGRAM_SIZE: usize = 1200;
 
 const DATAGRAM_MOUSE_MOVE: u8 = 1;
 const DATAGRAM_WHEEL: u8 = 2;
+const DATAGRAM_SMOOTH_WHEEL: u8 = 3;
 const DATAGRAM_VERSION: u8 = 1;
 const DATAGRAM_MOUSE_MOVE_SIZE: usize = 1 + 1 + 8 + 4 + 4;
 const DATAGRAM_WHEEL_SIZE: usize = 1 + 1 + 8 + 2 + 2;
+const DATAGRAM_SMOOTH_WHEEL_SIZE: usize = 1 + 1 + 8 + 4 + 4;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DatagramInput {
@@ -41,6 +43,7 @@ pub fn encode_input_datagram(packet: DatagramInput) -> std::io::Result<Vec<u8>> 
         match packet.event {
             InputEvent::MouseMove { .. } => DATAGRAM_MOUSE_MOVE,
             InputEvent::Wheel(_) => DATAGRAM_WHEEL,
+            InputEvent::SmoothWheel { .. } => DATAGRAM_SMOOTH_WHEEL,
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -56,6 +59,10 @@ pub fn encode_input_datagram(packet: DatagramInput) -> std::io::Result<Vec<u8>> 
             payload.extend_from_slice(&dy.to_be_bytes());
         }
         InputEvent::Wheel(WheelDelta { x, y }) => {
+            payload.extend_from_slice(&x.to_be_bytes());
+            payload.extend_from_slice(&y.to_be_bytes());
+        }
+        InputEvent::SmoothWheel { x, y } => {
             payload.extend_from_slice(&x.to_be_bytes());
             payload.extend_from_slice(&y.to_be_bytes());
         }
@@ -94,6 +101,9 @@ pub fn decode_input_datagram(payload: &[u8]) -> std::io::Result<DatagramInput> {
         DATAGRAM_WHEEL if payload.len() == DATAGRAM_WHEEL_SIZE => {
             (DATAGRAM_WHEEL_SIZE, read_u64(&payload[2..10]))
         }
+        DATAGRAM_SMOOTH_WHEEL if payload.len() == DATAGRAM_SMOOTH_WHEEL_SIZE => {
+            (DATAGRAM_SMOOTH_WHEEL_SIZE, read_u64(&payload[2..10]))
+        }
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -111,6 +121,10 @@ pub fn decode_input_datagram(payload: &[u8]) -> std::io::Result<DatagramInput> {
             x: read_i16(&payload[10..12]),
             y: read_i16(&payload[12..14]),
         }),
+        DATAGRAM_SMOOTH_WHEEL => InputEvent::SmoothWheel {
+            x: read_i32(&payload[10..14]),
+            y: read_i32(&payload[14..18]),
+        },
         _ => unreachable!("datagram kind was validated above"),
     };
     Ok(DatagramInput { sequence, event })
@@ -150,6 +164,11 @@ pub struct Hello {
     /// optional so older peers can still establish an input session.
     #[serde(default)]
     pub screen_geometry: Option<ScreenGeometry>,
+    /// The sender captures and understands high-resolution touchpad scroll
+    /// (`InputEvent::SmoothWheel`). Absent/false on older peers, which only
+    /// ever see downgraded detent `Wheel` events.
+    #[serde(default)]
+    pub smooth_scroll: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +211,10 @@ pub enum WireMessage {
         /// Logical coordinate space used by this receiver's local screen.
         #[serde(default)]
         screen_geometry: Option<ScreenGeometry>,
+        /// The receiver injects high-resolution touchpad scroll. The sender
+        /// downgrades to detent `Wheel` when this is absent/false.
+        #[serde(default)]
+        smooth_scroll: bool,
     },
     Input(InputPacket),
     /// Reliable sender state snapshot, sent before the first event on every
@@ -579,6 +602,31 @@ mod tests {
     }
 
     #[test]
+    fn smooth_scroll_capability_defaults_for_older_session_frames() {
+        let hello: WireMessage = serde_json::from_str(
+            r#"{"Hello":{"node_name":"legacy","mode":"Bidirectional","lock_screen_requested":false,"clipboard_enabled":false}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            hello,
+            WireMessage::Hello(Hello {
+                smooth_scroll: false,
+                ..
+            })
+        ));
+
+        let accepted: WireMessage =
+            serde_json::from_str(r#"{"Accepted":{"lock_screen_enabled":false}}"#).unwrap();
+        assert!(matches!(
+            accepted,
+            WireMessage::Accepted {
+                smooth_scroll: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn invalid_geometry_is_rejected_before_transport() {
         assert!(validate_message(&WireMessage::Hello(Hello {
             node_name: "node".into(),
@@ -590,6 +638,7 @@ mod tests {
                 width: 0,
                 height: 1080,
             }),
+            smooth_scroll: false,
         }))
         .is_err());
     }
@@ -602,6 +651,7 @@ mod tests {
             lock_screen_requested: false,
             clipboard_enabled: false,
             screen_geometry: None,
+            smooth_scroll: false,
         }))
         .is_err());
         assert!(validate_message(&WireMessage::PairRequest {
@@ -689,6 +739,18 @@ mod tests {
             decode_input_datagram(&wheel_encoded).unwrap().event,
             wheel.event
         );
+        // Touchpad smooth scroll keeps its sub-detent 120ths on the wire.
+        let smooth = DatagramInput {
+            sequence: 12,
+            event: InputEvent::SmoothWheel { x: 18, y: -45 },
+        };
+        let smooth_encoded = encode_input_datagram(smooth).unwrap();
+        assert_eq!(smooth_encoded.len(), DATAGRAM_SMOOTH_WHEEL_SIZE);
+        assert_eq!(
+            decode_input_datagram(&smooth_encoded).unwrap().event,
+            smooth.event
+        );
+        // Key/button transitions stay off the lossy datagram path.
         assert!(encode_input_datagram(DatagramInput {
             sequence: 11,
             event: InputEvent::Key(KeyEvent {

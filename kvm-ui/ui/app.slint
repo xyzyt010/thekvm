@@ -171,7 +171,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text {
-                        text: mode-index == 1 ? "Your keyboard and mouse will drive the other computer." : mode-index == 2 ? "The other computer will drive this keyboard and mouse." : "Both computers can drive each other.";
+                        text: mode-index == 1 ? "Control other: your keyboard, mouse and touchpad (including two-finger scroll) drive the other computer past any edge. The other computer cannot drive this one." : mode-index == 2 ? "Be controlled: the other computer drives this keyboard and mouse past any edge. This computer cannot dial out or drive back." : "Both ways: either computer drives the other past any edge — push to take control, push back to return. Both stay usable.";
                         color: #9ca3af;
                         font-size: 12px;
                         wrap: word-wrap;

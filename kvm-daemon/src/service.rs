@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use kvm_core::{
     Config, EdgeRouter, HidUsage, InputEvent, InputPacket, InputState, Mode, MouseButton,
-    RoutedEvent, ScreenId,
+    RoutedEvent, ScreenId, WheelDelta,
 };
 use kvm_platform::inject::Injector;
 use kvm_protocol::pairing::{Identity, PeerBook};
@@ -914,6 +914,7 @@ pub async fn capture(address: &str) -> Result<()> {
         &mut clipboard,
         clipboard_enabled,
         &mut clipboard_revision,
+        capabilities.smooth_scroll,
     )
     .await;
     // Keep local input usable after Ctrl+C, peer loss, or any protocol error.
@@ -1042,7 +1043,7 @@ async fn run_windows_service_controller(
             )
             .await
             {
-                Ok((connection, mut send, recv, _clipboard_enabled)) => {
+                Ok((connection, mut send, recv, capabilities)) => {
                     let peer_fingerprint = peer_fingerprint(&connection)?;
                     let snapshot = state.snapshot();
                     send_state_sync(&mut send, snapshot.state).await?;
@@ -1054,6 +1055,7 @@ async fn run_windows_service_controller(
                         &mut capture,
                         &mut state,
                         peer_fingerprint,
+                        capabilities.smooth_scroll,
                         revoked_peers.clone(),
                     )
                     .await;
@@ -1099,6 +1101,7 @@ async fn run_windows_service_capture_stream(
     capture: &mut ServiceCaptureProxy,
     state: &mut CapturedState,
     peer_fingerprint: String,
+    peer_smooth: bool,
     revoked_peers: tokio::sync::broadcast::Sender<String>,
 ) -> Result<()> {
     let (remote_closed_tx, mut remote_closed_rx) = tokio::sync::oneshot::channel();
@@ -1118,20 +1121,29 @@ async fn run_windows_service_capture_stream(
     let mut session_check = tokio::time::interval(Duration::from_secs(1));
     session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut revoked_rx = revoked_peers.subscribe();
+    let mut wheel_debt = WheelDowngrade::default();
     let result: Result<()> = loop {
         tokio::select! {
             biased;
             event = capture.recv() => match event {
                 Some(crate::windows_helper::ServiceCaptureEvent::Input(event)) => {
                     state.record(event);
+                    let Some(outgoing) =
+                        outgoing_wheel_event(event, peer_smooth, &mut wheel_debt)
+                    else {
+                        // Sub-detent touchpad debt kept, nothing sent.
+                        continue;
+                    };
                     sequence = sequence.wrapping_add(1);
-                    let send_result = match event {
-                        InputEvent::MouseMove { .. } | InputEvent::Wheel(_) => {
-                            send_input(&connection, &mut send, sequence, event).await
+                    let send_result = match outgoing {
+                        InputEvent::MouseMove { .. }
+                        | InputEvent::Wheel(_)
+                        | InputEvent::SmoothWheel { .. } => {
+                            send_input(&connection, &mut send, sequence, outgoing).await
                         }
                         _ => write_frame(
                             &mut send,
-                            &WireMessage::Input(InputPacket { sequence, event }),
+                            &WireMessage::Input(InputPacket { sequence, event: outgoing }),
                         )
                         .await
                         .map_err(Into::into),
@@ -1533,6 +1545,11 @@ struct TopologySession {
     event_barrier: u64,
     clipboard_enabled: bool,
     remote_clipboard_revision: u64,
+    /// Whether this peer injects high-resolution touchpad scroll. When it
+    /// does not, captured `SmoothWheel` events are downgraded to detent
+    /// `Wheel` here (never dropped wholesale, never sent raw).
+    peer_smooth: bool,
+    wheel_debt: WheelDowngrade,
 }
 
 #[derive(Debug, Clone)]
@@ -1570,6 +1587,51 @@ impl TopologySession {
 struct TopologyLink {
     fingerprint: String,
     address: String,
+}
+
+/// One warm, verified QUIC association to the linked peer, kept across
+/// drive episodes. A cold dial per screen-edge crossing costs endpoint
+/// setup plus a full handshake on EVERY crossing (the visible edge lag);
+/// a warm association turns a crossing into one stream plus Hello on an
+/// already-live connection — milliseconds on LAN. The transport's 5s
+/// keep-alive holds it across idle gaps; a dead association simply falls
+/// back to a cold dial and re-warms. One slot per child process is exact:
+/// each topology child drives exactly one link.
+#[derive(Clone)]
+struct WarmLink {
+    connection: quinn::Connection,
+    fingerprint: String,
+}
+
+static WARM_LINK: std::sync::OnceLock<std::sync::Mutex<Option<WarmLink>>> =
+    std::sync::OnceLock::new();
+
+fn warm_link_pool() -> &'static std::sync::Mutex<Option<WarmLink>> {
+    WARM_LINK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Take the warm association when it is for this peer and still alive.
+/// Anything else (wrong peer, closed connection, poisoned lock) means a
+/// cold dial. Never blocks: the pool is only ever briefly held.
+fn take_warm_link(fingerprint: &str) -> Option<quinn::Connection> {
+    let mut pool = warm_link_pool().lock().ok()?;
+    let warm = pool.take()?;
+    if warm.fingerprint != fingerprint || warm.connection.close_reason().is_some() {
+        return None;
+    }
+    Some(warm.connection)
+}
+
+fn store_warm_link(connection: &quinn::Connection, fingerprint: &str) {
+    if connection.close_reason().is_some() {
+        return;
+    }
+    if let Ok(mut pool) = warm_link_pool().lock() {
+        *pool = Some(WarmLink {
+            connection: connection.clone(),
+            fingerprint: fingerprint.to_owned(),
+        });
+    }
 }
 
 /// MWB lastJump parity: ignore a new edge transfer within 150ms of the last
@@ -1665,9 +1727,17 @@ async fn handle_topology_event(
             if session.target != target {
                 bail!("topology router/session target mismatch");
             }
+            // Sub-detent touchpad motion with nothing whole to report yet
+            // stays silent (the remainder is kept): an older peer must never
+            // see raw 120ths, and sending zeroes would only waste the wire.
+            let Some(outgoing) =
+                outgoing_wheel_event(event, session.peer_smooth, &mut session.wheel_debt)
+            else {
+                return Ok(());
+            };
             *sequence = sequence.wrapping_add(1);
             if let Err(error) =
-                send_input(&session.connection, &mut session.send, *sequence, event).await
+                send_input(&session.connection, &mut session.send, *sequence, outgoing).await
             {
                 let session = active.take().expect("active session exists");
                 let target = session.target;
@@ -1808,26 +1878,43 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         .as_deref()
         .context("target screen has no paired peer fingerprint")?;
     let peer_name = screen.name.clone();
-    let address = resolve_peer_address(peers, fingerprint, &peer_name)?;
-    let (conn, mut send, recv, capabilities) = dial_session(
-        identity,
-        peers,
-        &address,
-        ConnectPolicy {
-            node_name,
-            request_lock_screen,
-            mode,
-            clipboard_enabled,
-            screen_geometry: local_geometry,
+    let policy = ConnectPolicy {
+        node_name,
+        request_lock_screen,
+        mode,
+        clipboard_enabled,
+        screen_geometry: local_geometry,
+    };
+    // Warm first: an episode on the live association skips endpoint setup
+    // and the QUIC handshake, so the crossing feels instant. A stale
+    // association falls back to a cold dial, which re-warms the pool. Only
+    // a cold dial teaches us anything new about the peer's address (it
+    // heals the book across DHCP moves); warm episodes skip re-resolving.
+    let (conn, mut send, recv, capabilities, dialed_address) = match take_warm_link(fingerprint) {
+        Some(warm) => match open_episode_stream(&warm, policy).await {
+            Ok((send, recv, capabilities)) => {
+                tracing::debug!(?target, "topology episode opened on the warm link");
+                (warm, send, recv, capabilities, None)
+            }
+            Err(error) => {
+                tracing::debug!(%error, ?target, "warm link episode failed; re-dialling");
+                let (conn, send, recv, capabilities, address) =
+                    cold_topology_dial(identity, peers, fingerprint, &peer_name, policy, dir)
+                        .await?;
+                (conn, send, recv, capabilities, Some(address))
+            }
         },
-        Some(fingerprint),
-        dir,
-    )
-    .await?;
-    // Remember the working address for the fingerprint that actually
-    // answered (heals entries pinned without one, tracks DHCP moves).
-    if let Ok(presented) = peer_fingerprint(&conn) {
-        note_peer_address(dir, &presented, &address);
+        None => {
+            let (conn, send, recv, capabilities, address) =
+                cold_topology_dial(identity, peers, fingerprint, &peer_name, policy, dir).await?;
+            (conn, send, recv, capabilities, Some(address))
+        }
+    };
+    store_warm_link(&conn, fingerprint);
+    if let Some(address) = dialed_address {
+        if let Ok(presented) = peer_fingerprint(&conn) {
+            note_peer_address(dir, &presented, &address);
+        }
     }
     let clipboard_enabled = capabilities.clipboard_enabled;
     let target_geometry = ScreenGeometry {
@@ -1878,6 +1965,12 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
     }
     let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
     let response_drain = tokio::spawn(drain_peer_responses(recv, signal_tx));
+    // Normalize the first event for this peer's scroll capability exactly
+    // like every later event: an older peer gets detents, never raw 120ths
+    // it would misread as hundreds of detents.
+    let mut wheel_debt = WheelDowngrade::default();
+    let first_event = first_event
+        .and_then(|event| outgoing_wheel_event(event, capabilities.smooth_scroll, &mut wheel_debt));
     if let Some(event) = first_event {
         *sequence = sequence.wrapping_add(1);
         // Keep the first post-handoff motion on the same ordered stream as
@@ -1902,7 +1995,40 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         event_barrier,
         clipboard_enabled,
         remote_clipboard_revision: 0,
+        peer_smooth: capabilities.smooth_scroll,
+        wheel_debt,
     })
+}
+
+/// Cold dial for one topology episode: resolve the peer's daemon address
+/// and run the full TLS handshake. Successful episodes re-warm the link
+/// pool (see `open_topology_session`); the address also heals the peer
+/// book across DHCP moves.
+async fn cold_topology_dial(
+    identity: &Identity,
+    peers: &PeerBook,
+    fingerprint: &str,
+    peer_name: &str,
+    policy: ConnectPolicy<'_>,
+    dir: &std::path::Path,
+) -> Result<(
+    quinn::Connection,
+    quinn::SendStream,
+    quinn::RecvStream,
+    SessionCapabilities,
+    String,
+)> {
+    let address = resolve_peer_address(peers, fingerprint, peer_name)?;
+    let (conn, send, recv, capabilities) = dial_session(
+        identity,
+        peers,
+        &address,
+        policy,
+        Some(fingerprint),
+        dir,
+    )
+    .await?;
+    Ok((conn, send, recv, capabilities, address))
 }
 
 async fn drain_peer_responses(
@@ -2193,7 +2319,7 @@ impl CapturedState {
                     self.buttons.remove(&button)
                 }
             }
-            InputEvent::MouseMove { .. } | InputEvent::Wheel(_) => true,
+            InputEvent::MouseMove { .. } | InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. } => true,
         };
         if !changed {
             return None;
@@ -2268,6 +2394,7 @@ async fn run_capture_stream(
     clipboard: &mut Option<ClipboardAgent>,
     clipboard_enabled: bool,
     clipboard_revision: &mut u64,
+    peer_smooth: bool,
 ) -> Result<()> {
     // The receiver replies to pings on the same bidirectional stream. Drain
     // that direction so the QUIC receive window cannot fill during a long
@@ -2295,6 +2422,7 @@ async fn run_capture_stream(
     let mut sequence = 0u64;
     let mut clipboard_enabled = clipboard_enabled;
     let mut remote_clipboard_revision = 0u64;
+    let mut wheel_debt = WheelDowngrade::default();
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let result: Result<()> = loop {
@@ -2321,8 +2449,13 @@ async fn run_capture_stream(
             event = motion_rx.recv() => match event {
                 Some(captured) if captured.event_id <= event_barrier => continue,
                 Some(captured) => {
+                    let Some(outgoing) =
+                        outgoing_wheel_event(captured.event, peer_smooth, &mut wheel_debt)
+                    else {
+                        continue;
+                    };
                     sequence = sequence.wrapping_add(1);
-                    if let Err(error) = send_input(&connection, &mut send, sequence, captured.event).await {
+                    if let Err(error) = send_input(&connection, &mut send, sequence, outgoing).await {
                         break Err(error);
                     }
                 }
@@ -2744,6 +2877,8 @@ async fn handle_connection(
                     lock_screen_enabled,
                     clipboard_enabled,
                     screen_geometry: local_geometry,
+                    // This daemon injects high-resolution touchpad scroll.
+                    smooth_scroll: true,
                 },
             )
             .await?;
@@ -2757,12 +2892,24 @@ async fn handle_connection(
             );
             // Publish the live inbound link: the station-side UI arms its
             // own half of the link from here (it never dialed), and hangs
-            // the link up from here too.
+            // the link up from here too. The address MUST be dialable: the
+            // socket's remote address is an ephemeral source port that
+            // accepts no connections (dialling it back was why Both-ways
+            // return control never worked), so prefer the peer book's saved
+            // daemon address and otherwise the inbound IP on the standard
+            // daemon port.
+            let peer_book = peers.read().await;
             let (link_id, mut link_drop) = register_inbound_link(
                 &peer_fingerprint,
                 &hello.node_name,
-                &conn.remote_address().to_string(),
+                &dialable_peer_address(
+                    &peer_book,
+                    &peer_fingerprint,
+                    &hello.node_name,
+                    conn.remote_address(),
+                ),
             );
+            drop(peer_book);
             let mut seen_sequences = BTreeSet::new();
             let mut motion_sequence = MotionSequence::default();
             let mut last_activity = Instant::now();
@@ -2961,7 +3108,7 @@ async fn process_remote_input(
     }
     if matches!(
         packet.event,
-        InputEvent::MouseMove { .. } | InputEvent::Wheel(_)
+        InputEvent::MouseMove { .. } | InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
     ) && !motion_sequence.accept(packet.sequence)
     {
         // QUIC DATAGRAM is intentionally unordered and lossy. Applying an
@@ -3051,6 +3198,48 @@ async fn process_remote_input(
     }
     injector.send(packet.event)?;
     Ok(false)
+}
+
+/// Per-session 120ths remainder for peers that predate smooth scroll.
+/// Touchpad motion below one detent is debt, not waste: it accumulates here
+/// until a whole detent exists, so slow two-finger scrolling still arrives
+/// (late and steppy) instead of vanishing entirely.
+#[derive(Debug, Default)]
+struct WheelDowngrade {
+    x: i32,
+    y: i32,
+}
+
+/// Map one captured event onto what this peer can receive. Smooth-capable
+/// peers take everything as captured; older peers get `SmoothWheel`
+/// downgraded to whole detents, and `None` while nothing whole exists yet
+/// (the caller sends nothing and keeps the remainder). Pure so the
+/// determinism is unit-tested.
+fn outgoing_wheel_event(
+    event: InputEvent,
+    peer_smooth: bool,
+    debt: &mut WheelDowngrade,
+) -> Option<InputEvent> {
+    if peer_smooth {
+        return Some(event);
+    }
+    let InputEvent::SmoothWheel { x, y } = event else {
+        return Some(event);
+    };
+    debt.x = debt.x.saturating_add(x);
+    debt.y = debt.y.saturating_add(y);
+    // Truncation toward zero: a sub-detent remainder in either direction
+    // waits, instead of firing early on one side (as Euclidean division
+    // would for negative motion).
+    let detents = WheelDelta {
+        x: (debt.x / 120)
+            .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+        y: (debt.y / 120)
+            .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+    };
+    debt.x -= i32::from(detents.x) * 120;
+    debt.y -= i32::from(detents.y) * 120;
+    (detents.x != 0 || detents.y != 0).then_some(InputEvent::Wheel(detents))
 }
 
 /// Highest accepted sequence for unreliable pointer/wheel traffic. Reliable
@@ -3341,6 +3530,7 @@ async fn handle_pairing(
             lock_screen_enabled: false,
             clipboard_enabled: false,
             screen_geometry: None,
+            smooth_scroll: true,
         },
     )
     .await?;
@@ -3464,6 +3654,25 @@ async fn dial_session(
     }
 }
 
+/// Address the station side dials back for its half of a link: the peer
+/// book's saved daemon address for this fingerprint (exact entry, else a
+/// same-named sibling from a re-pairing), else the inbound IP on the
+/// standard daemon port. NEVER the socket's remote address verbatim: that
+/// is an ephemeral source port, and dialling it back fails forever — the
+/// defect that made Both-ways return control impossible. Pure so the
+/// determinism is unit-tested.
+fn dialable_peer_address(
+    peers: &PeerBook,
+    fingerprint: &str,
+    peer_name: &str,
+    inbound_remote: SocketAddr,
+) -> String {
+    if let Ok(address) = resolve_peer_address(peers, fingerprint, peer_name) {
+        return address;
+    }
+    std::net::SocketAddr::new(inbound_remote.ip(), DEFAULT_PORT).to_string()
+}
+
 /// Resolve a dial address for a layout peer fingerprint: the exact entry's
 /// address first; otherwise a same-named sibling entry's address (same
 /// machine, re-paired identity — the address moved with it). Fingerprint
@@ -3540,14 +3749,7 @@ async fn connect_input(
     quinn::RecvStream,
     SessionCapabilities,
 )> {
-    let ConnectPolicy {
-        node_name,
-        request_lock_screen,
-        mode,
-        clipboard_enabled,
-        screen_geometry,
-    } = policy;
-    if !mode_allows_outgoing(mode) {
+    if !mode_allows_outgoing(policy.mode) {
         bail!("receiver-only mode cannot initiate an input session");
     }
     let addr = normalize_addr(address)?;
@@ -3586,6 +3788,30 @@ async fn connect_input(
     if !peers.is_pinned(&fingerprint) {
         bail!("peer {addr} is not paired (fingerprint {fingerprint})");
     }
+    let (send, recv, capabilities) = open_episode_stream(&conn, policy).await?;
+    Ok((conn, send, recv, capabilities))
+}
+
+/// Open one drive episode on a live association: a fresh bidirectional
+/// stream plus the Hello/Accepted handshake, without touching TLS. This is
+/// the second half of a cold dial AND the whole of every later episode on
+/// the warm link association, so screen-edge crossings skip endpoint setup
+/// and the QUIC handshake entirely.
+async fn open_episode_stream(
+    conn: &quinn::Connection,
+    policy: ConnectPolicy<'_>,
+) -> Result<(
+    quinn::SendStream,
+    quinn::RecvStream,
+    SessionCapabilities,
+)> {
+    let ConnectPolicy {
+        node_name,
+        request_lock_screen,
+        mode,
+        clipboard_enabled,
+        screen_geometry,
+    } = policy;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(
         &mut send,
@@ -3595,6 +3821,8 @@ async fn connect_input(
             lock_screen_requested: request_lock_screen,
             clipboard_enabled,
             screen_geometry,
+            // This side captures and understands touchpad smooth scroll.
+            smooth_scroll: true,
         }),
     )
     .await?;
@@ -3605,14 +3833,15 @@ async fn connect_input(
         WireMessage::Accepted {
             clipboard_enabled,
             screen_geometry,
+            smooth_scroll,
             ..
         } => Ok((
-            conn,
             send,
             recv,
             SessionCapabilities {
                 clipboard_enabled,
                 screen_geometry,
+                smooth_scroll,
             },
         )),
         WireMessage::Reject { reason } => bail!("peer rejected session: {reason}"),
@@ -3624,6 +3853,7 @@ async fn connect_input(
 struct SessionCapabilities {
     clipboard_enabled: bool,
     screen_geometry: Option<ScreenGeometry>,
+    smooth_scroll: bool,
 }
 
 fn local_screen_geometry(layout: &kvm_core::Layout) -> Option<ScreenGeometry> {
@@ -3678,7 +3908,10 @@ async fn send_input(
     sequence: u64,
     event: InputEvent,
 ) -> Result<()> {
-    if matches!(event, InputEvent::MouseMove { .. } | InputEvent::Wheel(_)) {
+    if matches!(
+        event,
+        InputEvent::MouseMove { .. } | InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
+    ) {
         let payload = encode_input_datagram(DatagramInput { sequence, event })?;
         connection
             .send_datagram(payload.into())
@@ -4155,8 +4388,84 @@ mod tests {
     }
 
     #[test]
-    fn input_roles_are_enforced_in_both_directions() {
-        assert!(mode_allows_incoming(Mode::Bidirectional));
+    fn dialback_address_is_dialable_never_ephemeral() {
+        use kvm_protocol::pairing::Peer;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let fp = "aa".repeat(32);
+        let inbound: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 6)), 53622);
+        // Exact book entry wins, even when the inbound source port differs.
+        let mut book = PeerBook::default();
+        book.peers.push(Peer {
+            name: "mint".into(),
+            fingerprint_hex: fp.clone(),
+            address: Some("192.168.1.6:42110".into()),
+        });
+        assert_eq!(
+            dialable_peer_address(&book, &fp, "mint", inbound),
+            "192.168.1.6:42110"
+        );
+        // Same-named sibling (same machine, re-paired identity) heals a
+        // book entry pinned without an address.
+        book.peers[0].address = None;
+        book.peers.push(Peer {
+            name: "mint".into(),
+            fingerprint_hex: "bb".repeat(32),
+            address: Some("192.168.1.6:42110".into()),
+        });
+        assert_eq!(
+            dialable_peer_address(&book, &fp, "mint", inbound),
+            "192.168.1.6:42110"
+        );
+        // Unknown peer: inbound IP on the standard daemon port — the
+        // ephemeral source port (53622 here) must never come back out.
+        book.peers.clear();
+        let dialed = dialable_peer_address(&book, &fp, "mint", inbound);
+        assert_eq!(dialed, "192.168.1.6:42110");
+        assert!(!dialed.contains("53622"));
+    }
+
+    #[test]
+    fn smooth_wheel_downgrade_keeps_sub_detent_debt() {
+        use kvm_core::InputEvent;
+        let mut debt = WheelDowngrade::default();
+        // Smooth peers take events untouched.
+        assert_eq!(
+            outgoing_wheel_event(
+                InputEvent::SmoothWheel { x: 18, y: -45 },
+                true,
+                &mut debt
+            ),
+            Some(InputEvent::SmoothWheel { x: 18, y: -45 })
+        );
+        // Older peers: sub-detent motion banks debt and sends nothing…
+        assert_eq!(
+            outgoing_wheel_event(InputEvent::SmoothWheel { x: 18, y: -45 }, false, &mut debt),
+            None
+        );
+        // …until a whole detent exists (truncation toward zero: -90/120
+        // total waits, -135/120 fires exactly one).
+        assert_eq!(
+            outgoing_wheel_event(InputEvent::SmoothWheel { x: 0, y: -45 }, false, &mut debt),
+            None
+        );
+        assert_eq!(
+            outgoing_wheel_event(
+                InputEvent::SmoothWheel { x: 130, y: -45 },
+                false,
+                &mut debt
+            ),
+            Some(InputEvent::Wheel(WheelDelta { x: 1, y: -1 }))
+        );
+        // Non-wheel events always pass through.
+        assert_eq!(
+            outgoing_wheel_event(InputEvent::MouseMove { dx: 3, dy: 4 }, false, &mut debt),
+            Some(InputEvent::MouseMove { dx: 3, dy: 4 })
+        );
+    }
+
+    #[test]
+    fn input_roles_are_enforced_in_both_directions() {        assert!(mode_allows_incoming(Mode::Bidirectional));
         assert!(!mode_allows_incoming(Mode::ServerClient));
         assert!(mode_allows_incoming(Mode::ClientOnly));
         assert!(mode_allows_outgoing(Mode::Bidirectional));

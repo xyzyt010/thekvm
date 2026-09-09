@@ -8,7 +8,7 @@
 //! preserves physical keys rather than translating through the local layout.
 
 use crate::{capture::CaptureBackend, PlatformError};
-use kvm_core::{InputEvent, KeyEvent, MouseButton, WheelDelta};
+use kvm_core::{InputEvent, KeyEvent, MouseButton};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -215,18 +215,21 @@ fn button_event(detail: u32, pressed: bool) -> Option<InputEvent> {
             button: MouseButton::Right,
             pressed,
         }),
-        4..=7 if pressed => Some(InputEvent::Wheel(WheelDelta {
+        // X11 reports scroll as detent button clicks: one click is one
+        // detent is 120 smooth units, so old peers get their exact detent
+        // back through the sender-side downgrade.
+        4..=7 if pressed => Some(InputEvent::SmoothWheel {
             x: match detail {
-                6 => 1,
-                7 => -1,
+                6 => 120,
+                7 => -120,
                 _ => 0,
             },
             y: match detail {
-                4 => 1,
-                5 => -1,
+                4 => 120,
+                5 => -120,
                 _ => 0,
             },
-        })),
+        }),
         8 => Some(InputEvent::MouseButton {
             button: MouseButton::Back,
             pressed,
@@ -281,7 +284,7 @@ mod tests {
         );
         assert_eq!(
             button_event(4, true),
-            Some(InputEvent::Wheel(WheelDelta { x: 0, y: 1 }))
+            Some(InputEvent::SmoothWheel { x: 0, y: 120 })
         );
         assert_eq!(button_event(4, false), None);
         assert_eq!(
