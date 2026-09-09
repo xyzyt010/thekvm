@@ -1024,7 +1024,8 @@ pub async fn connect(
     identity_stdin: bool,
 ) -> Result<()> {
     let Some(address) = address else {
-        return connect_topology(None).await;
+        let identity = Identity::load_or_create(&data_dir())?;
+        return connect_topology(None, identity).await;
     };
     let address = address.to_owned();
     // One face per machine: with `--identity-stdin` the supervising UI
@@ -1093,7 +1094,7 @@ pub async fn connect(
                 let _ = send.finish();
                 store_warm_link(&conn, &link.fingerprint);
                 eprintln!("THEKVM_STATUS established {address}");
-                return connect_topology(Some(link)).await;
+                return connect_topology(Some(link), identity).await;
             }
             Err(error) => {
                 // A banned epoch is a deliberate remote Disconnect, not an
@@ -1327,7 +1328,7 @@ async fn run_windows_service_capture_stream(
 /// then drives ONLY that peer — MWB switches solely to connected machines.
 /// Without a link the child dials whatever the arrangement names (legacy
 /// standalone use; the desktop UI always links).
-async fn connect_topology(link: Option<TopologyLink>) -> Result<()> {
+async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Result<()> {
     let dir = data_dir();
     // Machine-readable progress for a supervising UI (which pipes stderr):
     // edge-ready when capture runs, driving <screen> while a peer owns the
@@ -1383,8 +1384,15 @@ async fn connect_topology(link: Option<TopologyLink>) -> Result<()> {
         Err(error) => tracing::debug!(%error, "could not query initial cursor position"),
     }
     let local_geometry = local_screen_geometry(&config.layout);
-    let identity = Identity::load_or_create(&dir)?;
     let peers = PeerBook::load_or_create(&dir)?;
+    // The face every episode dial presents. This MUST be the same identity
+    // the startup verify used (daemon-owned via --identity-stdin for
+    // supervised children): 0.8.0 verified as one face and drove as another,
+    // so the peer accepted the link and then rejected every crossing.
+    tracing::info!(
+        fingerprint = identity.fingerprint_hex(),
+        "topology driving identity"
+    );
     // Topology mode preserves local input until an edge transition is actually
     // selected. Once a remote screen owns the pointer, the platform backend is
     // switched to exclusive capture until control returns or the session dies.
