@@ -996,20 +996,61 @@ pub async fn capture(address: &str) -> Result<()> {
 /// that the user pressed Connect on; the station side dials back with the
 /// same value). A rejection naming a banned epoch ends the child instead of
 /// retrying: the other side ended the link on purpose.
-pub async fn connect(address: Option<&str>, link_id: Option<u64>) -> Result<()> {
+/// Read the daemon-owned identity the supervising UI pipes on stdin with
+/// `--identity-stdin`: two hex lines (certificate DER, then key DER).
+/// Blocking I/O runs off the async runtime; a 15s cap keeps a forgotten
+/// pipe from hanging the child forever instead of failing loudly.
+async fn read_identity_stdin() -> Result<Identity> {
+    let material = tokio::task::spawn_blocking(|| {
+        use std::io::Read as _;
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text).map(|_| text)
+    });
+    let text = tokio::time::timeout(Duration::from_secs(15), material)
+        .await
+        .context("identity stdin read timed out (UI must pipe two hex lines)")?
+        .context("identity stdin read failed")??;
+    let mut lines = text.lines();
+    let cert_der = kvm_protocol::pairing::hex_decode(lines.next().unwrap_or_default())
+        .context("decode daemon identity certificate")?;
+    let key_der = kvm_protocol::pairing::hex_decode(lines.next().unwrap_or_default())
+        .context("decode daemon identity key")?;
+    Identity::from_der(cert_der, key_der).context("adopt daemon identity")
+}
+
+pub async fn connect(
+    address: Option<&str>,
+    link_id: Option<u64>,
+    identity_stdin: bool,
+) -> Result<()> {
     let Some(address) = address else {
         return connect_topology(None).await;
     };
     let address = address.to_owned();
+    // One face per machine: with `--identity-stdin` the supervising UI
+    // hands us the daemon-owned identity (two hex lines on stdin), so this
+    // child presents the SAME fingerprint as the service. Read once, before
+    // the retry loop — a truncated pipe fails here, never as a mystery TLS
+    // error mid-link. Without the flag (manual/legacy use) the local files
+    // apply exactly as before.
+    let adopted_identity = if identity_stdin {
+        Some(read_identity_stdin().await?)
+    } else {
+        None
+    };
     // Machine-readable progress for a supervising UI (which pipes stderr):
     // dialing -> waiting <reason> (retries) -> established <peer>, and ended
     // on a clean shutdown. The UI must only claim "Connected" after
     // `established`; anything earlier is still connecting.
     eprintln!("THEKVM_STATUS dialing {address}");
     loop {
-        let identity = Identity::load_or_create(&data_dir())?;
+        let identity = match &adopted_identity {
+            Some(identity) => identity.clone(),
+            None => Identity::load_or_create(&data_dir())?,
+        };
         let peers = PeerBook::load_or_create(&data_dir())?;
         let config = load_local_config()?;
+        let dial_started = std::time::Instant::now();
         match dial_session(
             &identity,
             &peers,
@@ -1027,7 +1068,7 @@ pub async fn connect(address: Option<&str>, link_id: Option<u64>) -> Result<()> 
         )
         .await
         {
-            Ok((conn, _send, _recv, _capabilities)) => {
+            Ok((conn, mut send, _recv, _capabilities)) => {
                 // Verified logical link: this is the LIVE fingerprint — ghost
                 // pins elsewhere can no longer misroute. Episodes dial fresh
                 // per crossing, so the handshake connection itself is done.
@@ -1036,7 +1077,21 @@ pub async fn connect(address: Option<&str>, link_id: Option<u64>) -> Result<()> 
                     address: address.clone(),
                     link_id,
                 };
-                tracing::info!(peer = %address, "linked input session");
+                tracing::info!(
+                    peer = %address,
+                    elapsed_ms = dial_started.elapsed().as_millis() as u64,
+                    "linked input session",
+                );
+                // Deskflow-class first crossing: keep the verified QUIC
+                // association warm (transport keep-alive holds it across
+                // idle) instead of dropping it, so the first edge crossing
+                // opens a stream on a live connection — milliseconds, not a
+                // cold handshake. The verify stream itself closes gracefully
+                // (ReleaseAll + FIN) so the peer's session — and its input
+                // permit — ends cleanly instead of lingering into the lease.
+                let _ = write_frame(&mut send, &WireMessage::ReleaseAll).await;
+                let _ = send.finish();
+                store_warm_link(&conn, &link.fingerprint);
                 eprintln!("THEKVM_STATUS established {address}");
                 return connect_topology(Some(link)).await;
             }
@@ -1634,6 +1689,12 @@ struct TopologySession {
     /// `Wheel` here (never dropped wholesale, never sent raw).
     peer_smooth: bool,
     wheel_debt: WheelDowngrade,
+    /// Sender-side scroll census: captured vs forwarded wheel events. Logged
+    /// at teardown next to the receiver's census, so each side's journal
+    /// proves where scroll lived or died.
+    wheel_captured: u64,
+    smooth_captured: u64,
+    wheel_forwarded: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1655,6 +1716,14 @@ enum RemoteSignal {
 
 impl TopologySession {
     async fn finish(self) {
+        tracing::info!(
+            target = ?self.target,
+            wheel_captured = self.wheel_captured,
+            smooth_captured = self.smooth_captured,
+            wheel_forwarded = self.wheel_forwarded,
+            peer_smooth = self.peer_smooth,
+            "topology episode ended",
+        );
         let mut send = self.send;
         let _ = write_frame(&mut send, &WireMessage::ReleaseAll).await;
         let _ = send.finish();
@@ -1846,11 +1915,26 @@ async fn handle_topology_event(
             // Sub-detent touchpad motion with nothing whole to report yet
             // stays silent (the remainder is kept): an older peer must never
             // see raw 120ths, and sending zeroes would only waste the wire.
+            // Census: proves per session what the hook captured vs what the
+            // peer accepted, so a silent scroll drop is diagnosable from the
+            // journal instead of a mystery (captured counts arrivals here,
+            // forwarded counts wire sends).
+            match event {
+                InputEvent::Wheel(_) => session.wheel_captured += 1,
+                InputEvent::SmoothWheel { .. } => session.smooth_captured += 1,
+                _ => {}
+            }
             let Some(outgoing) =
                 outgoing_wheel_event(event, session.peer_smooth, &mut session.wheel_debt)
             else {
                 return Ok(());
             };
+            if matches!(
+                outgoing,
+                InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
+            ) {
+                session.wheel_forwarded += 1;
+            }
             *sequence = sequence.wrapping_add(1);
             if let Err(error) =
                 send_input(&session.connection, &mut session.send, *sequence, outgoing).await
@@ -2133,6 +2217,9 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         remote_clipboard_revision: 0,
         peer_smooth: capabilities.smooth_scroll,
         wheel_debt,
+        wheel_captured: 0,
+        smooth_captured: 0,
+        wheel_forwarded: 0,
     })
 }
 
@@ -3066,6 +3153,17 @@ async fn handle_connection(
                 hello.link_id,
             );
             drop(peer_book);
+            // One face per machine: the verified live fingerprint retires
+            // same-named ghosts (the service-cert vs user-cert split), so
+            // the book converges instead of flapping.
+            retire_ghost_identities(
+                &peers,
+                &data_dir(),
+                &hello.node_name,
+                &peer_fingerprint,
+                audit_dir,
+            )
+            .await;
             // Panic-safe: the guard unregisters even when the session below
             // dies abnormally, so no ghost entry can fool the station UI.
             let _link_guard = InboundLinkGuard {
@@ -3182,7 +3280,17 @@ async fn handle_connection(
                         let payload = datagram?;
                         last_activity = Instant::now();
                         injector.ensure_session()?;
-                        let packet = decode_input_datagram(&payload)?;
+                        // QUIC datagrams are unordered and lossy by design: a
+                        // corrupt or future-version datagram is dropped, never
+                        // fatal. Killing the whole input session over one bad
+                        // packet turned wire noise into visible control snaps.
+                        let packet = match decode_input_datagram(&payload) {
+                            Ok(packet) => packet,
+                            Err(error) => {
+                                tracing::debug!(%error, bytes = payload.len(), "dropping undecodable input datagram");
+                                continue;
+                            }
+                        };
                         match packet.event {
                             InputEvent::MouseMove { .. } => motion_count += 1,
                             InputEvent::Wheel(_) => wheel_count += 1,
@@ -3900,6 +4008,68 @@ fn resolve_peer_address(
     anyhow::bail!("target screen peer has no saved address")
 }
 
+/// Retire ghost identities: same device name, different fingerprint than
+/// the peer that just completed a verified session. Two faces for one
+/// machine (service cert vs interactive-user cert) used to accumulate here
+/// and flap the link — adoption churn, sibling-address redials,
+/// input-permit races. The LIVE fingerprint wins; the ghosts lose trust
+/// (in-memory and on file) with an audit line. A genuinely re-paired
+/// machine presents its new face the same way and retires the old one.
+async fn retire_ghost_identities(
+    peers: &Arc<tokio::sync::RwLock<PeerBook>>,
+    dir: &std::path::Path,
+    node_name: &str,
+    live_fingerprint: &str,
+    audit_dir: &std::path::Path,
+) {
+    if node_name.trim().is_empty() {
+        return;
+    }
+    let ghosts: Vec<String> = {
+        let book = peers.read().await;
+        book.peers
+            .iter()
+            .filter(|peer| {
+                peer.name == node_name && peer.fingerprint_hex != live_fingerprint
+            })
+            .map(|peer| peer.fingerprint_hex.clone())
+            .collect()
+    };
+    if ghosts.is_empty() {
+        return;
+    }
+    let mut retired = 0u32;
+    if let Ok(mut file_book) = PeerBook::load_or_create(dir) {
+        for ghost in &ghosts {
+            match file_book.unpin(ghost) {
+                Ok(true) => retired += 1,
+                Ok(false) => {}
+                Err(error) => tracing::debug!(%error, %ghost, "cannot retire ghost identity from peer book"),
+            }
+        }
+    }
+    {
+        let mut live_book = peers.write().await;
+        for ghost in &ghosts {
+            let _ = live_book.unpin(ghost);
+        }
+    }
+    tracing::warn!(
+        peer = node_name,
+        live = live_fingerprint,
+        ghosts = ghosts.len(),
+        retired,
+        "retired ghost identities for a verified peer; one face per machine from here on"
+    );
+    audit_event(
+        audit_dir,
+        &format!(
+            "ghost-identities-retired peer={node_name} live={live_fingerprint} ghosts={}",
+            ghosts.len()
+        ),
+    );
+}
+
 /// Record a working address for a fingerprint in a peer book (best effort,
 /// logged). Keeps dial addresses fresh across DHCP changes and heals
 /// entries pinned without one.
@@ -4391,6 +4561,40 @@ mod tests {
             assert!(validate_input_capability(&locked_on, false).is_ok());
             assert!(validate_input_capability(&locked_on, true).is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn verified_session_retires_same_named_ghost_identities() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("thekvm-ghost-retire-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = "aa".repeat(32);
+        let ghost = "bb".repeat(32);
+        let other = "cc".repeat(32);
+        let mut book = PeerBook::load_or_create(&dir).unwrap();
+        book.pin_with_address("mint", live.clone(), Some("192.168.1.7:42110".into()))
+            .unwrap();
+        book.pin_with_address("mint", ghost.clone(), None).unwrap();
+        book.pin_with_address("third", other.clone(), None).unwrap();
+        let peers = Arc::new(tokio::sync::RwLock::new(book));
+        retire_ghost_identities(&peers, &dir, "mint", &live, &dir).await;
+        {
+            let book = peers.read().await;
+            assert!(book.is_pinned(&live));
+            assert!(!book.is_pinned(&ghost));
+            assert!(book.is_pinned(&other));
+        }
+        let file_book = PeerBook::load_or_create(&dir).unwrap();
+        assert!(file_book.is_pinned(&live));
+        assert!(!file_book.is_pinned(&ghost));
+        assert!(file_book.is_pinned(&other));
+        // A second verified session with nothing to retire is a no-op.
+        retire_ghost_identities(&peers, &dir, "mint", &live, &dir).await;
+        assert!(peers.read().await.is_pinned(&live));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

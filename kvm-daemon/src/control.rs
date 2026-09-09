@@ -378,6 +378,17 @@ where
             crate::service::audit_event(&data_dir, &format!("link-ended link_id={link_id}"));
             ControlResponse::LinkEnded { link_id }
         }
+        ControlRequest::ExportIdentity => {
+            match kvm_protocol::pairing::Identity::load_or_create(&data_dir) {
+                Ok(identity) => ControlResponse::Identity {
+                    cert_der_hex: kvm_protocol::pairing::hex_encode(&identity.cert_der),
+                    key_der_hex: kvm_protocol::pairing::hex_encode(&identity.key_der),
+                },
+                Err(error) => ControlResponse::Error {
+                    message: format!("reading daemon identity failed: {error}"),
+                },
+            }
+        }
         ControlRequest::PinPeer {
             fingerprint_hex,
             node_name,

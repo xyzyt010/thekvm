@@ -404,8 +404,12 @@ mod win32_hooks {
     unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            // LLKHF_INJECTED. Ignore our own SendInput events.
-            if info.flags.0 & 0x10 == 0 {
+            // Echo suppression by magic tag, not by INJECTED flag: our own
+            // SendInput events carry ECHO_TAG and are skipped, while input
+            // synthesized by vendor drivers (trackpad utilities, hotkey
+            // tools) is real user input and must be captured. The old flag
+            // check swallowed those.
+            if info.dwExtraInfo != crate::ECHO_TAG {
                 let message = wparam.0 as u32;
                 let pressed = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
                 if pressed || matches!(message, WM_KEYUP | WM_SYSKEYUP) {
@@ -426,8 +430,9 @@ mod win32_hooks {
     unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            // LLMHF_INJECTED. Ignore our own SendInput events.
-            if info.flags & 0x01 == 0 {
+            // Same tag rule as the keyboard hook: skip our own echo, keep
+            // everything else including vendor-synthesized scroll.
+            if info.dwExtraInfo != crate::ECHO_TAG {
                 let message = wparam.0 as u32;
                 match message {
                     WM_MOUSEMOVE => {
@@ -628,6 +633,15 @@ mod win32_hooks {
         if header.dwType != RIM_TYPEMOUSE.0 {
             return None;
         }
+        // Software-synthesized motion (SendInput, including our own
+        // injector) arrives with a NULL device handle; physical devices
+        // always present a real one. Skipping handle-less packets keeps our
+        // own injected motion out of raw capture while the machine is driven
+        // remotely. Buttons, keys and scroll travel the hook path, which
+        // filters by echo tag instead.
+        if header.hDevice.0.is_null() {
+            return None;
+        }
         let mouse =
             unsafe { std::ptr::read_unaligned(data.as_ptr().add(header_size) as *const RAWMOUSE) };
         if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0 {
@@ -639,6 +653,7 @@ mod win32_hooks {
     #[cfg(test)]
     mod raw_input_tests {
         use super::decode_raw_mouse_motion;
+        use windows::Win32::Foundation::HANDLE;
         use windows::Win32::UI::Input::{
             MOUSE_MOVE_ABSOLUTE, MOUSE_STATE, RAWINPUT, RAWINPUTHEADER, RAWINPUT_0, RAWMOUSE,
             RAWMOUSE_0, RIM_TYPEMOUSE,
@@ -648,6 +663,9 @@ mod win32_hooks {
             RAWINPUT {
                 header: RAWINPUTHEADER {
                     dwType: RIM_TYPEMOUSE.0,
+                    // A real physical device always presents a handle;
+                    // software-synthesized input arrives handle-less.
+                    hDevice: HANDLE(0x1_234 as *mut _),
                     ..Default::default()
                 },
                 data: RAWINPUT_0 {
@@ -689,6 +707,19 @@ mod win32_hooks {
         #[test]
         fn rejects_truncated_packets() {
             assert_eq!(decode_raw_mouse_motion(&[]), None);
+        }
+
+        #[test]
+        fn ignores_handle_less_synthesized_motion() {
+            let mut raw = raw_mouse(MOUSE_STATE(0), 12, -4);
+            raw.header.hDevice = HANDLE(std::ptr::null_mut());
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&raw as *const RAWINPUT).cast::<u8>(),
+                    std::mem::size_of::<RAWINPUT>(),
+                )
+            };
+            assert_eq!(decode_raw_mouse_motion(bytes), None);
         }
     }
 

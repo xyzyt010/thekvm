@@ -94,6 +94,13 @@ enum Command {
         /// disconnected on purpose) instead of retrying forever.
         #[arg(long)]
         link_id: Option<u64>,
+        /// Read the daemon-owned identity from stdin (two hex lines:
+        /// certificate DER, then key DER) instead of the local files, so a
+        /// UI-supervised child presents the SAME fingerprint as the service.
+        /// Without this the child loads the interactive user's identity and
+        /// the peer sees two faces for one machine.
+        #[arg(long)]
+        identity_stdin: bool,
     },
     /// Update persistent daemon configuration.
     Configure {
@@ -209,7 +216,13 @@ async fn async_main() -> Result<()> {
         }
         Command::Send { address, keycode } => service::send_test(&address, keycode).await,
         Command::Capture { address } => service::capture(&address).await,
-        Command::Connect { address, link_id } => service::connect(address.as_deref(), link_id).await,
+        Command::Connect {
+            address,
+            link_id,
+            identity_stdin,
+        } => {
+            service::connect(address.as_deref(), link_id, identity_stdin).await
+        }
         Command::Configure {
             device_name,
             mode,

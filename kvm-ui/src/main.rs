@@ -566,6 +566,12 @@ fn main() -> Result<()> {
             .lock()
             .ok()
             .and_then(|slot| slot.as_ref().and_then(|session| session.link_id));
+        // Ban our epoch synchronously BEFORE killing the child: the peer
+        // redials every couple of seconds, and a retry landing between the
+        // kill and the ban would rebuild the zombie we are tearing down.
+        if let Some(link_id) = outbound_link {
+            end_link(link_id);
+        }
         stop_session(&weak, &disconnect_session, "Disconnected");
         // Hanging up a link we never dialed needs the daemon's help: drop
         // every live inbound session (trust untouched). The dialer's side
@@ -812,6 +818,13 @@ fn main() -> Result<()> {
                 let daemon =
                     std::env::var("THEKVM_DAEMON_PATH").unwrap_or_else(|_| "kvm-daemon".into());
                 let mut command = std::process::Command::new(daemon);
+                #[cfg(target_os = "windows")]
+                {
+                    // A spawned console binary flashes a terminal otherwise.
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                    command.creation_flags(CREATE_NO_WINDOW);
+                }
                 command.args(["configure", "--mode", mode]);
                 command.arg("--device-name").arg(&device_name);
                 if allow_lock_screen {
@@ -925,7 +938,14 @@ fn main() -> Result<()> {
                     Err(control_error) => {
                         let daemon = std::env::var("THEKVM_DAEMON_PATH")
                             .unwrap_or_else(|_| "kvm-daemon".into());
-                        let output = std::process::Command::new(daemon)
+                        let mut fallback = std::process::Command::new(daemon);
+                        #[cfg(target_os = "windows")]
+                        {
+                            use std::os::windows::process::CommandExt;
+                            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                            fallback.creation_flags(CREATE_NO_WINDOW);
+                        }
+                        let output = fallback
                             .args(["configure", "--layout"])
                             .arg(&path)
                             .output()
@@ -2187,8 +2207,43 @@ fn launch_child(
         command.arg("--link-id");
         command.arg(link_id.to_string());
     }
+    // One face per machine: hand the daemon-owned identity to the child on
+    // stdin so it presents the SAME fingerprint as the service. Without
+    // this the child loads the interactive user's files — a second face
+    // for the same machine that flaps the link (ghost adopt churn,
+    // sibling-address redials, input-permit races). An older daemon that
+    // does not know ExportIdentity falls back to the local files.
+    let inherited_identity: Option<(String, String)> =
+        match control_request(ControlRequest::ExportIdentity) {
+            Ok(ControlResponse::Identity {
+                cert_der_hex,
+                key_der_hex,
+            }) if !cert_der_hex.trim().is_empty() && !key_der_hex.trim().is_empty() => {
+                ui_log("session: child inherits the daemon identity (one face per machine)");
+                Some((cert_der_hex, key_der_hex))
+            }
+            Ok(other) => {
+                ui_log(&format!(
+                    "session: daemon identity unavailable ({other:?}); child uses local files"
+                ));
+                None
+            }
+            Err(error) => {
+                ui_log(&format!(
+                    "session: daemon identity unavailable ({error:#}); child uses local files"
+                ));
+                None
+            }
+        };
+    if inherited_identity.is_some() {
+        command.arg("--identity-stdin");
+    }
     command.env("THEKVM_DATA_DIR", data_dir);
-    command.stdin(std::process::Stdio::null());
+    command.stdin(if inherited_identity.is_some() {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    });
     command.stdout(std::process::Stdio::null());
     // Piped (not nulled): the child reports dialing/established/waiting
     // progress here and the relay below turns it into truthful status.
@@ -2202,6 +2257,21 @@ fn launch_child(
     match command.spawn() {
         Ok(mut child) => {
             let stderr = child.stderr.take();
+            // Deliver the inherited identity, then close the pipe: the child
+            // reads two hex lines and proceeds. A failed handoff is logged,
+            // and the child fails loudly on its own (never silently weird).
+            if let (Some((cert_hex, key_hex)), Some(mut stdin)) =
+                (inherited_identity, child.stdin.take())
+            {
+                use std::io::Write as _;
+                let payload = format!("{cert_hex}\n{key_hex}\n");
+                if let Err(error) = stdin
+                    .write_all(payload.as_bytes())
+                    .and_then(|()| stdin.flush())
+                {
+                    ui_log(&format!("session: daemon identity handoff failed: {error:#}"));
+                }
+            }
             let verified = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Ok(mut slot) = session.lock() {
                 *slot = Some(Session {
@@ -2246,6 +2316,39 @@ fn launch_child(
 /// automatically; a station dial-back just stops honestly (its inbound link
 /// persists, so the poll re-arms it once trust is repaired) — it must never
 /// hijack the ceremony with an unprompted outbound dial.
+/// Per-peer sender-side log path: `link-<address>.log` in the user state
+/// directory. Address characters outside `[0-9A-Za-z]` become underscores so
+/// the file name is always safe.
+fn link_log_path(data_dir: &std::path::Path, address: &str) -> std::path::PathBuf {
+    let mut safe: String = address
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    safe.truncate(64);
+    data_dir.join(format!("link-{safe}.log"))
+}
+
+/// Open (or rotate) the per-peer link log. Rotates past 512KB so a flapping
+/// link cannot fill the disk; best effort, never fatal.
+fn open_link_log(path: &std::path::Path) -> Option<std::fs::File> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > 512 * 1024 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
 fn relay_session_progress(
     weak: &slint::Weak<AppWindow>,
     stderr: std::process::ChildStderr,
@@ -2258,9 +2361,17 @@ fn relay_session_progress(
 ) {
     use std::io::BufRead as _;
     let reader = std::io::BufReader::new(stderr);
+    // Mirror the child's raw stderr into a per-peer link log (capped): the
+    // sender-side half of every link, persisted for diagnosis. The status
+    // relay below still only reacts to THEKVM_STATUS lines.
+    let mut link_log = open_link_log(&link_log_path(&data_dir, address));
     let mut last_shown = String::new();
     let mut not_paired_streak: u32 = 0;
     for line in reader.lines().map_while(Result::ok) {
+        if let Some(file) = link_log.as_mut() {
+            use std::io::Write as _;
+            let _ = writeln!(file, "{line}");
+        }
         let Some(progress) = line.strip_prefix("THEKVM_STATUS ") else {
             continue;
         };

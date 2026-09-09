@@ -541,8 +541,9 @@ fn spawn_helper(
     };
     use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, OpenProcess, OpenProcessToken, CREATE_UNICODE_ENVIRONMENT,
-        PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, STARTUPINFOW,
+        CreateProcessAsUserW, OpenProcess, OpenProcessToken, CREATE_NO_WINDOW,
+        CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
+        STARTUPINFOW, STARTF_USESHOWWINDOW,
     };
 
     let session_id = active_console_session_id()?;
@@ -632,6 +633,13 @@ fn spawn_helper(
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         lpDesktop: PWSTR(desktop_wide.as_mut_ptr()),
+        // The helper is a console-subsystem binary spawned onto the
+        // interactive desktop: without an explicit hide it flashes a
+        // terminal window on the user's screen every time it (re)spawns —
+        // exactly the popup reported on every crossing. Belt and braces:
+        // no console at creation AND a hidden show-state if one appears.
+        dwFlags: STARTF_USESHOWWINDOW,
+        wShowWindow: 0, // SW_HIDE
         ..Default::default()
     };
     let mut process_info = PROCESS_INFORMATION::default();
@@ -643,7 +651,7 @@ fn spawn_helper(
             None,
             None,
             false,
-            CREATE_UNICODE_ENVIRONMENT,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             None,
             None,
             &startup,

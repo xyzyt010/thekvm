@@ -19,6 +19,15 @@ pub mod x11_capture;
 
 use thiserror::Error;
 
+/// Magic `dwExtraInfo` tag on every `SendInput` event our own injector
+/// produces (Windows). The low-level hooks ignore exactly this tag instead
+/// of everything flagged INJECTED: our own echo stays out, while input
+/// synthesized by vendor drivers (trackpad scroll compositors, hotkey
+/// tools) is still captured. Any improbable constant works; absence of the
+/// tag means "not ours".
+#[cfg(target_os = "windows")]
+pub(crate) const ECHO_TAG: usize = 0x9E37_79B9_7F4A_7C15;
+
 #[derive(Error, Debug)]
 pub enum PlatformError {
     #[error("uinput unavailable: {0}")]

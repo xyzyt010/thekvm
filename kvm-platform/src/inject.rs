@@ -524,7 +524,7 @@ mod win32_inject {
                             mouseData: 0,
                             dwFlags: MOUSEEVENTF_MOVE,
                             time: 0,
-                            dwExtraInfo: 0,
+                            dwExtraInfo: crate::ECHO_TAG,
                         },
                     },
                 }],
@@ -539,7 +539,7 @@ mod win32_inject {
                                 mouseData: mouse_data,
                                 dwFlags: flags,
                                 time: 0,
-                                dwExtraInfo: 0,
+                                dwExtraInfo: crate::ECHO_TAG,
                             },
                         },
                     }]
@@ -587,7 +587,7 @@ mod win32_inject {
                                 wScan: scan_code,
                                 dwFlags: flags,
                                 time: 0,
-                                dwExtraInfo: 0,
+                                dwExtraInfo: crate::ECHO_TAG,
                             },
                         },
                     }]
@@ -682,7 +682,7 @@ mod win32_inject {
                         mouseData: vertical_120ths as u32,
                         dwFlags: MOUSEEVENTF_WHEEL,
                         time: 0,
-                        dwExtraInfo: 0,
+                        dwExtraInfo: crate::ECHO_TAG,
                     },
                 },
             });
@@ -697,7 +697,7 @@ mod win32_inject {
                         mouseData: horizontal_120ths as u32,
                         dwFlags: MOUSEEVENTF_HWHEEL,
                         time: 0,
-                        dwExtraInfo: 0,
+                        dwExtraInfo: crate::ECHO_TAG,
                     },
                 },
             });

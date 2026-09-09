@@ -129,6 +129,56 @@ impl Identity {
             .map(|b| format!("{b:02x}"))
             .collect()
     }
+
+    /// Adopt an already-existing identity (the daemon-owned one) instead of
+    /// the files on disk. This is how a UI-supervised `connect` child wears
+    /// the SAME face as the service: one fingerprint per machine, so the
+    /// peer book can never accumulate a second "ghost" identity for us and
+    /// sessions stop flapping between two faces. Rejects empty material so
+    /// a truncated handoff fails loudly instead of dialling untrusted.
+    pub fn from_der(cert_der: Vec<u8>, key_der: Vec<u8>) -> std::io::Result<Self> {
+        if cert_der.is_empty() || key_der.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "adopted identity material is empty",
+            ));
+        }
+        let fingerprint = sha256(&cert_der);
+        Ok(Self {
+            cert_der,
+            key_der,
+            fingerprint,
+        })
+    }
+}
+
+/// Hex-encode bytes for the identity handoff (control frame + child stdin):
+/// no new dependencies, and the ~1.5KB total fits the 64KB control frame.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decode what [`hex_encode`] produced. Rejects odd lengths and non-hex so
+/// a truncated pipe fails here, never as a mystery TLS error later.
+pub fn hex_decode(hex: &str) -> std::io::Result<Vec<u8>> {
+    let hex = hex.trim();
+    if hex.len() % 2 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "identity hex has an odd length",
+        ));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "identity hex contains non-hexadecimal data",
+                )
+            })
+        })
+        .collect()
 }
 
 fn generate_material() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
@@ -573,6 +623,39 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 fn harden_private_key(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(test)]
+mod identity_adopt_tests {
+    use super::{hex_decode, hex_encode, Identity};
+
+    #[test]
+    fn adopted_identity_keeps_the_daemon_fingerprint() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("thekvm-adopt-identity-{nonce}"));
+        let original = Identity::load_or_create(&root).unwrap();
+        let adopted = Identity::from_der(
+            original.cert_der.clone(),
+            original.key_der.clone(),
+        )
+        .unwrap();
+        assert_eq!(adopted.fingerprint, original.fingerprint);
+        assert_eq!(adopted.fingerprint_hex(), original.fingerprint_hex());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identity_hex_round_trips_and_rejects_truncation() {
+        let bytes = vec![0x00, 0xab, 0xcd, 0xef, 0x01];
+        assert_eq!(hex_decode(&hex_encode(&bytes)).unwrap(), bytes);
+        assert!(Identity::from_der(vec![], vec![1]).is_err());
+        assert!(Identity::from_der(vec![1], vec![]).is_err());
+        assert!(hex_decode("abc").is_err());
+        assert!(hex_decode("zz").is_err());
+    }
 }
 
 #[cfg(all(test, target_os = "windows"))]

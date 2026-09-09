@@ -73,6 +73,14 @@ pub enum ControlRequest {
     /// Disconnect bans + drops; the peer learns from the rejection and its
     /// child exits instead of retrying forever.
     EndLink { link_id: u64 },
+    /// Return the daemon-owned identity (certificate + key, hex-encoded) so
+    /// a UI-supervised `connect` child can wear the SAME face as the
+    /// service. Without this the child loads the interactive user's files
+    /// and presents a second fingerprint for the same machine; the peer
+    /// book then holds two "ghost" identities that flap the link (adopt
+    /// churn, sibling-address redials, input-permit races). Local
+    /// control-socket callers only — never sent over the network.
+    ExportIdentity,
     SetConfig {
         /// Optional for compatibility with older desktop UIs. When supplied,
         /// it becomes the node name advertised and sent in handshakes.
@@ -167,6 +175,12 @@ pub enum ControlResponse {
     Applied { restart_required: bool },
     SessionDropped { fingerprint_hex: String },
     LinkEnded { link_id: u64 },
+    /// The daemon-owned identity for [`ControlRequest::ExportIdentity`].
+    /// Hex-encoded DER (see `pairing::hex_encode`); empty on older daemons.
+    Identity {
+        cert_der_hex: String,
+        key_der_hex: String,
+    },
     Error { message: String },
 }
 

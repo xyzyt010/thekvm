@@ -28,6 +28,52 @@ pub struct X11Capture {
     exclusive: bool,
     motion_x: f64,
     motion_y: f64,
+    /// Slave-device ids owned by our own uinput injector ("TheKVM Virtual
+    /// Mouse/Keyboard"). Raw events carry only numeric source ids, so the
+    /// set is resolved by device name and refreshed periodically: the
+    /// injector creates its devices per receiver session, which can postdate
+    /// this capture backend.
+    ignored_sources: Vec<xinput::DeviceId>,
+    last_source_refresh: std::time::Instant,
+}
+
+/// True when an XI device name is one of our own virtual injector devices.
+/// Mirrors the evdev backend's name filter: the receiver injects through
+/// uinput, the X server attaches that device to the master pointer, and
+/// without this filter capture re-reads its own injected input and forwards
+/// it back — a phantom second driver.
+fn is_own_device_name(name: &[u8]) -> bool {
+    String::from_utf8_lossy(name)
+        .to_ascii_lowercase()
+        .contains("thekvm")
+}
+
+/// Resolve our own slave-device ids via XIQueryDevice (0 = all devices).
+/// `None` means enumeration failed: the caller keeps its previous set, so
+/// capture never degrades because one query hiccuped.
+fn query_own_sources(connection: &RustConnection) -> Option<Vec<xinput::DeviceId>> {
+    let reply = connection
+        .xinput_xi_query_device(0)
+        .map_err(|error| format!("query XInput2 devices: {error}"))
+        .and_then(|cookie| {
+            cookie
+                .reply()
+                .map_err(|error| format!("read XInput2 devices: {error}"))
+        });
+    match reply {
+        Ok(reply) => Some(
+            reply
+                .infos
+                .iter()
+                .filter(|info| is_own_device_name(&info.name))
+                .map(|info| info.deviceid)
+                .collect(),
+        ),
+        Err(error) => {
+            tracing::debug!(%error, "XInput2 device enumeration unavailable; echo filter unchanged");
+            None
+        }
+    }
 }
 
 impl X11Capture {
@@ -62,24 +108,52 @@ impl X11Capture {
             .flush()
             .map_err(|error| PlatformError::Capture(format!("flush XInput2 setup: {error}")))?;
 
+        let ignored_sources = query_own_sources(&connection).unwrap_or_default();
+        tracing::info!(
+            ignored = ignored_sources.len(),
+            "X11 capture armed; own injector devices excluded from capture"
+        );
         Ok(Self {
             connection,
             root,
             exclusive: false,
             motion_x: 0.0,
             motion_y: 0.0,
+            ignored_sources,
+            last_source_refresh: std::time::Instant::now(),
         })
     }
 
     fn translate(&mut self, event: x11rb::protocol::Event) -> Option<InputEvent> {
         match event {
-            x11rb::protocol::Event::XinputRawKeyPress(event) => key_event(event.detail, true),
-            x11rb::protocol::Event::XinputRawKeyRelease(event) => key_event(event.detail, false),
-            x11rb::protocol::Event::XinputRawButtonPress(event) => button_event(event.detail, true),
+            x11rb::protocol::Event::XinputRawKeyPress(event) => {
+                if self.ignored_sources.contains(&event.sourceid) {
+                    return None;
+                }
+                key_event(event.detail, true)
+            }
+            x11rb::protocol::Event::XinputRawKeyRelease(event) => {
+                if self.ignored_sources.contains(&event.sourceid) {
+                    return None;
+                }
+                key_event(event.detail, false)
+            }
+            x11rb::protocol::Event::XinputRawButtonPress(event) => {
+                if self.ignored_sources.contains(&event.sourceid) {
+                    return None;
+                }
+                button_event(event.detail, true)
+            }
             x11rb::protocol::Event::XinputRawButtonRelease(event) => {
+                if self.ignored_sources.contains(&event.sourceid) {
+                    return None;
+                }
                 button_event(event.detail, false)
             }
             x11rb::protocol::Event::XinputRawMotion(event) => {
+                if self.ignored_sources.contains(&event.sourceid) {
+                    return None;
+                }
                 let dx = axis_value(&event.valuator_mask, &event.axisvalues_raw, 0)
                     .map(|value| take_integer(&mut self.motion_x, value))
                     .unwrap_or(0);
@@ -103,6 +177,17 @@ impl CaptureBackend for X11Capture {
         loop {
             if stop.load(Ordering::Acquire) {
                 return Err(PlatformError::Capture("capture stopped".into()));
+            }
+            // The injector (re)creates its uinput devices per receiver
+            // session, which can postdate this backend: re-resolve our own
+            // sources every few seconds so freshly injected input is never
+            // re-captured. One round trip per interval is negligible next
+            // to the 4ms event poll.
+            if self.last_source_refresh.elapsed() > std::time::Duration::from_secs(5) {
+                self.last_source_refresh = std::time::Instant::now();
+                if let Some(refreshed) = query_own_sources(&self.connection) {
+                    self.ignored_sources = refreshed;
+                }
             }
             if release.swap(false, Ordering::AcqRel) {
                 self.release()?;
@@ -306,6 +391,16 @@ mod tests {
             }))
         );
         assert_eq!(key_event(7, true), None);
+    }
+
+    #[test]
+    fn own_injector_devices_match_case_insensitively() {
+        assert!(is_own_device_name(b"TheKVM Virtual Mouse"));
+        assert!(is_own_device_name(b"TheKVM Virtual Keyboard"));
+        assert!(is_own_device_name(b"thekvm virtual mouse"));
+        assert!(!is_own_device_name(b"Logitech USB Receiver"));
+        assert!(!is_own_device_name(b"AT Translated Set 2 keyboard"));
+        assert!(!is_own_device_name(b""));
     }
 
     #[test]
