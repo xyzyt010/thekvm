@@ -546,6 +546,9 @@ fn mouse_button(code: u16) -> Option<MouseButton> {
 }
 
 /// Convert the common Linux evdev keyboard namespace to USB HID usages.
+/// The QWERTY row is explicit, never arithmetic: HID usages are not
+/// sequential across Q..P, and a range formula here once reported W as R
+/// and eight of its neighbours wrong with it.
 pub(crate) fn hid_from_evdev(code: u16) -> Option<u16> {
     Some(match code {
         1 => 0x29,
@@ -554,7 +557,16 @@ pub(crate) fn hid_from_evdev(code: u16) -> Option<u16> {
         13 => 0x2e,
         14 => 0x2a,
         15 => 0x2b,
-        16..=25 => 0x14 + (code - 16),
+        16 => 0x14,
+        17 => 0x1a,
+        18 => 0x08,
+        19 => 0x15,
+        20 => 0x17,
+        21 => 0x1c,
+        22 => 0x18,
+        23 => 0x0c,
+        24 => 0x12,
+        25 => 0x13,
         26 => 0x2f,
         27 => 0x30,
         28 => 0x28,
@@ -716,6 +728,37 @@ mod tests {
         assert_eq!(hid_from_evdev(82), Some(0x62)); // keypad 0
         assert_eq!(hid_from_evdev(96), Some(0x58)); // keypad Enter
         assert_eq!(hid_from_evdev(183), Some(0x68)); // F13
+    }
+
+    #[test]
+    fn full_letter_rows_decode_to_hid_exactly() {
+        // (evdev code, USB HID usage, key). Mirror image of the inject
+        // table: every letter, exact in both directions.
+        let pairs: &[(u16, u16, &str)] = &[
+            (30, 0x04, "A"), (48, 0x05, "B"), (46, 0x06, "C"),
+            (32, 0x07, "D"), (18, 0x08, "E"), (33, 0x09, "F"),
+            (34, 0x0a, "G"), (35, 0x0b, "H"), (23, 0x0c, "I"),
+            (36, 0x0d, "J"), (37, 0x0e, "K"), (38, 0x0f, "L"),
+            (50, 0x10, "M"), (49, 0x11, "N"), (24, 0x12, "O"),
+            (25, 0x13, "P"), (16, 0x14, "Q"), (19, 0x15, "R"),
+            (31, 0x16, "S"), (20, 0x17, "T"), (22, 0x18, "U"),
+            (47, 0x19, "V"), (17, 0x1a, "W"), (45, 0x1b, "X"),
+            (21, 0x1c, "Y"), (44, 0x1d, "Z"),
+        ];
+        for (code, usage, name) in pairs {
+            assert_eq!(hid_from_evdev(*code), Some(*usage), "letter {name}");
+        }
+    }
+
+    #[test]
+    fn win_and_scroll_keys_decode_to_hid_exactly() {
+        assert_eq!(hid_from_evdev(125), Some(0xe3)); // left Meta
+        assert_eq!(hid_from_evdev(126), Some(0xe7)); // right Meta
+        assert_eq!(hid_from_evdev(70), Some(0x47)); // Scroll Lock
+        assert_eq!(hid_from_evdev(29), Some(0xe0)); // left Ctrl
+        assert_eq!(hid_from_evdev(42), Some(0xe1)); // left Shift
+        assert_eq!(hid_from_evdev(56), Some(0xe2)); // left Alt
+        assert_eq!(hid_from_evdev(57), Some(0x2c)); // Space
     }
 
     #[test]

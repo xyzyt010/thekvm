@@ -841,6 +841,36 @@ mod win32_hooks {
             assert_eq!(hid_from_vk(0x87), Some(0x73)); // F24
             assert_eq!(hid_from_vk(0x5d), Some(0x65)); // application
         }
+
+        #[test]
+        fn full_letter_rows_and_win_keys_decode_exactly() {
+            // (Set 1 scan code, USB HID usage, key) — extended flag matters
+            // for the Win keys.
+            let pairs: &[(u16, u16, &str)] = &[
+                (0x1e, 0x04, "A"), (0x30, 0x05, "B"), (0x2e, 0x06, "C"),
+                (0x20, 0x07, "D"), (0x12, 0x08, "E"), (0x21, 0x09, "F"),
+                (0x22, 0x0a, "G"), (0x23, 0x0b, "H"), (0x17, 0x0c, "I"),
+                (0x24, 0x0d, "J"), (0x25, 0x0e, "K"), (0x26, 0x0f, "L"),
+                (0x32, 0x10, "M"), (0x31, 0x11, "N"), (0x18, 0x12, "O"),
+                (0x19, 0x13, "P"), (0x10, 0x14, "Q"), (0x13, 0x15, "R"),
+                (0x1f, 0x16, "S"), (0x14, 0x17, "T"), (0x16, 0x18, "U"),
+                (0x2f, 0x19, "V"), (0x11, 0x1a, "W"), (0x2d, 0x1b, "X"),
+                (0x15, 0x1c, "Y"), (0x2c, 0x1d, "Z"),
+                (0x02, 0x1e, "1"), (0x0b, 0x27, "0"),
+                (0x39, 0x2c, "Space"), (0x46, 0x47, "ScrollLock"),
+                (0x1d, 0xe0, "LCtrl"), (0x2a, 0xe1, "LShift"),
+                (0x38, 0xe2, "LAlt"),
+            ];
+            for (scan, usage, name) in pairs {
+                assert_eq!(hid_from_scan_code(*scan, false), Some(*usage), "key {name}");
+            }
+            assert_eq!(hid_from_scan_code(0x5b, true), Some(0xe3)); // LWin
+            assert_eq!(hid_from_scan_code(0x5c, true), Some(0xe7)); // RWin
+            assert_eq!(hid_from_scan_code(0x1d, true), Some(0xe4)); // RCtrl
+            assert_eq!(hid_from_scan_code(0x38, true), Some(0xe6)); // RAlt
+            assert_eq!(hid_from_vk(0x5b), Some(0xe3)); // LWin fallback
+            assert_eq!(hid_from_vk(0x5c), Some(0xe7)); // RWin fallback
+        }
     }
 }
 

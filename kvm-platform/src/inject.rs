@@ -240,6 +240,9 @@ mod linux_uinput {
     }
 
     fn hid_to_evdev(usage: HidUsage) -> Option<u16> {
+        // Letter rows are explicit, never arithmetic: the HID usage order
+        // (QWERTYUIOP...) is not sequential, and a range formula here once
+        // scrambled thirteen letters (U pressed as R, and twelve friends).
         Some(match usage {
             0x04 => 30,
             0x05 => 48,
@@ -249,21 +252,21 @@ mod linux_uinput {
             0x09 => 33,
             0x0a => 34,
             0x0b => 35,
-            0x0c => 36,
-            0x0d => 37,
-            0x0e => 38,
-            0x0f => 50,
-            0x10 => 49,
-            0x11 => 24,
-            0x12 => 25,
-            0x13 => 16,
-            0x14 => 22,
-            0x15 => 23,
+            0x0c => 23,
+            0x0d => 36,
+            0x0e => 37,
+            0x0f => 38,
+            0x10 => 50,
+            0x11 => 49,
+            0x12 => 24,
+            0x13 => 25,
+            0x14 => 16,
+            0x15 => 19,
             0x16 => 31,
-            0x17 => 17,
-            0x18 => 19,
+            0x17 => 20,
+            0x18 => 22,
             0x19 => 47,
-            0x1a => 20,
+            0x1a => 17,
             0x1b => 45,
             0x1c => 21,
             0x1d => 44,
@@ -357,6 +360,55 @@ mod linux_uinput {
             assert_eq!(hid_to_evdev(0x5c), Some(75)); // keypad 4
             assert_eq!(hid_to_evdev(0x5f), Some(71)); // keypad 7
             assert_eq!(hid_to_evdev(0x62), Some(82)); // keypad 0
+        }
+
+        #[test]
+        fn full_letter_rows_map_to_evdev_exactly() {
+            // (USB HID usage, evdev code, key). Every letter, exact —
+            // regressions here type the wrong letter on the peer.
+            let pairs: &[(u16, u16, &str)] = &[
+                (0x04, 30, "A"), (0x05, 48, "B"), (0x06, 46, "C"),
+                (0x07, 32, "D"), (0x08, 18, "E"), (0x09, 33, "F"),
+                (0x0a, 34, "G"), (0x0b, 35, "H"), (0x0c, 23, "I"),
+                (0x0d, 36, "J"), (0x0e, 37, "K"), (0x0f, 38, "L"),
+                (0x10, 50, "M"), (0x11, 49, "N"), (0x12, 24, "O"),
+                (0x13, 25, "P"), (0x14, 16, "Q"), (0x15, 19, "R"),
+                (0x16, 31, "S"), (0x17, 20, "T"), (0x18, 22, "U"),
+                (0x19, 47, "V"), (0x1a, 17, "W"), (0x1b, 45, "X"),
+                (0x1c, 21, "Y"), (0x1d, 44, "Z"),
+            ];
+            for (usage, evdev, name) in pairs {
+                assert_eq!(hid_to_evdev(*usage), Some(*evdev), "letter {name}");
+            }
+        }
+
+        #[test]
+        fn digits_modifiers_and_win_keys_map_exactly() {
+            let pairs: &[(u16, u16, &str)] = &[
+                (0x1e, 2, "1"), (0x1f, 3, "2"), (0x20, 4, "3"),
+                (0x21, 5, "4"), (0x22, 6, "5"), (0x23, 7, "6"),
+                (0x24, 8, "7"), (0x25, 9, "8"), (0x26, 10, "9"),
+                (0x27, 11, "0"),
+                (0x2c, 57, "Space"), (0x28, 28, "Enter"),
+                (0x29, 1, "Esc"), (0x2b, 15, "Tab"),
+                (0x2a, 14, "Backspace"),
+                (0xe0, 29, "LCtrl"), (0xe1, 42, "LShift"),
+                (0xe2, 56, "LAlt"), (0xe3, 125, "LWin"),
+                (0xe4, 97, "RCtrl"), (0xe5, 54, "RShift"),
+                (0xe6, 100, "RAlt"), (0xe7, 126, "RWin"),
+                (0x47, 70, "ScrollLock"), (0x39, 58, "CapsLock"),
+                (0x53, 69, "NumLock"),
+                (0x4a, 102, "Home"), (0x52, 103, "Up"),
+                (0x4b, 104, "PgUp"), (0x50, 105, "Left"),
+                (0x4f, 106, "Right"), (0x4d, 107, "End"),
+                (0x51, 108, "Down"), (0x4e, 109, "PgDn"),
+                (0x49, 110, "Insert"), (0x4c, 111, "Delete"),
+                (0x3a, 59, "F1"), (0x43, 68, "F10"),
+                (0x44, 87, "F11"), (0x45, 88, "F12"),
+            ];
+            for (usage, evdev, name) in pairs {
+                assert_eq!(hid_to_evdev(*usage), Some(*evdev), "key {name}");
+            }
         }
     }
 }
@@ -695,6 +747,33 @@ mod win32_inject {
             assert_eq!(hid_to_scan_code(0x58), Some((0x1c, true))); // keypad Enter
             assert_eq!(hid_to_scan_code(0x73), Some((0x76, false))); // F24
             assert_eq!(hid_to_scan_code(0x65), Some((0x5d, true))); // application
+        }
+
+        #[test]
+        fn full_letter_rows_and_win_keys_emit_exact_scans() {
+            // (USB HID usage, scan code, extended, key). The reverse trip:
+            // Mint driving Windows must land the same physical keys.
+            let pairs: &[(u16, (u16, bool), &str)] = &[
+                (0x04, (0x1e, false), "A"), (0x05, (0x30, false), "B"),
+                (0x06, (0x2e, false), "C"), (0x07, (0x20, false), "D"),
+                (0x08, (0x12, false), "E"), (0x09, (0x21, false), "F"),
+                (0x0a, (0x22, false), "G"), (0x0b, (0x23, false), "H"),
+                (0x0c, (0x17, false), "I"), (0x0d, (0x24, false), "J"),
+                (0x0e, (0x25, false), "K"), (0x0f, (0x26, false), "L"),
+                (0x10, (0x32, false), "M"), (0x11, (0x31, false), "N"),
+                (0x12, (0x18, false), "O"), (0x13, (0x19, false), "P"),
+                (0x14, (0x10, false), "Q"), (0x15, (0x13, false), "R"),
+                (0x16, (0x1f, false), "S"), (0x17, (0x14, false), "T"),
+                (0x18, (0x16, false), "U"), (0x19, (0x2f, false), "V"),
+                (0x1a, (0x11, false), "W"), (0x1b, (0x2d, false), "X"),
+                (0x1c, (0x15, false), "Y"), (0x1d, (0x2c, false), "Z"),
+                (0xe3, (0x5b, true), "LWin"), (0xe7, (0x5c, true), "RWin"),
+                (0xe0, (0x1d, false), "LCtrl"), (0xe2, (0x38, false), "LAlt"),
+                (0x47, (0x46, false), "ScrollLock"),
+            ];
+            for (usage, scan, name) in pairs {
+                assert_eq!(hid_to_scan_code(*usage), Some(*scan), "key {name}");
+            }
         }
     }
 }
