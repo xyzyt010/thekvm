@@ -143,6 +143,9 @@ fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        // Supervised children run with stdout nulled (the UI pipes stderr
+        // for progress): diagnostics must go to stderr or they vanish.
+        .with_writer(std::io::stderr)
         .init();
 
     #[cfg(target_os = "windows")]

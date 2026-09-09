@@ -633,14 +633,19 @@ mod win32_hooks {
         if header.dwType != RIM_TYPEMOUSE.0 {
             return None;
         }
-        // Software-synthesized motion (SendInput, including our own
-        // injector) arrives with a NULL device handle; physical devices
-        // always present a real one. Skipping handle-less packets keeps our
-        // own injected motion out of raw capture while the machine is driven
-        // remotely. Buttons, keys and scroll travel the hook path, which
-        // filters by echo tag instead.
-        if header.hDevice.0.is_null() {
-            return None;
+        // NOTE (0.8.1): a NULL device handle does NOT mean synthesized
+        // input. Live-traced on real hardware: every raw motion packet from
+        // a built-in precision trackpad arrives handle-less, so skipping
+        // them drops 100% of motion and kills all crossing. Accept all raw
+        // motion exactly like 0.7 did. Echo protection for our own SendInput
+        // stays on the hook path (magic echo tag) and on Mint's X11 backend
+        // (injector device-name filter); raw motion has no tag channel, and
+        // the simultaneous-both-drive loop it could feed is far rarer than
+        // a trackpad that must work.
+        static ACCEPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let accepted = ACCEPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if accepted % 500 == 1 {
+            tracing::debug!(accepted, "raw motion accepted from physical devices");
         }
         let mouse =
             unsafe { std::ptr::read_unaligned(data.as_ptr().add(header_size) as *const RAWMOUSE) };
@@ -710,7 +715,10 @@ mod win32_hooks {
         }
 
         #[test]
-        fn ignores_handle_less_synthesized_motion() {
+        fn accepts_handle_less_motion_like_builtin_trackpads() {
+            // Regression guard for 0.8.0: built-in precision trackpads
+            // deliver raw motion with a NULL device handle, so handle-less
+            // packets must be accepted, never dropped.
             let mut raw = raw_mouse(MOUSE_STATE(0), 12, -4);
             raw.header.hDevice = HANDLE(std::ptr::null_mut());
             let bytes = unsafe {
@@ -719,7 +727,7 @@ mod win32_hooks {
                     std::mem::size_of::<RAWINPUT>(),
                 )
             };
-            assert_eq!(decode_raw_mouse_motion(bytes), None);
+            assert_eq!(decode_raw_mouse_motion(bytes), Some((12, -4)));
         }
     }
 
