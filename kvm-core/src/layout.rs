@@ -401,6 +401,12 @@ pub struct EdgeRouter {
     /// only; Double = both horizontal outer edges on a lone-peer link).
     /// Return hysteresis is identical in both modes.
     edge_mode: EdgeMode,
+    /// Push-through streak toward one edge: the edge of the current
+    /// outward run and the accumulated overflow px. A Handoff fires only
+    /// once the run reaches EDGE_PUSH_PX (see above); coming back inside
+    /// or switching edge restarts the run from zero.
+    push_edge: Option<Edge>,
+    push_accum: i64,
     /// Deskflow-style screen lock (ScrollLock): while set, no edge crossing
     /// opens a new handoff — the cursor stays where it is. Locking never
     /// strands control remotely: engaging it returns home first (see the
@@ -431,6 +437,8 @@ impl EdgeRouter {
             entry_edge: None,
             return_armed: false,
             edge_mode: EdgeMode::Single,
+            push_edge: None,
+            push_accum: 0,
             locked: false,
         })
     }
@@ -504,8 +512,7 @@ impl EdgeRouter {
     /// Seed the local cursor from the platform's current pointer position.
     /// This is intentionally allowed only while control is local; a remote
     /// handoff owns the router's current coordinate until it returns.
-    pub fn set_local_cursor_position(&mut self, x: u32, y: u32) -> Result<(), String> {
-        if self.active_remote.is_some() {
+    pub fn set_local_cursor_position(&mut self, x: u32, y: u32) -> Result<(), String> {        if self.active_remote.is_some() {
             return Err("cannot seed cursor while a remote screen is active".into());
         }
         let (width, height) = self
@@ -517,7 +524,31 @@ impl EdgeRouter {
         self.cursor_y = y.min(height - 1);
         self.local_cursor_x = self.cursor_x;
         self.local_cursor_y = self.cursor_y;
+        self.push_edge = None;
+        self.push_accum = 0;
         Ok(())
+    }
+
+    /// Re-pin the virtual cursor to the OS pointer truth while local.
+    /// Raw deltas keep arriving after the OS pointer has stopped at the
+    /// edge, so pure integration runs AHEAD of the visible cursor — that
+    /// drift is the "crosses while visibly near the edge" phantom. The
+    /// daemon calls this from the live OS position ahead of routing local
+    /// motion (throttled); like the seed it is a no-op while driving
+    /// remotely, and fresh truth restarts any push streak.
+    pub fn resync_if_local(&mut self, x: u32, y: u32) {
+        if self.active_remote.is_some() || self.current_screen != self.local_screen {
+            return;
+        }
+        let Some(screen) = self.layout.screen(self.local_screen) else {
+            return;
+        };
+        self.cursor_x = x.min(screen.width - 1);
+        self.cursor_y = y.min(screen.height - 1);
+        self.local_cursor_x = self.cursor_x;
+        self.local_cursor_y = self.cursor_y;
+        self.push_edge = None;
+        self.push_accum = 0;
     }
 
     pub fn route(&mut self, event: InputEvent) -> RoutedEvent {
@@ -629,16 +660,41 @@ impl EdgeRouter {
             self.cursor_y = next_y as u32;
             self.local_cursor_x = self.cursor_x;
             self.local_cursor_y = self.cursor_y;
+            // Back inside: any outward run restarts from zero, so drift
+            // and jitter can never save up for a phantom crossing.
+            self.push_edge = None;
+            self.push_accum = 0;
             return RoutedEvent::Local(event);
         };
         // Locked screens never open a handoff: clamp like an unlinked edge
         // so local window controls stay reachable.
         if self.locked {
+            self.push_edge = None;
+            self.push_accum = 0;
             return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
         }
         let Some(target) = self.crossing_target(self.current_screen, edge) else {
+            self.push_edge = None;
+            self.push_accum = 0;
             return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
         };
+        // Push-through (Deskflow jump-zone + switch-delay spirit): one
+        // stray delta never crosses. The outward run on THIS edge must
+        // accumulate EDGE_PUSH_PX before the Handoff fires; a firm push
+        // gets there in a couple of events, resting noise never does.
+        // A fresh truth resync (see resync_if_local) already restarted
+        // the run, so only genuinely sustained pressure opens the edge.
+        if self.push_edge == Some(edge) {
+            self.push_accum += overflow;
+        } else {
+            self.push_edge = Some(edge);
+            self.push_accum = overflow;
+        }
+        if self.push_accum < EDGE_PUSH_PX {
+            return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
+        }
+        self.push_edge = None;
+        self.push_accum = 0;
         let target_screen = self
             .layout
             .screen(target)
@@ -747,6 +803,8 @@ impl EdgeRouter {
         self.active_remote = None;
         self.entry_edge = None;
         self.return_armed = false;
+        self.push_edge = None;
+        self.push_accum = 0;
         Ok(())
     }
 
@@ -774,6 +832,8 @@ impl EdgeRouter {
         self.active_remote = None;
         self.entry_edge = None;
         self.return_armed = false;
+        self.push_edge = None;
+        self.push_accum = 0;
         Ok((self.cursor_x, self.cursor_y))
     }
 
@@ -794,6 +854,8 @@ impl EdgeRouter {
             self.active_remote = None;
             self.entry_edge = None;
             self.return_armed = false;
+            self.push_edge = None;
+            self.push_accum = 0;
             return Ok(false);
         }
         if self.current_screen == self.local_screen {
@@ -817,6 +879,18 @@ impl EdgeRouter {
 /// it, one deliberate push back out comes home. A firm flick exceeds it in
 /// a single event; resting trackpad noise never reaches it.
 const SETTLE_PX: u32 = 12;
+
+/// Sustained outward pressure (px of accumulated edge overflow) required
+/// to OPEN a crossing. Deskflow's half of this is the jump zone (the
+/// cursor must truly be at the edge, not near it); the other half is its
+/// switch delay / double-tap (a stray event never crosses). Ours: the
+/// daemon re-pins the virtual cursor to the OS pointer so "near" can
+/// never read as "at", and overflow must accumulate to this depth on one
+/// edge streak before a Handoff fires. One firm push crosses instantly;
+/// resting noise, single stray deltas and fling tails pin at the border.
+/// The streak resets the moment motion comes back inside or changes
+/// edge, so drift can never save up for a phantom crossing.
+const EDGE_PUSH_PX: i64 = 24;
 
 /// Pixels between a cursor position and one screen edge (inward distance).
 fn distance_from_edge(edge: Edge, x: u32, y: u32, width: u32, height: u32) -> u32 {
@@ -944,6 +1018,129 @@ mod tests {
         assert!(!router.is_locked());
         let result = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert!(matches!(result, RoutedEvent::Handoff { .. }));
+    }
+
+    #[test]
+    fn edge_crossing_needs_sustained_push() {
+        // Deskflow jump-zone parity: a stray 1px overflow pins at the
+        // border; only accumulated outward pressure opens the edge.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        // Walk to one px inside the right edge (cursor starts centered).
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 959, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert_eq!(router.cursor_position(), (1919, 540));
+        // A lone stray delta overflows by 1px: stays local, pinned.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 1, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert_eq!(router.active_remote(), None);
+        assert_eq!(router.cursor_position(), (1919, 540));
+        // Sustained pressure accumulates across events, then crosses.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 30, dy: 0 }),
+            RoutedEvent::Handoff {
+                edge: Edge::Right,
+                ..
+            }
+        ));
+        assert_eq!(router.active_remote(), Some(ScreenId(2)));
+    }
+
+    #[test]
+    fn edge_push_streak_resets_back_inside() {
+        // Drift can never "save up": coming back inside restarts the run.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 959, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 10, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert_eq!(router.active_remote(), None);
+        // Back inside wipes the 10px run ...
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -100, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        // ... so a fresh 10px overflow still does not cross.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 110, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert_eq!(router.cursor_position(), (1919, 540));
+        assert_eq!(router.active_remote(), None);
+        // ... but uninterrupted pressure from here does.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 30, dy: 0 }),
+            RoutedEvent::Handoff { .. }
+        ));
+    }
+
+    #[test]
+    fn edge_push_streak_resets_on_edge_change() {
+        // Double mode opens both horizontal edges; a run on one edge
+        // never spends toward the other.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_edge_mode(EdgeMode::Double);
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 959, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        // 10px run toward the right edge ...
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 10, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        // ... then all the way to the left edge: the left run starts
+        // from zero, so a 10px left overflow stays local too.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -1929, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert_eq!(router.cursor_position(), (0, 540));
+        assert_eq!(router.active_remote(), None);
+        // And the earlier right-edge run is forgotten as well.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 1929, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert_eq!(router.active_remote(), None);
+    }
+
+    #[test]
+    fn resync_pins_virtual_cursor_to_os_truth() {
+        // The phantom-crossing root cause: integrated deltas run ahead of
+        // the OS pointer that stopped at the edge. Fresh truth re-pins.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 959, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert_eq!(router.cursor_position(), (1919, 540));
+        // OS truth says the pointer is mid-screen (e.g. a warp or a
+        // clamped edge stop the deltas never saw): adopt it, drop runs.
+        router.resync_if_local(100, 200);
+        assert_eq!(router.cursor_position(), (100, 200));
+        assert_eq!(router.local_cursor_position(), (100, 200));
+        // Out-of-range truth clamps instead of panicking.
+        router.resync_if_local(9000, 9000);
+        assert_eq!(router.cursor_position(), (1919, 1079));
+        // While driving remotely the peer owns the coordinate: no-op.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 5000, dy: 0 }),
+            RoutedEvent::Handoff { .. }
+        ));
+        router.resync_if_local(5, 5);
+        assert_ne!(router.cursor_position(), (5, 5));
     }
 
     #[test]

@@ -2264,6 +2264,21 @@ fn follow_link(
                         link.node_name
                     ),
                 );
+                // Reverse-path honesty: if this computer will NOT dial its
+                // half back, say why ONCE per new link instead of silently
+                // staying one-way (the top user trap: this side set to
+                // "Be controlled" can never drive back).
+                if status.mode == kvm_core::Mode::ClientOnly {
+                    ui_log(&format!(
+                        "link: {} is one-way while this computer is Be-controlled-only; set Both ways to drive back",
+                        link.node_name
+                    ));
+                } else if ceremony_open {
+                    ui_log(&format!(
+                        "link: reverse dial-back to {} waits for the open pairing window",
+                        link.node_name
+                    ));
+                }
             }
             // Grace latch: a live link breathes (verify ends, episodes go
             // idle, the dial-back respawns) — blank the display only after

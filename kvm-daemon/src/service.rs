@@ -1444,6 +1444,9 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut discarded_event_barrier = 0u64;
     let mut last_transfer: Option<std::time::Instant> = None;
     let mut last_failed_episode: Option<std::time::Instant> = None;
+    // Last OS-pointer truth resync (see handle_topology_event): throttles
+    // the GetCursorPos/query_pointer read to 20Hz so motion stays cheap.
+    let mut last_resync: Option<std::time::Instant> = None;
     let mut local_wheel_dropped = 0u64;
     let mut sequence = 0u64;
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
@@ -1672,6 +1675,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     dir: &dir,
                     discarded_event_barrier: &mut discarded_event_barrier,
                     local_wheel_dropped: &mut local_wheel_dropped,
+                    last_resync: &mut last_resync,
                 })
                 .await?;
             }
@@ -1705,6 +1709,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     dir: &dir,
                     discarded_event_barrier: &mut discarded_event_barrier,
                     local_wheel_dropped: &mut local_wheel_dropped,
+                    last_resync: &mut last_resync,
                 })
                 .await?;
             }
@@ -1984,6 +1989,8 @@ struct TopologyEventContext<'a> {
     /// never opens a crossing). Logged at each handoff: distinguishes a
     /// dead capture hook (zero here too) from scrolling while local.
     local_wheel_dropped: &'a mut u64,
+    /// Throttle stamp for the OS-pointer truth resync below.
+    last_resync: &'a mut Option<std::time::Instant>,
 }
 
 async fn handle_topology_event(
@@ -2011,7 +2018,32 @@ async fn handle_topology_event(
         dir,
         discarded_event_barrier,
         local_wheel_dropped,
+        last_resync,
     } = context;
+    // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
+    // Raw deltas keep flowing after the OS pointer has stopped at the edge,
+    // so the integrated virtual cursor runs AHEAD of the visible one and a
+    // later push looks like it started "near" the edge. Re-pin to truth at
+    // 20Hz while local; the router ignores it while driving remotely, and
+    // Wayland (no query) simply skips — the push threshold still guards.
+    if matches!(captured.event, InputEvent::MouseMove { .. })
+        && router.current_screen() == router.local_screen()
+        && router.active_remote().is_none()
+    {
+        let due = last_resync
+            .map(|when| when.elapsed() >= Duration::from_millis(50))
+            .unwrap_or(true);
+        if due {
+            *last_resync = Some(Instant::now());
+            match kvm_platform::capture::current_cursor_position() {
+                Ok(Some((x, y))) => router.resync_if_local(x, y),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%error, "truth resync unavailable");
+                }
+            }
+        }
+    }
     // ScrollLock toggles the Deskflow-style screen lock (consumed, never
     // forwarded): locking returns home first so it always means "held
     // locally", never "stranded remotely".
@@ -3591,17 +3623,38 @@ async fn handle_connection(
                 reject(&mut send, "peer is configured as receiver-only").await?;
                 bail!("peer cannot initiate control from receiver-only mode");
             }
-            if let Err(error) = validate_input_capability(&config, hello.lock_screen_requested) {
-                reject(&mut send, &error.to_string()).await?;
+            // Effective grant: requested AND allowed. A downgrade (peer
+            // asked, we did not opt in) stays an ordinary desktop session
+            // instead of a rejection, so reverse control survives a
+            // one-sided checkbox — with an audit line saying exactly that.
+            let lock_screen_enabled =
+                match validate_input_capability(&config, hello.lock_screen_requested) {
+                    Ok(enabled) => enabled,
+                    Err(error) => {
+                        reject(&mut send, &error.to_string()).await?;
+                        audit_event(
+                            audit_dir,
+                            &format!(
+                                "session-rejected peer={peer_fingerprint} remote={} lock_screen_requested={} reason={error}",
+                                conn.remote_address(),
+                                hello.lock_screen_requested
+                            ),
+                        );
+                        return Err(error);
+                    }
+                };
+            if hello.lock_screen_requested && !lock_screen_enabled {
                 audit_event(
                     audit_dir,
                     &format!(
-                        "session-rejected peer={peer_fingerprint} remote={} lock_screen_requested={} reason={error}",
+                        "session-downgraded peer={peer_fingerprint} remote={} reason=lock_screen_not_allowed_locally",
                         conn.remote_address(),
-                        hello.lock_screen_requested
                     ),
                 );
-                return Err(error);
+                tracing::info!(
+                    peer = %peer_fingerprint,
+                    "peer requested lock-screen input; not allowed here, continuing as ordinary desktop session",
+                );
             }
 
             // The input slot is taken lazily at the first PointerHandoff
@@ -3610,8 +3663,6 @@ async fn handle_connection(
             // starve the episode that follows it on this same association.
             let mut input_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
 
-            let lock_screen_enabled =
-                config.allow_lock_screen_control && hello.lock_screen_requested;
             let peer_screen_geometry = hello.screen_geometry;
             let local_geometry = local_screen_geometry(&config.layout);
             let mut clipboard = if config.clipboard_enabled && hello.clipboard_enabled {
@@ -3624,7 +3675,7 @@ async fn handle_connection(
             // session. Otherwise a missing /dev/uinput device or unavailable
             // Windows interactive helper can make the sender believe input is
             // live until the connection fails asynchronously.
-            let mut injector = match ReceiverInjector::create(hello.lock_screen_requested)
+            let mut injector = match ReceiverInjector::create(lock_screen_enabled)
                 .context("create input injector")
             {
                 Ok(injector) => injector,
@@ -3706,6 +3757,16 @@ async fn handle_connection(
                 fingerprint_hex: peer_fingerprint.clone(),
                 id: link_id,
             };
+            // Reverse-path pointer: our half is live, but WE can never dial
+            // theirs — their UI must dial back (MWB arming). If the peer
+            // never drives, this line plus their ui.log names the gate:
+            // peer UI not running, peer in Be-controlled-only mode, or our
+            // mode blocking incoming (controller-only).
+            tracing::info!(
+                peer = %peer_fingerprint,
+                node = %hello.node_name,
+                "inbound link live; waiting for the peer's dial-back for two-way edge",
+            );
             let mut seen_sequences = BTreeSet::new();
             let mut motion_sequence = MotionSequence::default();
             let mut last_activity = Instant::now();
@@ -5018,8 +5079,20 @@ fn saved_peer_fingerprint(peers: &PeerBook, address: SocketAddr) -> Option<&str>
     })
 }
 
-fn validate_input_capability(config: &Config, lock_screen_requested: bool) -> Result<()> {
+fn validate_input_capability(config: &Config, lock_screen_requested: bool) -> Result<bool> {
+    // Returns the EFFECTIVE lock-screen grant (requested AND allowed).
+    // MWB-like both-ways rule: a peer that asks for privileged input from
+    // a machine that did not opt in is DOWNGRADED to an ordinary desktop
+    // session on Windows (the Default-desktop helper isolates it, so this
+    // is exactly the "normal paired Windows desktop session" the module
+    // below blesses) instead of rejected — a one-sided checkbox must never
+    // silently kill reverse control while forward works. The non-Windows
+    // evdev/uinput receiver writes below the compositor and can reach a
+    // greeter, so its opt-in stays a hard reject in every direction.
     if lock_screen_requested && !config.allow_lock_screen_control {
+        if cfg!(target_os = "windows") {
+            return Ok(false);
+        }
         bail!("privileged remote input is disabled locally");
     }
     // The non-Windows evdev/uinput receiver writes a virtual HID device below
@@ -5031,7 +5104,7 @@ fn validate_input_capability(config: &Config, lock_screen_requested: bool) -> Re
     if !lock_screen_requested && !config.allow_lock_screen_control && !cfg!(target_os = "windows") {
         bail!("evdev/uinput input injection requires the local lock-screen capability opt-in");
     }
-    Ok(())
+    Ok(lock_screen_requested && config.allow_lock_screen_control)
 }
 
 fn mode_allows_incoming(mode: Mode) -> bool {
@@ -5162,18 +5235,20 @@ mod tests {
         };
         if cfg!(target_os = "windows") {
             // Windows isolates ordinary sessions in the Default desktop
-            // helper: no opt-in needed, privileged input stays gated.
-            assert!(validate_input_capability(&locked_off, false).is_ok());
-            assert!(validate_input_capability(&locked_off, true).is_err());
-            assert!(validate_input_capability(&locked_on, true).is_ok());
+            // helper: no opt-in needed, and a privileged request downgrades
+            // to ordinary (Ok(false)) instead of killing reverse control.
+            assert!(!validate_input_capability(&locked_off, false).unwrap());
+            assert!(!validate_input_capability(&locked_off, true).unwrap());
+            assert!(!validate_input_capability(&locked_on, false).unwrap());
+            assert!(validate_input_capability(&locked_on, true).unwrap());
         } else {
             // evdev/uinput writes below the compositor and can reach a
             // greeter, so every non-Windows session needs the explicit
             // opt-in — ordinary and privileged alike.
             assert!(validate_input_capability(&locked_off, false).is_err());
             assert!(validate_input_capability(&locked_off, true).is_err());
-            assert!(validate_input_capability(&locked_on, false).is_ok());
-            assert!(validate_input_capability(&locked_on, true).is_ok());
+            assert!(!validate_input_capability(&locked_on, false).unwrap());
+            assert!(validate_input_capability(&locked_on, true).unwrap());
         }
     }
 
@@ -5635,7 +5710,14 @@ mod tests {
 
     #[test]
     fn lock_screen_requests_require_local_opt_in() {
-        assert!(validate_input_capability(&Config::default(), true).is_err());
+        // Windows downgrades a privileged request to an ordinary desktop
+        // session (MWB-like both-ways); non-Windows uinput keeps the hard
+        // reject because it writes below the compositor.
+        if cfg!(target_os = "windows") {
+            assert!(!validate_input_capability(&Config::default(), true).unwrap());
+        } else {
+            assert!(validate_input_capability(&Config::default(), true).is_err());
+        }
         assert!(validate_input_capability(
             &Config {
                 allow_lock_screen_control: true,
@@ -5643,7 +5725,7 @@ mod tests {
             },
             true
         )
-        .is_ok());
+        .unwrap());
     }
 
     #[cfg(target_os = "windows")]
