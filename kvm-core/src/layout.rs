@@ -495,6 +495,41 @@ impl EdgeRouter {
         (self.entry_edge, self.return_armed)
     }
 
+    /// True when the virtual cursor sits within `margin_px` of an edge
+    /// that would open a crossing. The daemon affords a per-event OS
+    /// truth resync exactly there — near-edge overflow is computed from
+    /// this position, so staleness there is what fires phantom
+    /// crossings — while keeping the cheap throttle everywhere else.
+    /// Only while local and unlocked; driving and locked states never
+    /// cross.
+    pub fn near_crossing_edge(&self, margin_px: u32) -> bool {
+        if self.active_remote.is_some()
+            || self.current_screen != self.local_screen
+            || self.locked
+        {
+            return false;
+        }
+        let Some(screen) = self.layout.screen(self.current_screen) else {
+            return false;
+        };
+        let margin = i64::from(margin_px);
+        let distances = [
+            (Edge::Left, i64::from(self.cursor_x)),
+            (
+                Edge::Right,
+                i64::from(screen.width.saturating_sub(1)) - i64::from(self.cursor_x),
+            ),
+            (Edge::Top, i64::from(self.cursor_y)),
+            (
+                Edge::Bottom,
+                i64::from(screen.height.saturating_sub(1)) - i64::from(self.cursor_y),
+            ),
+        ];
+        distances.iter().any(|(edge, distance)| {
+            *distance <= margin && self.crossing_target(self.current_screen, *edge).is_some()
+        })
+    }
+
     /// Switch the crossing discipline live (the Settings toggle): Single
     /// crosses only the arranged facing edge; Double additionally opens
     /// the other horizontal outer edge to the lone peer on a two-machine
@@ -1213,6 +1248,35 @@ mod tests {
     }
 
     #[test]
+    fn near_crossing_edge_flags_only_crossable_borders() {
+        // Mid-screen is never near; the facing edge within margin is;
+        // an unlinked edge (top) never is; lock and remote never are.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        assert!(!router.near_crossing_edge(64));
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 895, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        // Cursor now at 1855: 64px from the facing right edge.
+        assert!(router.near_crossing_edge(64));
+        assert!(!router.near_crossing_edge(63));
+        // Top edge has no neighbour in Single: never near.
+        router.resync_if_local(960, 10);
+        assert!(!router.near_crossing_edge(64));
+        // Locked and driving states never cross.
+        router.resync_if_local(1910, 540);
+        router.set_locked(true);
+        assert!(!router.near_crossing_edge(64));
+        router.set_locked(false);
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 5000, dy: 0 }),
+            RoutedEvent::Handoff { .. }
+        ));
+        assert!(!router.near_crossing_edge(64));
+    }
+
+    #[test]
     fn edge_overflow_reports_signed_overshoot() {
         // Shared jump-zone primitive: inside is None, each edge reports
         // how far past it the step lands.
@@ -1259,8 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn next_screen_id_never_collides() {
-        let paired = Layout::pair_default("me", "peer", &"ab".repeat(32));
+    fn next_screen_id_never_collides() {        let paired = Layout::pair_default("me", "peer", &"ab".repeat(32));
         assert_eq!(paired.next_screen_id(), ScreenId(3));
         assert_eq!(Layout::default().next_screen_id(), ScreenId(1));
     }

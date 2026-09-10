@@ -1465,6 +1465,8 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // Last OS-pointer truth resync (see handle_topology_event): throttles
     // the GetCursorPos/query_pointer read to 20Hz so motion stays cheap.
     let mut last_resync: Option<std::time::Instant> = None;
+    // Last backend-census journal line (see the keep-alive tick).
+    let mut last_census_log: Option<std::time::Instant> = None;
     let mut local_wheel_dropped = 0u64;
     let mut sequence = 0u64;
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
@@ -1808,6 +1810,26 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         }
                     }
                 }
+                // Backend receipt census, once a minute: which OS channel
+                // speaks (hook vs raw HID). Scroll-silence reports end
+                // here — hook_wheel/raw_wheel name the guilty channel.
+                let census_due = last_census_log
+                    .map(|when| when.elapsed() >= Duration::from_secs(60))
+                    .unwrap_or(true);
+                if census_due {
+                    last_census_log = Some(Instant::now());
+                    let (hook_key, hook_button, hook_move, hook_wheel, raw_move, raw_wheel) =
+                        kvm_platform::capture::backend_census();
+                    tracing::info!(
+                        hook_key,
+                        hook_button,
+                        hook_move,
+                        hook_wheel,
+                        raw_move,
+                        raw_wheel,
+                        "capture backend census"
+                    );
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 capture_control.set_exclusive(false)?;
@@ -2048,9 +2070,14 @@ async fn handle_topology_event(
         && router.current_screen() == router.local_screen()
         && router.active_remote().is_none()
     {
-        let due = last_resync
-            .map(|when| when.elapsed() >= Duration::from_millis(50))
-            .unwrap_or(true);
+        // Near a crossing edge every event re-pins (a 50ms-old virtual
+        // position is where phantom crossings are computed from); mid
+        // screen the throttle is plenty and keeps motion cheap.
+        let near = router.near_crossing_edge(64);
+        let due = near
+            || last_resync
+                .map(|when| when.elapsed() >= Duration::from_millis(50))
+                .unwrap_or(true);
         if due {
             *last_resync = Some(Instant::now());
             match kvm_platform::capture::current_cursor_position() {
@@ -2327,6 +2354,27 @@ async fn handle_topology_event(
                 // local_wheel names scroll that arrived while nobody was
                 // driven.
                 tracing::info!(?target, open_ms = opened_at.elapsed().as_millis(), resumed, local_wheel = *local_wheel_dropped, "topology handoff activated");
+                // Handoff-open diagnostic: how far the OS pointer truth
+                // stood from the exit edge at the crossing moment.
+                // Near-zero = a genuine sustained push; far = virtual and
+                // truth disagree (input scaling), never a feel complaint.
+                if let Ok(Some((truth_x, truth_y))) =
+                    kvm_platform::capture::current_cursor_position()
+                {
+                    if let Some(local) = router.layout().screen(router.local_screen()) {
+                        let gap = match edge {
+                            kvm_core::Edge::Left => truth_x as i64,
+                            kvm_core::Edge::Right => {
+                                i64::from(local.width.saturating_sub(1)) - truth_x as i64
+                            }
+                            kvm_core::Edge::Top => truth_y as i64,
+                            kvm_core::Edge::Bottom => {
+                                i64::from(local.height.saturating_sub(1)) - truth_y as i64
+                            }
+                        };
+                        tracing::info!(?edge, truth_gap_px = gap, "topology handoff opened this far from the edge");
+                    }
+                }
                 eprintln!("THEKVM_STATUS driving {name}");
             }
         }

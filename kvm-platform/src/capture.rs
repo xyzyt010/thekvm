@@ -186,6 +186,21 @@ pub fn screen_size() -> Result<Option<(u32, u32)>, PlatformError> {
     Ok(None)
 }
 
+/// Backend receipt census: (hook keys, hook buttons, hook fallback
+/// motion, hook wheel, raw motion, raw wheel) delivered into our
+/// channel since process start. Zeros elsewhere; the daemon logs it
+/// once a minute so input-path reports are evidence, not guesses.
+#[cfg(target_os = "windows")]
+pub fn backend_census() -> (u64, u64, u64, u64, u64, u64) {
+    win32_hooks::census()
+}
+
+/// Platforms without channel split report no census.
+#[cfg(not(target_os = "windows"))]
+pub fn backend_census() -> (u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0)
+}
+
 #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
 pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {
     Ok(None)
@@ -241,7 +256,7 @@ pub fn create_capture(
 mod win32_hooks {
     use super::{CaptureBackend, InputEvent, PlatformError};
     use kvm_core::{KeyEvent, MouseButton};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Mutex, OnceLock};
     use windows::core::PCWSTR;
@@ -267,6 +282,29 @@ mod win32_hooks {
     static LAST_POINT: OnceLock<Mutex<Option<POINT>>> = OnceLock::new();
     static BLOCK_LOCAL: AtomicBool = AtomicBool::new(false);
     static RAW_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    /// Backend receipt census: what each OS channel actually delivered
+    /// into our channel (hook keys/buttons/fallback-motion/wheel, raw
+    /// motion/wheel). Read by the daemon once a minute into the journal:
+    /// the groundwork that settles "this input never arrives" reports
+    /// from evidence instead of by guessing.
+    static HOOK_KEY: AtomicU64 = AtomicU64::new(0);
+    static HOOK_BUTTON: AtomicU64 = AtomicU64::new(0);
+    static HOOK_MOVE: AtomicU64 = AtomicU64::new(0);
+    static HOOK_WHEEL: AtomicU64 = AtomicU64::new(0);
+    static RAW_MOVE: AtomicU64 = AtomicU64::new(0);
+    static RAW_WHEEL: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn census() -> (u64, u64, u64, u64, u64, u64) {
+        (
+            HOOK_KEY.load(Ordering::Relaxed),
+            HOOK_BUTTON.load(Ordering::Relaxed),
+            HOOK_MOVE.load(Ordering::Relaxed),
+            HOOK_WHEEL.load(Ordering::Relaxed),
+            RAW_MOVE.load(Ordering::Relaxed),
+            RAW_WHEEL.load(Ordering::Relaxed),
+        )
+    }
 
     pub(super) fn set_exclusive(exclusive: bool) {
         BLOCK_LOCAL.store(exclusive, Ordering::Release);
@@ -464,6 +502,7 @@ mod win32_hooks {
                     let usage = hid_from_scan_code(info.scanCode as u16, info.flags.0 & 0x01 != 0)
                         .or_else(|| hid_from_vk(info.vkCode as u16));
                     if let Some(usage) = usage {
+                        HOOK_KEY.fetch_add(1, Ordering::Relaxed);
                         send(InputEvent::Key(KeyEvent { usage, pressed }));
                         if BLOCK_LOCAL.load(Ordering::Acquire) {
                             return LRESULT(1);
@@ -519,6 +558,7 @@ mod win32_hooks {
                                 let dx = point.x.saturating_sub(previous.x);
                                 let dy = point.y.saturating_sub(previous.y);
                                 if dx != 0 || dy != 0 {
+                                    HOOK_MOVE.fetch_add(1, Ordering::Relaxed);
                                     send(InputEvent::MouseMove { dx, dy });
                                 }
                             }
@@ -529,6 +569,7 @@ mod win32_hooks {
                         }
                     }
                     WM_LBUTTONDOWN | WM_LBUTTONUP => {
+                        HOOK_BUTTON.fetch_add(1, Ordering::Relaxed);
                         send(InputEvent::MouseButton {
                             button: MouseButton::Left,
                             pressed: message == WM_LBUTTONDOWN,
@@ -538,6 +579,7 @@ mod win32_hooks {
                         }
                     }
                     WM_RBUTTONDOWN | WM_RBUTTONUP => {
+                        HOOK_BUTTON.fetch_add(1, Ordering::Relaxed);
                         send(InputEvent::MouseButton {
                             button: MouseButton::Right,
                             pressed: message == WM_RBUTTONDOWN,
@@ -547,6 +589,7 @@ mod win32_hooks {
                         }
                     }
                     WM_MBUTTONDOWN | WM_MBUTTONUP => {
+                        HOOK_BUTTON.fetch_add(1, Ordering::Relaxed);
                         send(InputEvent::MouseButton {
                             button: MouseButton::Middle,
                             pressed: message == WM_MBUTTONDOWN,
@@ -565,6 +608,7 @@ mod win32_hooks {
                             button,
                             pressed: message == WM_XBUTTONDOWN,
                         });
+                        HOOK_BUTTON.fetch_add(1, Ordering::Relaxed);
                         if BLOCK_LOCAL.load(Ordering::Acquire) {
                             return LRESULT(1);
                         }
@@ -584,6 +628,7 @@ mod win32_hooks {
                             now,
                         );
                         if y != 0 {
+                            HOOK_WHEEL.fetch_add(1, Ordering::Relaxed);
                             send(InputEvent::SmoothWheel { x: 0, y });
                         }
                         if BLOCK_LOCAL.load(Ordering::Acquire) {
@@ -598,6 +643,7 @@ mod win32_hooks {
                             now,
                         );
                         if x != 0 {
+                            HOOK_WHEEL.fetch_add(1, Ordering::Relaxed);
                             send(InputEvent::SmoothWheel { x, y: 0 });
                         }
                         if BLOCK_LOCAL.load(Ordering::Acquire) {
@@ -697,6 +743,7 @@ mod win32_hooks {
             return;
         }
         if let Some((dx, dy)) = decode_raw_mouse_motion(&buffer[..result as usize]) {
+            RAW_MOVE.fetch_add(1, Ordering::Relaxed);
             send(InputEvent::MouseMove { dx, dy });
         }
         // HID wheel channel (the trackpad fix): precision touchpads report
@@ -710,6 +757,7 @@ mod win32_hooks {
             let now = std::time::Instant::now();
             let (x, y) = wheel_dedup().filter_raw(wheel_x, wheel_y, now);
             if x != 0 || y != 0 {
+                RAW_WHEEL.fetch_add(1, Ordering::Relaxed);
                 send(InputEvent::SmoothWheel { x, y });
             }
         }
@@ -1177,6 +1225,12 @@ mod win32_hooks {
             0x5b => 0xe3,
             0x5c => 0xe7,
             0x5d => 0x65,
+            // F-row media keys: captured as virtual keys (they carry no
+            // useful scan code) and injected back as VK on the peer — the
+            // VK -> HID -> VK round trip mirrors key_virtual_key.
+            0xAD => 0x7f, // VK_VOLUME_MUTE
+            0xAE => 0x81, // VK_VOLUME_DOWN
+            0xAF => 0x80, // VK_VOLUME_UP
             _ => return None,
         })
     }
@@ -1225,6 +1279,10 @@ mod win32_hooks {
             assert_eq!(hid_from_scan_code(0x38, true), Some(0xe6)); // RAlt
             assert_eq!(hid_from_vk(0x5b), Some(0xe3)); // LWin fallback
             assert_eq!(hid_from_vk(0x5c), Some(0xe7)); // RWin fallback
+            // F-row media keys (round trip with key_virtual_key).
+            assert_eq!(hid_from_vk(0xAD), Some(0x7f)); // mute
+            assert_eq!(hid_from_vk(0xAF), Some(0x80)); // volume up
+            assert_eq!(hid_from_vk(0xAE), Some(0x81)); // volume down
         }
     }
 }

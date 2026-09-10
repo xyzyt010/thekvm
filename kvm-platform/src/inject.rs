@@ -610,19 +610,24 @@ mod win32_inject {
                 InputEvent::SmoothWheel { x, y } => wheel_inputs(y, x),
                 InputEvent::Key(key) => {
                     // Pause has an E1-prefixed make code that SendInput does
-                    // not represent through KEYEVENTF_SCANCODE; VK_PAUSE is
-                    // the documented fallback for that one key.
-                    let (virtual_key, scan_code, extended) = if key.usage == 0x48 {
-                        (0x13, 0, false)
-                    } else {
-                        let (scan_code, extended) =
-                            hid_to_scan_code(key.usage).ok_or_else(|| {
-                                PlatformError::Win32(format!(
-                                    "unsupported USB HID keyboard usage: {:#x}",
-                                    key.usage
-                                ))
-                            })?;
-                        (0, scan_code, extended)
+                    // not represent through KEYEVENTF_SCANCODE, and the
+                    // media keys (mute/volume) have no AT scancode at all:
+                    // both travel as virtual keys, which is also how the
+                    // hook captures them (VK_PAUSE / VK_VOLUME_*), so the
+                    // cross-device round trip is VK -> HID -> VK with no
+                    // scancode in the middle.
+                    let (virtual_key, scan_code, extended) = match key_virtual_key(key.usage) {
+                        Some(virtual_path) => virtual_path,
+                        None => {
+                            let (scan_code, extended) =
+                                hid_to_scan_code(key.usage).ok_or_else(|| {
+                                    PlatformError::Win32(format!(
+                                        "unsupported USB HID keyboard usage: {:#x}",
+                                        key.usage
+                                    ))
+                                })?;
+                            (0, scan_code, extended)
+                        }
                     };
                     let mut flags = if scan_code == 0 {
                         Default::default()
@@ -784,8 +789,22 @@ mod win32_inject {
     /// Convert USB HID usages to Set 1 scan codes. Scan-code injection keeps
     /// the receiver's keyboard layout in charge instead of hard-coding US
     /// virtual-key meanings into the protocol.
-    fn hid_to_scan_code(usage: u16) -> Option<(u16, bool)> {
+    /// Virtual-key escape hatch for usages SendInput cannot express as AT
+    /// scancodes: Pause (E1 prefix) and the media keys (mute/volume up /
+    /// volume down). Returns (virtual_key, scan_code = 0, extended);
+    /// None means "use the scancode table". The codes mirror hid_from_vk
+    /// in capture, so F-row media keys round-trip VK -> HID -> VK.
+    fn key_virtual_key(usage: u16) -> Option<(u16, u16, bool)> {
         Some(match usage {
+            0x48 => (0x13, 0, false), // Pause -> VK_PAUSE
+            0x7f => (0xAD, 0, false), // mute -> VK_VOLUME_MUTE
+            0x80 => (0xAF, 0, false), // volume up -> VK_VOLUME_UP
+            0x81 => (0xAE, 0, false), // volume down -> VK_VOLUME_DOWN
+            _ => return None,
+        })
+    }
+
+    fn hid_to_scan_code(usage: u16) -> Option<(u16, bool)> {        Some(match usage {
             0x04 => (0x1e, false),
             0x05 => (0x30, false),
             0x06 => (0x2e, false),
@@ -889,6 +908,7 @@ mod win32_inject {
     #[cfg(test)]
     mod tests {
         use super::hid_to_scan_code;
+        use super::key_virtual_key;
 
         #[test]
         fn uses_physical_scan_codes_for_common_keys() {
@@ -927,6 +947,19 @@ mod win32_inject {
             for (usage, scan, name) in pairs {
                 assert_eq!(hid_to_scan_code(*usage), Some(*scan), "key {name}");
             }
+        }
+
+        #[test]
+        fn media_keys_and_pause_travel_as_virtual_keys() {
+            // No AT scancode exists for these; the VK path must carry them
+            // or Mint driving Windows can never mute/adjust volume.
+            assert_eq!(key_virtual_key(0x48), Some((0x13, 0, false))); // Pause
+            assert_eq!(key_virtual_key(0x7f), Some((0xAD, 0, false))); // mute
+            assert_eq!(key_virtual_key(0x80), Some((0xAF, 0, false))); // vol up
+            assert_eq!(key_virtual_key(0x81), Some((0xAE, 0, false))); // vol down
+            // Ordinary keys stay on the scancode table.
+            assert_eq!(key_virtual_key(0x04), None);
+            assert_eq!(key_virtual_key(0xe0), None);
         }
     }
 }
