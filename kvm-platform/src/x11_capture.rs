@@ -241,11 +241,11 @@ impl CaptureBackend for X11Capture {
             // XIGrabDevice with BadValue while XGrabPointer succeeds).
             // Either hold suppresses local delivery; the XI raw selection
             // underneath keeps feeding capture in both cases.
-            match self.xi_grab() {
+            match xi_grab(&self.connection, self.root) {
                 Ok(()) => self.grab_kind = GrabKind::Xi,
                 Err(xi_error) => {
                     tracing::info!(%xi_error, "XIGrabDevice refused; falling back to core pointer+keyboard grab");
-                    self.core_grab()?;
+                    core_grab(&self.connection, self.root)?;
                     self.grab_kind = GrabKind::Core;
                 }
             }
@@ -264,7 +264,7 @@ impl CaptureBackend for X11Capture {
                         })?;
                 }
                 GrabKind::Core => {
-                    self.core_ungrab()?;
+                    core_ungrab(&self.connection)?;
                 }
             }
             self.grab_kind = GrabKind::None;
@@ -285,105 +285,7 @@ impl CaptureBackend for X11Capture {
         }
         Ok(())
     }
-}
 
-impl X11Capture {
-    /// XI2 active grab of all master devices (raw-device semantics).
-    fn xi_grab(&self) -> Result<(), PlatformError> {
-        let mask = [raw_mask()];
-        let status = self
-            .connection
-            .xinput_xi_grab_device(
-                self.root,
-                0u32,
-                0u32,
-                ALL_MASTER_DEVICES,
-                xproto::GrabMode::ASYNC,
-                xproto::GrabMode::ASYNC,
-                xinput::GrabOwner::NO_OWNER,
-                &mask,
-            )
-            .map_err(|error| PlatformError::Capture(format!("grab XInput2 devices: {error}")))?
-            .reply()
-            .map_err(|error| {
-                PlatformError::Capture(format!("read XInput2 grab status: {error}"))
-            })?
-            .status;
-        if status != xproto::GrabStatus::SUCCESS {
-            return Err(PlatformError::Capture(format!(
-                "XInput2 device grab was rejected ({status:?})"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Deskflow-parity core grabs (pointer + keyboard), Async/Async with
-    /// no event owner: local apps receive nothing while held, and the XI
-    /// raw selection underneath keeps feeding capture untouched.
-    fn core_grab(&self) -> Result<(), PlatformError> {
-        let pointer = self
-            .connection
-            .grab_pointer(
-                false,
-                self.root,
-                xproto::EventMask::BUTTON_PRESS
-                    | xproto::EventMask::BUTTON_RELEASE
-                    | xproto::EventMask::POINTER_MOTION,
-                xproto::GrabMode::ASYNC,
-                xproto::GrabMode::ASYNC,
-                0u32,
-                0u32,
-                0u32,
-            )
-            .map_err(|error| PlatformError::Capture(format!("grab core pointer: {error}")))?
-            .reply()
-            .map_err(|error| {
-                PlatformError::Capture(format!("read core pointer grab status: {error}"))
-            })?
-            .status;
-        if pointer != xproto::GrabStatus::SUCCESS {
-            return Err(PlatformError::Capture(format!(
-                "core pointer grab was rejected ({pointer:?})"
-            )));
-        }
-        let keyboard = self
-            .connection
-            .grab_keyboard(false, self.root, 0u32, xproto::GrabMode::ASYNC, xproto::GrabMode::ASYNC)
-            .map_err(|error| PlatformError::Capture(format!("grab core keyboard: {error}")))?
-            .reply()
-            .map_err(|error| {
-                PlatformError::Capture(format!("read core keyboard grab status: {error}"))
-            })?
-            .status;
-        if keyboard != xproto::GrabStatus::SUCCESS {
-            let _ = self
-                .connection
-                .ungrab_pointer(0u32)
-                .map(|cookie| cookie.check());
-            return Err(PlatformError::Capture(format!(
-                "core keyboard grab was rejected ({keyboard:?})"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Release a core hold (pointer first, then keyboard).
-    fn core_ungrab(&self) -> Result<(), PlatformError> {
-        self.connection
-            .ungrab_pointer(0u32)
-            .map_err(|error| PlatformError::Capture(format!("ungrab core pointer: {error}")))?
-            .check()
-            .map_err(|error| PlatformError::Capture(format!("ungrab core pointer: {error}")))?;
-        self.connection
-            .ungrab_keyboard(0u32)
-            .map_err(|error| PlatformError::Capture(format!("ungrab core keyboard: {error}")))?
-            .check()
-            .map_err(|error| PlatformError::Capture(format!("ungrab core keyboard: {error}")))?;
-        Ok(())
-    }
-}
-
-impl CaptureBackend for X11Capture {
     fn release(&mut self) -> Result<(), PlatformError> {
         if self.exclusive {
             self.set_exclusive(false)?;
@@ -411,6 +313,89 @@ fn raw_mask() -> u32 {
         | u32::from(xinput::XIEventMask::RAW_BUTTON_PRESS)
         | u32::from(xinput::XIEventMask::RAW_BUTTON_RELEASE)
         | u32::from(xinput::XIEventMask::RAW_MOTION)
+}
+
+/// XI2 active grab of all master devices (raw-device semantics). Free
+/// function so the capture trait keeps only the backend interface.
+fn xi_grab(connection: &RustConnection, root: xproto::Window) -> Result<(), PlatformError> {
+    let mask = [raw_mask()];
+    let status = connection
+        .xinput_xi_grab_device(
+            root,
+            0u32,
+            0u32,
+            ALL_MASTER_DEVICES,
+            xproto::GrabMode::ASYNC,
+            xproto::GrabMode::ASYNC,
+            xinput::GrabOwner::NO_OWNER,
+            &mask,
+        )
+        .map_err(|error| PlatformError::Capture(format!("grab XInput2 devices: {error}")))?
+        .reply()
+        .map_err(|error| PlatformError::Capture(format!("read XInput2 grab status: {error}")))?
+        .status;
+    if status != xproto::GrabStatus::SUCCESS {
+        return Err(PlatformError::Capture(format!(
+            "XInput2 device grab was rejected ({status:?})"
+        )));
+    }
+    Ok(())
+}
+
+/// Deskflow-parity core grabs (pointer + keyboard), Async/Async with no
+/// event owner: local apps receive nothing while held, and the XI raw
+/// selection underneath keeps feeding capture untouched.
+fn core_grab(connection: &RustConnection, root: xproto::Window) -> Result<(), PlatformError> {
+    let pointer = connection
+        .grab_pointer(
+            false,
+            root,
+            xproto::EventMask::BUTTON_PRESS
+                | xproto::EventMask::BUTTON_RELEASE
+                | xproto::EventMask::POINTER_MOTION,
+            xproto::GrabMode::ASYNC,
+            xproto::GrabMode::ASYNC,
+            0u32,
+            0u32,
+            0u32,
+        )
+        .map_err(|error| PlatformError::Capture(format!("grab core pointer: {error}")))?
+        .reply()
+        .map_err(|error| PlatformError::Capture(format!("read core pointer grab status: {error}")))?
+        .status;
+    if pointer != xproto::GrabStatus::SUCCESS {
+        return Err(PlatformError::Capture(format!(
+            "core pointer grab was rejected ({pointer:?})"
+        )));
+    }
+    let keyboard = connection
+        .grab_keyboard(false, root, 0u32, xproto::GrabMode::ASYNC, xproto::GrabMode::ASYNC)
+        .map_err(|error| PlatformError::Capture(format!("grab core keyboard: {error}")))?
+        .reply()
+        .map_err(|error| PlatformError::Capture(format!("read core keyboard grab status: {error}")))?
+        .status;
+    if keyboard != xproto::GrabStatus::SUCCESS {
+        let _ = connection.ungrab_pointer(0u32).map(|cookie| cookie.check());
+        return Err(PlatformError::Capture(format!(
+            "core keyboard grab was rejected ({keyboard:?})"
+        )));
+    }
+    Ok(())
+}
+
+/// Release a core hold (pointer first, then keyboard).
+fn core_ungrab(connection: &RustConnection) -> Result<(), PlatformError> {
+    connection
+        .ungrab_pointer(0u32)
+        .map_err(|error| PlatformError::Capture(format!("ungrab core pointer: {error}")))?
+        .check()
+        .map_err(|error| PlatformError::Capture(format!("ungrab core pointer: {error}")))?;
+    connection
+        .ungrab_keyboard(0u32)
+        .map_err(|error| PlatformError::Capture(format!("ungrab core keyboard: {error}")))?
+        .check()
+        .map_err(|error| PlatformError::Capture(format!("ungrab core keyboard: {error}")))?;
+    Ok(())
 }
 
 fn button_event(detail: u32, pressed: bool) -> Option<InputEvent> {
