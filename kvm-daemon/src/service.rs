@@ -977,7 +977,7 @@ pub async fn capture(address: &str) -> Result<()> {
     )
     .await;
     // Keep local input usable after Ctrl+C, peer loss, or any protocol error.
-    capture_control.set_exclusive(false)?;
+    release_suppression(&capture_control, None);
     result
 }
 
@@ -1467,6 +1467,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut last_resync: Option<std::time::Instant> = None;
     // Last backend-census journal line (see the keep-alive tick).
     let mut last_census_log: Option<std::time::Instant> = None;
+    // Whether local-input suppression is currently requested for a drive.
+    // Every release clears it; the keep-alive reaper heals any hold that
+    // outlives its drive (the total-freeze class).
+    let mut suppression_requested = false;
     let mut local_wheel_dropped = 0u64;
     let mut sequence = 0u64;
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
@@ -1488,7 +1492,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     Some(RemoteSignal::Handoff(handoff)) => {
                         if let Some(session) = active.take() {
                             session.finish().await;
-                            capture_control.set_exclusive(false)?;
+                            release_suppression(&capture_control, Some(&mut suppression_requested));
                             discarded_event_barrier = discarded_event_barrier
                                 .max(capture_control.snapshot().last_event_id);
                         }
@@ -1627,6 +1631,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         }
                         if let Some(session) = session {
                                 capture_control.set_exclusive(true)?;
+                                suppression_requested = true;
                                 active = Some(session);
                                 let name = router
                                     .screen(target)
@@ -1653,7 +1658,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         if let Some(session) = active.take() {
                             let target = session.target;
                             session.finish().await;
-                            capture_control.set_exclusive(false)?;
+                            release_suppression(&capture_control, Some(&mut suppression_requested));
                             discarded_event_barrier = discarded_event_barrier
                                 .max(capture_control.snapshot().last_event_id);
                             let _ = router.restore_local(target);
@@ -1696,6 +1701,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     discarded_event_barrier: &mut discarded_event_barrier,
                     local_wheel_dropped: &mut local_wheel_dropped,
                     last_resync: &mut last_resync,
+                    suppression_requested: &mut suppression_requested,
                 })
                 .await?;
             }
@@ -1730,6 +1736,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     discarded_event_barrier: &mut discarded_event_barrier,
                     local_wheel_dropped: &mut local_wheel_dropped,
                     last_resync: &mut last_resync,
+                    suppression_requested: &mut suppression_requested,
                 })
                 .await?;
             }
@@ -1765,7 +1772,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         if let Some(stale) = parked.take() {
                             stale.finish().await;
                         }
-                        capture_control.set_exclusive(false)?;
+                        release_suppression(&capture_control, Some(&mut suppression_requested));
                         discarded_event_barrier = discarded_event_barrier
                             .max(capture_control.snapshot().last_event_id);
                         let _ = router.restore_local(target);
@@ -1790,7 +1797,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         if let Some(stale) = parked.take() {
                             stale.finish().await;
                         }
-                        capture_control.set_exclusive(false)?;
+                        release_suppression(&capture_control, Some(&mut suppression_requested));
                         discarded_event_barrier = discarded_event_barrier
                             .max(capture_control.snapshot().last_event_id);
                         let _ = router.restore_local(target);
@@ -1809,6 +1816,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             stale.finish().await;
                         }
                     }
+                }
+                // Suppression-hold reaper: a held local-suppression with no
+                // active drive freezes ALL local input (and injected input
+                // too) while the cursor still moves. Any missed or resisted
+                // release heals here within seconds, loudly.
+                if stale_hold_needs_release(active.is_some(), suppression_requested) {
+                    release_suppression(&capture_control, Some(&mut suppression_requested));
+                    tracing::info!("suppression reaper: released stale hold with no active drive");
                 }
                 // Backend receipt census, once a minute: which OS channel
                 // speaks (hook vs raw HID). Scroll-silence reports end
@@ -1832,7 +1847,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                capture_control.set_exclusive(false)?;
+                release_suppression(&capture_control, Some(&mut suppression_requested));
                 if let Some(session) = active.take() {
                     session.finish().await;
                 }
@@ -1978,6 +1993,30 @@ fn transfer_debounced(last_transfer: Option<std::time::Instant>) -> bool {
     last_transfer.is_some_and(|when| when.elapsed() < Duration::from_millis(100))
 }
 
+/// Best-effort release of local-input suppression. A failed ungrab must
+/// NEVER abort drive teardown (or kill the child): the cleanup after it
+/// (warp, status, barriers) still has to run, and the keep-alive reaper
+/// below retries a resisting hold until it lifts. Loud, so a stuck
+/// server-side hold is visible in the journal instead of a mystery
+/// freeze where the cursor moves but nothing responds.
+fn release_suppression(
+    capture_control: &CaptureGuard,
+    requested: Option<&mut bool>,
+) {
+    if let Err(error) = capture_control.set_exclusive(false) {
+        tracing::warn!(%error, "suppression release failed; reaper will retry");
+    }
+    if let Some(requested) = requested {
+        *requested = false;
+    }
+}
+
+/// Reaper predicate: suppression was requested for a drive, but no drive
+/// is active anymore — the hold must be released now. Pure for tests.
+fn stale_hold_needs_release(drive_active: bool, suppression_requested: bool) -> bool {
+    suppression_requested && !drive_active
+}
+
 /// Cooldown after a FAILED episode dial: the peer is unreachable, busy, or
 /// gone, and the cursor sits at the edge pouring motion events in — without
 /// a pause every one of them would open a full QUIC handshake (the dial
@@ -2031,6 +2070,9 @@ struct TopologyEventContext<'a> {
     local_wheel_dropped: &'a mut u64,
     /// Throttle stamp for the OS-pointer truth resync below.
     last_resync: &'a mut Option<std::time::Instant>,
+    /// Belief flag for the suppression-hold reaper: set on drive start,
+    /// cleared on every release.
+    suppression_requested: &'a mut bool,
 }
 
 async fn handle_topology_event(
@@ -2059,6 +2101,7 @@ async fn handle_topology_event(
         discarded_event_barrier,
         local_wheel_dropped,
         last_resync,
+        suppression_requested,
     } = context;
     // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
     // Raw deltas keep flowing after the OS pointer has stopped at the edge,
@@ -2101,7 +2144,7 @@ async fn handle_topology_event(
             if let Some(session) = active.take() {
                 let target = session.target;
                 session.finish().await;
-                capture_control.set_exclusive(false)?;
+                release_suppression(&capture_control, Some(&mut *suppression_requested));
                 *discarded_event_barrier = (*discarded_event_barrier)
                     .max(capture_control.snapshot().last_event_id);
                 let _ = router.restore_local(target);
@@ -2187,7 +2230,7 @@ async fn handle_topology_event(
                 if let Some(stale) = parked.take() {
                     stale.finish().await;
                 }
-                capture_control.set_exclusive(false)?;
+                release_suppression(&capture_control, Some(&mut *suppression_requested));
                 *discarded_event_barrier = (*discarded_event_barrier)
                     .max(capture_control.snapshot().last_event_id);
                 let _ = router.restore_local(target);
@@ -2210,7 +2253,7 @@ async fn handle_topology_event(
                     stale.finish().await;
                 }
             }
-            capture_control.set_exclusive(false)?;
+            release_suppression(&capture_control, Some(&mut *suppression_requested));
             *discarded_event_barrier = (*discarded_event_barrier)
                 .max(capture_control.snapshot().last_event_id);
             *last_transfer = Some(std::time::Instant::now());
@@ -2343,6 +2386,7 @@ async fn handle_topology_event(
             }
             if let Some(session) = session {
                 capture_control.set_exclusive(true)?;
+                *suppression_requested = true;
                 *last_transfer = Some(std::time::Instant::now());
                 *active = Some(session);
                 let name = router
@@ -5409,8 +5453,19 @@ mod tests {
     }
 
     #[test]
-    fn failed_handoff_parks_the_cursor_inside_and_cools_down() {
-        use kvm_core::{InputEvent, RoutedEvent};
+    #[test]
+    fn stale_hold_reaper_fires_only_without_a_drive() {
+        // The total-freeze invariant: suppression requested + no active
+        // drive = release now. Any other combination leaves the hold
+        // alone (an active drive legitimately suppresses).
+        assert!(stale_hold_needs_release(false, true));
+        assert!(!stale_hold_needs_release(true, true));
+        assert!(!stale_hold_needs_release(false, false));
+        assert!(!stale_hold_needs_release(true, false));
+    }
+
+    #[test]
+    fn failed_handoff_parks_the_cursor_inside_and_cools_down() {        use kvm_core::{InputEvent, RoutedEvent};
         let mut router = EdgeRouter::new(kvm_core::Layout::pair_default(
             "me",
             "peer",
