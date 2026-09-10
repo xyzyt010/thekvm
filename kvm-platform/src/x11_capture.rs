@@ -285,7 +285,9 @@ impl CaptureBackend for X11Capture {
         }
         Ok(())
     }
+}
 
+impl X11Capture {
     /// XI2 active grab of all master devices (raw-device semantics).
     fn xi_grab(&self) -> Result<(), PlatformError> {
         let mask = [raw_mask()];
@@ -379,7 +381,9 @@ impl CaptureBackend for X11Capture {
             .map_err(|error| PlatformError::Capture(format!("ungrab core keyboard: {error}")))?;
         Ok(())
     }
+}
 
+impl CaptureBackend for X11Capture {
     fn release(&mut self) -> Result<(), PlatformError> {
         if self.exclusive {
             self.set_exclusive(false)?;
