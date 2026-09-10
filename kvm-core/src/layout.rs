@@ -104,10 +104,9 @@ impl Layout {
     }
 
     /// True when the layout links exactly one peer screen (the normal
-    /// two-machine link). Single-peer links are double-edged: pushing past
-    /// ANY edge hands control to the peer, so a link works with zero
-    /// arrangement fuss and a stale arrangement can never strand the
-    /// cursor. Multi-screen grids keep strict facing edges.
+    /// two-machine link). This is a COUNTING helper for UI hints and the
+    /// push-through return rule — it does NOT mean "any edge crosses".
+    /// Routing is always strict grid (see [`Layout::edge_target`]).
     pub fn single_peer_screen(&self) -> Option<ScreenId> {
         let mut found = None;
         for screen in &self.screens {
@@ -121,17 +120,15 @@ impl Layout {
         found
     }
 
-    /// Edge target with the single-peer fallback: a grid neighbour wins;
-    /// otherwise, on a two-machine link, the lone peer takes ANY edge.
+    /// Edge target on the arranged grid ONLY: a crossing opens solely
+    /// through the edge that faces a real arranged neighbour
+    /// (Deskflow/MWB parity). Brushing the top edge of a side-by-side
+    /// link clamps the cursor — it must never fling control to the other
+    /// computer — and motion off any unarranged edge stays local. The old
+    /// single-peer "any edge crosses" fallback is gone on purpose: it
+    /// turned every top-edge brush into a phantom crossing.
     pub fn edge_target(&self, me: ScreenId, edge: Edge) -> Option<ScreenId> {
-        if let Some(neighbour) = self.neighbor_for_edge(me, edge) {
-            return Some(neighbour);
-        }
-        let peer = self.single_peer_screen()?;
-        if peer == me {
-            return None;
-        }
-        Some(peer)
+        self.neighbor_for_edge(me, edge)
     }
     pub fn screen(&self, id: ScreenId) -> Option<&Screen> {
         self.screens.iter().find(|screen| screen.id == id)
@@ -149,8 +146,10 @@ impl Layout {
     }
 
     /// Default two-screen arrangement for a fresh pairing: this machine at
-    /// (0,0), the peer at (1,0). Every machine writes this same shape —
-    /// self=1, peer=2 — because handoffs travel by device name and numbers
+    /// (0,0), the peer at (1,0) on its RIGHT. This is the dialer-side
+    /// (Machine-1) default; the station side mirrors it to the left (see
+    /// the UI's inbound auto-arrangement). Every machine numbers itself 1
+    /// and its first peer 2 — handoffs travel by device name and numbers
     /// are local-only.
     pub fn pair_default(
         self_name: &str,
@@ -183,8 +182,8 @@ impl Layout {
     }
 
     /// Which edge of the self screen leads to a linked peer screen, if any.
-    /// (Display helper for icons and texts; the router itself crosses ANY
-    /// edge on single-peer links — see [`Layout::edge_target`].)
+    /// (Display helper for icons and texts; the router crosses exactly
+    /// these arranged facing edges — see [`Layout::edge_target`].)
     pub fn peer_exit_edge(&self) -> Option<Edge> {
         let me = self.self_screen?;
         [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
@@ -343,6 +342,13 @@ pub enum RoutedEvent {
         target_y: u32,
         event: InputEvent,
     },
+    /// The virtual remote cursor overflowed while a remote screen was
+    /// driven: the caller ends the episode and restores the saved local
+    /// position (Deskflow-style edge return, no network round trip).
+    /// Pushing past the edge FACING home returns; pushing past the FAR
+    /// side of a lone peer also returns (on a two-machine link there is
+    /// nowhere else to go); a grid's far edge only clamps.
+    ReturnHome { from: ScreenId, edge: Edge },
 }
 
 /// Stateful edge router for a local controller. It tracks the cursor in the
@@ -451,6 +457,55 @@ impl EdgeRouter {
 
     pub fn route(&mut self, event: InputEvent) -> RoutedEvent {
         if let Some(target) = self.active_remote {
+            // Deskflow-style virtual cursor: while a remote screen owns the
+            // pointer, relative motion still advances the router's cursor
+            // inside the REMOTE geometry, so pushing back past the facing
+            // edge returns home instead of stranding control remotely
+            // until a session dies. Non-motion events forward untouched.
+            if let InputEvent::MouseMove { dx, dy } = event {
+                let from = self.current_screen;
+                let Some(remote) = self.layout.screen(from) else {
+                    return RoutedEvent::Forward { target, event };
+                };
+                let next_x = self.cursor_x as i64 + i64::from(dx);
+                let next_y = self.cursor_y as i64 + i64::from(dy);
+                let edge = if next_x < 0 {
+                    Some(Edge::Left)
+                } else if next_x >= i64::from(remote.width) {
+                    Some(Edge::Right)
+                } else if next_y < 0 {
+                    Some(Edge::Top)
+                } else if next_y >= i64::from(remote.height) {
+                    Some(Edge::Bottom)
+                } else {
+                    None
+                };
+                match edge {
+                    None => {
+                        self.cursor_x = next_x as u32;
+                        self.cursor_y = next_y as u32;
+                    }
+                    Some(edge) => {
+                        let faces_home =
+                            self.layout.neighbor_for_edge(from, edge) == Some(self.local_screen);
+                        let lone_peer = self.layout.single_peer_screen() == Some(from);
+                        if faces_home || lone_peer {
+                            // Park on the saved local position
+                            // (jump-position semantics): a return never
+                            // lands mid-screen.
+                            let _ = self.restore_local(target);
+                            return RoutedEvent::ReturnHome { from, edge };
+                        }
+                        // A grid's far edge: stop at the border and keep
+                        // driving (local overflow never auto-chains a
+                        // third hop; the peer routes onwards by request).
+                        self.cursor_x =
+                            next_x.clamp(0, i64::from(remote.width) - 1) as u32;
+                        self.cursor_y =
+                            next_y.clamp(0, i64::from(remote.height) - 1) as u32;
+                    }
+                }
+            }
             return RoutedEvent::Forward { target, event };
         }
 
@@ -776,28 +831,24 @@ mod tests {
     }
 
     #[test]
-    fn double_edge_exit_on_single_peer_links() {        // Machine 1: peer on the right, but the LEFT (outer) edge must also
-        // cross on a two-machine link.
+    fn single_peer_links_cross_only_facing_edges() {
+        // Machine 1: peer on the right. The facing edge crosses; every
+        // other edge — including the old "double edge" outer edge and the
+        // top/bottom brushes — clamps locally and never hands off.
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         assert_eq!(
-            layout.edge_target(SELF_SCREEN_ID, Edge::Left),
+            layout.edge_target(SELF_SCREEN_ID, Edge::Right),
             Some(FIRST_PEER_SCREEN_ID)
         );
-        assert_eq!(
-            layout.edge_target(SELF_SCREEN_ID, Edge::Top),
-            Some(FIRST_PEER_SCREEN_ID)
-        );
-        assert_eq!(
-            layout.edge_target(SELF_SCREEN_ID, Edge::Bottom),
-            Some(FIRST_PEER_SCREEN_ID)
-        );
-        // The receiver side agrees: any motion out of its screen hops back.
-        let back = layout
-            .handoff_for_motion(SELF_SCREEN_ID, 0, 540, -50, 0)
-            .expect("outer edge must hand off on a single-peer link");
-        assert_eq!(back.target, FIRST_PEER_SCREEN_ID);
-        // Grids keep strict facing edges: no fallback past real neighbours.
-        let mut grid = layout.clone();
+        assert_eq!(layout.edge_target(SELF_SCREEN_ID, Edge::Left), None);
+        assert_eq!(layout.edge_target(SELF_SCREEN_ID, Edge::Top), None);
+        assert_eq!(layout.edge_target(SELF_SCREEN_ID, Edge::Bottom), None);
+        let mut router = EdgeRouter::new(layout).unwrap();
+        let brushed_top = router.route(InputEvent::MouseMove { dx: 0, dy: -5000 });
+        assert!(matches!(brushed_top, RoutedEvent::Local(_)));
+        assert_eq!(router.active_remote(), None);
+        // Grids were and stay strict: the neighbour wins, nothing else.
+        let mut grid = Layout::pair_default("me", "peer", &"ab".repeat(32));
         grid.screens.push(Screen {
             id: ScreenId(9),
             name: "third".into(),
@@ -812,6 +863,86 @@ mod tests {
             Some(ScreenId(9))
         );
         assert_eq!(grid.single_peer_screen(), None);
+    }
+
+    #[test]
+    fn driving_home_returns_past_the_facing_edge() {
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        let _ = router.route(InputEvent::MouseMove { dx: 200, dy: 0 });
+        let home = router.cursor_position();
+        // Exit right into the peer: entry at the peer's left edge.
+        let handoff = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(matches!(
+            handoff,
+            RoutedEvent::Handoff {
+                target,
+                target_x: 0,
+                ..
+            } if target == FIRST_PEER_SCREEN_ID
+        ));
+        // Small motion while driving forwards and tracks the remote cursor.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 100, dy: 50 }),
+            RoutedEvent::Forward { .. }
+        ));
+        assert_eq!(router.cursor_position(), (100, 590));
+        // Pushing back past the facing edge returns to the saved home —
+        // never mid-screen — with no network round trip.
+        let back = router.route(InputEvent::MouseMove {
+            dx: -5000,
+            dy: 0,
+        });
+        assert!(matches!(
+            back,
+            RoutedEvent::ReturnHome {
+                from,
+                edge: Edge::Left,
+            } if from == FIRST_PEER_SCREEN_ID
+        ));
+        assert_eq!(router.active_remote(), None);
+        assert_eq!(router.cursor_position(), home);
+    }
+
+    #[test]
+    fn lone_peer_push_through_returns_home() {
+        // Two-machine link: pushing past the peer's FAR side has nowhere
+        // to go, so it returns instead of stranding control remotely.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
+        let home = router.local_cursor_position();
+        let back = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(matches!(
+            back,
+            RoutedEvent::ReturnHome { edge: Edge::Right, .. }
+        ));
+        assert_eq!(router.active_remote(), None);
+        assert_eq!(router.cursor_position(), home);
+    }
+
+    #[test]
+    fn grid_far_edge_clamps_without_returning() {
+        // Three in a row: driving the middle screen, its far edge stops
+        // at the border and keeps driving (no automatic third hop).
+        let mut layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        layout.screens.push(Screen {
+            id: ScreenId(9),
+            name: "third".into(),
+            x: 2,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            peer_fingerprint: Some("ff".repeat(32)),
+        });
+        let mut router = EdgeRouter::new(layout).unwrap();
+        let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
+        let pushed = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(matches!(pushed, RoutedEvent::Forward { .. }));
+        assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
+        assert_eq!(router.cursor_position(), (1919, 540));
     }
 
     #[test]
@@ -850,13 +981,10 @@ mod tests {
             .expect("right edge must hand off");
         assert_eq!(handoff.target, FIRST_PEER_SCREEN_ID);
         assert_eq!(handoff.target_x, 0);
-        // No grid neighbour on the outer edge — but edge_target still
-        // crosses there on a single-peer link (double edge exit).
+        // No grid neighbour on the outer edge — and a single-peer link no
+        // longer crosses there either (strict facing edges only).
         assert_eq!(layout.neighbor_for_edge(SELF_SCREEN_ID, Edge::Left), None);
-        assert_eq!(
-            layout.edge_target(SELF_SCREEN_ID, Edge::Left),
-            Some(FIRST_PEER_SCREEN_ID)
-        );
+        assert_eq!(layout.edge_target(SELF_SCREEN_ID, Edge::Left), None);
     }
 
     #[test]
@@ -871,6 +999,10 @@ mod tests {
         assert_eq!(mint.self_screen, Some(SELF_SCREEN_ID));
         assert_eq!(laptop.screen_by_name("mint").map(|s| s.id), Some(FIRST_PEER_SCREEN_ID));
         assert_eq!(mint.screen_by_name("laptop").map(|s| s.id), Some(FIRST_PEER_SCREEN_ID));
+        // Fresh defaults face right on both sides (the dialer keeps this;
+        // the station mirrors to the left on first inbound).
+        assert_eq!(laptop.peer_exit_edge(), Some(Edge::Right));
+        assert_eq!(mint.peer_exit_edge(), Some(Edge::Right));
     }
 
     #[test]

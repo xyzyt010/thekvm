@@ -1405,6 +1405,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut discarded_event_barrier = 0u64;
     let mut last_transfer: Option<std::time::Instant> = None;
     let mut last_failed_episode: Option<std::time::Instant> = None;
+    let mut local_wheel_dropped = 0u64;
     let mut sequence = 0u64;
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1598,6 +1599,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     clipboard_revision: &mut clipboard_revision,
                     dir: &dir,
                     discarded_event_barrier: &mut discarded_event_barrier,
+                    local_wheel_dropped: &mut local_wheel_dropped,
                 })
                 .await?;
             }
@@ -1629,6 +1631,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     clipboard_revision: &mut clipboard_revision,
                     dir: &dir,
                     discarded_event_barrier: &mut discarded_event_barrier,
+                    local_wheel_dropped: &mut local_wheel_dropped,
                 })
                 .await?;
             }
@@ -1643,14 +1646,30 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         continue;
                     }
                     clipboard_revision = clipboard_revision.wrapping_add(1);
-                    write_frame(
+                    if let Err(error) = write_frame(
                         &mut session.send,
                         &WireMessage::ClipboardText {
                             revision: clipboard_revision,
                             text,
                         },
                     )
-                    .await?;
+                    .await
+                    {
+                        // Like a failed input send: the episode ends, the
+                        // child lives on for the next crossing.
+                        tracing::warn!(%error, "topology clipboard send failed; control is local");
+                        let session = active.take().expect("active session exists");
+                        let target = session.target;
+                        session.finish().await;
+                        capture_control.set_exclusive(false)?;
+                        discarded_event_barrier = discarded_event_barrier
+                            .max(capture_control.snapshot().last_event_id);
+                        let _ = router.restore_local(target);
+                        let (x, y) = router.cursor_position();
+                        let _ = capture_control.warp_cursor(x, y);
+                        last_failed_episode = Some(std::time::Instant::now());
+                        eprintln!("THEKVM_STATUS local");
+                    }
                 }
                 None => clipboard_enabled = false,
             },
@@ -1851,6 +1870,10 @@ struct TopologyEventContext<'a> {
     clipboard_revision: &'a mut u64,
     dir: &'a std::path::Path,
     discarded_event_barrier: &'a mut u64,
+    /// Scroll events routed locally while nobody is driven (scroll alone
+    /// never opens a crossing). Logged at each handoff: distinguishes a
+    /// dead capture hook (zero here too) from scrolling while local.
+    local_wheel_dropped: &'a mut u64,
 }
 
 async fn handle_topology_event(
@@ -1876,6 +1899,7 @@ async fn handle_topology_event(
         clipboard_revision,
         dir,
         discarded_event_barrier,
+        local_wheel_dropped,
     } = context;
     // ScrollLock toggles the Deskflow-style screen lock (consumed, never
     // forwarded): locking returns home first so it always means "held
@@ -1904,7 +1928,16 @@ async fn handle_topology_event(
     }
     let routed = router.route(captured.event);
     match routed {
-        RoutedEvent::Local(_) => {
+        RoutedEvent::Local(event) => {
+            // Scroll that arrives with nobody driven stays local (scroll
+            // alone never opens a crossing): count it so the journal
+            // distinguishes "hook is dead" from "scrolled while local".
+            if matches!(
+                event,
+                InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
+            ) {
+                *local_wheel_dropped += 1;
+            }
             // A compositor portal may have activated a barrier even when the
             // topology has no neighbor on that edge. Release it so the local
             // compositor can continue receiving pointer motion.
@@ -1947,15 +1980,42 @@ async fn handle_topology_event(
             if let Err(error) =
                 send_input(&session.connection, &mut session.send, *sequence, outgoing).await
             {
+                // A dead episode ends the EPISODE, never the child: the
+                // link (and the next crossing) survives a wobbly network.
+                // This used to `return Err`, killing the whole child — one
+                // dropped datagram ended every future crossing until the
+                // UI noticed the exit and redialled.
+                tracing::warn!(%error, "topology episode send failed; control is local");
                 let session = active.take().expect("active session exists");
                 let target = session.target;
                 session.finish().await;
                 capture_control.set_exclusive(false)?;
+                *discarded_event_barrier = (*discarded_event_barrier)
+                    .max(capture_control.snapshot().last_event_id);
                 let _ = router.restore_local(target);
                 let (x, y) = router.cursor_position();
                 let _ = capture_control.warp_cursor(x, y);
-                return Err(error);
+                *last_failed_episode = Some(std::time::Instant::now());
+                eprintln!("THEKVM_STATUS local");
             }
+        }
+        RoutedEvent::ReturnHome { from, edge } => {
+            // Deskflow-style edge return: the virtual remote cursor came
+            // back past the facing edge, so end the episode and re-enter
+            // at the exact saved pixel — no network round trip, no
+            // session death, no mid-screen landing. The transfer stamp
+            // doubles as MWB lastJump debounce against instant re-exit.
+            if let Some(session) = active.take() {
+                session.finish().await;
+            }
+            capture_control.set_exclusive(false)?;
+            *discarded_event_barrier = (*discarded_event_barrier)
+                .max(capture_control.snapshot().last_event_id);
+            *last_transfer = Some(std::time::Instant::now());
+            let (x, y) = router.cursor_position();
+            let _ = capture_control.warp_cursor(x, y);
+            tracing::info!(?from, ?edge, "topology edge return; control is local");
+            eprintln!("THEKVM_STATUS local");
         }
         RoutedEvent::Handoff {
             target,
@@ -1998,6 +2058,7 @@ async fn handle_topology_event(
                 return Ok(());
             }
             let snapshot = capture_control.snapshot();
+            let opened_at = std::time::Instant::now();
             match open_topology_session(TopologyOpen {
                 router,
                 identity,
@@ -2029,7 +2090,10 @@ async fn handle_topology_event(
                         .screen(target)
                         .map(|screen| screen.name.clone())
                         .unwrap_or_else(|| format!("screen {}", target.0));
-                    tracing::info!(?target, "topology handoff activated");
+                    // open_ms proves the crossing cost (warm stream vs
+                    // cold dial); local_wheel names scroll that arrived
+                    // while nobody was driven.
+                    tracing::info!(?target, open_ms = opened_at.elapsed().as_millis(), local_wheel = *local_wheel_dropped, "topology handoff activated");
                     eprintln!("THEKVM_STATUS driving {name}");
                 }
                 Err(error) => {
@@ -2326,9 +2390,72 @@ fn start_capture(
     let thread = std::thread::Builder::new()
         .name("thekvm-input-capture".into())
         .spawn(move || {
-            while let Ok(event) =
-                capture.next_event(&thread_stop, &thread_exclusive, &thread_release)
-            {
+            // A capture backend can die mid-link (an X11 grab rejected
+            // while a menu holds one, a torn-down hook thread, ...):
+            // rebuild it with backoff instead of killing the child, so a
+            // transient platform flake costs a beat, not the link. Event
+            // ids stay monotonic across rebuilds (shared state), so
+            // barriers never discard the resumed stream. Past a burst of
+            // consecutive failures the backend is really gone: exit, so
+            // the channels close and the child bails for a fresh redial.
+            let mut backend = Some(capture);
+            let mut failures = 0u32;
+            let mut last_warn: Option<std::time::Instant> = None;
+            'capture: loop {
+                if thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break 'capture;
+                }
+                let Some(active) = backend.as_mut() else {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    match kvm_platform::capture::create_capture(prefer_wayland, false) {
+                        Ok(rebuilt) => {
+                            backend = Some(rebuilt);
+                            continue;
+                        }
+                        Err(error) => {
+                            failures += 1;
+                            tracing::debug!(%error, failures, "input capture rebuild failed");
+                            if failures > 20 {
+                                tracing::warn!(
+                                    failures,
+                                    "input capture backend keeps failing; stopping capture"
+                                );
+                                break 'capture;
+                            }
+                            continue;
+                        }
+                    }
+                };
+                let event =
+                    match active.next_event(&thread_stop, &thread_exclusive, &thread_release) {
+                        Ok(event) => {
+                            failures = 0;
+                            event
+                        }
+                        Err(error) => {
+                            if thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                                break 'capture;
+                            }
+                            failures += 1;
+                            let due = last_warn.map_or(true, |when| {
+                                when.elapsed() > std::time::Duration::from_secs(30)
+                            });
+                            if due {
+                                last_warn = Some(std::time::Instant::now());
+                                tracing::warn!(%error, failures, "input capture backend failed; rebuilding");
+                            }
+                            backend = None;
+                            if failures > 20 {
+                                tracing::warn!(
+                                    failures,
+                                    "input capture backend keeps failing; stopping capture"
+                                );
+                                break 'capture;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            continue;
+                        }
+                    };
                 let captured = match thread_state.lock() {
                     Ok(mut state) => {
                         let Some(captured) = state.record(event) else {
@@ -2349,15 +2476,17 @@ fn start_capture(
                 // silently corrupted by a busy network.
                 if matches!(event, InputEvent::Key(_) | InputEvent::MouseButton { .. }) {
                     if priority_tx.blocking_send(captured).is_err() {
-                        break;
+                        break 'capture;
                     }
                     continue;
                 }
                 if motion_tx.try_send(captured).is_err() && motion_tx.is_closed() {
-                    break;
+                    break 'capture;
                 }
             }
-            let _ = capture.set_exclusive(false);
+            if let Some(active) = backend.as_mut() {
+                let _ = active.set_exclusive(false);
+            }
         })
         .context("start capture thread")?;
     Ok((
@@ -2996,14 +3125,33 @@ async fn handle_connection(
     pairing_approvals: crate::control::PairingApprovals,
 ) -> Result<()> {
     let peer_fingerprint = peer_fingerprint(&conn)?;
-    let mut revoked_rx = revoked_peers.subscribe();
-    let (mut send, mut recv) = conn.accept_bi().await?;
-    let first = read_frame(&mut recv)
-        .await?
-        .context("peer closed before hello")?;
-    let local_config = config.read().await.clone();
+    // One association, many episodes (Deskflow persistent-socket parity):
+    // every bidirectional stream on this connection is dispatched on its
+    // own — pairing once, then one input episode per stream — so a link
+    // costs one handshake and each crossing costs one stream open
+    // (milliseconds on LAN), never a cold dial. A bad stream ends that
+    // stream, never the association.
+    loop {
+        let (mut send, mut recv) = match conn.accept_bi().await {
+            Ok(streams) => streams,
+            // The peer went away (child exited, network dropped): nothing
+            // left to serve on this association.
+            Err(_) => return Ok(()),
+        };
+        let mut revoked_rx = revoked_peers.subscribe();
+        let first = match read_frame(&mut recv).await {
+            Ok(Some(frame)) => frame,
+            // A stream that dies before saying hello is just gone; the
+            // next stream on the live association still gets served.
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::debug!(%error, "episode stream died before hello");
+                continue;
+            }
+        };
+        let local_config = config.read().await.clone();
 
-    match first {
+        match first {
         WireMessage::PairRequest {
             node_name,
             fingerprint_hex,
@@ -3013,9 +3161,9 @@ async fn handle_connection(
                 &conn,
                 &mut send,
                 &mut recv,
-                peers,
+                peers.clone(),
                 &peer_fingerprint,
-                pairing_approvals,
+                pairing_approvals.clone(),
                 PairingRequest {
                     local_node_name: local_config.device_name.clone(),
                     node_name,
@@ -3023,9 +3171,14 @@ async fn handle_connection(
                     pairing_code,
                 },
             )
-            .await
+            .await?;
         }
         WireMessage::Hello(hello) => {
+            // Per-stream containment: this async block is a return
+            // boundary, so `bail!`, `return` and `?` end THIS episode
+            // with a logged reason while the association loop above keeps
+            // serving later streams.
+            let stream_result: Result<()> = async {
             let config = local_config;
             if !peers.read().await.is_pinned(&peer_fingerprint) {
                 reject(&mut send, "peer is not paired").await?;
@@ -3071,24 +3224,11 @@ async fn handle_connection(
                 return Err(error);
             }
 
-            let _input_session_permit = match input_session_slot.try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    reject(
-                        &mut send,
-                        "another input session already controls this node",
-                    )
-                    .await?;
-                    audit_event(
-                        audit_dir,
-                        &format!(
-                            "session-rejected peer={peer_fingerprint} remote={} reason=input_session_busy",
-                            conn.remote_address()
-                        ),
-                    );
-                    bail!("another input session already controls this node");
-                }
-            };
+            // The input slot is taken lazily at the first PointerHandoff
+            // on this stream (see below), not here: a verify handshake
+            // that never drives must not hold the single-driver slot and
+            // starve the episode that follows it on this same association.
+            let mut input_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
 
             let lock_screen_enabled =
                 config.allow_lock_screen_control && hello.lock_screen_requested;
@@ -3236,6 +3376,31 @@ async fn handle_connection(
                                 y,
                                 screen_geometry,
                             } => {
+                                // Lazy single-driver slot: the first handoff
+                                // on this stream claims it; a second live
+                                // driver is rejected on THIS stream (the
+                                // association stays up for the next one).
+                                // The permit lives until the stream ends.
+                                if input_permit.is_none() {
+                                    match input_session_slot.clone().try_acquire_owned() {
+                                        Ok(permit) => input_permit = Some(permit),
+                                        Err(_) => {
+                                            reject(
+                                                &mut send,
+                                                "another input session already controls this node",
+                                            )
+                                            .await?;
+                                            audit_event(
+                                                audit_dir,
+                                                &format!(
+                                                    "session-rejected peer={peer_fingerprint} remote={} reason=input_session_busy",
+                                                    conn.remote_address()
+                                                ),
+                                            );
+                                            bail!("another input session already controls this node");
+                                        }
+                                    }
+                                }
                                 // Named acceptance: the sender names THIS
                                 // machine, and names agree across machines.
                                 // Local screen numbers never cross the wire
@@ -3387,12 +3552,18 @@ async fn handle_connection(
             }
             injector.release_all()?;
             Ok(())
+            }
+            .await;
+            if let Err(error) = stream_result {
+                tracing::debug!(%error, "episode stream ended");
+            }
         }
         other => {
             reject(&mut send, &format!("expected hello, received {other:?}")).await?;
             bail!("invalid first message")
         }
-    }
+        } // match first: one pairing or one episode per stream
+    } // association loop: streams share one handshake
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4244,16 +4415,19 @@ fn screen_geometry_for(layout: &kvm_core::Layout, screen_id: ScreenId) -> Option
 /// Map a pointer position between inclusive logical screen coordinate spaces.
 /// The edge coordinates are preserved (`0` maps to `0`, the last source pixel
 /// maps to the last target pixel), which avoids a one-pixel drift accumulating
-/// across repeated topology handoffs.
+/// across repeated topology handoffs. Only the DIMENSIONS participate: the
+/// geometry's screen id is a per-machine local number (one side's "screen 1"
+/// says nothing about the other's), so comparing ids across the wire only
+/// ever forced the unscaled fallback — entry at the raw local pixel instead
+/// of the proportional edge point.
 fn remap_position(
     x: u32,
     y: u32,
     source: Option<ScreenGeometry>,
     target: ScreenGeometry,
 ) -> (u32, u32) {
-    let Some(source) = source.filter(|geometry| {
-        geometry.screen_id == target.screen_id && geometry.width > 0 && geometry.height > 0
-    }) else {
+    let Some(source) = source.filter(|geometry| geometry.width > 0 && geometry.height > 0)
+    else {
         return (
             x.min(target.width.saturating_sub(1)),
             y.min(target.height.saturating_sub(1)),
@@ -4949,19 +5123,44 @@ mod tests {
             height: 720,
         };
         assert_eq!(remap_position(4000, 4000, None, target), (1279, 719));
+        // Degenerate source geometry still clamps instead of dividing.
         assert_eq!(
             remap_position(
                 4000,
                 4000,
                 Some(ScreenGeometry {
-                    screen_id: 99,
-                    width: 4000,
-                    height: 4000,
+                    screen_id: 3,
+                    width: 0,
+                    height: 0,
                 }),
                 target,
             ),
             (1279, 719)
         );
+    }
+
+    #[test]
+    fn geometry_remapping_ignores_cross_machine_screen_numbers() {
+        // Screen ids are per-machine local numbers: the sender's id for
+        // the peer screen never equals the receiver's id for itself, so
+        // the mapping must scale by dimensions anyway. Comparing ids
+        // forced the unscaled fallback — entry at the raw local pixel
+        // instead of the proportional edge point.
+        let source = ScreenGeometry {
+            screen_id: 1,
+            width: 1920,
+            height: 1080,
+        };
+        let target = ScreenGeometry {
+            screen_id: 2,
+            width: 2560,
+            height: 1440,
+        };
+        assert_eq!(
+            remap_position(1919, 1079, Some(source), target),
+            (2559, 1439)
+        );
+        assert_eq!(remap_position(960, 540, Some(source), target), (1280, 720));
     }
 
     #[tokio::test]

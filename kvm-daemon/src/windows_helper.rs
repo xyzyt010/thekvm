@@ -93,10 +93,7 @@ impl ServiceInputProxy {
     pub fn send(&mut self, event: InputEvent) -> Result<()> {
         self.ensure_session()?;
         let message = serde_json::to_vec(&HelperMessage::Input(event))?;
-        for stream in &mut self.streams {
-            write_ipc_frame(stream, &message).context("send event to Windows helper")?;
-        }
-        Ok(())
+        fan_out(&mut self.streams, "send event to Windows helper", &message)
     }
 
     pub fn ensure_session(&self) -> Result<()> {
@@ -113,19 +110,25 @@ impl ServiceInputProxy {
 
     pub fn release_all(&mut self) -> Result<()> {
         let message = serde_json::to_vec(&HelperMessage::ReleaseAll)?;
-        for stream in &mut self.streams {
-            write_ipc_frame(stream, &message).context("release input in Windows helper")?;
-        }
-        Ok(())
+        fan_out(&mut self.streams, "release input in Windows helper", &message)
     }
 
     pub fn warp_cursor(&mut self, x: u32, y: u32) -> Result<()> {
         let message = serde_json::to_vec(&HelperMessage::WarpCursor { x, y })?;
-        for stream in &mut self.streams {
-            write_ipc_frame(stream, &message).context("warp cursor in Windows helper")?;
-        }
-        Ok(())
+        fan_out(&mut self.streams, "warp cursor in Windows helper", &message)
     }
+}
+
+/// Best-effort fan-out to the interactive helpers: a dead helper is
+/// dropped, never fatal. The old fail-on-first-dead stream turned one
+/// departed helper (e.g. the winlogon helper after a desktop switch)
+/// into a dead input session even though the other helper was healthy.
+fn fan_out(streams: &mut Vec<TcpStream>, context: &str, payload: &[u8]) -> Result<()> {
+    streams.retain_mut(|stream| write_ipc_frame(stream, payload).is_ok());
+    if streams.is_empty() {
+        bail!("{context}: all Windows helpers are gone");
+    }
+    Ok(())
 }
 
 fn active_console_session_id() -> Result<u32> {
@@ -336,7 +339,23 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                 }
             }
             HelperMessage::ReleaseAll => injector.release_all()?,
-            HelperMessage::WarpCursor { x, y } => warp_cursor(x, y)?,
+            HelperMessage::WarpCursor { x, y } => {
+                // Like input: only the desktop that currently owns input
+                // may move the visible cursor. The idle helper (typically
+                // winlogon) must no-op SUCCESSFULLY — its SetCursorPos
+                // fails on a desktop nobody sees, and the old
+                // unconditional warp killed that helper, broke the
+                // fan-out pipe, and ended every inbound session
+                // milliseconds after it was accepted (Mint could never
+                // drive Windows).
+                match current_desktop_is_input() {
+                    Ok(true) => warp_cursor(x, y)?,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, "cannot identify active Windows input desktop");
+                    }
+                }
+            }
             HelperMessage::SetExclusive(_) => {}
         }
     }
@@ -668,4 +687,47 @@ fn spawn_helper(
 fn quote_windows_arg(path: &Path) -> String {
     let value = path.to_string_lossy();
     format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Shutdown;
+
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn fan_out_delivers_to_every_live_helper() {
+        let (left_tx, mut left_rx) = loopback_pair();
+        let (right_tx, mut right_rx) = loopback_pair();
+        let mut streams = vec![left_tx, right_tx];
+        fan_out(&mut streams, "test", b"ping").unwrap();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(read_ipc_frame(&mut left_rx).unwrap(), b"ping");
+        assert_eq!(read_ipc_frame(&mut right_rx).unwrap(), b"ping");
+    }
+
+    #[test]
+    fn fan_out_drops_a_dead_helper_and_keeps_the_live_one() {
+        let (dead_tx, _dead_rx) = loopback_pair();
+        // A locally shut-down socket fails writes deterministically.
+        dead_tx.shutdown(Shutdown::Both).unwrap();
+        let (live_tx, mut live_rx) = loopback_pair();
+        let mut streams = vec![dead_tx, live_tx];
+        fan_out(&mut streams, "test", b"ping").unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(read_ipc_frame(&mut live_rx).unwrap(), b"ping");
+    }
+
+    #[test]
+    fn fan_out_fails_only_when_no_helper_remains() {
+        let mut streams: Vec<TcpStream> = Vec::new();
+        assert!(fan_out(&mut streams, "test", b"ping").is_err());
+    }
 }

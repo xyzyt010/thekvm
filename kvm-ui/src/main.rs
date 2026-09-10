@@ -182,11 +182,14 @@ fn main() -> Result<()> {
     let last_autostart = Arc::new(Mutex::new(None::<std::time::Instant>));
     let autostart_state = last_autostart.clone();
     // Link-following state: last seen inbound fingerprint (transition
-    // detection) and last dial-back attempt (30s throttle).
+    // detection), last dial-back attempt (30s throttle), and last proof
+    // the link is alive (45s display grace latch).
     let last_inbound = Arc::new(Mutex::new(None::<String>));
     let last_inbound_state = last_inbound.clone();
     let last_dialback = Arc::new(Mutex::new(None::<std::time::Instant>));
     let last_dialback_state = last_dialback.clone();
+    let last_link_seen = Arc::new(Mutex::new(None::<std::time::Instant>));
+    let last_link_seen_state = last_link_seen.clone();
     let pending_for_poll = pending_pair.clone();
     let link_dir = startup_dir.clone();
     // Local LAN address is shown even while the daemon is unreachable so the
@@ -267,6 +270,7 @@ fn main() -> Result<()> {
                     &link_dir,
                     &last_inbound_state,
                     &last_dialback_state,
+                    &last_link_seen_state,
                 );
                 let port = status.listen_port;
                 let fingerprint = status.fingerprint_hex.clone();
@@ -1675,6 +1679,38 @@ fn ensure_default_arrangement(peer_name: &str, peer_fingerprint: &str) {
     }
 }
 
+/// Station-side mirror of the dialer's Machine-1 default: on the FIRST
+/// inbound link, with no arrangement saved yet, put the peer on the LEFT
+/// (the dialer put us on its right). Writes ONLY when no arrangement
+/// exists yet — a saved arrangement (including Swap sides) is never
+/// overwritten.
+fn ensure_station_arrangement(peer_name: &str, fingerprint: &str) {
+    let current = match control_request(ControlRequest::GetConfig) {
+        Ok(ControlResponse::Config(config)) => config,
+        _ => return,
+    };
+    if !current.layout.screens.is_empty() {
+        return;
+    }
+    let fingerprint = fingerprint.to_ascii_lowercase();
+    let mut layout =
+        kvm_core::Layout::pair_default(&current.device_name, peer_name, &fingerprint);
+    if layout
+        .place_peer(&fingerprint, kvm_core::Edge::Left)
+        .is_err()
+    {
+        return;
+    }
+    match write_arrangement(layout) {
+        Ok(_) => {
+            ensure_user_pin(&fingerprint, peer_name, None);
+            pin_daemon_peer(&fingerprint, peer_name, None);
+            ui_log("arrange: station default saved (peer on the left), both books linked");
+        }
+        Err(error) => ui_log(&format!("arrange: station default failed: {error:#}")),
+    }
+}
+
 /// Throttle for the automatic arrangement/trust setup check (seconds).
 static LAST_ARRANGE_CHECK_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -1803,20 +1839,10 @@ fn side_name(side: kvm_core::Edge) -> &'static str {
     }
 }
 
-/// True when this machine links exactly one peer screen: any edge crosses
-/// (double edge exit), so status text must say "any edge", never one side.
-fn any_edge_link() -> bool {
-    matches!(
-        control_request(ControlRequest::GetConfig),
-        Ok(ControlResponse::Config(config)) if config.layout.single_peer_screen().is_some()
-    )
-}
-
 /// Refresh the Devices arrangement display from live state. Runs on the
 /// poll worker; all blocking calls are fine there.
 fn refresh_arrangement(weak: &slint::Weak<AppWindow>, edge_active: bool) {
     let peers = linked_peers();
-    let any_edge = any_edge_link();
     let (peer_name, text, peer_on_right) = match peers.first() {
         None => (
             String::new(),
@@ -1830,19 +1856,12 @@ fn refresh_arrangement(weak: &slint::Weak<AppWindow>, edge_active: bool) {
                 peer.name.clone()
             };
             match peer.side {
-                Some(side) if !any_edge => (
+                Some(side) => (
                     label.clone(),
                     format!(
                         "{label} is on your {} — push past the {} edge to drive it. Push back past the edge to return.",
                         side_name(side),
                         edge_name(side)
-                    ),
-                    !matches!(side, kvm_core::Edge::Left),
-                ),
-                Some(side) => (
-                    label.clone(),
-                    format!(
-                        "{label} is linked — push past ANY edge to drive it, on either computer. Push back past any edge to return."
                     ),
                     !matches!(side, kvm_core::Edge::Left),
                 ),
@@ -2060,6 +2079,7 @@ fn follow_link(
     data_dir: &std::path::Path,
     last_inbound: &Arc<Mutex<Option<String>>>,
     last_attempt: &Arc<Mutex<Option<std::time::Instant>>>,
+    last_link_seen: &Arc<Mutex<Option<std::time::Instant>>>,
 ) {
     let outbound_running = session
         .lock()
@@ -2078,25 +2098,41 @@ fn follow_link(
         *slot = inbound_fp.clone();
         prev
     });
+    // The link is alive while the peer holds a session OR our child runs:
+    // stamp it, so the display grace latch below can tell a breathing
+    // link from a dead one.
+    if inbound.is_some() || outbound_running {
+        if let Ok(mut seen) = last_link_seen.lock() {
+            *seen = Some(std::time::Instant::now());
+        }
+    }
     if !outbound_running {
         match (&previous, &inbound) {
             (old, Some(link)) if old.as_deref() != Some(link.fingerprint_hex.as_str()) => {
+                ensure_station_arrangement(&link.node_name, &link.fingerprint_hex);
                 adopt_layout_fingerprint(&link.node_name, &link.fingerprint_hex);
                 set_session(&weak, Some(link.node_name.clone()));
                 set_status(
                     &weak,
                     format!(
-                        "{} is linked — push past any edge to take control. Both computers stay usable; Disconnect ends the link.",
+                        "{} is linked — push past the arranged edge to take control. Both computers stay usable; Disconnect ends the link.",
                         link.node_name
                     ),
                 );
             }
-            // No live inbound AND no child at all: genuinely unlinked.
-            // (A running dial-back owns the display from here on — the
-            // peer merely sitting idle must not blank it.)
+            // Grace latch: a live link breathes (verify ends, episodes go
+            // idle, the dial-back respawns) — blank the display only after
+            // 45s of true silence, never on a gap between sessions.
             (Some(_), None) if !child_running(session) => {
-                set_session(&weak, None);
-                set_status(&weak, "Not connected".into());
+                let stale = last_link_seen.lock().ok().map_or(true, |seen| {
+                    seen.map_or(true, |when| {
+                        when.elapsed() > std::time::Duration::from_secs(45)
+                    })
+                });
+                if stale {
+                    set_session(&weak, None);
+                    set_status(&weak, "Not connected".into());
+                }
             }
             _ => {}
         }
@@ -2426,7 +2462,7 @@ fn relay_session_progress(
                 // arranged (ghost pins misroute every handoff).
                 adopt_link_fingerprint(&data_dir, address);
                 format!(
-                    "Connected to {address} — shared cursor is live both ways: push past any edge to drive the other screen, push back to return. Both computers stay usable. Disconnect ends the link."
+                    "Connected to {address} — shared cursor is live both ways: push past the arranged edge to drive the other screen, push back past the edge to return. Both computers stay usable. Disconnect ends the link."
                 )
             }
             "edge-ready" => {
@@ -2440,7 +2476,7 @@ fn relay_session_progress(
             }
             "local" => {
                 set_driving(weak, String::new());
-                "Edge control is on — this computer. Push past any edge to drive the other screen.".into()
+                "Edge control is on — this computer. Push past the arranged edge to drive the other screen.".into()
             }
             "locked" => {
                 set_driving(weak, String::new());
@@ -3107,15 +3143,14 @@ fn edge_ready_text() -> String {
                 .screens
                 .iter()
                 .find(|screen| screen.peer_fingerprint.is_some());
-            let any_edge = config.layout.single_peer_screen().is_some();
             match (config.layout.peer_exit_edge(), peer) {
-                (Some(edge), Some(screen)) if !any_edge => format!(
+                (Some(edge), Some(screen)) => format!(
                     "Edge control is on — push past the {} edge to drive {}. Push back past the edge to return here.",
                     edge_name(edge),
                     screen.name
                 ),
                 (_, Some(screen)) => format!(
-                    "Edge control is on — push past ANY edge to drive {}. Push back past any edge to return here.",
+                    "Edge control is on — {} is linked but has no facing edge yet: open Devices and place its screen beside yours.",
                     screen.name
                 ),
                 _ => "Edge control is on, but no linked screen is arranged yet — open Devices, place the other screen, and push past an edge.".into(),
