@@ -478,6 +478,28 @@ mod win32_hooks {
     unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+            // Own-echo oracle for the tag-less raw channel (see
+            // WheelDedup): our SendInput wheel always traverses this hook
+            // tagged, while the raw channel carries no tag at all.
+            if info.dwExtraInfo == crate::ECHO_TAG {
+                let own_message = wparam.0 as u32;
+                let now = std::time::Instant::now();
+                match own_message {
+                    WM_MOUSEWHEEL => wheel_dedup().note_hook(
+                        0,
+                        (info.mouseData >> 16) as i16 as i32,
+                        true,
+                        now,
+                    ),
+                    WM_MOUSEHWHEEL => wheel_dedup().note_hook(
+                        (info.mouseData >> 16) as i16 as i32,
+                        0,
+                        true,
+                        now,
+                    ),
+                    _ => {}
+                }
+            }
             // Same tag rule as the keyboard hook: skip our own echo, keep
             // everything else including vendor-synthesized scroll.
             if info.dwExtraInfo != crate::ECHO_TAG {
@@ -553,20 +575,31 @@ mod win32_hooks {
                         // and the old `/ 120` detent truncation rounded all
                         // of it to zero, so two-finger scroll never arrived
                         // remotely on any legacy KVM. The sender downgrades
-                        // to detents for older peers.
-                        send(InputEvent::SmoothWheel {
-                            x: 0,
-                            y: (info.mouseData >> 16) as i16 as i32,
-                        });
+                        // to detents for older peers. Filtered against the
+                        // raw HID channel (same tick, raw arrived first).
+                        let now = std::time::Instant::now();
+                        let (_, y) = wheel_dedup().filter_hook(
+                            0,
+                            (info.mouseData >> 16) as i16 as i32,
+                            now,
+                        );
+                        if y != 0 {
+                            send(InputEvent::SmoothWheel { x: 0, y });
+                        }
                         if BLOCK_LOCAL.load(Ordering::Acquire) {
                             return LRESULT(1);
                         }
                     }
                     WM_MOUSEHWHEEL => {
-                        send(InputEvent::SmoothWheel {
-                            x: (info.mouseData >> 16) as i16 as i32,
-                            y: 0,
-                        });
+                        let now = std::time::Instant::now();
+                        let (x, _) = wheel_dedup().filter_hook(
+                            (info.mouseData >> 16) as i16 as i32,
+                            0,
+                            now,
+                        );
+                        if x != 0 {
+                            send(InputEvent::SmoothWheel { x, y: 0 });
+                        }
                         if BLOCK_LOCAL.load(Ordering::Acquire) {
                             return LRESULT(1);
                         }
@@ -666,6 +699,20 @@ mod win32_hooks {
         if let Some((dx, dy)) = decode_raw_mouse_motion(&buffer[..result as usize]) {
             send(InputEvent::MouseMove { dx, dy });
         }
+        // HID wheel channel (the trackpad fix): precision touchpads report
+        // two-finger scroll in the raw HID report (RI_MOUSE_WHEEL), and some
+        // drivers never synthesize a hook-visible WM_MOUSEWHEEL for it — the
+        // hook then records zero scroll while Windows apps scroll, exactly
+        // the reported symptom. Read the raw wheel bits too; the dedup
+        // below keeps dual-delivery hardware to a single event.
+        let (wheel_x, wheel_y) = decode_raw_mouse_wheel(&buffer[..result as usize]);
+        if wheel_x != 0 || wheel_y != 0 {
+            let now = std::time::Instant::now();
+            let (x, y) = wheel_dedup().filter_raw(wheel_x, wheel_y, now);
+            if x != 0 || y != 0 {
+                send(InputEvent::SmoothWheel { x, y });
+            }
+        }
     }
 
     fn decode_raw_mouse_motion(data: &[u8]) -> Option<(i32, i32)> {
@@ -703,14 +750,140 @@ mod win32_hooks {
         (mouse.lLastX != 0 || mouse.lLastY != 0).then_some((mouse.lLastX, mouse.lLastY))
     }
 
+    /// Wheel bits of one raw mouse report, in WHEEL_DELTA 120ths
+    /// `(x, y)`. Zero when the report carries no wheel data. Absolute
+    /// motion mode does not affect the wheel channel.
+    fn decode_raw_mouse_wheel(data: &[u8]) -> (i32, i32) {
+        use windows::Win32::UI::WindowsAndMessaging::{RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL};
+
+        let header_size = std::mem::size_of::<RAWINPUTHEADER>();
+        let mouse_size = std::mem::size_of::<RAWMOUSE>();
+        if data.len() < header_size + mouse_size {
+            return (0, 0);
+        }
+        let header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const RAWINPUTHEADER) };
+        if header.dwType != RIM_TYPEMOUSE.0 {
+            return (0, 0);
+        }
+        let mouse =
+            unsafe { std::ptr::read_unaligned(data.as_ptr().add(header_size) as *const RAWMOUSE) };
+        // Same unaligned discipline as the motion decoder above.
+        let (button_flags, button_data) =
+            unsafe { (mouse.Anonymous.Anonymous.usButtonFlags, mouse.Anonymous.Anonymous.usButtonData) };
+        let delta = button_data as i16 as i32;
+        let flags = u32::from(button_flags);
+        let mut x = 0;
+        let mut y = 0;
+        if flags & RI_MOUSE_WHEEL != 0 {
+            y = delta;
+        }
+        if flags & RI_MOUSE_HWHEEL != 0 {
+            x = delta;
+        }
+        (x, y)
+    }
+
+    /// One hook thread owns every wheel receipt, so a plain mutex is
+    /// plenty: it serializes the hook proc and the raw window proc.
+    fn wheel_dedup() -> std::sync::MutexGuard<'static, WheelDedup> {
+        use std::sync::Mutex;
+
+        static DEDUP: Mutex<WheelDedup> = Mutex::new(WheelDedup::new());
+        DEDUP.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Our own SendInput echo stays suppressible for this long after the
+    /// tagged hook receipt (the raw channel carries no tag of its own).
+    const WHEEL_ECHO_WINDOW_MS: u128 = 30;
+    /// Same physical tick seen on both channels lands inside this window.
+    const WHEEL_DEDUP_WINDOW_MS: u128 = 20;
+
+    /// Cross-source wheel dedup + own-echo oracle. Pure apart from the
+    /// clock the caller passes in, so the windows are unit-tested.
+    #[derive(Debug, Default)]
+    struct WheelDedup {
+        last_hook: Option<(std::time::Instant, i8, i8)>,
+        last_raw: Option<(std::time::Instant, i8, i8)>,
+        last_own: Option<std::time::Instant>,
+    }
+
+    impl WheelDedup {
+        const fn new() -> Self {
+            Self {
+                last_hook: None,
+                last_raw: None,
+                last_own: None,
+            }
+        }
+
+        /// Record a hook wheel receipt; tagged ones are our own echo and
+        /// only arm the echo oracle, never the dedup window.
+        fn note_hook(&mut self, x: i32, y: i32, own: bool, now: std::time::Instant) {
+            if own {
+                self.last_own = Some(now);
+                return;
+            }
+            self.last_hook = Some((now, x.signum() as i8, y.signum() as i8));
+        }
+
+        /// Filter a hook tick against a just-seen raw tick (same gesture,
+        /// raw arrived first). Returns the surviving axes.
+        fn filter_hook(&mut self, x: i32, y: i32, now: std::time::Instant) -> (i32, i32) {
+            let x = if self.raw_reported(x, true, now) { 0 } else { x };
+            let y = if self.raw_reported(y, false, now) { 0 } else { y };
+            if x != 0 || y != 0 {
+                self.last_hook = Some((now, x.signum() as i8, y.signum() as i8));
+            }
+            (x, y)
+        }
+
+        /// Filter a raw tick: drop our own echo, then drop per-axis the
+        /// tick the hook already reported. Returns the surviving axes.
+        fn filter_raw(&mut self, x: i32, y: i32, now: std::time::Instant) -> (i32, i32) {
+            if let Some(own) = self.last_own {
+                if now.duration_since(own).as_millis() <= WHEEL_ECHO_WINDOW_MS {
+                    return (0, 0);
+                }
+            }
+            let x = if self.hook_reported(x, true, now) { 0 } else { x };
+            let y = if self.hook_reported(y, false, now) { 0 } else { y };
+            if x != 0 || y != 0 {
+                self.last_raw = Some((now, x.signum() as i8, y.signum() as i8));
+            }
+            (x, y)
+        }
+
+        fn hook_reported(&self, delta: i32, is_x: bool, now: std::time::Instant) -> bool {
+            let Some((at, sx, sy)) = self.last_hook else {
+                return false;
+            };
+            let reported = if is_x { sx } else { sy };
+            delta != 0
+                && reported == delta.signum() as i8
+                && now.duration_since(at).as_millis() <= WHEEL_DEDUP_WINDOW_MS
+        }
+
+        fn raw_reported(&self, delta: i32, is_x: bool, now: std::time::Instant) -> bool {
+            let Some((at, sx, sy)) = self.last_raw else {
+                return false;
+            };
+            let reported = if is_x { sx } else { sy };
+            delta != 0
+                && reported == delta.signum() as i8
+                && now.duration_since(at).as_millis() <= WHEEL_DEDUP_WINDOW_MS
+        }
+    }
+
     #[cfg(test)]
     mod raw_input_tests {
         use super::decode_raw_mouse_motion;
+        use super::{decode_raw_mouse_wheel, WheelDedup};
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::UI::Input::{
             MOUSE_MOVE_ABSOLUTE, MOUSE_STATE, RAWINPUT, RAWINPUTHEADER, RAWINPUT_0, RAWMOUSE,
             RAWMOUSE_0, RIM_TYPEMOUSE,
         };
+        use windows::Win32::UI::WindowsAndMessaging::{RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL};
 
         fn raw_mouse(flags: MOUSE_STATE, x: i32, y: i32) -> RAWINPUT {
             RAWINPUT {
@@ -776,6 +949,95 @@ mod win32_hooks {
                 )
             };
             assert_eq!(decode_raw_mouse_motion(bytes), Some((12, -4)));
+        }
+
+        fn raw_wheel(flags: u32, data: i16) -> RAWINPUT {
+            let mut raw = raw_mouse(MOUSE_STATE(0), 0, 0);
+            unsafe {
+                raw.data.mouse.Anonymous.Anonymous.usButtonFlags = flags as u16;
+                raw.data.mouse.Anonymous.Anonymous.usButtonData = data as u16;
+            }
+            raw
+        }
+
+        fn raw_bytes(raw: &RAWINPUT) -> &[u8] {
+            unsafe {
+                std::slice::from_raw_parts(
+                    (raw as *const RAWINPUT).cast::<u8>(),
+                    std::mem::size_of::<RAWINPUT>(),
+                )
+            }
+        }
+
+        #[test]
+        fn decodes_raw_wheel_reports_in_detent_units() {
+            // The HID wheel channel precision touchpads scroll through when
+            // no hook-visible WM_MOUSEWHEEL exists.
+            let raw = raw_wheel(RI_MOUSE_WHEEL, 120);
+            assert_eq!(decode_raw_mouse_wheel(raw_bytes(&raw)), (0, 120));
+            let raw = raw_wheel(RI_MOUSE_HWHEEL, -30);
+            assert_eq!(decode_raw_mouse_wheel(raw_bytes(&raw)), (-30, 0));
+            // Signed data survives the u16 wire field.
+            let raw = raw_wheel(RI_MOUSE_WHEEL, -120);
+            assert_eq!(decode_raw_mouse_wheel(raw_bytes(&raw)), (0, -120));
+            // No wheel bits, no wheel — even with motion present.
+            let raw = raw_mouse(MOUSE_STATE(0), 12, -4);
+            assert_eq!(decode_raw_mouse_wheel(raw_bytes(&raw)), (0, 0));
+            assert_eq!(decode_raw_mouse_wheel(&[]), (0, 0));
+        }
+
+        #[test]
+        fn wheel_dedup_passes_single_source_traffic() {
+            // One channel alone is never suppressed: only the SECOND
+            // channel's copy of the same tick dies.
+            let now = std::time::Instant::now();
+            let mut dedup = WheelDedup::new();
+            assert_eq!(dedup.filter_hook(0, 120, now), (0, 120));
+            assert_eq!(
+                dedup.filter_hook(0, 120, now + std::time::Duration::from_millis(5)),
+                (0, 120)
+            );
+            let mut dedup = WheelDedup::new();
+            assert_eq!(dedup.filter_raw(0, 120, now), (0, 120));
+            assert_eq!(
+                dedup.filter_raw(0, 120, now + std::time::Duration::from_millis(5)),
+                (0, 120)
+            );
+        }
+
+        #[test]
+        fn wheel_dedup_drops_the_second_copy_of_one_tick() {
+            // Dual-delivery hardware (hook + raw for one tick): whichever
+            // arrives second with the same sign inside the window dies.
+            let now = std::time::Instant::now();
+            let mut dedup = WheelDedup::new();
+            dedup.note_hook(0, 120, false, now);
+            assert_eq!(dedup.filter_raw(0, 120, now), (0, 0));
+            let mut dedup = WheelDedup::new();
+            assert_eq!(dedup.filter_raw(0, 120, now), (0, 120));
+            assert_eq!(dedup.filter_hook(0, 120, now), (0, 0));
+            // Opposite directions are different gestures, never copies.
+            let mut dedup = WheelDedup::new();
+            dedup.note_hook(0, 120, false, now);
+            assert_eq!(dedup.filter_raw(0, -120, now), (0, -120));
+            // Outside the window the same tick is new information.
+            let mut dedup = WheelDedup::new();
+            dedup.note_hook(0, 120, false, now);
+            let later = now + std::time::Duration::from_millis(50);
+            assert_eq!(dedup.filter_raw(0, 120, later), (0, 120));
+        }
+
+        #[test]
+        fn wheel_echo_oracle_drops_own_sendinput() {
+            // Our injected wheel has no raw tag channel, but it always
+            // crosses the hook tagged: raw wheel right after it is echo.
+            let now = std::time::Instant::now();
+            let mut dedup = WheelDedup::new();
+            dedup.note_hook(0, 120, true, now);
+            assert_eq!(dedup.filter_raw(0, 120, now), (0, 0));
+            // Genuine user scroll after the echo window passes through.
+            let later = now + std::time::Duration::from_millis(100);
+            assert_eq!(dedup.filter_raw(0, -45, later), (0, -45));
         }
     }
 
