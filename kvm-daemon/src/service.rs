@@ -2026,7 +2026,13 @@ async fn handle_topology_event(
             *last_transfer = Some(std::time::Instant::now());
             let (x, y) = router.cursor_position();
             let _ = capture_control.warp_cursor(x, y);
-            tracing::info!(?from, ?edge, "topology edge return; control is local");
+            // Armed-state telemetry: `armed=false` here is always a bug
+            // (the router clamps unarmed overflows); `armed=true` means
+            // the cursor settled inside and then brushed the boundary —
+            // the specified return gesture, however surprising it feels
+            // without edge feedback.
+            let (entry_edge, armed) = router.return_state();
+            tracing::info!(?from, ?edge, ?entry_edge, armed, x, y, "topology edge return; control is local");
             eprintln!("THEKVM_STATUS local");
         }
         RoutedEvent::Handoff {

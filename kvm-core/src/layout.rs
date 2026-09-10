@@ -461,6 +461,14 @@ impl EdgeRouter {
         self.active_remote
     }
 
+    /// Why the next home-facing overflow would (or would not) return:
+    /// the entry edge and whether the cursor has settled inside since.
+    /// Logged with every edge return so the journal proves design
+    /// (armed brush of the boundary) versus bug (unarmed fire).
+    pub fn return_state(&self) -> (Option<Edge>, bool) {
+        (self.entry_edge, self.return_armed)
+    }
+
     /// Switch the crossing discipline live (the Settings toggle): Single
     /// crosses only the arranged facing edge; Double additionally opens
     /// the other horizontal outer edge to the lone peer on a two-machine
