@@ -1408,6 +1408,33 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // Topology mode preserves local input until an edge transition is actually
     // selected. Once a remote screen owns the pointer, the platform backend is
     // switched to exclusive capture until control returns or the session dies.
+    // Parked drive stream: the last episode's accepted stream, kept across
+    // edge returns so the next push costs one Handoff frame instead of a
+    // dial (Deskflow always-ready parity without any protocol change).
+    let mut parked: Option<TopologySession> = None;
+    // Pre-warm one drive stream BEFORE capture starts (nothing queued yet,
+    // so a slow/dead peer cannot stall the hook): the first crossing then
+    // costs one Handoff frame instead of a dial plus just-in-time receiver
+    // provisioning. Bounded and best effort — a miss just means the first
+    // push opens cold like before.
+    if let Some(link) = link.as_ref() {
+        let prewarm = prewarm_link_stream(
+            &identity,
+            &peers,
+            &config,
+            &router,
+            link,
+            &dir,
+            local_geometry,
+        );
+        parked = match tokio::time::timeout(Duration::from_secs(5), prewarm).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                tracing::debug!("pre-warm timed out; first push opens cold");
+                None
+            }
+        };
+    }
     let (mut priority_rx, mut motion_rx, capture_control) = start_capture(false, true)?;
     let mut active: Option<TopologySession> = None;
     let mut clipboard = start_clipboard_agent(config.clipboard_enabled);
@@ -1502,33 +1529,80 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             continue;
                         }
                         let snapshot = capture_control.snapshot();
-                        match open_topology_session(TopologyOpen {
-                            router: &router,
-                            identity: &identity,
-                            peers: &peers,
-                            node_name: &config.device_name,
-                            target,
-                            target_x: handoff_x,
-                            target_y: handoff_y,
-                            state: snapshot.state,
-                            event_barrier: snapshot.last_event_id,
-                            first_event: (handoff.dx != 0 || handoff.dy != 0).then_some(
-                                InputEvent::MouseMove {
-                                    dx: handoff.dx,
-                                    dy: handoff.dy,
-                                },
-                            ),
-                            request_lock_screen: config.allow_lock_screen_control,
-                            mode: config.mode,
-                            local_geometry,
-                            clipboard_enabled,
-                            initial_clipboard: latest_clipboard.clone(),
-                            sequence: &mut sequence,
-                            clipboard_revision: &mut clipboard_revision,
-                            dir: &dir,
-                            link_id: link.as_ref().and_then(|link| link.link_id),
-                        }).await {
-                            Ok(session) => {
+                        let first_event = (handoff.dx != 0 || handoff.dy != 0).then_some(
+                            InputEvent::MouseMove {
+                                dx: handoff.dx,
+                                dy: handoff.dy,
+                            },
+                        );
+                        // A parked stream to this target resumes with one
+                        // Handoff frame; otherwise open fresh below.
+                        let mut session = match take_parked_for(&mut parked, target).await {
+                            Some(parked_session) => {
+                                match resume_parked_session(
+                                    parked_session,
+                                    &router,
+                                    target,
+                                    handoff_x,
+                                    handoff_y,
+                                    snapshot.state.clone(),
+                                    first_event,
+                                    latest_clipboard.clone(),
+                                    &mut clipboard_revision,
+                                    &mut sequence,
+                                    snapshot.last_event_id,
+                                )
+                                .await
+                                {
+                                    Ok(resumed) => Some(resumed),
+                                    Err(error) => {
+                                        tracing::debug!(%error, ?target, "parked drive stream went stale; opening a fresh episode");
+                                        None
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
+                        if session.is_none() {
+                            match open_topology_session(TopologyOpen {
+                                router: &router,
+                                identity: &identity,
+                                peers: &peers,
+                                node_name: &config.device_name,
+                                target,
+                                target_x: handoff_x,
+                                target_y: handoff_y,
+                                state: snapshot.state,
+                                event_barrier: snapshot.last_event_id,
+                                first_event,
+                                request_lock_screen: config.allow_lock_screen_control,
+                                mode: config.mode,
+                                local_geometry,
+                                clipboard_enabled,
+                                initial_clipboard: latest_clipboard.clone(),
+                                sequence: &mut sequence,
+                                clipboard_revision: &mut clipboard_revision,
+                                dir: &dir,
+                                link_id: link.as_ref().and_then(|link| link.link_id),
+                            }).await {
+                                Ok(opened) => session = Some(opened),
+                                Err(error) => {
+                                    // A banned epoch ends the child (the peer
+                                    // disconnected on purpose); anything else
+                                    // just returns control locally.
+                                    if is_link_ended_rejection(&error) {
+                                        eprintln!("THEKVM_STATUS ended link ended by the other side");
+                                        return Err(error);
+                                    }
+                                    let _ = router.restore_local(target);
+                                    let (x, y) = router.cursor_position();
+                                    let _ = capture_control.warp_cursor(x, y);
+                                    tracing::warn!(%error, ?target, "topology handoff target unavailable; returned control locally");
+                                    eprintln!("THEKVM_STATUS local");
+                                }
+                            }
+                        }
+                        if let Some(session) = session {
                                 capture_control.set_exclusive(true)?;
                                 active = Some(session);
                                 let name = router
@@ -1538,22 +1612,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                 tracing::info!(?target, "topology handoff continued to next peer");
                                 eprintln!("THEKVM_STATUS driving {name}");
                             }
-                            Err(error) => {
-                                // A banned epoch ends the child (the peer
-                                // disconnected on purpose); anything else
-                                // just returns control locally.
-                                if is_link_ended_rejection(&error) {
-                                    eprintln!("THEKVM_STATUS ended link ended by the other side");
-                                    return Err(error);
-                                }
-                                let _ = router.restore_local(target);
-                                let (x, y) = router.cursor_position();
-                                let _ = capture_control.warp_cursor(x, y);
-                                tracing::warn!(%error, ?target, "topology handoff target unavailable; returned control locally");
-                                eprintln!("THEKVM_STATUS local");
-                            }
                         }
-                    }
                     Some(RemoteSignal::Clipboard { revision, text }) => {
                         let Some(session) = active.as_mut() else {
                             continue;
@@ -1598,6 +1657,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     peers: &peers,
                     capture_control: &capture_control,
                     active: &mut active,
+                    parked: &mut parked,
                     link: link.as_ref(),
                     last_transfer: &mut last_transfer,
                     last_failed_episode: &mut last_failed_episode,
@@ -1630,6 +1690,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     peers: &peers,
                     capture_control: &capture_control,
                     active: &mut active,
+                    parked: &mut parked,
                     link: link.as_ref(),
                     last_transfer: &mut last_transfer,
                     last_failed_episode: &mut last_failed_episode,
@@ -1673,6 +1734,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         let session = active.take().expect("active session exists");
                         let target = session.target;
                         session.finish().await;
+                        // The association itself is suspect: drop the park
+                        // too, so the next push redials instead of
+                        // resuming a dead stream.
+                        if let Some(stale) = parked.take() {
+                            stale.finish().await;
+                        }
                         capture_control.set_exclusive(false)?;
                         discarded_event_barrier = discarded_event_barrier
                             .max(capture_control.snapshot().last_event_id);
@@ -1692,6 +1759,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         let session = active.take().expect("active session exists");
                         let target = session.target;
                         session.finish().await;
+                        // The association itself is suspect: drop the park
+                        // too, so the next push redials instead of
+                        // resuming a dead stream.
+                        if let Some(stale) = parked.take() {
+                            stale.finish().await;
+                        }
                         capture_control.set_exclusive(false)?;
                         discarded_event_barrier = discarded_event_barrier
                             .max(capture_control.snapshot().last_event_id);
@@ -1700,12 +1773,26 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         let _ = capture_control.warp_cursor(x, y);
                         eprintln!("THEKVM_STATUS local");
                     }
+                } else if let Some(session) = parked.as_mut() {
+                    // A parked stream still holds the peer's input slot and
+                    // provisioned injector: ping it so the lease never
+                    // reaps it and a silent death is noticed within seconds
+                    // instead of on the next push.
+                    if let Err(error) = write_frame(&mut session.send, &WireMessage::Ping { nonce: sequence }).await {
+                        tracing::debug!(%error, "parked drive stream died; next push reopens");
+                        if let Some(stale) = parked.take() {
+                            stale.finish().await;
+                        }
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
                 capture_control.set_exclusive(false)?;
                 if let Some(session) = active.take() {
                     session.finish().await;
+                }
+                if let Some(stale) = parked.take() {
+                    stale.finish().await;
                 }
                 eprintln!("THEKVM_STATUS ended stopped");
                 return Ok(());
@@ -1734,6 +1821,13 @@ struct TopologySession {
     wheel_captured: u64,
     smooth_captured: u64,
     wheel_forwarded: u64,
+    /// The peer's self-reported geometry (for re-mapping re-entry points
+    /// when this stream is reused after parking).
+    peer_geometry: Option<ScreenGeometry>,
+    /// True once a PointerHandoff has gone out on this stream. Pre-warmed
+    /// streams that never drove skip the end-of-episode census line so the
+    /// journal never shows a phantom drive.
+    handed_off: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1755,14 +1849,16 @@ enum RemoteSignal {
 
 impl TopologySession {
     async fn finish(self) {
-        tracing::info!(
-            target = ?self.target,
-            wheel_captured = self.wheel_captured,
-            smooth_captured = self.smooth_captured,
-            wheel_forwarded = self.wheel_forwarded,
-            peer_smooth = self.peer_smooth,
-            "topology episode ended",
-        );
+        if self.handed_off {
+            tracing::info!(
+                target = ?self.target,
+                wheel_captured = self.wheel_captured,
+                smooth_captured = self.smooth_captured,
+                wheel_forwarded = self.wheel_forwarded,
+                peer_smooth = self.peer_smooth,
+                "topology episode ended",
+            );
+        }
         let mut send = self.send;
         let _ = write_frame(&mut send, &WireMessage::ReleaseAll).await;
         let _ = send.finish();
@@ -1772,9 +1868,10 @@ impl TopologySession {
 
 /// A verified logical link to one peer: the upfront dial proved
 /// reachability and mutual trust (and yielded the LIVE fingerprint —
-/// ghost pins in the book can no longer misroute). Drive episodes dial
-/// fresh per crossing (cheap on LAN) and only ever to this peer: MWB
-/// switches solely to connected machines, never to a stranger in a field.
+/// ghost pins in the book can no longer misroute). Drive streams persist
+/// across crossings (parked on return, pre-warmed at edge-ready) and only
+/// ever target this peer: MWB switches solely to connected machines,
+/// never to a stranger in a field.
 #[derive(Debug, Clone)]
 struct TopologyLink {
     fingerprint: String,
@@ -1869,6 +1966,7 @@ struct TopologyEventContext<'a> {
     peers: &'a PeerBook,
     capture_control: &'a CaptureGuard,
     active: &'a mut Option<TopologySession>,
+    parked: &'a mut Option<TopologySession>,
     link: Option<&'a TopologyLink>,
     last_transfer: &'a mut Option<std::time::Instant>,
     last_failed_episode: &'a mut Option<std::time::Instant>,
@@ -1898,6 +1996,7 @@ async fn handle_topology_event(
         peers,
         capture_control,
         active,
+        parked,
         link,
         last_transfer,
         last_failed_episode,
@@ -1931,6 +2030,11 @@ async fn handle_topology_event(
                 let _ = router.restore_local(target);
                 let (x, y) = router.cursor_position();
                 let _ = capture_control.warp_cursor(x, y);
+            }
+            // A lock is total: the parked stream goes too, so nothing
+            // resumes under the lock.
+            if let Some(stale) = parked.take() {
+                stale.finish().await;
             }
             router.set_locked(true);
             tracing::info!("edge control locked to this computer");
@@ -2001,6 +2105,11 @@ async fn handle_topology_event(
                 let session = active.take().expect("active session exists");
                 let target = session.target;
                 session.finish().await;
+                // The association itself is suspect: drop the park too, so
+                // the next push redials instead of resuming a dead stream.
+                if let Some(stale) = parked.take() {
+                    stale.finish().await;
+                }
                 capture_control.set_exclusive(false)?;
                 *discarded_event_barrier = (*discarded_event_barrier)
                     .max(capture_control.snapshot().last_event_id);
@@ -2013,12 +2122,16 @@ async fn handle_topology_event(
         }
         RoutedEvent::ReturnHome { from, edge } => {
             // Deskflow-style edge return: the virtual remote cursor came
-            // back past the facing edge, so end the episode and re-enter
+            // back past the facing edge, so park the episode and re-enter
             // at the exact saved pixel — no network round trip, no
-            // session death, no mid-screen landing. The transfer stamp
-            // doubles as MWB lastJump debounce against instant re-exit.
+            // session death, no mid-screen landing. The stream stays open
+            // (parked): the next push resumes it with one Handoff frame
+            // instead of a dial. The transfer stamp doubles as MWB
+            // lastJump debounce against instant re-exit.
             if let Some(session) = active.take() {
-                session.finish().await;
+                if let Some(stale) = parked.replace(session) {
+                    stale.finish().await;
+                }
             }
             capture_control.set_exclusive(false)?;
             *discarded_event_barrier = (*discarded_event_barrier)
@@ -2077,57 +2190,94 @@ async fn handle_topology_event(
             }
             let snapshot = capture_control.snapshot();
             let opened_at = std::time::Instant::now();
-            match open_topology_session(TopologyOpen {
-                router,
-                identity,
-                peers,
-                node_name,
-                target,
-                target_x,
-                target_y,
-                state: snapshot.state,
-                event_barrier: snapshot.last_event_id,
-                first_event: Some(event),
-                request_lock_screen,
-                mode,
-                local_geometry,
-                clipboard_enabled,
-                initial_clipboard,
-                clipboard_revision,
-                sequence,
-                dir,
-                link_id: link.and_then(|link| link.link_id),
-            })
-            .await
-            {
-                Ok(session) => {
-                    capture_control.set_exclusive(true)?;
-                    *last_transfer = Some(std::time::Instant::now());
-                    *active = Some(session);
-                    let name = router
-                        .screen(target)
-                        .map(|screen| screen.name.clone())
-                        .unwrap_or_else(|| format!("screen {}", target.0));
-                    // open_ms proves the crossing cost (warm stream vs
-                    // cold dial); local_wheel names scroll that arrived
-                    // while nobody was driven.
-                    tracing::info!(?target, open_ms = opened_at.elapsed().as_millis(), local_wheel = *local_wheel_dropped, "topology handoff activated");
-                    eprintln!("THEKVM_STATUS driving {name}");
-                }
-                Err(error) => {
-                    // A banned epoch is a deliberate remote Disconnect: end
-                    // the child so the UI reports it, instead of warning
-                    // locally and retrying a dead link forever.
-                    if is_link_ended_rejection(&error) {
-                        eprintln!("THEKVM_STATUS ended link ended by the other side");
-                        return Err(error);
+            // Parked-stream reuse: a crossing on the live drive stream
+            // costs one Handoff frame (~0ms on LAN), never a dial. Falls
+            // back to a fresh episode when the park is stale or gone.
+            let mut resumed = false;
+            let mut session = match take_parked_for(parked, target).await {
+                Some(parked_session) => {
+                    match resume_parked_session(
+                        parked_session,
+                        router,
+                        target,
+                        target_x,
+                        target_y,
+                        snapshot.state.clone(),
+                        Some(event),
+                        initial_clipboard.clone(),
+                        &mut *clipboard_revision,
+                        &mut *sequence,
+                        snapshot.last_event_id,
+                    )
+                    .await
+                    {
+                        Ok(resumed_session) => {
+                            resumed = true;
+                            Some(resumed_session)
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, ?target, "parked drive stream went stale; opening a fresh episode");
+                            None
+                        }
                     }
-                    *last_failed_episode = Some(std::time::Instant::now());
-                    let _ = capture_control.set_exclusive(false);
-                    let _ = router.restore_local(target);
-                    park_inside(router, edge);
-                    tracing::warn!(%error, ?target, "topology target unavailable; control remains local");
                 }
+                None => None,
+            };
+            if session.is_none() {
+                match open_topology_session(TopologyOpen {
+                    router,
+                    identity,
+                    peers,
+                    node_name,
+                    target,
+                    target_x,
+                    target_y,
+                    state: snapshot.state,
+                    event_barrier: snapshot.last_event_id,
+                    first_event: Some(event),
+                    request_lock_screen,
+                    mode,
+                    local_geometry,
+                    clipboard_enabled,
+                    initial_clipboard,
+                    clipboard_revision,
+                    sequence,
+                    dir,
+                    link_id: link.and_then(|link| link.link_id),
+                })
+                .await
+                {
+                    Ok(opened) => session = Some(opened),
+                    Err(error) => {
+                        // A banned epoch is a deliberate remote Disconnect: end
+                        // the child so the UI reports it, instead of warning
+                        // locally and retrying a dead link forever.
+                        if is_link_ended_rejection(&error) {
+                            eprintln!("THEKVM_STATUS ended link ended by the other side");
+                            return Err(error);
+                        }
+                        *last_failed_episode = Some(std::time::Instant::now());
+                        let _ = capture_control.set_exclusive(false);
+                        let _ = router.restore_local(target);
+                        park_inside(router, edge);
+                        tracing::warn!(%error, ?target, "topology target unavailable; control remains local");
+                    }
+                }
+            }
+            if let Some(session) = session {
+                capture_control.set_exclusive(true)?;
+                *last_transfer = Some(std::time::Instant::now());
+                *active = Some(session);
+                let name = router
+                    .screen(target)
+                    .map(|screen| screen.name.clone())
+                    .unwrap_or_else(|| format!("screen {}", target.0));
+                // open_ms proves the crossing cost (a resumed park reads
+                // ~0ms; a cold dial reads handshake + provisioning);
+                // local_wheel names scroll that arrived while nobody was
+                // driven.
+                tracing::info!(?target, open_ms = opened_at.elapsed().as_millis(), resumed, local_wheel = *local_wheel_dropped, "topology handoff activated");
+                eprintln!("THEKVM_STATUS driving {name}");
             }
         }
     }
@@ -2227,30 +2377,20 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         }
     }
     let clipboard_enabled = capabilities.clipboard_enabled;
-    let target_geometry = ScreenGeometry {
-        screen_id: target.0,
-        width: screen.width,
-        height: screen.height,
-    };
-    let (target_x, target_y, wire_geometry) = match capabilities
-        .screen_geometry
-        .filter(|geometry| geometry.screen_id == target.0)
-    {
-        Some(peer_geometry) => {
-            let (x, y) = remap_position(target_x, target_y, Some(target_geometry), peer_geometry);
-            (x, y, Some(peer_geometry))
-        }
-        None => (
-            target_x.min(target_geometry.width.saturating_sub(1)),
-            target_y.min(target_geometry.height.saturating_sub(1)),
-            None,
-        ),
-    };
+    let (target_name, target_x, target_y, wire_geometry) = handoff_wire_target(
+        router,
+        target,
+        target_x,
+        target_y,
+        capabilities
+            .screen_geometry
+            .filter(|geometry| geometry.screen_id == target.0),
+    )?;
     write_frame(
         &mut send,
         &WireMessage::PointerHandoff {
             screen_id: target.0,
-            target_name: screen.name.clone(),
+            target_name,
             x: target_x,
             y: target_y,
             screen_geometry: wire_geometry,
@@ -2273,14 +2413,19 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
             }
         }
     }
-    let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
-    let response_drain = tokio::spawn(drain_peer_responses(recv, signal_tx));
+    let mut session = spawn_episode_driver(
+        conn,
+        send,
+        recv,
+        capabilities,
+        target,
+        event_barrier,
+    );
     // Normalize the first event for this peer's scroll capability exactly
     // like every later event: an older peer gets detents, never raw 120ths
     // it would misread as hundreds of detents.
-    let mut wheel_debt = WheelDowngrade::default();
     let first_event = first_event
-        .and_then(|event| outgoing_wheel_event(event, capabilities.smooth_scroll, &mut wheel_debt));
+        .and_then(|event| outgoing_wheel_event(event, session.peer_smooth, &mut session.wheel_debt));
     if let Some(event) = first_event {
         *sequence = sequence.wrapping_add(1);
         // Keep the first post-handoff motion on the same ordered stream as
@@ -2288,7 +2433,7 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         // and be applied before the receiver knows which logical screen it
         // owns.
         write_frame(
-            &mut send,
+            &mut session.send,
             &WireMessage::Input(InputPacket {
                 sequence: *sequence,
                 event,
@@ -2296,21 +2441,238 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         )
         .await?;
     }
-    Ok(TopologySession {
+    session.handed_off = true;
+    Ok(session)
+}
+
+/// Policy every episode dial presents (fresh, reused, or pre-warmed): one
+/// constructor so all three prove the same node, mode, clipboard, geometry
+/// and link epoch.
+fn episode_policy<'a>(
+    config: &'a Config,
+    link: Option<&'a TopologyLink>,
+    local_geometry: Option<ScreenGeometry>,
+) -> ConnectPolicy<'a> {
+    ConnectPolicy {
+        node_name: &config.device_name,
+        request_lock_screen: config.allow_lock_screen_control,
+        mode: config.mode,
+        clipboard_enabled: config.clipboard_enabled,
+        screen_geometry: local_geometry,
+        link_id: link.and_then(|link| link.link_id),
+    }
+}
+
+/// Take the parked drive stream when it already targets this screen and its
+/// association is still alive. A stale park (wrong target, dead
+/// association) is finished here — freeing the peer's input slot — so a
+/// fresh episode follows instead of leaking a zombie.
+async fn take_parked_for(
+    parked: &mut Option<TopologySession>,
+    target: ScreenId,
+) -> Option<TopologySession> {
+    let session = parked.take()?;
+    if session.target == target && session.connection.close_reason().is_none() {
+        return Some(session);
+    }
+    session.finish().await;
+    None
+}
+
+/// Drive on an idle/pre-warmed or parked stream: Handoff + state + first
+/// input go out on the ALREADY-ACCEPTED stream, so a crossing costs one
+/// frame (~0ms on LAN), never a dial. Our fresh push wins: anything the
+/// peer queued while parked is dropped before driving.
+#[allow(clippy::too_many_arguments)]
+async fn resume_parked_session(
+    session: TopologySession,
+    router: &EdgeRouter,
+    target: ScreenId,
+    target_x: u32,
+    target_y: u32,
+    state: InputState,
+    first_event: Option<InputEvent>,
+    initial_clipboard: Option<String>,
+    clipboard_revision: &mut u64,
+    sequence: &mut u64,
+    event_barrier: u64,
+) -> Result<TopologySession> {
+    let mut session = session;
+    while session.signals.try_recv().is_ok() {}
+    session.event_barrier = event_barrier;
+    let (target_name, target_x, target_y, wire_geometry) = handoff_wire_target(
+        router,
         target,
-        connection: conn,
+        target_x,
+        target_y,
+        session
+            .peer_geometry
+            .filter(|geometry| geometry.screen_id == target.0),
+    )?;
+    write_frame(
+        &mut session.send,
+        &WireMessage::PointerHandoff {
+            screen_id: target.0,
+            target_name,
+            x: target_x,
+            y: target_y,
+            screen_geometry: wire_geometry,
+        },
+    )
+    .await?;
+    send_state_sync(&mut session.send, state).await?;
+    if session.clipboard_enabled {
+        if let Some(text) = initial_clipboard {
+            if text.len() <= kvm_protocol::wire::MAX_CLIPBOARD_TEXT_BYTES {
+                *clipboard_revision = clipboard_revision.wrapping_add(1);
+                write_frame(
+                    &mut session.send,
+                    &WireMessage::ClipboardText {
+                        revision: *clipboard_revision,
+                        text,
+                    },
+                )
+                .await?;
+            }
+        }
+    }
+    let first_event = first_event
+        .and_then(|event| outgoing_wheel_event(event, session.peer_smooth, &mut session.wheel_debt));
+    if let Some(event) = first_event {
+        *sequence = sequence.wrapping_add(1);
+        // Same ordering rule as a fresh open: the first post-handoff
+        // motion rides the stream, never a datagram.
+        write_frame(
+            &mut session.send,
+            &WireMessage::Input(InputPacket {
+                sequence: *sequence,
+                event,
+            }),
+        )
+        .await?;
+    }
+    session.handed_off = true;
+    Ok(session)
+}
+
+/// Pre-warm the drive stream at edge-ready (always-ready parity): open one
+/// episode stream on the live association BEFORE any crossing, so even the
+/// first push costs one Handoff frame instead of a dial plus a
+/// just-in-time receiver provisioning (uinput create + helpers). Silent on
+/// failure — the first real push opens cold exactly as before.
+#[allow(clippy::too_many_arguments)]
+async fn prewarm_link_stream(
+    identity: &Identity,
+    peers: &PeerBook,
+    config: &Config,
+    router: &EdgeRouter,
+    link: &TopologyLink,
+    dir: &std::path::Path,
+    local_geometry: Option<ScreenGeometry>,
+) -> Option<TopologySession> {
+    let screen = router.layout().screens.iter().find(|screen| {
+        screen.peer_fingerprint.as_deref() == Some(link.fingerprint.as_str())
+    })?;
+    let target = screen.id;
+    let policy = episode_policy(config, Some(link), local_geometry);
+    let (conn, send, recv, capabilities) = match take_warm_link(&link.fingerprint) {
+        Some(warm) => match open_episode_stream(&warm, policy).await {
+            Ok((send, recv, capabilities)) => (warm, send, recv, capabilities),
+            Err(error) => {
+                tracing::debug!(%error, "pre-warm on the warm link failed; dialling cold");
+                let (conn, send, recv, capabilities, _) =
+                    cold_topology_dial(identity, peers, &link.fingerprint, &screen.name, policy, dir)
+                        .await
+                        .map_err(|error| {
+                            tracing::debug!(%error, "pre-warm cold dial failed");
+                            error
+                        })
+                        .ok()?;
+                store_warm_link(&conn, &link.fingerprint);
+                (conn, send, recv, capabilities)
+            }
+        },
+        None => {
+            let (conn, send, recv, capabilities, _) =
+                cold_topology_dial(identity, peers, &link.fingerprint, &screen.name, policy, dir)
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(%error, "pre-warm cold dial failed");
+                        error
+                    })
+                    .ok()?;
+            store_warm_link(&conn, &link.fingerprint);
+            (conn, send, recv, capabilities)
+        }
+    };
+    tracing::info!(?target, "link drive stream pre-warmed; first crossing needs no dial");
+    Some(spawn_episode_driver(conn, send, recv, capabilities, target, 0))
+}
+
+/// Map an edge-entry point into the peer's current geometry and name the
+/// target screen. Shared by fresh opens and parked resumes so both land
+/// identically — entry at the proportional edge point, never mid-screen.
+fn handoff_wire_target(
+    router: &EdgeRouter,
+    target: ScreenId,
+    target_x: u32,
+    target_y: u32,
+    peer_geometry: Option<ScreenGeometry>,
+) -> Result<(String, u32, u32, Option<ScreenGeometry>)> {
+    let screen = router
+        .screen(target)
+        .context("topology target screen disappeared")?;
+    let target_geometry = ScreenGeometry {
+        screen_id: target.0,
+        width: screen.width,
+        height: screen.height,
+    };
+    let (x, y, wire_geometry) = match peer_geometry {
+        Some(peer_geometry) => {
+            let (x, y) = remap_position(target_x, target_y, Some(target_geometry), peer_geometry);
+            (x, y, Some(peer_geometry))
+        }
+        None => (
+            target_x.min(target_geometry.width.saturating_sub(1)),
+            target_y.min(target_geometry.height.saturating_sub(1)),
+            None,
+        ),
+    };
+    Ok((screen.name.clone(), x, y, wire_geometry))
+}
+
+/// Build a drive session around an already-accepted episode stream — a
+/// fresh dial and a parked reuse converge here: response drain, capability
+/// snapshot, quiet census. Handoff/state/first-input go out next (fresh
+/// open sends them inline below; parked reuse sends them in
+/// `resume_parked_session`).
+fn spawn_episode_driver(
+    connection: quinn::Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    capabilities: SessionCapabilities,
+    target: ScreenId,
+    event_barrier: u64,
+) -> TopologySession {
+    let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let response_drain = tokio::spawn(drain_peer_responses(recv, signal_tx));
+    TopologySession {
+        target,
+        connection,
         send,
         signals: signal_rx,
         response_drain,
         event_barrier,
-        clipboard_enabled,
+        clipboard_enabled: capabilities.clipboard_enabled,
         remote_clipboard_revision: 0,
         peer_smooth: capabilities.smooth_scroll,
-        wheel_debt,
+        peer_geometry: capabilities.screen_geometry,
+        handed_off: false,
+        wheel_debt: WheelDowngrade::default(),
         wheel_captured: 0,
         smooth_captured: 0,
         wheel_forwarded: 0,
-    })
+    }
 }
 
 /// Cold dial for one topology episode: resolve the peer's daemon address
@@ -3760,6 +4122,17 @@ fn outgoing_wheel_event(
     let InputEvent::SmoothWheel { x, y } = event else {
         return Some(event);
     };
+    // Like the receiver's bank: a scroll reversal drops the stale debt
+    // first, so the turn acts at once instead of paying off the old
+    // direction. (Live peers are smooth and skip this entirely; this is
+    // the legacy-detent path.) A zero axis carries no information and
+    // must not reset the other axis's bank.
+    if x != 0 && debt.x.signum() != 0 && debt.x.signum() != x.signum() {
+        debt.x = 0;
+    }
+    if y != 0 && debt.y.signum() != 0 && debt.y.signum() != y.signum() {
+        debt.y = 0;
+    }
     debt.x = debt.x.saturating_add(x);
     debt.y = debt.y.saturating_add(y);
     // Truncation toward zero: a sub-detent remainder in either direction
@@ -5143,6 +5516,35 @@ mod tests {
             outgoing_wheel_event(InputEvent::MouseMove { dx: 3, dy: 4 }, false, &mut debt),
             Some(InputEvent::MouseMove { dx: 3, dy: 4 })
         );
+    }
+
+    #[test]
+    fn smooth_wheel_downgrade_reversal_drops_stale_debt() {
+        use kvm_core::InputEvent;
+        let mut debt = WheelDowngrade::default();
+        // Bank +100 down, then reverse with -10: acts at once (bank
+        // cleared), sends nothing yet — no dead first detent.
+        assert_eq!(
+            outgoing_wheel_event(InputEvent::SmoothWheel { x: 0, y: 100 }, false, &mut debt),
+            None
+        );
+        assert_eq!(
+            outgoing_wheel_event(InputEvent::SmoothWheel { x: 0, y: -10 }, false, &mut debt),
+            None
+        );
+        assert_eq!(debt.y, -10);
+        // A zero axis never resets the other axis's bank: banking x while
+        // a y bank sits untouched must preserve both.
+        let mut debt2 = WheelDowngrade::default();
+        assert_eq!(
+            outgoing_wheel_event(InputEvent::SmoothWheel { x: 0, y: 100 }, false, &mut debt2),
+            None
+        );
+        assert_eq!(
+            outgoing_wheel_event(InputEvent::SmoothWheel { x: 50, y: 0 }, false, &mut debt2),
+            None
+        );
+        assert_eq!((debt2.x, debt2.y), (50, 100));
     }
 
     #[test]

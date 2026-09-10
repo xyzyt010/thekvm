@@ -101,6 +101,28 @@ mod linux_uinput {
         wheel_debt_y: i32,
     }
 
+    /// Bank one smooth-scroll axis (120ths): returns the whole detents to
+    /// emit on the legacy axis plus the new banked remainder. A scroll
+    /// reversal drops the stale bank first: banked +100 followed by -10
+    /// scrolls up at once instead of sitting at +90 invisible. Without
+    /// this, every direction change eats the first detent — the mushy,
+    /// unnatural feel that makes cross-machine touchpad scroll feel
+    /// broken even when every event arrives.
+    fn bank_smooth_debt(debt: i32, delta: i32) -> (i32, i32) {
+        // A zero axis carries no information and never resets the bank.
+        if delta == 0 {
+            return (0, debt);
+        }
+        let debt = if debt.signum() != 0 && debt.signum() != delta.signum() {
+            0
+        } else {
+            debt
+        };
+        let debt = debt.saturating_add(delta);
+        let detents = debt / 120;
+        (detents, debt - detents.saturating_mul(120))
+    }
+
     impl UinputDevice {
         pub fn create() -> Result<Self, PlatformError> {
             let open = || {
@@ -226,9 +248,8 @@ mod linux_uinput {
                     // vanishing. Truncation toward zero keeps both
                     // directions symmetric.
                     if y != 0 {
-                        self.wheel_debt_y = self.wheel_debt_y.saturating_add(y);
-                        let detents = self.wheel_debt_y / 120;
-                        self.wheel_debt_y -= detents.saturating_mul(120);
+                        let (detents, debt) = bank_smooth_debt(self.wheel_debt_y, y);
+                        self.wheel_debt_y = debt;
                         if detents != 0 {
                             Self::emit(&mut self.mouse, EV_REL, REL_WHEEL, detents)
                                 .map_err(io_error)?;
@@ -237,9 +258,8 @@ mod linux_uinput {
                             .map_err(io_error)?;
                     }
                     if x != 0 {
-                        self.wheel_debt_x = self.wheel_debt_x.saturating_add(x);
-                        let detents = self.wheel_debt_x / 120;
-                        self.wheel_debt_x -= detents.saturating_mul(120);
+                        let (detents, debt) = bank_smooth_debt(self.wheel_debt_x, x);
+                        self.wheel_debt_x = debt;
                         if detents != 0 {
                             Self::emit(&mut self.mouse, EV_REL, REL_HWHEEL, detents)
                                 .map_err(io_error)?;
@@ -418,7 +438,7 @@ mod linux_uinput {
 
     #[cfg(test)]
     mod tests {
-        use super::hid_to_evdev;
+        use super::{bank_smooth_debt, hid_to_evdev};
 
         #[test]
         fn preserves_non_linear_linux_keypad_codes() {
@@ -426,6 +446,38 @@ mod linux_uinput {
             assert_eq!(hid_to_evdev(0x5c), Some(75)); // keypad 4
             assert_eq!(hid_to_evdev(0x5f), Some(71)); // keypad 7
             assert_eq!(hid_to_evdev(0x62), Some(82)); // keypad 0
+        }
+
+        #[test]
+        fn smooth_debt_banks_sub_detents_into_detents() {
+            // +30 four times: silent, silent, silent, one detent emitted.
+            let (d, debt) = bank_smooth_debt(0, 30);
+            assert_eq!((d, debt), (0, 30));
+            let (d, debt) = bank_smooth_debt(debt, 30);
+            assert_eq!((d, debt), (0, 60));
+            let (d, debt) = bank_smooth_debt(debt, 30);
+            assert_eq!((d, debt), (0, 90));
+            let (d, debt) = bank_smooth_debt(debt, 30);
+            assert_eq!((d, debt), (1, 0));
+            // Negative direction is symmetric.
+            let (d, debt) = bank_smooth_debt(0, -130);
+            assert_eq!((d, debt), (-1, -10));
+            // A zero delta carries no information and never resets.
+            let (d, debt) = bank_smooth_debt(100, 0);
+            assert_eq!((d, debt), (0, 100));
+        }
+
+        #[test]
+        fn smooth_debt_reversal_drops_the_stale_bank() {
+            // Scroll down almost a detent, then reverse: the reversal
+            // must act at once instead of paying off the old bank.
+            let (_, debt) = bank_smooth_debt(0, 100);
+            assert_eq!(debt, 100);
+            let (d, debt) = bank_smooth_debt(debt, -10);
+            assert_eq!((d, debt), (0, -10));
+            // And back the other way from a negative bank.
+            let (d, debt) = bank_smooth_debt(-100, 130);
+            assert_eq!((d, debt), (1, 10));
         }
 
         #[test]
