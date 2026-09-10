@@ -2035,7 +2035,23 @@ async fn handle_topology_event(
             .unwrap_or(true);
         if due {
             *last_resync = Some(Instant::now());
-            match kvm_platform::capture::current_cursor_position() {
+    // Real geometry BEFORE the seed (Deskflow getShape parity): the
+    // crossing edge must sit on the visible edge. A layout in fallback
+    // dims while the pointer lives in physical ones fires crossings the
+    // user sees as "far from any edge" — on either computer.
+    match kvm_platform::capture::screen_size() {
+        Ok(Some((width, height))) => {
+            match router.adopt_local_screen_size(width, height) {
+                Some((w, h)) => {
+                    tracing::info!(width = w, height = h, "topology local geometry measured")
+                }
+                None => tracing::warn!("measured screen size rejected; keeping configured geometry"),
+            }
+        }
+        Ok(None) => tracing::debug!("platform did not expose a screen size; keeping configured geometry"),
+        Err(error) => tracing::debug!(%error, "could not query screen size"),
+    }
+    match kvm_platform::capture::current_cursor_position() {
                 Ok(Some((x, y))) => router.resync_if_local(x, y),
                 Ok(None) => {}
                 Err(error) => {
@@ -3782,6 +3798,13 @@ async fn handle_connection(
             let mut smooth_count = 0u64;
             let mut remote_screen = None;
             let mut remote_cursor = None;
+            // Push-through run for the stateless receiver hop (same
+            // EDGE_PUSH_PX the stateful router demands): one stray motion
+            // datagram must never end the episode — sustained outward
+            // overflow on one edge earns the HandoffRequest. Reset below
+            // whenever motion comes back inside.
+            let mut hop_edge: Option<kvm_core::Edge> = None;
+            let mut hop_accum: i64 = 0;
             let mut clipboard_revision = 0u64;
             let mut remote_clipboard_revision = 0u64;
             let mut lease_check = tokio::time::interval(Duration::from_secs(5));
@@ -3823,6 +3846,8 @@ async fn handle_connection(
                                     &mut seen_sequences,
                                     &mut motion_sequence,
                                     peer_screen_geometry,
+                                    &mut hop_edge,
+                                    &mut hop_accum,
                                 )
                                 .await?
                                 {
@@ -3944,6 +3969,8 @@ async fn handle_connection(
                             &mut seen_sequences,
                             &mut motion_sequence,
                             peer_screen_geometry,
+                            &mut hop_edge,
+                            &mut hop_accum,
                         )
                         .await?
                         {
@@ -4055,6 +4082,8 @@ async fn process_remote_input(
     seen_sequences: &mut BTreeSet<u64>,
     motion_sequence: &mut MotionSequence,
     peer_screen_geometry: Option<ScreenGeometry>,
+    hop_edge: &mut Option<kvm_core::Edge>,
+    hop_accum: &mut i64,
 ) -> Result<bool> {
     if !seen_sequences.insert(packet.sequence) {
         return Ok(false);
@@ -4078,11 +4107,38 @@ async fn process_remote_input(
     if let (Some(screen_id), Some((x, y)), InputEvent::MouseMove { dx, dy }) =
         (*remote_screen, *remote_cursor, packet.event)
     {
-        if let Some(handoff) =
-            config
+        // Push-through parity with the stateful router: the old code asked
+        // handoff_for_motion on EVERY motion step, so a single 1px virtual
+        // overflow ended the episode — the "Mint exits while visibly far
+        // from the edge" flap (virtual edge from wrong dims, echo, or one
+        // stray datagram). Now the run must reach EDGE_PUSH_PX on one
+        // edge before a HandoffRequest goes out; anything less clamps the
+        // tracked cursor and keeps driving.
+        let mut hop_ready = false;
+        if let Some(screen) = config.layout.screen(screen_id) {
+            match kvm_core::edge_overflow(screen.width, screen.height, x, y, dx, dy) {
+                Some((edge, overflow)) => {
+                    if *hop_edge == Some(edge) {
+                        *hop_accum += overflow;
+                    } else {
+                        *hop_edge = Some(edge);
+                        *hop_accum = overflow;
+                    }
+                    hop_ready = *hop_accum >= kvm_core::EDGE_PUSH_PX;
+                }
+                None => {
+                    *hop_edge = None;
+                    *hop_accum = 0;
+                }
+            }
+        }
+        if hop_ready {
+            *hop_edge = None;
+            *hop_accum = 0;
+            if let Some(handoff) = config
                 .layout
                 .handoff_for_motion(screen_id, x, y, dx, dy, config.edge_mode)
-        {
+            {
             let screen = config
                 .layout
                 .screen(screen_id)
@@ -4144,7 +4200,10 @@ async fn process_remote_input(
             )
             .await?;
             return Ok(true);
+            }
         }
+        // Sub-threshold overflow lands here too: the tracked cursor pins
+        // at the border (never past it) and the episode keeps driving.
         if let Some(screen) = config.layout.screen(screen_id) {
             let next_x =
                 (i64::from(x) + i64::from(dx)).clamp(0, i64::from(screen.width - 1)) as u32;
@@ -4183,17 +4242,13 @@ fn outgoing_wheel_event(
     let InputEvent::SmoothWheel { x, y } = event else {
         return Some(event);
     };
-    // Like the receiver's bank: a scroll reversal drops the stale debt
-    // first, so the turn acts at once instead of paying off the old
-    // direction. (Live peers are smooth and skip this entirely; this is
-    // the legacy-detent path.) A zero axis carries no information and
-    // must not reset the other axis's bank.
-    if x != 0 && debt.x.signum() != 0 && debt.x.signum() != x.signum() {
-        debt.x = 0;
-    }
-    if y != 0 && debt.y.signum() != 0 && debt.y.signum() != y.signum() {
-        debt.y = 0;
-    }
+    // Like the receiver's bank: NET accumulation, never dropped on
+    // reversal. Trackpad sensors jitter sign under a slow finger, and
+    // dropping the bank on every micro-flip starves legacy peers forever
+    // (nothing whole ever exists). A deliberate turn spends the bank back
+    // down — the honest physics. (Live peers are smooth and skip this
+    // entirely; this is the legacy-detent path.) A zero axis carries no
+    // information and must not touch the other axis's bank.
     debt.x = debt.x.saturating_add(x);
     debt.y = debt.y.saturating_add(y);
     // Truncation toward zero: a sub-detent remainder in either direction
@@ -5594,11 +5649,11 @@ mod tests {
     }
 
     #[test]
-    fn smooth_wheel_downgrade_reversal_drops_stale_debt() {
+    fn smooth_wheel_downgrade_reversal_nets_against_the_bank() {
         use kvm_core::InputEvent;
         let mut debt = WheelDowngrade::default();
-        // Bank +100 down, then reverse with -10: acts at once (bank
-        // cleared), sends nothing yet — no dead first detent.
+        // Bank +100 down, then reverse with -10: net 90 sits waiting —
+        // nothing lost to the turn, nothing eaten either.
         assert_eq!(
             outgoing_wheel_event(InputEvent::SmoothWheel { x: 0, y: 100 }, false, &mut debt),
             None
@@ -5607,7 +5662,7 @@ mod tests {
             outgoing_wheel_event(InputEvent::SmoothWheel { x: 0, y: -10 }, false, &mut debt),
             None
         );
-        assert_eq!(debt.y, -10);
+        assert_eq!(debt.y, 90);
         // A zero axis never resets the other axis's bank: banking x while
         // a y bank sits untouched must preserve both.
         let mut debt2 = WheelDowngrade::default();

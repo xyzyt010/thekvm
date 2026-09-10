@@ -255,6 +255,16 @@ impl CaptureBackend for X11Capture {
             PlatformError::Capture(format!("flush XInput2 grab state: {error}"))
         })?;
         self.exclusive = exclusive;
+        if exclusive {
+            // The peer provisions its injector around handoff time, so a
+            // device born seconds ago may not be excluded yet: re-learn
+            // own devices NOW instead of inside the 5s window, or the
+            // first injected motion is re-captured as a phantom drive.
+            self.last_source_refresh = std::time::Instant::now();
+            if let Some(refreshed) = query_own_sources(&self.connection) {
+                self.ignored_sources = refreshed;
+            }
+        }
         Ok(())
     }
 

@@ -135,6 +135,24 @@ impl Layout {
         self.screens.iter().find(|screen| screen.id == id)
     }
 
+    /// Adopt measured pixel dims for one screen (Deskflow `getShape`
+    /// parity: the platform reports its real geometry instead of trusting
+    /// the 1920x1080 fallback). A virtual edge computed from wrong dims
+    /// is the whole "exits while visibly far from the edge" class, on
+    /// either computer. Returns false when the id is unknown or a dim
+    /// is zero (layout left untouched).
+    pub fn set_screen_size(&mut self, id: ScreenId, width: u32, height: u32) -> bool {
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let Some(screen) = self.screens.iter_mut().find(|screen| screen.id == id) else {
+            return false;
+        };
+        screen.width = width;
+        screen.height = height;
+        true
+    }
+
     /// Look a screen up by device name. Handoff routing uses this — never a
     /// bare number — so both sides agree on WHO is driven even when their
     /// local numbering differs.
@@ -551,6 +569,29 @@ impl EdgeRouter {
         self.push_accum = 0;
     }
 
+    /// Adopt this machine's measured screen size into the layout (called
+    /// once per controller start, before the cursor seed). Without it the
+    /// router works in fallback dims while the pointer lives in physical
+    /// ones, and the crossing edge sits where no visible edge is. Clamps
+    /// the tracked cursors into the new dims and restarts any push run.
+    /// Returns the dims now in force for the local screen.
+    pub fn adopt_local_screen_size(&mut self, width: u32, height: u32) -> Option<(u32, u32)> {
+        if !self.layout.set_screen_size(self.local_screen, width, height) {
+            return None;
+        }
+        let screen = self
+            .layout
+            .screen(self.local_screen)
+            .expect("EdgeRouter invariant: local screen exists");
+        self.cursor_x = self.cursor_x.min(screen.width - 1);
+        self.cursor_y = self.cursor_y.min(screen.height - 1);
+        self.local_cursor_x = self.local_cursor_x.min(screen.width - 1);
+        self.local_cursor_y = self.local_cursor_y.min(screen.height - 1);
+        self.push_edge = None;
+        self.push_accum = 0;
+        Some((screen.width, screen.height))
+    }
+
     pub fn route(&mut self, event: InputEvent) -> RoutedEvent {
         if let Some(target) = self.active_remote {
             // Virtual remote cursor with a Schmitt-trigger edge return.
@@ -890,7 +931,35 @@ const SETTLE_PX: u32 = 12;
 /// resting noise, single stray deltas and fling tails pin at the border.
 /// The streak resets the moment motion comes back inside or changes
 /// edge, so drift can never save up for a phantom crossing.
-const EDGE_PUSH_PX: i64 = 24;
+pub const EDGE_PUSH_PX: i64 = 24;
+
+/// Overflow of one motion step past a screen edge (the Deskflow
+/// jump-zone primitive both crossing paths share): None while the step
+/// stays inside, else the edge and how far past it the step lands. The
+/// stateful router and the stateless receiver hop use the same math so a
+/// crossing costs identical sustained pressure in both directions.
+pub fn edge_overflow(
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    dx: i32,
+    dy: i32,
+) -> Option<(Edge, i64)> {
+    let next_x = i64::from(x) + i64::from(dx);
+    let next_y = i64::from(y) + i64::from(dy);
+    if next_x < 0 {
+        Some((Edge::Left, -next_x))
+    } else if next_x >= i64::from(width) {
+        Some((Edge::Right, next_x - i64::from(width.saturating_sub(1))))
+    } else if next_y < 0 {
+        Some((Edge::Top, -next_y))
+    } else if next_y >= i64::from(height) {
+        Some((Edge::Bottom, next_y - i64::from(height.saturating_sub(1))))
+    } else {
+        None
+    }
+}
 
 /// Pixels between a cursor position and one screen edge (inward distance).
 fn distance_from_edge(edge: Edge, x: u32, y: u32, width: u32, height: u32) -> u32 {
@@ -1141,6 +1210,52 @@ mod tests {
         ));
         router.resync_if_local(5, 5);
         assert_ne!(router.cursor_position(), (5, 5));
+    }
+
+    #[test]
+    fn edge_overflow_reports_signed_overshoot() {
+        // Shared jump-zone primitive: inside is None, each edge reports
+        // how far past it the step lands.
+        assert_eq!(edge_overflow(1920, 1080, 100, 100, 5, 5), None);
+        assert_eq!(
+            edge_overflow(1920, 1080, 1919, 540, 5, 0),
+            Some((Edge::Right, 5))
+        );
+        assert_eq!(
+            edge_overflow(1920, 1080, 0, 540, -3, 0),
+            Some((Edge::Left, 3))
+        );
+        assert_eq!(
+            edge_overflow(1920, 1080, 400, 0, 0, -7),
+            Some((Edge::Top, 7))
+        );
+        assert_eq!(
+            edge_overflow(1920, 1080, 400, 1079, 0, 2),
+            Some((Edge::Bottom, 2))
+        );
+    }
+
+    #[test]
+    fn adopt_local_screen_size_clamps_and_applies() {
+        // Measured geometry replaces the fallback: the virtual edge moves
+        // to the visible edge and tracked cursors clamp inside.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        assert_eq!(router.adopt_local_screen_size(1280, 720), Some((1280, 720)));
+        assert_eq!(
+            router.layout().screen(router.local_screen()).map(|s| (s.width, s.height)),
+            Some((1280, 720))
+        );
+        // Cursor was centered in 1920x1080: now clamped into 1280x720.
+        assert_eq!(router.cursor_position(), (960, 540));
+        router.resync_if_local(5000, 5000);
+        assert_eq!(router.cursor_position(), (1279, 719));
+        // Zero dims or unknown screens never corrupt the layout.
+        assert_eq!(router.adopt_local_screen_size(0, 720), None);
+        assert_eq!(
+            router.layout().screen(router.local_screen()).map(|s| (s.width, s.height)),
+            Some((1280, 720))
+        );
     }
 
     #[test]

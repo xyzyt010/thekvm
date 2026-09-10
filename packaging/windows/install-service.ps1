@@ -112,8 +112,10 @@ sc.exe description $serviceName "TheKVM privileged receiver service" | Out-Host
 sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/5000/restart/10000 | Out-Host
 sc.exe start $serviceName | Out-Host
 
-# Idempotent firewall rule: replace any previous TheKVM rule.
+# Idempotent firewall rule: replace any previous TheKVM rule. Public is
+# included (installer parity): a PS-installed machine on a Public-classed
+# network blackholed ALL Mint->Windows inbound while Windows->Mint worked.
 Get-NetFirewallRule -DisplayName "TheKVM QUIC and discovery" -ErrorAction SilentlyContinue |
     Remove-NetFirewallRule -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName "TheKVM QUIC and discovery" -Direction Inbound -Action Allow -Protocol UDP -LocalPort 42110,42111 -Program $binary -Profile Domain,Private | Out-Null
+New-NetFirewallRule -DisplayName "TheKVM QUIC and discovery" -Direction Inbound -Action Allow -Protocol UDP -LocalPort 42110,42111 -Program $binary -Profile Domain,Private,Public | Out-Null
 Write-Host "TheKVM installed to $InstallDirectory and the $serviceName service is running."

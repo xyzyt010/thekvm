@@ -144,11 +144,14 @@ fi
 
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0770 "$DATA_DIR"
 
-# A fresh system installation is a receiver by default. Preserve an existing
-# operator-managed configuration on reinstall; an explicit configure command
-# can still select bidirectional or controller-only operation later.
+# A fresh system installation is both-ways (MWB parity: either computer
+# drives the other over one link, whichever dials). Receiver-only as a
+# default silently killed reverse drive AND Mint-initiated Connect while
+# Windows-initiated links worked — the exact one-way trap. Preserve an
+# existing operator-managed configuration on reinstall; an explicit
+# configure command can still select receiver-only or controller-only.
 if [ ! -e "$DATA_DIR/config.json" ]; then
-    THEKVM_DATA_DIR="$DATA_DIR" "$PREFIX/bin/kvm-daemon" configure --mode receiver-only
+    THEKVM_DATA_DIR="$DATA_DIR" "$PREFIX/bin/kvm-daemon" configure --mode bidirectional
     chown "$SERVICE_USER:$SERVICE_GROUP" "$DATA_DIR/config.json"
 fi
 

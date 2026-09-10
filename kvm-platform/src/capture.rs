@@ -60,6 +60,25 @@ pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {
     Ok(Some((point.x as u32, point.y as u32)))
 }
 
+/// Measured primary-desktop size in pixels (Deskflow `getShape` parity).
+/// The crossing edge must sit on the visible edge: a layout working in
+/// fallback dims while the pointer lives in physical ones is the whole
+/// "exits while visibly far from the edge" class. `None` where the
+/// platform exposes no truth (the router keeps its configured dims).
+#[cfg(target_os = "windows")]
+pub fn screen_size() -> Result<Option<(u32, u32)>, PlatformError> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    };
+
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    if width <= 0 || height <= 0 {
+        return Ok(None);
+    }
+    Ok(Some((width as u32, height as u32)))
+}
+
 /// Update the Windows hook's suppression flag immediately. The capture loop
 /// also observes the shared flag, but handoff transitions should not wait for
 /// its next input poll before local physical events are blocked or released.
@@ -133,9 +152,38 @@ pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {
     Ok(Some((reply.root_x as u32, reply.root_y as u32)))
 }
 
+/// Measured X11 root size in pixels (see the Windows twin above). Reads
+/// the same screen the pointer query uses, so seed and dims agree.
+#[cfg(target_os = "linux")]
+pub fn screen_size() -> Result<Option<(u32, u32)>, PlatformError> {
+    use x11rb::connection::Connection;
+
+    let (connection, screen) = x11rb::connect(None).map_err(|error| {
+        PlatformError::Capture(format!("connect to X11 for screen size: {error}"))
+    })?;
+    let info = connection
+        .setup()
+        .roots
+        .get(screen)
+        .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?;
+    if info.width_in_pixels == 0 || info.height_in_pixels == 0 {
+        return Ok(None);
+    }
+    Ok(Some((
+        info.width_in_pixels as u32,
+        info.height_in_pixels as u32,
+    )))
+}
+
 #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
 pub fn warp_cursor(_x: u32, _y: u32) -> Result<(), PlatformError> {
     Ok(())
+}
+
+/// Platforms without a screen query keep the configured layout dims.
+#[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
+pub fn screen_size() -> Result<Option<(u32, u32)>, PlatformError> {
+    Ok(None)
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]

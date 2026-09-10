@@ -3008,6 +3008,14 @@ static LAST_INCOMING_COUNT: std::sync::atomic::AtomicUsize =
 static POLL_FIRST_OK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the user-socket fallback warning fired already. Talking to a
+/// user-session daemon instead of the system service splits identity and
+/// peer books (ceremony in one, sessions in the other) — the classic
+/// half-paired Mint. Loud once, then quiet.
+#[cfg(unix)]
+static CONTROL_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// One shared runtime for every background call (control pipe, pairing
 /// preview dials, LAN scans). Creating a fresh Tokio runtime per request
 /// churns threads and turns a failed creation into an untraceable call
@@ -3066,7 +3074,17 @@ fn control_request(request: ControlRequest) -> Result<ControlResponse> {
                         None
                     };
                     match user_attempt {
-                        Some(Ok(stream)) => stream,
+                        Some(Ok(stream)) => {
+                            // System service unreachable, user daemon
+                            // answering: every mode/pin/identity call from
+                            // here lands in the WRONG book. Say so once —
+                            // the fix is group membership + relogin, not
+                            // another pairing attempt.
+                            if !CONTROL_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                ui_log("control: system service unreachable, using user-session daemon — pairing/mode changes may land in the wrong book; add this user to the 'thekvm' group and log back in");
+                            }
+                            stream
+                        }
                         _ => {
                             return Err(match system_outcome {
                                 Ok(Err(error)) => anyhow::Error::new(error)

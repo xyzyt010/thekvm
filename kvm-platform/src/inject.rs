@@ -102,22 +102,18 @@ mod linux_uinput {
     }
 
     /// Bank one smooth-scroll axis (120ths): returns the whole detents to
-    /// emit on the legacy axis plus the new banked remainder. A scroll
-    /// reversal drops the stale bank first: banked +100 followed by -10
-    /// scrolls up at once instead of sitting at +90 invisible. Without
-    /// this, every direction change eats the first detent — the mushy,
-    /// unnatural feel that makes cross-machine touchpad scroll feel
-    /// broken even when every event arrives.
+    /// emit on the legacy axis plus the new banked remainder. The bank is
+    /// NET accumulation, never dropped on reversal: trackpad sensors
+    /// jitter sign under a slow finger, and dropping the bank on every
+    /// micro-flip starves legacy stacks forever (Mint never scrolls while
+    /// Windows, driven natively, scrolls fine). A deliberate reversal
+    /// simply spends the bank back down — the honest physics every OS
+    /// accumulator uses — instead of eating the first detent.
     fn bank_smooth_debt(debt: i32, delta: i32) -> (i32, i32) {
-        // A zero axis carries no information and never resets the bank.
+        // A zero axis carries no information and never touches the bank.
         if delta == 0 {
             return (0, debt);
         }
-        let debt = if debt.signum() != 0 && debt.signum() != delta.signum() {
-            0
-        } else {
-            debt
-        };
         let debt = debt.saturating_add(delta);
         let detents = debt / 120;
         (detents, debt - detents.saturating_mul(120))
@@ -468,16 +464,24 @@ mod linux_uinput {
         }
 
         #[test]
-        fn smooth_debt_reversal_drops_the_stale_bank() {
-            // Scroll down almost a detent, then reverse: the reversal
-            // must act at once instead of paying off the old bank.
+        fn smooth_debt_reversal_nets_against_the_bank() {
+            // Net accumulation, never dropped: banked +100 reversed by
+            // -10 sits at +90 (a deliberate turn spends the bank down),
+            // and sensor jitter (+8,+7,-2) can never starve the bank.
             let (_, debt) = bank_smooth_debt(0, 100);
             assert_eq!(debt, 100);
             let (d, debt) = bank_smooth_debt(debt, -10);
+            assert_eq!((d, debt), (0, 90));
+            let (d, debt) = bank_smooth_debt(debt, -100);
             assert_eq!((d, debt), (0, -10));
-            // And back the other way from a negative bank.
+            // Jitter under a slow finger accumulates instead of dying.
+            let (_, debt) = bank_smooth_debt(0, 8);
+            let (_, debt) = bank_smooth_debt(debt, 7);
+            let (d, debt) = bank_smooth_debt(debt, -2);
+            assert_eq!((d, debt), (0, 13));
+            // And back the other way across zero from a negative bank.
             let (d, debt) = bank_smooth_debt(-100, 130);
-            assert_eq!((d, debt), (1, 10));
+            assert_eq!((d, debt), (0, 30));
         }
 
         #[test]
