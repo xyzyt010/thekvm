@@ -1,4 +1,5 @@
 use crate::InputEvent;
+use crate::EdgeMode;
 use serde::{Deserialize, Serialize};
 
 /// Screen arrangement, like MWB's topology grid / Deskflow's layout editor.
@@ -255,6 +256,27 @@ impl Layout {
         Ok(())
     }
 
+    /// Shared mode-aware target rule (router + stateless receiver hop):
+    /// the arranged grid neighbour wins; on a lone-peer link in Double
+    /// mode the other horizontal outer edge also leads to the peer.
+    fn crossing_target_for(
+        &self,
+        me: ScreenId,
+        edge: Edge,
+        edge_mode: EdgeMode,
+    ) -> Option<ScreenId> {
+        if let Some(neighbour) = self.neighbor_for_edge(me, edge) {
+            return Some(neighbour);
+        }
+        if edge_mode == EdgeMode::Double && matches!(edge, Edge::Left | Edge::Right) {
+            let peer = self.single_peer_screen()?;
+            if peer != me {
+                return Some(peer);
+            }
+        }
+        None
+    }
+
     /// Resolve a relative motion that would leave `screen_id`. This stateless
     /// form is used by a receiver to request the next network hop while the
     /// stateful `EdgeRouter` is used by the controller.
@@ -265,6 +287,7 @@ impl Layout {
         y: u32,
         dx: i32,
         dy: i32,
+        edge_mode: EdgeMode,
     ) -> Option<EdgeHandoff> {
         let screen = self.screen(screen_id)?;
         let x = x.min(screen.width - 1);
@@ -282,7 +305,7 @@ impl Layout {
         } else {
             return None;
         };
-        let target = self.edge_target(screen_id, edge)?;
+        let target = self.crossing_target_for(screen_id, edge, edge_mode)?;
         let target_screen = self.screen(target)?;
         let along = match edge {
             Edge::Left | Edge::Right => y,
@@ -344,10 +367,9 @@ pub enum RoutedEvent {
     },
     /// The virtual remote cursor overflowed while a remote screen was
     /// driven: the caller ends the episode and restores the saved local
-    /// position (Deskflow-style edge return, no network round trip).
-    /// Pushing past the edge FACING home returns; pushing past the FAR
-    /// side of a lone peer also returns (on a two-machine link there is
-    /// nowhere else to go); a grid's far edge only clamps.
+    /// position (edge return, no network round trip). Fires only for an
+    /// ARMED home-facing overflow (see the router's Schmitt trigger), so
+    /// post-entry jitter can never produce one.
     ReturnHome { from: ScreenId, edge: Edge },
 }
 
@@ -364,6 +386,21 @@ pub struct EdgeRouter {
     local_cursor_x: u32,
     local_cursor_y: u32,
     active_remote: Option<ScreenId>,
+    /// Remote edge this drive entered through (the local exit edge's
+    /// opposite). Starts DISARMED: overflow there clamps until the cursor
+    /// settles inside (see SETTLE_PX), which arms the return. Entry always
+    /// faces home by grid symmetry, so arming exactly this edge is the
+    /// whole snap-back fix — and future modes only widen which edges are
+    /// return-eligible.
+    entry_edge: Option<Edge>,
+    /// True once the cursor has moved SETTLE_PX inside from the entry
+    /// edge (or the peer placed us while driving). Only an armed,
+    /// home-facing overflow returns.
+    return_armed: bool,
+    /// Which edges may open a crossing (Single = arranged facing edge
+    /// only; Double = both horizontal outer edges on a lone-peer link).
+    /// Return hysteresis is identical in both modes.
+    edge_mode: EdgeMode,
     /// Deskflow-style screen lock (ScrollLock): while set, no edge crossing
     /// opens a new handoff — the cursor stays where it is. Locking never
     /// strands control remotely: engaging it returns home first (see the
@@ -391,6 +428,9 @@ impl EdgeRouter {
             local_cursor_x: screen_width / 2,
             local_cursor_y: screen_height / 2,
             active_remote: None,
+            entry_edge: None,
+            return_armed: false,
+            edge_mode: EdgeMode::Single,
             locked: false,
         })
     }
@@ -419,6 +459,23 @@ impl EdgeRouter {
 
     pub fn active_remote(&self) -> Option<ScreenId> {
         self.active_remote
+    }
+
+    /// Switch the crossing discipline live (the Settings toggle): Single
+    /// crosses only the arranged facing edge; Double additionally opens
+    /// the other horizontal outer edge to the lone peer on a two-machine
+    /// link. Applies to the NEXT handoff; an active drive keeps the edge
+    /// it entered through.
+    pub fn set_edge_mode(&mut self, mode: EdgeMode) {
+        self.edge_mode = mode;
+    }
+
+    /// Mode-aware crossing target for the router: the arranged grid
+    /// neighbour wins; on a lone-peer link in Double mode the other
+    /// horizontal outer edge also leads to the peer. Top/bottom never
+    /// cross implicitly, in any mode; grids are facing-only in both.
+    fn crossing_target(&self, me: ScreenId, edge: Edge) -> Option<ScreenId> {
+        self.layout.crossing_target_for(me, edge, self.edge_mode)
     }
 
     pub fn screen(&self, id: ScreenId) -> Option<&Screen> {
@@ -457,11 +514,18 @@ impl EdgeRouter {
 
     pub fn route(&mut self, event: InputEvent) -> RoutedEvent {
         if let Some(target) = self.active_remote {
-            // Deskflow-style virtual cursor: while a remote screen owns the
-            // pointer, relative motion still advances the router's cursor
-            // inside the REMOTE geometry, so pushing back past the facing
-            // edge returns home instead of stranding control remotely
-            // until a session dies. Non-motion events forward untouched.
+            // Virtual remote cursor with a Schmitt-trigger edge return.
+            // Entry parks exactly on the boundary (1px from overflow), so
+            // a naive "overflow returns" rule turns every trackpad jitter
+            // into an instant snap-back. Instead the ENTRY edge starts
+            // DISARMED: overflow there clamps until the cursor has settled
+            // SETTLE_PX inside (armed), after which overflowing the
+            // home-facing edge returns. Holding outward pressure can never
+            // fire — the clamped state is stable, not accumulating — so
+            // there is no bounce: to return you come inside, then push
+            // back out, which is the natural motion. Only the edge facing
+            // home ever returns; every other edge clamps, so a driven
+            // screen exits exactly where the arrangement says.
             if let InputEvent::MouseMove { dx, dy } = event {
                 let from = self.current_screen;
                 let Some(remote) = self.layout.screen(from) else {
@@ -484,21 +548,43 @@ impl EdgeRouter {
                     None => {
                         self.cursor_x = next_x as u32;
                         self.cursor_y = next_y as u32;
+                        // Settling inside arms the entry edge (see above):
+                        // a firm flick arms in one event, resting noise
+                        // never reaches the threshold.
+                        if !self.return_armed {
+                            if let Some(entry) = self.entry_edge {
+                                if distance_from_edge(
+                                    entry,
+                                    self.cursor_x,
+                                    self.cursor_y,
+                                    remote.width,
+                                    remote.height,
+                                ) >= SETTLE_PX
+                                {
+                                    self.return_armed = true;
+                                }
+                            }
+                        }
                     }
                     Some(edge) => {
-                        let faces_home =
-                            self.layout.neighbor_for_edge(from, edge) == Some(self.local_screen);
-                        let lone_peer = self.layout.single_peer_screen() == Some(from);
-                        if faces_home || lone_peer {
+                        // Unarmed entry edge: clamp, stay disarmed. This is
+                        // the snap-back fix: post-entry jitter and fling
+                        // tails pin at the boundary instead of firing.
+                        let unarmed_entry =
+                            self.entry_edge == Some(edge) && !self.return_armed;
+                        let faces_home = self.layout.neighbor_for_edge(from, edge)
+                            == Some(self.local_screen);
+                        if faces_home && !unarmed_entry {
                             // Park on the saved local position
                             // (jump-position semantics): a return never
                             // lands mid-screen.
                             let _ = self.restore_local(target);
                             return RoutedEvent::ReturnHome { from, edge };
                         }
-                        // A grid's far edge: stop at the border and keep
-                        // driving (local overflow never auto-chains a
-                        // third hop; the peer routes onwards by request).
+                        // Any other edge (or the still-disarmed entry):
+                        // stop at the border and keep driving. Local
+                        // overflow never auto-chains a third hop; the peer
+                        // routes onwards by request.
                         self.cursor_x =
                             next_x.clamp(0, i64::from(remote.width) - 1) as u32;
                         self.cursor_y =
@@ -542,7 +628,7 @@ impl EdgeRouter {
         if self.locked {
             return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
         }
-        let Some(target) = self.layout.edge_target(self.current_screen, edge) else {
+        let Some(target) = self.crossing_target(self.current_screen, edge) else {
             return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
         };
         let target_screen = self
@@ -577,6 +663,10 @@ impl EdgeRouter {
         self.cursor_x = target_x;
         self.cursor_y = target_y;
         self.active_remote = Some(target);
+        // Arm the Schmitt trigger: the remote entry edge is the local
+        // exit edge's opposite, and it starts disarmed (see route()).
+        self.entry_edge = Some(edge.opposite());
+        self.return_armed = false;
         // Preserve the overshoot as a relative event. The receiver can use
         // the handoff coordinates to establish its own logical pointer and
         // then apply this small remainder.
@@ -647,6 +737,8 @@ impl EdgeRouter {
         self.local_cursor_x = self.cursor_x;
         self.local_cursor_y = self.cursor_y;
         self.active_remote = None;
+        self.entry_edge = None;
+        self.return_armed = false;
         Ok(())
     }
 
@@ -672,6 +764,8 @@ impl EdgeRouter {
         self.local_cursor_x = self.cursor_x;
         self.local_cursor_y = self.cursor_y;
         self.active_remote = None;
+        self.entry_edge = None;
+        self.return_armed = false;
         Ok((self.cursor_x, self.cursor_y))
     }
 
@@ -690,6 +784,8 @@ impl EdgeRouter {
             self.local_cursor_x = self.cursor_x;
             self.local_cursor_y = self.cursor_y;
             self.active_remote = None;
+            self.entry_edge = None;
+            self.return_armed = false;
             return Ok(false);
         }
         if self.current_screen == self.local_screen {
@@ -700,12 +796,31 @@ impl EdgeRouter {
         self.cursor_x = x.min(target_screen.width - 1);
         self.cursor_y = y.min(target_screen.height - 1);
         self.active_remote = Some(target);
+        // Peer-placed drive: no entry edge is known, so arm the return —
+        // any home-facing overflow comes home; anything else clamps.
+        self.entry_edge = None;
+        self.return_armed = true;
         Ok(true)
     }
 }
 
-fn map_coordinate(value: u32, source_span: u32, target_span: u32) -> u32 {
-    if source_span <= 1 || target_span <= 1 {
+/// Inward settle distance that arms the entry edge for return (px). Below
+/// this, post-entry jitter and fling tails can never fire a return; above
+/// it, one deliberate push back out comes home. A firm flick exceeds it in
+/// a single event; resting trackpad noise never reaches it.
+const SETTLE_PX: u32 = 12;
+
+/// Pixels between a cursor position and one screen edge (inward distance).
+fn distance_from_edge(edge: Edge, x: u32, y: u32, width: u32, height: u32) -> u32 {
+    match edge {
+        Edge::Left => x,
+        Edge::Right => width.saturating_sub(1).saturating_sub(x),
+        Edge::Top => y,
+        Edge::Bottom => height.saturating_sub(1).saturating_sub(y),
+    }
+}
+
+fn map_coordinate(value: u32, source_span: u32, target_span: u32) -> u32 {    if source_span <= 1 || target_span <= 1 {
         return 0;
     }
     (u64::from(value.min(source_span - 1)) * u64::from(target_span - 1)
@@ -881,6 +996,11 @@ mod tests {
                 ..
             } if target == FIRST_PEER_SCREEN_ID
         ));
+        // Post-entry jitter against the entry edge pins, never returns.
+        let jitter = router.route(InputEvent::MouseMove { dx: -3, dy: 0 });
+        assert!(matches!(jitter, RoutedEvent::Forward { .. }));
+        assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
+        assert_eq!(router.cursor_position(), (0, 540));
         // Small motion while driving forwards and tracks the remote cursor.
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: 100, dy: 50 }),
@@ -905,21 +1025,217 @@ mod tests {
     }
 
     #[test]
-    fn lone_peer_push_through_returns_home() {
-        // Two-machine link: pushing past the peer's FAR side has nowhere
-        // to go, so it returns instead of stranding control remotely.
+    fn lone_peer_far_edge_clamps_without_returning() {
+        // Two-machine link, driving the peer: pushing past the FAR side
+        // has nowhere arranged to go, so it pins at the border and keeps
+        // driving. Only the home-facing edge ever returns (the old
+        // push-through rule turned every far-side brush into a snap-back).
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
         let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
-        let home = router.local_cursor_position();
+        // Settle first, so the clamp below proves the edge rule and not
+        // the entry disarm.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 100, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        let pushed = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(matches!(pushed, RoutedEvent::Forward { .. }));
+        assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
+        assert_eq!(router.cursor_position(), (1919, 540));
+    }
+
+    #[test]
+    fn entry_edge_jitter_never_returns_before_settling() {
+        // The live desk: Mint on Windows' left; Windows exits left and
+        // enters Mint at its right edge (x=1919, 1px from overflow).
+        let peer_fp = "ab".repeat(32);
+        let layout = Layout {
+            screens: vec![
+                Screen {
+                    id: ScreenId(2),
+                    name: "windows".into(),
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    peer_fingerprint: None,
+                },
+                Screen {
+                    id: ScreenId(1),
+                    name: "mint".into(),
+                    x: -1,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    peer_fingerprint: Some(peer_fp),
+                },
+            ],
+            self_screen: Some(ScreenId(2)),
+        };
+        let mut router = EdgeRouter::new(layout).unwrap();
+        let home = router.cursor_position();
+        let handoff = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(matches!(
+            handoff,
+            RoutedEvent::Handoff {
+                from,
+                target,
+                edge: Edge::Left,
+                target_x: 1919,
+                ..
+            } if from == ScreenId(2) && target == ScreenId(1)
+        ));
+        // Jitter around the entry point: out, in, out — all Forward, all
+        // pinned, never home. This exact sequence snapped back on 0.8.3.
+        for delta in [2, -1, 1, 3, -2, 2] {
+            let routed = router.route(InputEvent::MouseMove { dx: delta, dy: 0 });
+            assert!(
+                matches!(routed, RoutedEvent::Forward { .. }),
+                "jitter dx={delta} must forward, not return"
+            );
+            assert_eq!(router.active_remote(), Some(ScreenId(1)));
+        }
+        assert_eq!(router.cursor_position(), (1919, 540));
+        // Non-facing edges clamp too, armed or not: Mint exits to Windows
+        // only through its right edge.
+        for motion in [
+            InputEvent::MouseMove { dx: 0, dy: -5000 },
+            InputEvent::MouseMove { dx: 0, dy: 5000 },
+            InputEvent::MouseMove { dx: -5000, dy: 0 },
+        ] {
+            let routed = router.route(motion);
+            assert!(
+                matches!(routed, RoutedEvent::Forward { .. }),
+                "non-facing overflow must clamp, not return"
+            );
+            assert_eq!(router.active_remote(), Some(ScreenId(1)));
+        }
+        // Settle inside (arms the entry), then push back out through the
+        // shared edge: now it comes home, to the exact saved pixel.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 500, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
         let back = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert!(matches!(
             back,
-            RoutedEvent::ReturnHome { edge: Edge::Right, .. }
+            RoutedEvent::ReturnHome {
+                from,
+                edge: Edge::Right,
+            } if from == ScreenId(1)
         ));
         assert_eq!(router.active_remote(), None);
         assert_eq!(router.cursor_position(), home);
+    }
+
+    #[test]
+    fn return_arms_exactly_at_the_settle_threshold() {
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        // Peer on the right: enter at its left edge (x=0), entry edge Left.
+        let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        // 11px inside: still disarmed — facing overflow clamps.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 11, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        let clamped = router.route(InputEvent::MouseMove { dx: -50, dy: 0 });
+        assert!(matches!(clamped, RoutedEvent::Forward { .. }));
+        assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
+        // One step to exactly 12px inside: armed — facing overflow home.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 12, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        let back = router.route(InputEvent::MouseMove { dx: -50, dy: 0 });
+        assert!(matches!(
+            back,
+            RoutedEvent::ReturnHome { edge: Edge::Left, .. }
+        ));
+        assert_eq!(router.active_remote(), None);
+    }
+
+    #[test]
+    fn peer_placed_drive_returns_without_settling() {
+        // A peer-driven hop (chained control) has no entry edge: any
+        // home-facing overflow returns immediately, anything else clamps.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        assert!(router.handoff_to(FIRST_PEER_SCREEN_ID, 0, 540).unwrap());
+        let back = router.route(InputEvent::MouseMove { dx: -50, dy: 0 });
+        assert!(matches!(
+            back,
+            RoutedEvent::ReturnHome { edge: Edge::Left, .. }
+        ));
+        assert_eq!(router.active_remote(), None);
+    }
+
+    #[test]
+    fn opposite_edges_mirror() {
+        assert_eq!(Edge::Left.opposite(), Edge::Right);
+        assert_eq!(Edge::Right.opposite(), Edge::Left);
+        assert_eq!(Edge::Top.opposite(), Edge::Bottom);
+        assert_eq!(Edge::Bottom.opposite(), Edge::Top);
+    }
+
+    #[test]
+    fn double_edge_opens_both_horizontal_edges_to_the_lone_peer() {
+        // Two-machine link, peer on the right: Single crosses right only;
+        // Double additionally crosses the left outer edge. Top/bottom
+        // clamp in both modes.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut single = EdgeRouter::new(layout.clone()).unwrap();
+        assert!(matches!(
+            single.route(InputEvent::MouseMove { dx: -5000, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        let mut double = EdgeRouter::new(layout).unwrap();
+        double.set_edge_mode(EdgeMode::Double);
+        let handoff = double.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(matches!(
+            handoff,
+            RoutedEvent::Handoff {
+                target,
+                edge: Edge::Left,
+                target_x: 1919,
+                ..
+            } if target == FIRST_PEER_SCREEN_ID
+        ));
+        // The stateless receiver hop agrees, per mode.
+        let layout2 = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        assert!(layout2
+            .handoff_for_motion(SELF_SCREEN_ID, 0, 540, -50, 0, EdgeMode::Single)
+            .is_none());
+        let hop = layout2
+            .handoff_for_motion(SELF_SCREEN_ID, 0, 540, -50, 0, EdgeMode::Double)
+            .expect("double mode must hand off the outer edge");
+        assert_eq!(hop.target, FIRST_PEER_SCREEN_ID);
+        assert_eq!(hop.target_x, 1919);
+        // Top and bottom never cross implicitly, even doubled.
+        assert!(layout2
+            .handoff_for_motion(SELF_SCREEN_ID, 960, 0, 0, -50, EdgeMode::Double)
+            .is_none());
+        // Grids stay facing-only in Double mode: the third screen owns
+        // the left edge, so no fallback fires there.
+        let mut grid = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        grid.screens.push(Screen {
+            id: ScreenId(9),
+            name: "third".into(),
+            x: -1,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            peer_fingerprint: Some("ff".repeat(32)),
+        });
+        let mut grid_router = EdgeRouter::new(grid).unwrap();
+        grid_router.set_edge_mode(EdgeMode::Double);
+        let routed = grid_router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(matches!(
+            routed,
+            RoutedEvent::Handoff { target, .. } if target == ScreenId(9)
+        ));
     }
 
     #[test]
@@ -977,7 +1293,7 @@ mod tests {
         assert_eq!(layout.peer_exit_edge(), Some(Edge::Right));
         // Facing edges agree across the pair: A pushes right into B.
         let handoff = layout
-            .handoff_for_motion(SELF_SCREEN_ID, 1919, 540, 50, 0)
+            .handoff_for_motion(SELF_SCREEN_ID, 1919, 540, 50, 0, EdgeMode::Single)
             .expect("right edge must hand off");
         assert_eq!(handoff.target, FIRST_PEER_SCREEN_ID);
         assert_eq!(handoff.target_x, 0);
@@ -1054,4 +1370,17 @@ pub enum Edge {
     Right,
     Top,
     Bottom,
+}
+
+impl Edge {
+    /// The edge facing the opposite direction: exiting locally through
+    /// Left enters the peer through its Right edge, and vice versa.
+    pub fn opposite(self) -> Edge {
+        match self {
+            Edge::Left => Edge::Right,
+            Edge::Right => Edge::Left,
+            Edge::Top => Edge::Bottom,
+            Edge::Bottom => Edge::Top,
+        }
+    }
 }

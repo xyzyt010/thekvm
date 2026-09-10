@@ -262,6 +262,7 @@ where
                 allow_lock_screen_control: current.allow_lock_screen_control,
                 auto_connect_address: current.auto_connect_address,
                 clipboard_enabled: current.clipboard_enabled,
+                edge_mode: current.edge_mode,
                 peer_count,
                 active_session_count: active_sessions.load(std::sync::atomic::Ordering::Relaxed),
                 sessions: crate::service::list_inbound_links(),
@@ -429,6 +430,7 @@ where
             auto_connect_address,
             clear_auto_connect,
             clipboard_enabled,
+            edge_mode,
         } => {
             if listen_port == Some(0) {
                 ControlResponse::Error {
@@ -475,6 +477,9 @@ where
                     }
                     if let Some(enabled) = clipboard_enabled {
                         updated.clipboard_enabled = enabled;
+                    }
+                    if let Some(edge_mode) = edge_mode {
+                        updated.edge_mode = edge_mode;
                     }
                     if let Some(layout) = layout {
                         if let Err(error) = layout.validate() {

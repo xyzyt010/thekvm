@@ -1,7 +1,7 @@
 //! Local daemon-control protocol shared by the daemon and the desktop UI.
 
 use crate::pairing::Peer;
-use kvm_core::{Config, Layout, Mode};
+use kvm_core::{Config, EdgeMode, Layout, Mode};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -108,6 +108,12 @@ pub enum ControlRequest {
         /// Set or preserve normal logged-in text clipboard synchronization.
         #[serde(default)]
         clipboard_enabled: Option<bool>,
+        /// Replace the edge-crossing discipline when supplied (Single =
+        /// arranged facing edge only; Double = both horizontal outer edges
+        /// on a two-machine link); omission preserves the current one so
+        /// partial CLI/UI updates are safe.
+        #[serde(default)]
+        edge_mode: Option<EdgeMode>,
     },
 }
 
@@ -120,6 +126,10 @@ pub struct DaemonStatus {
     pub allow_lock_screen_control: bool,
     pub auto_connect_address: Option<String>,
     pub clipboard_enabled: bool,
+    /// The daemon's current edge-crossing discipline. Defaults to Single
+    /// for older daemons that predate the field.
+    #[serde(default)]
+    pub edge_mode: EdgeMode,
     pub peer_count: usize,
     pub active_session_count: usize,
     pub uptime_seconds: u64,
@@ -273,6 +283,7 @@ mod tests {
             auto_connect_address: Some("127.0.0.1:42110".into()),
             clear_auto_connect: false,
             clipboard_enabled: Some(true),
+            edge_mode: Some(EdgeMode::Double),
         };
         let expected_address = "127.0.0.1:42110".to_owned();
         let sender = tokio::spawn(async move {
@@ -287,6 +298,7 @@ mod tests {
             auto_connect_address,
             clear_auto_connect,
             clipboard_enabled,
+            edge_mode,
         }) = read_request(&mut right).await.unwrap()
         else {
             panic!("expected SetConfig request");
@@ -302,6 +314,7 @@ mod tests {
         );
         assert!(!clear_auto_connect);
         assert_eq!(clipboard_enabled, Some(true));
+        assert_eq!(edge_mode, Some(EdgeMode::Double));
         sender.await.unwrap();
     }
 
@@ -345,6 +358,7 @@ mod tests {
         let ControlRequest::SetConfig {
             mode,
             allow_lock_screen_control,
+            edge_mode,
             ..
         } = request
         else {
@@ -352,5 +366,26 @@ mod tests {
         };
         assert!(mode.is_none());
         assert!(allow_lock_screen_control.is_none());
+        assert!(edge_mode.is_none());
+    }
+
+    #[test]
+    fn older_daemon_status_defaults_edge_mode_to_single() {
+        let status: DaemonStatus = serde_json::from_str(
+            r#"{
+                "node_name": "old",
+                "fingerprint_hex": "aa",
+                "listen_port": 42110,
+                "mode": "Bidirectional",
+                "allow_lock_screen_control": false,
+                "auto_connect_address": null,
+                "clipboard_enabled": false,
+                "peer_count": 0,
+                "active_session_count": 0,
+                "uptime_seconds": 0
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(status.edge_mode, EdgeMode::Single);
     }
 }

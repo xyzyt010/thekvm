@@ -624,6 +624,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
             auto_connect_address: auto_connect_address.map(|address| address.trim().to_owned()),
             clear_auto_connect,
             clipboard_enabled,
+            edge_mode: None,
         },
     )
     .await
@@ -1378,11 +1379,22 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
         Ok(Some((x, y))) => {
             if let Err(error) = router.set_local_cursor_position(x, y) {
                 tracing::debug!(%error, "could not seed topology cursor position");
+            } else {
+                // Proves the first-launch sync: every crossing tracks
+                // relative motion from HERE, so a wrong seed puts the
+                // first handoff mid-screen while later ones (re-synced by
+                // warps) look fine.
+                tracing::info!(x, y, "topology cursor seeded from OS position");
             }
         }
         Ok(None) => tracing::debug!("platform did not expose an initial cursor position"),
         Err(error) => tracing::debug!(%error, "could not query initial cursor position"),
     }
+    // The Settings edge discipline applies from the first crossing: the
+    // router starts in the configured Single/Double mode, and the toggle
+    // only affects later handoffs through a fresh child.
+    router.set_edge_mode(config.edge_mode);
+    tracing::info!(edge_mode = ?config.edge_mode, "topology edge discipline");
     let local_geometry = local_screen_geometry(&config.layout);
     let peers = PeerBook::load_or_create(&dir)?;
     // The face every episode dial presents. This MUST be the same identity
@@ -3280,6 +3292,14 @@ async fn handle_connection(
                     hello.lock_screen_requested
                 ),
             );
+            // Correlates with the sender's handoff line: an accept with no
+            // motion after it means the peer died before driving (or never
+            // drove), not that the handshake failed.
+            tracing::info!(
+                peer = %peer_fingerprint,
+                remote = %conn.remote_address(),
+                "input session accepted",
+            );
             // Publish the live inbound link: the station-side UI arms its
             // own half of the link from here (it never dialed), and hangs
             // the link up from here too. The address MUST be dialable: the
@@ -3321,6 +3341,11 @@ async fn handle_connection(
             let mut seen_sequences = BTreeSet::new();
             let mut motion_sequence = MotionSequence::default();
             let mut last_activity = Instant::now();
+            // Why this session ended, for the census line below: a bare
+            // motion/wheel/smooth count cannot tell "peer went away" from
+            // "we killed it", and that distinction is the whole reverse-
+            // direction diagnosis (Mint driving Windows dies in ms).
+            let mut end_reason = "unknown";
             // Per-session input census for the end-of-session journal line:
             // proves what actually arrived (motion vs detent vs smooth).
             let mut motion_count = 0u64;
@@ -3335,7 +3360,13 @@ async fn handle_connection(
             let session_result: Result<()> = loop {
                 tokio::select! {
                     message = read_frame(&mut recv) => {
-                        let Some(message) = message? else { break Ok(()) };
+                        let Some(message) = message.map_err(|error| {
+                            end_reason = "stream read failed";
+                            error
+                        })? else {
+                            end_reason = "peer finished the stream";
+                            break Ok(());
+                        };
                         last_activity = Instant::now();
                         injector.ensure_session()?;
                         match message {
@@ -3366,6 +3397,7 @@ async fn handle_connection(
                                 )
                                 .await?
                                 {
+                                    end_reason = "peer requested the session end";
                                     break Ok(());
                                 }
                             }
@@ -3450,7 +3482,10 @@ async fn handle_connection(
                         }
                     }
                     datagram = conn.read_datagram() => {
-                        let payload = datagram?;
+                        let payload = datagram.map_err(|error| {
+                            end_reason = "datagram read failed";
+                            error
+                        })?;
                         last_activity = Instant::now();
                         injector.ensure_session()?;
                         // QUIC datagrams are unordered and lossy by design: a
@@ -3507,7 +3542,10 @@ async fn handle_connection(
                     _ = lease_check.tick() => {
                         injector.ensure_session()?;
                         if last_activity.elapsed() > Duration::from_secs(15) {
-                            bail!("input session lease expired; released remote input");
+                            end_reason = "input lease expired without activity";
+                            break Err(anyhow::anyhow!(
+                                "input session lease expired; released remote input"
+                            ));
                         }
                     }
                     revoked = revoked_rx.recv() => {
@@ -3515,7 +3553,10 @@ async fn handle_connection(
                             .as_ref()
                             .is_ok_and(|fingerprint| fingerprint == &peer_fingerprint)
                         {
-                            bail!("trusted peer was revoked during the input session");
+                            end_reason = "trusted peer revoked mid-session";
+                            break Err(anyhow::anyhow!(
+                                "trusted peer was revoked during the input session"
+                            ));
                         }
                     }
                     _ = async {
@@ -3531,18 +3572,26 @@ async fn handle_connection(
                             }
                         }
                     } => {
+                        end_reason = "station user dropped the session";
                         tracing::info!(peer = %peer_fingerprint, "station user dropped the input session");
                         break Ok(());
                     }
                 }
             };
             // The guard below unregisters (panic-safe); the census names
-            // what actually arrived over the wire this session.
+            // what actually arrived over the wire this session, WHY it
+            // ended, and the error when it ended badly.
             tracing::info!(
                 peer = %peer_fingerprint,
                 motion = motion_count,
                 wheel = wheel_count,
                 smooth = smooth_count,
+                reason = end_reason,
+                error = session_result
+                    .as_ref()
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default(),
                 "input session ended",
             );
             drop(_link_guard);
@@ -3600,7 +3649,11 @@ async fn process_remote_input(
     if let (Some(screen_id), Some((x, y)), InputEvent::MouseMove { dx, dy }) =
         (*remote_screen, *remote_cursor, packet.event)
     {
-        if let Some(handoff) = config.layout.handoff_for_motion(screen_id, x, y, dx, dy) {
+        if let Some(handoff) =
+            config
+                .layout
+                .handoff_for_motion(screen_id, x, y, dx, dy, config.edge_mode)
+        {
             let screen = config
                 .layout
                 .screen(screen_id)

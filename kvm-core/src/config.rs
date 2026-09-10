@@ -9,6 +9,13 @@ pub struct Config {
     pub device_name: String,
     pub listen_port: u16,
     pub mode: Mode,
+    /// Which screen edges may open a crossing. Single (default) crosses
+    /// only the arranged facing edge; Double additionally opens the other
+    /// horizontal outer edge to the lone peer on a two-machine link
+    /// (top/bottom always clamp; grids stay facing-only in both modes).
+    /// Old config files without this field load as Single.
+    #[serde(default)]
+    pub edge_mode: EdgeMode,
     #[serde(default)]
     pub layout: crate::layout::Layout,
     #[serde(default)]
@@ -36,12 +43,23 @@ pub enum Mode {
     ClientOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EdgeMode {
+    /// Cross only the arranged facing edge (strict Deskflow/MWB parity).
+    #[default]
+    Single,
+    /// Two-machine link: both horizontal outer edges lead to the lone
+    /// peer; top/bottom still clamp. Grids are unaffected (facing-only).
+    Double,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             device_name: hostname().unwrap_or_else(|| "unknown".into()),
             listen_port: 42110,
             mode: Mode::Bidirectional,
+            edge_mode: EdgeMode::Single,
             layout: Default::default(),
             allow_lock_screen_control: false,
             auto_connect_address: None,
@@ -275,6 +293,21 @@ mod tests {
         assert!(!config.allow_lock_screen_control);
         assert!(config.auto_connect_address.is_none());
         assert!(!config.clipboard_enabled);
+        assert_eq!(config.edge_mode, EdgeMode::Single);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn edge_mode_defaults_single_and_roundtrips() {
+        assert_eq!(Config::default().edge_mode, EdgeMode::Single);
+        let double = Config {
+            edge_mode: EdgeMode::Double,
+            ..Config::default()
+        };
+        assert!(double.validate().is_ok());
+        let raw = serde_json::to_string(&double).unwrap();
+        assert!(raw.contains("\"Double\""));
+        let back: Config = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.edge_mode, EdgeMode::Double);
     }
 }

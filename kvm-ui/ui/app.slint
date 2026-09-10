@@ -30,6 +30,7 @@ export component AppWindow inherits Window {
     in-out property <bool> lock-screen-control: false;
     in-out property <bool> clipboard-enabled: false;
     in-out property <int> mode-index: 0;
+    in-out property <int> edge-mode-index: 0;
     in property <string> role-text: "Both ways";
     in property <string> app-version: "";
     // Taskbar/dock alert: set while an incoming pairing waits, so a
@@ -52,6 +53,7 @@ export component AppWindow inherits Window {
     callback connect-to(string /* address */, string /* typed station code, may be empty */);
     callback disconnect();
     callback set-role(int /* 0 both, 1 controller, 2 receiver */);
+    callback set-edge-mode(int /* 0 single facing edge, 1 double horizontal edges */);
     callback pair-from-invite(string /* invite */);
     callback discover-lan();
     callback start-daemon();
@@ -519,6 +521,26 @@ export component AppWindow inherits Window {
                             enabled: linked-peer-name != "";
                             clicked => { swap-sides(); }
                         }
+                    }
+                    Text { text: "Crossing edges (two-computer link)"; color: white; font-size: 14px; font-weight: 700; }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Button {
+                            text: "Single edge";
+                            enabled: linked-peer-name != "";
+                            clicked => { set-edge-mode(0); }
+                        }
+                        Button {
+                            text: "Double edge";
+                            enabled: linked-peer-name != "";
+                            clicked => { set-edge-mode(1); }
+                        }
+                    }
+                    Text {
+                        text: edge-mode-index == 1 ? "Double edge: on a two-computer link both the left and right outer edges cross to the other screen (top and bottom never cross). Grids always use facing edges only." : "Single edge: only the arranged facing edge crosses — the edge that points at the other screen's icon above. Top, bottom and the outer edge do nothing.";
+                        color: #9ca3af;
+                        font-size: 12px;
+                        wrap: word-wrap;
                     }
                     Text {
                         visible: driving-text != "";

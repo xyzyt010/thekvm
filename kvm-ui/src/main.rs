@@ -5,7 +5,7 @@
 slint::include_modules!();
 
 use anyhow::{Context, Result};
-use kvm_core::Mode;
+use kvm_core::{EdgeMode, Mode};
 use kvm_protocol::control::{
     read_response, write_request, ControlRequest, ControlResponse, DaemonStatus, PendingPairing,
 };
@@ -164,6 +164,10 @@ fn main() -> Result<()> {
             kvm_core::Mode::Bidirectional => 0,
             kvm_core::Mode::ServerClient => 1,
             kvm_core::Mode::ClientOnly => 2,
+        });
+        ui.set_edge_mode_index(match config.edge_mode {
+            EdgeMode::Single => 0,
+            EdgeMode::Double => 1,
         });
         // Seed the green "Current role" text from the same file: until the
         // first successful poll it is the only source of truth on screen.
@@ -481,6 +485,7 @@ fn main() -> Result<()> {
                 auto_connect_address: current.auto_connect_address.clone(),
                 clear_auto_connect: current.auto_connect_address.is_none(),
                 clipboard_enabled: Some(current.clipboard_enabled),
+                edge_mode: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -489,6 +494,7 @@ fn main() -> Result<()> {
                         current.allow_lock_screen_control,
                         current.clipboard_enabled,
                         None,
+                        Some(current.edge_mode),
                     );
                     ui_log(&format!("role applied: {}", role_name(requested)));
                     // Update the green role text from the authoritative
@@ -530,6 +536,96 @@ fn main() -> Result<()> {
                 Err(error) => {
                     ui_log(&format!("role change failed: {error}"));
                     set_status(&weak, format!("Cannot set role: {error}"))
+                }
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let edge_session = session_state.clone();
+    ui.on_set_edge_mode(move |index| {
+        let weak = weak.clone();
+        let edge_session = edge_session.clone();
+        let requested = match index {
+            1 => EdgeMode::Double,
+            _ => EdgeMode::Single,
+        };
+        ui_log(&format!("edge button pressed: {}", edge_mode_name(requested)));
+        set_status(&weak, "Applying edge crossing…".into());
+        std::thread::spawn(move || {
+            // Read-modify-write so the toggle only ever changes the edge
+            // discipline, never anything else.
+            let current = match control_request(ControlRequest::GetConfig) {
+                Ok(ControlResponse::Config(config)) => config,
+                Ok(other) => {
+                    ui_log(&format!("edge change: cannot read settings: {other:?}"));
+                    set_status(&weak, format!("Cannot read settings: {other:?}"));
+                    return;
+                }
+                Err(error) => {
+                    ui_log(&format!("edge change: settings unreadable: {error:#}"));
+                    set_status(&weak, control_denied_status(&error, "Background service unreachable"));
+                    return;
+                }
+            };
+            match control_request(ControlRequest::SetConfig {
+                device_name: Some(current.device_name.clone()),
+                mode: Some(current.mode),
+                allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                listen_port: None,
+                layout: None,
+                auto_connect_address: current.auto_connect_address.clone(),
+                clear_auto_connect: current.auto_connect_address.is_none(),
+                clipboard_enabled: Some(current.clipboard_enabled),
+                edge_mode: Some(requested),
+            }) {
+                Ok(ControlResponse::Applied { .. }) => {
+                    mirror_user_config(
+                        &current.device_name,
+                        current.mode,
+                        current.allow_lock_screen_control,
+                        current.clipboard_enabled,
+                        None,
+                        Some(requested),
+                    );
+                    ui_log(&format!("edge crossing applied: {}", edge_mode_name(requested)));
+                    set_edge_mode_display(&weak, requested);
+                    refresh_arrangement(&weak, child_running(&edge_session));
+                    if edge_session
+                        .lock()
+                        .ok()
+                        .is_some_and(|slot| slot.as_ref().is_some())
+                    {
+                        // The running child routed under the old discipline;
+                        // stop it rather than drive stale (re-Connect
+                        // re-arms under the new one).
+                        ui_log("edge change: stopping the link; Connect again to re-link");
+                        stop_session(&weak, &edge_session, "Link stopped");
+                        set_status(
+                            &weak,
+                            format!(
+                                "Edge crossing set: {}. Link stopped — Connect again to re-link.",
+                                edge_mode_name(requested)
+                            ),
+                        );
+                    } else {
+                        set_status(
+                            &weak,
+                            format!("Edge crossing set: {}.", edge_mode_name(requested)),
+                        );
+                    }
+                }
+                Ok(ControlResponse::Error { message }) => {
+                    ui_log(&format!("edge change refused: {message}"));
+                    set_status(&weak, message)
+                }
+                Ok(other) => {
+                    ui_log(&format!("edge change unexpected: {other:?}"));
+                    set_status(&weak, format!("Unexpected daemon response: {other:?}"))
+                }
+                Err(error) => {
+                    ui_log(&format!("edge change failed: {error}"));
+                    set_status(&weak, format!("Cannot set edge crossing: {error}"))
                 }
             }
         });
@@ -806,12 +902,14 @@ fn main() -> Result<()> {
                 };
                 // The supervised controller session reads the USER config, so
                 // mirror the same choices there (without any boot peer, which
-                // the user config must never carry).
+                // the user config must never carry). Edge discipline is not
+                // part of this form: preserve whatever the file already has.
                 mirror_user_config(
                     &device_name,
                     requested_mode,
                     allow_lock_screen,
                     clipboard_enabled,
+                    None,
                     None,
                 );
                 let mode = match mode_index {
@@ -856,6 +954,8 @@ fn main() -> Result<()> {
                         .then_some(auto_address.clone()),
                     clear_auto_connect: auto_address.trim().is_empty(),
                     clipboard_enabled: Some(clipboard_enabled),
+                    // The Settings form has no edge control: preserve it.
+                    edge_mode: None,
                 }) {
                     Ok(ControlResponse::Applied { restart_required }) => {
                         // Same truth rule as the role buttons: the green
@@ -932,6 +1032,7 @@ fn main() -> Result<()> {
                             auto_connect_address: None,
                             clear_auto_connect: false,
                             clipboard_enabled: Some(current.clipboard_enabled),
+                            edge_mode: None,
                         })? {
                             ControlResponse::Applied { .. } => Ok(()),
                             ControlResponse::Error { message } => anyhow::bail!(message),
@@ -976,6 +1077,31 @@ fn main() -> Result<()> {
 
     ui.run()?;
     Ok(())
+}
+
+/// Plain-language edge-discipline names shown in the Devices tab log lines
+/// and status sentences.
+fn edge_mode_name(mode: EdgeMode) -> &'static str {
+    match mode {
+        EdgeMode::Single => "Single edge",
+        EdgeMode::Double => "Double edge",
+    }
+}
+
+/// Show the authoritative edge discipline immediately (same rule as the
+/// role display: never wait for the next poll).
+fn set_edge_mode_display(weak: &slint::Weak<AppWindow>, mode: EdgeMode) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_edge_mode_index(match mode {
+                    EdgeMode::Single => 0,
+                    EdgeMode::Double => 1,
+                });
+            }
+        }
+    });
 }
 
 /// Plain-language role names shown next to "Current role:" and in the
@@ -1090,6 +1216,10 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                     Mode::Bidirectional => 0,
                     Mode::ServerClient => 1,
                     Mode::ClientOnly => 2,
+                });
+                ui.set_edge_mode_index(match status.edge_mode {
+                    EdgeMode::Single => 0,
+                    EdgeMode::Double => 1,
                 });
                 ui.set_fingerprint(SharedString::from(status.fingerprint_hex));
                 ui.set_role_text(SharedString::from(role_name(status.mode)));
@@ -1643,6 +1773,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         auto_connect_address: current.auto_connect_address.clone(),
         clear_auto_connect: current.auto_connect_address.is_none(),
         clipboard_enabled: Some(current.clipboard_enabled),
+        edge_mode: None,
     }) {
         Ok(ControlResponse::Applied { .. }) => {}
         Ok(ControlResponse::Error { message }) => anyhow::bail!("{message}"),
@@ -1655,6 +1786,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         current.allow_lock_screen_control,
         current.clipboard_enabled,
         Some(layout.clone()),
+        None,
     );
     ui_log("arrange: screen arrangement saved");
     Ok(layout)
@@ -1843,6 +1975,12 @@ fn side_name(side: kvm_core::Edge) -> &'static str {
 /// poll worker; all blocking calls are fine there.
 fn refresh_arrangement(weak: &slint::Weak<AppWindow>, edge_active: bool) {
     let peers = linked_peers();
+    // The crossing copy follows the Settings discipline, not just the
+    // geometry: double-edge links cross past either horizontal edge.
+    let edge_mode = match control_request(ControlRequest::GetConfig) {
+        Ok(ControlResponse::Config(config)) => config.edge_mode,
+        _ => EdgeMode::Single,
+    };
     let (peer_name, text, peer_on_right) = match peers.first() {
         None => (
             String::new(),
@@ -1858,11 +1996,18 @@ fn refresh_arrangement(weak: &slint::Weak<AppWindow>, edge_active: bool) {
             match peer.side {
                 Some(side) => (
                     label.clone(),
-                    format!(
-                        "{label} is on your {} — push past the {} edge to drive it. Push back past the edge to return.",
-                        side_name(side),
-                        edge_name(side)
-                    ),
+                    if edge_mode == EdgeMode::Double {
+                        format!(
+                            "{label} is on your {} — double edge is on: push past the left or right edge to drive it. Push back past the edge to return.",
+                            side_name(side),
+                        )
+                    } else {
+                        format!(
+                            "{label} is on your {} — push past the {} edge to drive it. Push back past the edge to return.",
+                            side_name(side),
+                            edge_name(side)
+                        )
+                    },
                     !matches!(side, kvm_core::Edge::Left),
                 ),
                 None => (
@@ -3080,6 +3225,7 @@ fn mirror_user_config(
     allow_lock_screen: bool,
     clipboard_enabled: bool,
     layout: Option<kvm_core::Layout>,
+    edge_mode: Option<EdgeMode>,
 ) {
     let path = data_dir().join("config.json");
     let mut config = kvm_core::Config::load(&path).unwrap_or_default();
@@ -3092,9 +3238,13 @@ fn mirror_user_config(
     config.auto_connect_address = None;
     // A supplied layout replaces the user's topology (arrangement UI,
     // auto-layout); omission preserves whatever is there so role presses
-    // can never wipe the screen arrangement.
+    // can never wipe the screen arrangement. Same rule for the edge
+    // discipline: only an explicit edge toggle writes it.
     if let Some(layout) = layout {
         config.layout = layout;
+    }
+    if let Some(edge_mode) = edge_mode {
+        config.edge_mode = edge_mode;
     }
     let _ = config.save(&path);
 }
@@ -3144,11 +3294,20 @@ fn edge_ready_text() -> String {
                 .iter()
                 .find(|screen| screen.peer_fingerprint.is_some());
             match (config.layout.peer_exit_edge(), peer) {
-                (Some(edge), Some(screen)) => format!(
-                    "Edge control is on — push past the {} edge to drive {}. Push back past the edge to return here.",
-                    edge_name(edge),
-                    screen.name
-                ),
+                (Some(edge), Some(screen)) => {
+                    if config.edge_mode == EdgeMode::Double {
+                        format!(
+                            "Edge control is on — double edge: push past the left or right edge to drive {}. Push back past the edge to return here.",
+                            screen.name
+                        )
+                    } else {
+                        format!(
+                            "Edge control is on — push past the {} edge to drive {}. Push back past the edge to return here.",
+                            edge_name(edge),
+                            screen.name
+                        )
+                    }
+                }
                 (_, Some(screen)) => format!(
                     "Edge control is on — {} is linked but has no facing edge yet: open Devices and place its screen beside yours.",
                     screen.name
@@ -3279,7 +3438,8 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{edge_name, pair_status_text, should_dial_back};
+    use super::{edge_mode_name, edge_name, pair_status_text, should_dial_back};
+    use kvm_core::EdgeMode;
 
     #[test]
     fn compare_screen_names_peer_and_code() {
@@ -3302,6 +3462,12 @@ mod tests {
         assert_eq!(edge_name(kvm_core::Edge::Right), "right");
         assert_eq!(edge_name(kvm_core::Edge::Top), "top");
         assert_eq!(edge_name(kvm_core::Edge::Bottom), "bottom");
+    }
+
+    #[test]
+    fn edge_mode_names_are_plain_words() {
+        assert_eq!(edge_mode_name(EdgeMode::Single), "Single edge");
+        assert_eq!(edge_mode_name(EdgeMode::Double), "Double edge");
     }
 
     #[test]
