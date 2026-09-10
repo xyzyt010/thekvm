@@ -587,8 +587,18 @@ impl EdgeRouter {
     /// edge, so pure integration runs AHEAD of the visible cursor — that
     /// drift is the "crosses while visibly near the edge" phantom. The
     /// daemon calls this from the live OS position ahead of routing local
-    /// motion (throttled); like the seed it is a no-op while driving
-    /// remotely, and fresh truth restarts any push streak.
+    /// motion (throttled, and per-event near a crossing edge).
+    ///
+    /// The pin restarts a push run ONLY when it actually moves the cursor
+    /// (beyond RESYNC_DIVERGE_PX): a jump means the integrated position
+    /// ran away from truth (input scaling, warps, resolution change),
+    /// and overflow accumulated from a phantom position is exactly what
+    /// fires crossings the user sees as "far from any edge". But a pin
+    /// that barely moves — the normal case, truth and virtual agreeing
+    /// at the edge while the user leans into it — MUST keep the run:
+    /// wiping it here made sustained pushes uncrossable (only single
+    /// giant flings crossed), forcing the move-away-and-slam-back
+    /// gesture. That was the 0.9.5 edge regression.
     pub fn resync_if_local(&mut self, x: u32, y: u32) {
         if self.active_remote.is_some() || self.current_screen != self.local_screen {
             return;
@@ -596,12 +606,19 @@ impl EdgeRouter {
         let Some(screen) = self.layout.screen(self.local_screen) else {
             return;
         };
-        self.cursor_x = x.min(screen.width - 1);
-        self.cursor_y = y.min(screen.height - 1);
+        let pinned_x = x.min(screen.width - 1);
+        let pinned_y = y.min(screen.height - 1);
+        let moved = pinned_x
+            .abs_diff(self.cursor_x)
+            .max(pinned_y.abs_diff(self.cursor_y));
+        self.cursor_x = pinned_x;
+        self.cursor_y = pinned_y;
         self.local_cursor_x = self.cursor_x;
         self.local_cursor_y = self.cursor_y;
-        self.push_edge = None;
-        self.push_accum = 0;
+        if moved > RESYNC_DIVERGE_PX {
+            self.push_edge = None;
+            self.push_accum = 0;
+        }
     }
 
     /// Adopt this machine's measured screen size into the layout (called
@@ -968,6 +985,12 @@ const SETTLE_PX: u32 = 12;
 /// edge, so drift can never save up for a phantom crossing.
 pub const EDGE_PUSH_PX: i64 = 24;
 
+/// A truth re-pin that moves the cursor further than this keeps the
+/// position but restarts the push run (the old position was phantom);
+/// anything smaller is rounding noise on an agreeing cursor and keeps
+/// the run accumulating.
+const RESYNC_DIVERGE_PX: u32 = 2;
+
 /// Overflow of one motion step past a screen edge (the Deskflow
 /// jump-zone primitive both crossing paths share): None while the step
 /// stays inside, else the edge and how far past it the step lands. The
@@ -1248,8 +1271,66 @@ mod tests {
     }
 
     #[test]
-    fn near_crossing_edge_flags_only_crossable_borders() {
-        // Mid-screen is never near; the facing edge within margin is;
+    fn resync_at_edge_preserves_push_run() {
+        // The 0.9.5 edge regression: the per-event truth resync wiped the
+        // push run even when it pinned nothing, so sustained small pushes
+        // never accumulated and only giant flings crossed. Lean into the
+        // edge with 1px events and identical truth: must accumulate and
+        // fire like one firm push.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 959, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert_eq!(router.cursor_position(), (1919, 540));
+        let mut fired = false;
+        for _ in 0..30 {
+            // OS truth agrees with virtual (both clamped at the edge):
+            // the pin moves nothing, the run survives.
+            router.resync_if_local(1919, 540);
+            if matches!(
+                router.route(InputEvent::MouseMove { dx: 1, dy: 0 }),
+                RoutedEvent::Handoff { edge: Edge::Right, .. }
+            ) {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "sustained 1px pushes with agreeing truth must cross");
+        assert_eq!(router.active_remote(), Some(ScreenId(2)));
+    }
+
+    #[test]
+    fn resync_jump_restarts_push_run() {
+        // ...but a pin that actually moves the cursor (warp, scaling
+        // divergence, resolution change) still drops the stale run: the
+        // old overflow was measured from a phantom position.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 959, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 10, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        // Jump far away: cursor adopts truth, stale 10px run is gone.
+        router.resync_if_local(100, 200);
+        assert_eq!(router.cursor_position(), (100, 200));
+        // Back at the edge on fresh truth: one more 10px overflow is a
+        // fresh 10px run, not 20 — stays local.
+        router.resync_if_local(1919, 540);
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 10, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert_eq!(router.active_remote(), None);
+    }
+
+    #[test]
+    fn near_crossing_edge_flags_only_crossable_borders() {        // Mid-screen is never near; the facing edge within margin is;
         // an unlinked edge (top) never is; lock and remote never are.
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
