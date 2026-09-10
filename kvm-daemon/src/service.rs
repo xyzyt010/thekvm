@@ -1375,6 +1375,24 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
             }
         }
     };
+    // Real geometry BEFORE the seed (Deskflow getShape parity): the
+    // crossing edge must sit on the visible edge. A layout in fallback
+    // dims while the pointer lives in physical ones fires crossings the
+    // user sees as "far from any edge" — on either computer. Once per
+    // process: the per-event truth feed below only re-pins the cursor,
+    // never the dims.
+    match kvm_platform::capture::screen_size() {
+        Ok(Some((width, height))) => {
+            match router.adopt_local_screen_size(width, height) {
+                Some((w, h)) => {
+                    tracing::info!(width = w, height = h, "topology local geometry measured")
+                }
+                None => tracing::warn!("measured screen size rejected; keeping configured geometry"),
+            }
+        }
+        Ok(None) => tracing::debug!("platform did not expose a screen size; keeping configured geometry"),
+        Err(error) => tracing::debug!(%error, "could not query screen size"),
+    }
     match kvm_platform::capture::current_cursor_position() {
         Ok(Some((x, y))) => {
             if let Err(error) = router.set_local_cursor_position(x, y) {
@@ -2035,23 +2053,7 @@ async fn handle_topology_event(
             .unwrap_or(true);
         if due {
             *last_resync = Some(Instant::now());
-    // Real geometry BEFORE the seed (Deskflow getShape parity): the
-    // crossing edge must sit on the visible edge. A layout in fallback
-    // dims while the pointer lives in physical ones fires crossings the
-    // user sees as "far from any edge" — on either computer.
-    match kvm_platform::capture::screen_size() {
-        Ok(Some((width, height))) => {
-            match router.adopt_local_screen_size(width, height) {
-                Some((w, h)) => {
-                    tracing::info!(width = w, height = h, "topology local geometry measured")
-                }
-                None => tracing::warn!("measured screen size rejected; keeping configured geometry"),
-            }
-        }
-        Ok(None) => tracing::debug!("platform did not expose a screen size; keeping configured geometry"),
-        Err(error) => tracing::debug!(%error, "could not query screen size"),
-    }
-    match kvm_platform::capture::current_cursor_position() {
+            match kvm_platform::capture::current_cursor_position() {
                 Ok(Some((x, y))) => router.resync_if_local(x, y),
                 Ok(None) => {}
                 Err(error) => {
