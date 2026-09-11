@@ -204,9 +204,17 @@ pub fn backend_census() -> (u64, u64, u64, u64, u64, u64) {
 }
 
 /// Platforms without channel split report no census.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
 pub fn backend_census() -> (u64, u64, u64, u64, u64, u64) {
     (0, 0, 0, 0, 0, 0)
+}
+
+/// Linux census: X11 translated arrivals fill the key/button/move/wheel
+/// slots (raw slots stay zero — no hook/RAW split here).
+#[cfg(target_os = "linux")]
+pub fn backend_census() -> (u64, u64, u64, u64, u64, u64) {
+    let (key, button, motion, wheel) = crate::x11_capture::census();
+    (key, button, motion, wheel, 0, 0)
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]

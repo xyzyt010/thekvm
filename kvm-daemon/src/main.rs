@@ -139,6 +139,32 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // The Windows SCM discards service stderr, so the service has always
+    // been log-blind: every Mint→Windows receive-side line (warp
+    // outcomes, session ends, rejections) vanished at birth. Service mode
+    // logs to a capped file instead; every other mode keeps stderr
+    // (supervised children rely on it for THEKVM_STATUS progress).
+    #[cfg(target_os = "windows")]
+    let writer = service_file_writer();
+    #[cfg(target_os = "windows")]
+    if let Some(writer) = writer {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            )
+            .with_writer(writer)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            )
+            // Supervised children run with stdout nulled (the UI pipes stderr
+            // for progress): diagnostics must go to stderr or they vanish.
+            .with_writer(std::io::stderr)
+            .init();
+    }
+    #[cfg(not(target_os = "windows"))]
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -188,6 +214,102 @@ fn main() -> Result<()> {
     }
 
     async_main()
+}
+
+/// SCM-discarded stderr replacement for `--service` mode: an
+/// append-only, capped process log at %ProgramData%\TheKVM\daemon.log.
+/// std-only (offline builds can't add tracing-appender): an Arc-Mutex
+/// file behind MakeWriter. Some(...) only in service mode; foreground
+/// modes keep stderr via the None path in main().
+#[cfg(target_os = "windows")]
+fn service_file_writer() -> Option<ServiceFileWriter> {
+    if !std::env::args().any(|argument| argument == "--service") {
+        return None;
+    }
+    let dir = std::env::var("PROGRAMDATA")
+        .map(|base| std::path::PathBuf::from(base).join("TheKVM"))
+        .ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let file = open_capped_log(&dir.join("daemon.log"), 8 * 1024 * 1024)?;
+    Some(ServiceFileWriter {
+        file: std::sync::Arc::new(std::sync::Mutex::new(file)),
+    })
+}
+
+/// Open an append log, truncating a wedged giant first so a stuck
+/// session can never fill the disk. Pure enough for tests (any dir).
+#[cfg(target_os = "windows")]
+fn open_capped_log(path: &std::path::Path, cap_bytes: u64) -> Option<std::fs::File> {
+    if std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0) > cap_bytes {
+        std::fs::write(path, "").ok()?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+struct ServiceFileWriter {
+    file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+}
+
+#[cfg(target_os = "windows")]
+impl std::io::Write for ServiceFileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "service log lock poisoned"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "service log lock poisoned"))?
+            .flush()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ServiceFileWriter {
+    type Writer = ServiceFileWriter;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn service_log_appends_and_caps() {
+        let dir = std::env::temp_dir().join(format!("thekvm-svclog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("daemon.log");
+        let file = open_capped_log(&path, 8 * 1024 * 1024).expect("open log");
+        let mut writer = ServiceFileWriter {
+            file: std::sync::Arc::new(std::sync::Mutex::new(file)),
+        };
+        writer.write_all(b"warp placed\n").unwrap();
+        writer.flush().unwrap();
+        // Round-trip through the MakeWriter face the subscriber uses.
+        use tracing_subscriber::fmt::MakeWriter as _;
+        writer.make_writer().write_all(b"second line\n").unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("warp placed"), "{body}");
+        assert!(body.contains("second line"), "{body}");
+        // Over the cap: next open truncates.
+        std::fs::write(&path, vec![b'x'; 16]).unwrap();
+        open_capped_log(&path, 8).expect("reopen capped log");
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[tokio::main]

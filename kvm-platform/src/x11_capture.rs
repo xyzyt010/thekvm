@@ -9,7 +9,7 @@
 
 use crate::{capture::CaptureBackend, PlatformError};
 use kvm_core::{InputEvent, KeyEvent, MouseButton};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use x11rb::connection::Connection;
@@ -50,6 +50,26 @@ fn is_own_device_name(name: &[u8]) -> bool {
     String::from_utf8_lossy(name)
         .to_ascii_lowercase()
         .contains("thekvm")
+}
+
+/// Backend receipt census for X11: what the server actually delivered
+/// past the own-device filter (raw key/button/motion/wheel arrivals).
+/// Read by the daemon into the journal: separates "the X server never
+/// delivered" (all zero while the user pushes) from "delivered but not
+/// routed". The Windows hook/RAW split has no meaning here, so motion
+/// fills the move slot and raw slots stay zero.
+static XI_KEY: AtomicU64 = AtomicU64::new(0);
+static XI_BUTTON: AtomicU64 = AtomicU64::new(0);
+static XI_MOTION: AtomicU64 = AtomicU64::new(0);
+static XI_WHEEL: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn census() -> (u64, u64, u64, u64) {
+    (
+        XI_KEY.load(Ordering::Relaxed),
+        XI_BUTTON.load(Ordering::Relaxed),
+        XI_MOTION.load(Ordering::Relaxed),
+        XI_WHEEL.load(Ordering::Relaxed),
+    )
 }
 
 /// Resolve our own slave-device ids via XIQueryDevice (0 = all devices).
@@ -151,30 +171,33 @@ impl X11Capture {
                 if self.ignored_sources.contains(&event.sourceid) {
                     return None;
                 }
+                XI_KEY.fetch_add(1, Ordering::Relaxed);
                 key_event(event.detail, true)
             }
             x11rb::protocol::Event::XinputRawKeyRelease(event) => {
                 if self.ignored_sources.contains(&event.sourceid) {
                     return None;
                 }
+                XI_KEY.fetch_add(1, Ordering::Relaxed);
                 key_event(event.detail, false)
             }
             x11rb::protocol::Event::XinputRawButtonPress(event) => {
                 if self.ignored_sources.contains(&event.sourceid) {
                     return None;
                 }
-                button_event(event.detail, true)
+                count_button_event(button_event(event.detail, true))
             }
             x11rb::protocol::Event::XinputRawButtonRelease(event) => {
                 if self.ignored_sources.contains(&event.sourceid) {
                     return None;
                 }
-                button_event(event.detail, false)
+                count_button_event(button_event(event.detail, false))
             }
             x11rb::protocol::Event::XinputRawMotion(event) => {
                 if self.ignored_sources.contains(&event.sourceid) {
                     return None;
                 }
+                XI_MOTION.fetch_add(1, Ordering::Relaxed);
                 let dx = axis_value(&event.valuator_mask, &event.axisvalues_raw, 0)
                     .map(|value| take_integer(&mut self.motion_x, value))
                     .unwrap_or(0);
@@ -447,6 +470,21 @@ fn button_event(detail: u32, pressed: bool) -> Option<InputEvent> {
         }),
         _ => None,
     }
+}
+
+/// Census wrapper for translated button arrivals: wheel clicks (4-7)
+/// count as wheel, everything else as buttons. Pure counter, no logic.
+fn count_button_event(event: Option<InputEvent>) -> Option<InputEvent> {
+    match event {
+        Some(InputEvent::SmoothWheel { .. }) => {
+            XI_WHEEL.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(_) => {
+            XI_BUTTON.fetch_add(1, Ordering::Relaxed);
+        }
+        None => {}
+    }
+    event
 }
 
 fn axis_value(mask: &[u32], values: &[xinput::Fp3232], axis: usize) -> Option<f64> {

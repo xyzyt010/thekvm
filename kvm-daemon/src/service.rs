@@ -2385,6 +2385,13 @@ async fn handle_topology_event(
             if active.is_some() {
                 bail!("topology router attempted a second active handoff");
             }
+            // Push-attempt telemetry: the router fired for this edge push.
+            // If crossings silently never start, this line (or its absence
+            // beside live capture) names the dead layer: no line with
+            // motion flowing means the push never reached the router
+            // (wrong edge/capture), while guard lines below mean the
+            // router refused it (unlinked/debounce/cooldown).
+            tracing::info!(?target, ?edge, target_x, target_y, "edge push reaches router; opening crossing");
             // MWB connected-guard: a linked child drives ONLY its verified
             // linked peer. Anything else is a stranger — clamp back local.
             if let Some(link) = link {
@@ -2401,6 +2408,7 @@ async fn handle_topology_event(
             }
             // MWB lastJump debounce: let the last transfer settle first.
             if transfer_debounced(*last_transfer) {
+                tracing::debug!(?target, ?edge, "edge push debounced after a transfer");
                 let _ = router.restore_local(target);
                 park_inside(router, edge);
                 return Ok(());
@@ -2410,6 +2418,7 @@ async fn handle_topology_event(
             // full QUIC handshake — the dial storm that flapped control.
             // The user simply keeps pushing; a fresh crossing retries.
             if episode_cooling_down(*last_failed_episode) {
+                tracing::debug!(?target, ?edge, "edge push in failed-episode cooldown");
                 let _ = router.restore_local(target);
                 park_inside(router, edge);
                 return Ok(());
