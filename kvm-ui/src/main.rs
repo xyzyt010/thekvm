@@ -204,6 +204,12 @@ fn main() -> Result<()> {
         "UI started; user state at {}",
         startup_dir.display()
     ));
+    // Let the headless system daemon place entry warps on this session's
+    // X server: without the grant its receiver drives unplaced (entries
+    // land mid-screen). Localhost-only, warp-scoped in practice, and best
+    // effort — a missing xhost binary just keeps today's behavior.
+    #[cfg(target_os = "linux")]
+    grant_daemon_x_access();
     // Poll thread owns no UI handles (see NOTE inside the loop); everything
     // it needs is cloned here.
     let poll_weak = weak.clone();
@@ -2970,6 +2976,33 @@ fn ui_log(message: &str) {
             .unwrap_or_default()
             .as_millis();
         let _ = writeln!(file, "{millis}\t{message}");
+    }
+}
+
+/// Grant the headless system daemon access to this session's X server so
+/// its receiver can place entry warps exactly (see receiver warp). Runs
+/// once at UI startup, localhost-only (`+SI:localuser:thekvm` touches no
+/// network ACL), best effort with a journal line either way.
+#[cfg(target_os = "linux")]
+fn grant_daemon_x_access() {
+    match std::process::Command::new("xhost")
+        .arg("+SI:localuser:thekvm")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            ui_log("x11: granted the system daemon access to this session for entry warps");
+        }
+        Ok(output) => {
+            ui_log(&format!(
+                "x11: daemon X grant refused ({}); entries land unplaced",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Err(error) => {
+            ui_log(&format!(
+                "x11: xhost unavailable ({error}); entries land unplaced"
+            ));
+        }
     }
 }
 

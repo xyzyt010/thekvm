@@ -4483,10 +4483,20 @@ impl ReceiverInjector {
                 // point (Deskflow Client::enter parity): without this warp
                 // the peer drives a virtual edge cursor while the visible
                 // one sits wherever it was — entries land mid-screen and
-                // every later exit looks like it fires mid-screen. The X11
-                // warp is a real pointer warp, not a virtual-only update.
+                // every later exit looks like it fires mid-screen. The
+                // headless daemon has no DISPLAY of its own, so it warps
+                // through the session-published display (the UI grants
+                // access at startup); without one it warns and drives
+                // unplaced rather than failing the episode.
                 #[cfg(target_os = "linux")]
-                return kvm_platform::capture::warp_cursor(x, y).map_err(anyhow::Error::from);
+                {
+                    let Some(display) = receiver_display() else {
+                        tracing::debug!(x, y, "no session display for entry warp; driving unplaced");
+                        return Ok(());
+                    };
+                    return kvm_platform::capture::warp_cursor_on(Some(&display), x, y)
+                        .map_err(anyhow::Error::from);
+                }
                 #[cfg(not(target_os = "linux"))]
                 {
                     let _ = (x, y);
@@ -5112,6 +5122,37 @@ fn parse_geometry_sidecar(text: &str) -> Option<(u32, u32)> {
     Some((width as u32, height as u32))
 }
 
+/// Parse the session display name from the sidecar body (`":0"`).
+/// Validated hard: this string selects an X connection, so anything
+/// that is not a plain local display id is rejected. Pure for tests.
+fn parse_sidecar_display(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let display = value.get("display")?.as_str()?;
+    if display.len() > 32
+        || !display.starts_with(':')
+        || !display
+            .chars()
+            .all(|cell| cell.is_ascii_alphanumeric() || cell == ':' || cell == '.')
+    {
+        return None;
+    }
+    Some(display.to_owned())
+}
+
+/// Display the receiver should warp on: our own environment first, else
+/// the session-published sidecar display (headless daemons have no
+/// DISPLAY of their own). None means "no session display known".
+fn receiver_display() -> Option<String> {
+    if let Ok(display) = std::env::var("DISPLAY") {
+        if !display.trim().is_empty() {
+            return Some(display);
+        }
+    }
+    std::fs::read_to_string(data_dir().join(GEOMETRY_SIDECAR))
+        .ok()
+        .and_then(|text| parse_sidecar_display(&text))
+}
+
 /// Pick the advertised geometry from best to worst evidence. Pure for
 /// tests: session truth (a child measured it inside the live desktop)
 /// beats a live platform query beats configured fallback dims.
@@ -5167,7 +5208,13 @@ fn publish_local_geometry(router: &EdgeRouter) {
     let Some(geometry) = local_screen_geometry(router.layout()) else {
         return;
     };
-    let body = serde_json::json!({ "width": geometry.width, "height": geometry.height }).to_string();
+    // The session display travels with the dims: the headless daemon
+    // needs it to place the entry warp on the right X server.
+    let display = std::env::var("DISPLAY").ok().filter(|name| {
+        let name = name.trim();
+        !name.is_empty() && name.len() <= 32
+    });
+    let body = serde_json::json!({ "width": geometry.width, "height": geometry.height, "display": display }).to_string();
     if let Err(error) = std::fs::write(
         std::path::Path::new(&daemon_dir).join(GEOMETRY_SIDECAR),
         body,
@@ -5622,6 +5669,36 @@ mod tests {
             pick_geometry(2, None, None, configured)
                 .map(|geometry| (geometry.width, geometry.height)),
             Some((1920, 1080))
+        );
+    }
+
+    #[test]
+    fn sidecar_display_parses_strictly() {
+        // Plain local display ids pass; anything else (paths, commands,
+        // remote specs) is rejected — this string selects an X connection.
+        assert_eq!(
+            parse_sidecar_display(r#"{"width":1536,"height":864,"display":":0"}"#),
+            Some(":0".to_owned())
+        );
+        assert_eq!(
+            parse_sidecar_display(r#"{"width":1536,"height":864,"display":":0.0"}"#),
+            Some(":0.0".to_owned())
+        );
+        assert_eq!(
+            parse_sidecar_display(r#"{"width":1536,"height":864}"#),
+            None
+        );
+        assert_eq!(
+            parse_sidecar_display(r#"{"display":"/tmp/evil"}"#),
+            None
+        );
+        assert_eq!(
+            parse_sidecar_display(r#"{"display":"host:0"}"#),
+            None
+        );
+        assert_eq!(
+            parse_sidecar_display(r#"{"display":"; rm -rf ~"}"#),
+            None
         );
     }
 

@@ -92,10 +92,19 @@ pub fn set_exclusive(_exclusive: bool) {}
 
 #[cfg(target_os = "linux")]
 pub fn warp_cursor(x: u32, y: u32) -> Result<(), PlatformError> {
+    warp_cursor_on(None, x, y)
+}
+
+/// Warp the pointer on an explicitly named X display. Headless daemons
+/// have no DISPLAY of their own: the session side publishes its display
+/// name (see the geometry sidecar) and grants access, so the receiver
+/// can still place the OS cursor exactly on the entry point.
+#[cfg(target_os = "linux")]
+pub fn warp_cursor_on(display: Option<&str>, x: u32, y: u32) -> Result<(), PlatformError> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt;
 
-    let (connection, screen) = x11rb::connect(None).map_err(|error| {
+    let (connection, screen) = x11rb::connect(display).map_err(|error| {
         PlatformError::Capture(format!("connect to X11 for pointer warp: {error}"))
     })?;
     let root = connection
@@ -125,8 +134,7 @@ pub fn warp_cursor(x: u32, y: u32) -> Result<(), PlatformError> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {
-    use x11rb::connection::Connection;
+pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {    use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt;
 
     // This is only a best-effort initialization aid for X11. A negative root
