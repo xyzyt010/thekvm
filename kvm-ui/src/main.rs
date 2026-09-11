@@ -1081,6 +1081,38 @@ fn main() -> Result<()> {
         });
     });
 
+    // Close == Disconnect: window close bans the link epoch and kills
+    // the supervised child. Rust does NOT kill Child on drop, so without
+    // this a closed UI orphans a live `kvm-daemon connect` that keeps
+    // driving the peer with nobody watching — on Mint that froze the
+    // machine (its dial-back kept driving a Windows service whose app
+    // was gone, holding input suppression with no way back except a
+    // manual Disconnect). No UI calls here: the event loop is going
+    // away, so this only touches the child, the daemon, and the log.
+    {
+        let close_session = session.clone();
+        ui.window().on_close_requested(move || {
+            if let Ok(mut slot) = close_session.lock() {
+                if let Some(mut session) = slot.take() {
+                    if let Some(link_id) = session.link_id {
+                        end_link(link_id);
+                    }
+                    ui_log(&format!(
+                        "app closing; stopped supervised child for {}",
+                        session.address
+                    ));
+                    // SIGKILL-equivalent: cannot be ignored, so no orphan
+                    // survives this. try_wait reaps if already dead without
+                    // ever blocking the exit; init reaps the rest.
+                    let _ = session.child.kill();
+                    let _ = session.child.try_wait();
+                }
+            }
+            ui_log("app closing");
+            std::process::exit(0);
+        });
+    }
+
     ui.run()?;
     Ok(())
 }
