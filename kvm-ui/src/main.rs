@@ -709,10 +709,18 @@ fn main() -> Result<()> {
     });
 
     let weak = ui.as_weak();
-    ui.on_swap_sides(move || {
+    ui.on_place_peer_left(move || {
         let weak = weak.clone();
         std::thread::spawn(move || {
-            arrange_swap(&weak);
+            arrange_place_first_peer(&weak, kvm_core::Edge::Left);
+        });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_place_peer_right(move || {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            arrange_place_first_peer(&weak, kvm_core::Edge::Right);
         });
     });
 
@@ -2051,7 +2059,7 @@ fn refresh_arrangement(weak: &slint::Weak<AppWindow>, edge_active: bool) {
                 None => (
                     label.clone(),
                     format!(
-                        "{label} is linked but has no screen yet — press Swap sides to place it."
+                        "{label} is linked but has no screen yet — press Put on left or Put on right to place it."
                     ),
                     true,
                 ),
@@ -2171,23 +2179,18 @@ fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kv
     }
 }
 
-/// Swap the first linked peer to the opposite side (Left<->Right,
-/// Top<->Bottom). With no placed side yet, this places the peer on the
-/// right (Machine-1 default).
-fn arrange_swap(weak: &slint::Weak<AppWindow>) {
+/// Place the first linked peer on an explicitly chosen side (the
+/// arrangement buttons). Explicit choice replaced the old toggle: a
+/// mirrored arrangement makes pushes toward the other computer die
+/// silently on the wrong outer edge, and a toggle invites guessing.
+/// With no placed side yet, this places the peer on the requested side.
+fn arrange_place_first_peer(weak: &slint::Weak<AppWindow>, side: kvm_core::Edge) {
     let peers = linked_peers();
     let Some(peer) = peers.first() else {
         set_status(&weak, "No linked computer to place — pair one first.".into());
         return;
     };
-    let next = match peer.side {
-        Some(kvm_core::Edge::Left) => kvm_core::Edge::Right,
-        Some(kvm_core::Edge::Right) => kvm_core::Edge::Left,
-        Some(kvm_core::Edge::Top) => kvm_core::Edge::Bottom,
-        Some(kvm_core::Edge::Bottom) => kvm_core::Edge::Top,
-        None => kvm_core::Edge::Right,
-    };
-    arrange_place_peer(&weak, &peer.fingerprint.clone(), next);
+    arrange_place_peer(&weak, &peer.fingerprint.clone(), side);
 }
 
 /// Start the supervised `connect` session.

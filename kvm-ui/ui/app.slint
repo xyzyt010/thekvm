@@ -62,7 +62,8 @@ export component AppWindow inherits Window {
     callback approve-incoming-pairing(string);
     callback reject-incoming-pairing(string);
     callback revoke-peer(string);
-    callback swap-sides();
+    callback place-peer-left();
+    callback place-peer-right();
     callback open-log-folder();
     callback apply-config(bool, int, string, string, bool);
     callback import-layout(string);
@@ -517,10 +518,21 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         spacing: 12px;
                         Button {
-                            text: "Swap sides";
+                            text: "Put on left";
                             enabled: linked-peer-name != "";
-                            clicked => { swap-sides(); }
+                            clicked => { place-peer-left(); }
                         }
+                        Button {
+                            text: "Put on right";
+                            enabled: linked-peer-name != "";
+                            clicked => { place-peer-right(); }
+                        }
+                    }
+                    Text {
+                        text: "Put the linked screen where it physically sits — the crossing edge is the facing edge between the two icons above. A wrong side makes pushes toward the other computer silently do nothing.";
+                        color: #9ca3af;
+                        font-size: 12px;
+                        wrap: word-wrap;
                     }
                     Text { text: "Crossing edges (two-computer link)"; color: white; font-size: 14px; font-weight: 700; }
                     HorizontalLayout {
