@@ -2748,7 +2748,7 @@ fn relay_session_progress(
             }
             "driving" => {
                 set_driving(weak, detail.to_owned());
-                format!("Driving {detail} — push back past the edge to return here.")
+                format!("Driving {detail} — push back past the edge to return here. Tap ScrollLock to release instantly.")
             }
             "local" => {
                 set_driving(weak, String::new());

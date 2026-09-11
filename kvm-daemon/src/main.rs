@@ -217,17 +217,20 @@ fn main() -> Result<()> {
 }
 
 /// SCM-discarded stderr replacement for `--service` mode: an
-/// append-only, capped process log at %ProgramData%\TheKVM\daemon.log.
-/// std-only (offline builds can't add tracing-appender): an Arc-Mutex
-/// file behind MakeWriter. Some(...) only in service mode; foreground
-/// modes keep stderr via the None path in main().
+/// append-only, capped process log. Lives in a dedicated Logs directory
+/// (NOT the locked-down data dir that holds identity keys): the
+/// installer grants Users read/write there so the UI, diagnostics, and
+/// support can actually read it. std-only (offline builds can't add
+/// tracing-appender): an Arc-Mutex file behind MakeWriter. Some(...)
+/// only in service mode; foreground modes keep stderr via the None path
+/// in main().
 #[cfg(target_os = "windows")]
 fn service_file_writer() -> Option<ServiceFileWriter> {
     if !std::env::args().any(|argument| argument == "--service") {
         return None;
     }
     let dir = std::env::var("PROGRAMDATA")
-        .map(|base| std::path::PathBuf::from(base).join("TheKVM"))
+        .map(|base| std::path::PathBuf::from(base).join("TheKVM").join("Logs"))
         .ok()?;
     std::fs::create_dir_all(&dir).ok()?;
     let file = open_capped_log(&dir.join("daemon.log"), 8 * 1024 * 1024)?;
