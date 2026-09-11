@@ -2435,6 +2435,11 @@ fn launch_child(
         command.arg("--identity-stdin");
     }
     command.env("THEKVM_DATA_DIR", data_dir);
+    // Where the supervised child publishes session-measured screen
+    // geometry for the (possibly headless) daemon to advertise.
+    // Unix-only: the Windows daemon measures its own screen directly.
+    #[cfg(unix)]
+    command.env("THEKVM_DAEMON_DIR", control_data_dir());
     command.stdin(if inherited_identity.is_some() {
         std::process::Stdio::piped()
     } else {

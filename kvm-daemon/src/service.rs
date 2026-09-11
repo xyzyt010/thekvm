@@ -1062,7 +1062,7 @@ pub async fn connect(
                 request_lock_screen: config.allow_lock_screen_control,
                 mode: config.mode,
                 clipboard_enabled: config.clipboard_enabled,
-                screen_geometry: local_screen_geometry(&config.layout),
+                screen_geometry: truthful_local_geometry(&config.layout),
                 link_id,
             },
             None,
@@ -1413,7 +1413,11 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // only affects later handoffs through a fresh child.
     router.set_edge_mode(config.edge_mode);
     tracing::info!(edge_mode = ?config.edge_mode, "topology edge discipline");
-    let local_geometry = local_screen_geometry(&config.layout);
+    // Episodes advertise the ADOPTED router geometry (real measured dims),
+    // never the configured fallback: the peer maps every entry point
+    // against this. Plus publish it for the headless daemon sidecar.
+    let local_geometry = local_screen_geometry(router.layout());
+    publish_local_geometry(&router);
     let peers = PeerBook::load_or_create(&dir)?;
     // The face every episode dial presents. This MUST be the same identity
     // the startup verify used (daemon-owned via --identity-stdin for
@@ -3458,6 +3462,24 @@ pub async fn run() -> Result<()> {
             }
         }
     }
+    // Real local geometry at startup (Deskflow getShape parity): every
+    // Accepted/Hello advertisement and entry remap derives from this
+    // layout. Sessionful daemons measure directly; headless ones keep
+    // fallback until a child publishes the sidecar (see
+    // truthful_local_geometry).
+    if let Ok(size) = kvm_platform::capture::screen_size() {
+        if let Some((width, height)) = size {
+            let local = config
+                .layout
+                .self_screen
+                .or_else(|| config.layout.screens.first().map(|screen| screen.id));
+            if let Some(id) = local {
+                if config.layout.set_screen_size(id, width, height) {
+                    tracing::info!(width, height, "daemon measured local geometry");
+                }
+            }
+        }
+    }
 
     let identity = Identity::load_or_create(&dir).context("creating identity")?;
     let listen_port = config.listen_port;
@@ -3774,7 +3796,7 @@ async fn handle_connection(
             let mut input_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
 
             let peer_screen_geometry = hello.screen_geometry;
-            let local_geometry = local_screen_geometry(&config.layout);
+            let local_geometry = truthful_local_geometry(&config.layout);
             let mut clipboard = if config.clipboard_enabled && hello.clipboard_enabled {
                 start_clipboard_agent(true)
             } else {
@@ -4010,7 +4032,17 @@ async fn handle_connection(
                                 );
                                 remote_screen = Some(target);
                                 remote_cursor = Some((x, y));
-                                injector.warp_cursor(x, y)?;
+                                // Proves entry exactness per crossing: the OS
+                                // cursor was just placed here, so a later
+                                // "exited mid-screen" report can be checked
+                                // against this line, not guessed about. A
+                                // failed warp warns but never kills the
+                                // episode — driving unplaced beats not
+                                // driving at all.
+                                match injector.warp_cursor(x, y) {
+                                    Ok(()) => tracing::info!(x, y, "receiver placed cursor at entry"),
+                                    Err(error) => tracing::warn!(%error, x, y, "receiver entry warp failed; cursor starts unplaced"),
+                                }
                             }
                             WireMessage::ReleaseAll => injector.release_all()?,
                             WireMessage::Ping { nonce } => {
@@ -4447,9 +4479,19 @@ impl ReceiverInjector {
     fn warp_cursor(&mut self, x: u32, y: u32) -> Result<()> {
         match self {
             Self::Native(_) => {
-                #[cfg(not(target_os = "windows"))]
-                let _ = (x, y);
-                Ok(())
+                // Linux receivers MUST place the OS cursor at the entry
+                // point (Deskflow Client::enter parity): without this warp
+                // the peer drives a virtual edge cursor while the visible
+                // one sits wherever it was — entries land mid-screen and
+                // every later exit looks like it fires mid-screen. The X11
+                // warp is a real pointer warp, not a virtual-only update.
+                #[cfg(target_os = "linux")]
+                return kvm_platform::capture::warp_cursor(x, y).map_err(anyhow::Error::from);
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (x, y);
+                    Ok(())
+                }
             }
             #[cfg(target_os = "windows")]
             Self::Service(proxy) => proxy.warp_cursor(x, y),
@@ -5054,6 +5096,86 @@ fn screen_geometry_for(layout: &kvm_core::Layout, screen_id: ScreenId) -> Option
     })
 }
 
+/// Session-measured local geometry, published by in-session children for
+/// headless daemons (see the connect_topology publish step):
+/// `{"width":1536,"height":864}` in the daemon data dir.
+const GEOMETRY_SIDECAR: &str = "local-geometry.json";
+
+/// Parse sidecar body into dims. Pure for tests.
+fn parse_geometry_sidecar(text: &str) -> Option<(u32, u32)> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let width = value.get("width")?.as_u64()?;
+    let height = value.get("height")?.as_u64()?;
+    if width == 0 || height == 0 || width > 16384 || height > 16384 {
+        return None;
+    }
+    Some((width as u32, height as u32))
+}
+
+/// Pick the advertised geometry from best to worst evidence. Pure for
+/// tests: session truth (a child measured it inside the live desktop)
+/// beats a live platform query beats configured fallback dims.
+fn pick_geometry(
+    screen_id: u32,
+    sidecar: Option<(u32, u32)>,
+    measured: Option<(u32, u32)>,
+    configured: Option<ScreenGeometry>,
+) -> Option<ScreenGeometry> {
+    if let Some((width, height)) = sidecar {
+        return Some(ScreenGeometry {
+            screen_id,
+            width,
+            height,
+        });
+    }
+    if let Some((width, height)) = measured.filter(|(w, h)| *w != 0 && *h != 0) {
+        return Some(ScreenGeometry {
+            screen_id,
+            width,
+            height,
+        });
+    }
+    configured
+}
+
+/// Truthful local geometry for advertisements (Deskflow getShape parity).
+/// The headless Mint daemon cannot query X11 itself, so without the
+/// child-published sidecar it advertises fallback dims and the peer maps
+/// every entry point against a screen that does not exist — entries land
+/// off-edge and exits look like they fire mid-screen.
+fn truthful_local_geometry(layout: &kvm_core::Layout) -> Option<ScreenGeometry> {
+    let screen_id = layout
+        .self_screen
+        .or_else(|| layout.screens.first().map(|screen| screen.id))?;
+    let sidecar = std::fs::read_to_string(data_dir().join(GEOMETRY_SIDECAR))
+        .ok()
+        .and_then(|text| parse_geometry_sidecar(&text));
+    let measured = kvm_platform::capture::screen_size()
+        .ok()
+        .flatten()
+        .filter(|(width, height)| *width != 0 && *height != 0);
+    pick_geometry(screen_id.0, sidecar, measured, local_screen_geometry(layout))
+}
+
+/// Publish session-measured geometry for the headless daemon to
+/// advertise (see truthful_local_geometry). Best effort: an unwritable
+/// daemon dir just keeps fallback advertisements, today's behavior.
+fn publish_local_geometry(router: &EdgeRouter) {
+    let Ok(daemon_dir) = std::env::var("THEKVM_DAEMON_DIR") else {
+        return;
+    };
+    let Some(geometry) = local_screen_geometry(router.layout()) else {
+        return;
+    };
+    let body = serde_json::json!({ "width": geometry.width, "height": geometry.height }).to_string();
+    if let Err(error) = std::fs::write(
+        std::path::Path::new(&daemon_dir).join(GEOMETRY_SIDECAR),
+        body,
+    ) {
+        tracing::debug!(%error, "local geometry sidecar unavailable");
+    }
+}
+
 /// Map a pointer position between inclusive logical screen coordinate spaces.
 /// The edge coordinates are preserved (`0` maps to `0`, the last source pixel
 /// maps to the last target pixel), which avoids a one-pixel drift accumulating
@@ -5454,14 +5576,53 @@ mod tests {
 
     #[test]
     #[test]
-    fn stale_hold_reaper_fires_only_without_a_drive() {
-        // The total-freeze invariant: suppression requested + no active
+    fn stale_hold_reaper_fires_only_without_a_drive() {        // The total-freeze invariant: suppression requested + no active
         // drive = release now. Any other combination leaves the hold
         // alone (an active drive legitimately suppresses).
         assert!(stale_hold_needs_release(false, true));
         assert!(!stale_hold_needs_release(true, true));
         assert!(!stale_hold_needs_release(false, false));
         assert!(!stale_hold_needs_release(true, false));
+    }
+
+    #[test]
+    fn geometry_sidecar_parses_and_preference_holds() {
+        // Sidecar truth beats live measure beats configured fallback;
+        // garbage never corrupts an advertisement.
+        assert_eq!(parse_geometry_sidecar(r#"{"width":1536,"height":864}"#), Some((1536, 864)));
+        assert_eq!(parse_geometry_sidecar(r#"{"width":0,"height":864}"#), None);
+        assert_eq!(parse_geometry_sidecar(r#"{"width":99999,"height":864}"#), None);
+        assert_eq!(parse_geometry_sidecar("not json"), None);
+        assert_eq!(parse_geometry_sidecar(r#"{"width":1536}"#), None);
+        let configured = Some(kvm_protocol::wire::ScreenGeometry {
+            screen_id: 2,
+            width: 1920,
+            height: 1080,
+        });
+        // Sidecar wins over everything.
+        assert_eq!(
+            pick_geometry(2, Some((1536, 864)), Some((1280, 720)), configured.clone())
+                .map(|geometry| (geometry.width, geometry.height)),
+            Some((1536, 864))
+        );
+        // Live measure wins over fallback.
+        assert_eq!(
+            pick_geometry(2, None, Some((1280, 720)), configured.clone())
+                .map(|geometry| (geometry.width, geometry.height)),
+            Some((1280, 720))
+        );
+        // Zero live measure falls through to fallback.
+        assert_eq!(
+            pick_geometry(2, None, Some((0, 720)), configured.clone())
+                .map(|geometry| (geometry.width, geometry.height)),
+            Some((1920, 1080))
+        );
+        // Nothing measured: configured fallback survives.
+        assert_eq!(
+            pick_geometry(2, None, None, configured)
+                .map(|geometry| (geometry.width, geometry.height)),
+            Some((1920, 1080))
+        );
     }
 
     #[test]
