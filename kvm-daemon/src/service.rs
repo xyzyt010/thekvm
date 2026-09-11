@@ -1497,6 +1497,13 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // until the first Pong, so legacy peers that never Pong keep today's
     // behavior instead of tripping the watchdog.
     let mut last_peer_progress: Option<std::time::Instant> = None;
+    // Consecutive active-episode Pings with no Pong answer. Clock-free
+    // starvation proof: twelve unanswered Pings (~60s) means the peer app
+    // is not reading the episode stream — every released version answers
+    // Pings since 0.1.0, so this cannot be a healthy old peer. Covers
+    // the None-forever hole (Pong never arrives, e.g. drain wedged at
+    // drive start) that the timestamp watchdog above cannot see.
+    let mut unacked_pings: u32 = 0;
     // Whether local-input suppression is currently requested for a drive.
     // Every release clears it; the keep-alive reaper heals any hold that
     // outlives its drive (the total-freeze class).
@@ -1671,6 +1678,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                 // proves the peer app end (then the watchdog
                                 // enforces continued proof).
                                 last_peer_progress = None;
+                                unacked_pings = 0;
                                 active = Some(session);
                                 let name = router
                                     .screen(target)
@@ -1686,6 +1694,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         // idle drive from a wedged peer app (transport ACKs
                         // either way).
                         last_peer_progress = Some(Instant::now());
+                        unacked_pings = 0;
                     }
                     Some(RemoteSignal::Clipboard { revision, text }) => {                        let Some(session) = active.as_mut() else {
                             continue;
@@ -1748,6 +1757,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     last_resync: &mut last_resync,
                     suppression_requested: &mut suppression_requested,
                     last_peer_progress: &mut last_peer_progress,
+                    unacked_pings: &mut unacked_pings,
                 })
                 .await?;
             }
@@ -1784,6 +1794,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     last_resync: &mut last_resync,
                     suppression_requested: &mut suppression_requested,
                     last_peer_progress: &mut last_peer_progress,
+                    unacked_pings: &mut unacked_pings,
                 })
                 .await?;
             }
@@ -1860,7 +1871,22 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             "drive peer app silent 60s (heartbeats stopped); ending the episode locally"
                         );
                     }
-                    if ping_error.is_some() || episode_silent {
+                    // Clock-free starvation proof: twelve consecutive Pings
+                    // with no Pong answer (see unacked_pings) ends the
+                    // episode even when no heartbeat ever arrived — the
+                    // None-forever hole where a wedged peer app holds the
+                    // local grab hostage with the cursor still moving.
+                    if ping_error.is_none() {
+                        unacked_pings = unacked_pings.saturating_add(1);
+                    }
+                    let episode_starved = drive_starved(unacked_pings);
+                    if episode_starved {
+                        tracing::warn!(
+                            unacked_pings,
+                            "drive peer app never answers keep-alive; ending the episode locally"
+                        );
+                    }
+                    if ping_error.is_some() || episode_silent || episode_starved {
                         if let Some(detail) = ping_error {
                             tracing::warn!(detail, "topology peer keep-alive failed");
                         }
@@ -1936,6 +1962,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         suppression_requested,
                         parked = parked.is_some(),
                         peer_progress_age_secs,
+                        unacked_pings,
                         "capture backend census"
                     );
                 }
@@ -2118,6 +2145,13 @@ fn stale_hold_needs_release(drive_active: bool, suppression_requested: bool) -> 
     suppression_requested && !drive_active
 }
 
+/// Starvation predicate: this many consecutive active-episode Pings with
+/// no Pong answer proves the peer app is not reading the episode stream
+/// (twelve Pings at the 5s cadence is ~60s). Pure for tests.
+fn drive_starved(unacked_pings: u32) -> bool {
+    unacked_pings >= 12
+}
+
 /// Cooldown after a FAILED episode dial: the peer is unreachable, busy, or
 /// gone, and the cursor sits at the edge pouring motion events in — without
 /// a pause every one of them would open a full QUIC handshake (the dial
@@ -2178,6 +2212,9 @@ struct TopologyEventContext<'a> {
     /// on every drive start (grace until the first Pong), stamped by the
     /// Progress signal.
     last_peer_progress: &'a mut Option<std::time::Instant>,
+    /// Consecutive unanswered active-episode Pings (see the loop-local):
+    /// reset on drive start and on every Pong.
+    unacked_pings: &'a mut u32,
 }
 
 async fn handle_topology_event(
@@ -2208,6 +2245,7 @@ async fn handle_topology_event(
         last_resync,
         suppression_requested,
         last_peer_progress,
+        unacked_pings,
     } = context;
     // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
     // Raw deltas keep flowing after the OS pointer has stopped at the edge,
@@ -2510,6 +2548,7 @@ async fn handle_topology_event(
                 // Fresh episode: grace until the first Pong (see the
                 // Progress signal); the watchdog enforces continued proof.
                 *last_peer_progress = None;
+                *unacked_pings = 0;
                 *last_transfer = Some(std::time::Instant::now());
                 *active = Some(session);
                 let name = router
@@ -5944,8 +5983,7 @@ mod tests {
     }
 
     #[test]
-    fn ban_exit_status_names_the_dead_epoch() {
-        // The supervising UI parses this exact shape to auto-redial, so
+    fn ban_exit_status_names_the_dead_epoch() {        // The supervising UI parses this exact shape to auto-redial, so
         // the wording is a contract, not prose.
         assert_eq!(
             ban_ended_status(Some(16824951138575866452)),
@@ -5961,6 +5999,17 @@ mod tests {
         assert!(!is_link_ended_rejection(&anyhow::anyhow!(
             "connection refused"
         )));
+    }
+
+    #[test]
+    fn starved_drives_trip_only_after_a_dozen_silent_pings() {
+        // Healthy drives answer every Ping: the counter hovers near zero.
+        assert!(!drive_starved(0));
+        assert!(!drive_starved(1));
+        assert!(!drive_starved(11));
+        // Twelve consecutive Pings (~60s) with no Pong is proof, not noise.
+        assert!(drive_starved(12));
+        assert!(drive_starved(120));
     }
 
     #[test]
