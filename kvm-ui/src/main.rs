@@ -2335,6 +2335,55 @@ fn follow_link(
             _ => {}
         }
     }
+    // Peer re-epoch adoption: our supervised child still speaks the epoch
+    // the peer just banned, while the peer's fresh dial is already inbound
+    // with the new one. Kill the zombie and redial on the peer's epoch —
+    // symmetric bans, no manual step. Bypasses the dial-back throttle:
+    // this is the peer's action, not a retry loop. Honors mode (a
+    // Be-controlled-only station never dials) and never hijacks an open
+    // pairing ceremony via the shared should_dial_back gate.
+    if should_dial_back(status.mode, ceremony_open) {
+        if let Some(link) = inbound.as_ref() {
+            if let Some(new_id) = link.link_id {
+                let stale = session.lock().ok().and_then(|slot| {
+                    let current = slot.as_ref()?;
+                    match current.link_id {
+                        Some(old) if old != new_id => Some(Some(old)),
+                        None => Some(None),
+                        _ => None,
+                    }
+                });
+                if let Some(old) = stale {
+                    if let Some(old_id) = old {
+                        ui_log(&format!(
+                            "link: peer re-epoch {old_id} -> {new_id}; adopting the fresh epoch"
+                        ));
+                        end_link(old_id);
+                    } else {
+                        ui_log(&format!(
+                            "link: adopting peer epoch {new_id} for an epoch-less child"
+                        ));
+                    }
+                    stop_session(weak, session, "Peer started a fresh link");
+                    set_status(
+                        weak,
+                        "Peer started a fresh link — redialling automatically…".into(),
+                    );
+                    spawn_dial_back(
+                        weak,
+                        session,
+                        pending,
+                        data_dir,
+                        link.address.clone(),
+                        Some(new_id),
+                    );
+                    if let Ok(mut slot) = last_attempt.lock() {
+                        *slot = Some(std::time::Instant::now());
+                    }
+                }
+            }
+        }
+    }
     if inbound.is_some() && !outbound_running && should_dial_back(status.mode, ceremony_open) {
         let mut attempt = false;
         if let Ok(mut slot) = last_attempt.lock() {
@@ -2544,6 +2593,27 @@ fn launch_child(
     }
 }
 
+/// Parse the shared ban-exit detail `ban <epoch> (...)`: outer None means
+/// not a ban line at all; inner None means a ban without a usable epoch
+/// (legacy builds print `ban none`). Pure for tests — the wording is a
+/// cross-process contract with the daemon's `ban_ended_status`.
+fn parse_ban_epoch(detail: &str) -> Option<Option<u64>> {
+    let rest = detail.strip_prefix("ban")?;
+    // Reject lookalikes (`bandwidth …`): the epoch follows a space or the
+    // string ends right after `ban`.
+    if let Some(tail) = rest.strip_prefix(' ') {
+        let token = tail.split([' ', '(']).next().unwrap_or("");
+        if token.is_empty() || token == "none" {
+            return Some(None);
+        }
+        return token.parse::<u64>().ok().map(Some);
+    }
+    if rest.trim().is_empty() {
+        return Some(None);
+    }
+    None
+}
+
 /// Relay the `connect` child's THEKVM_STATUS progress lines into the UI
 /// status line. Only `established` flips the session to Connected; anything
 /// else is shown as still-connecting. Identical consecutive lines are
@@ -2710,7 +2780,35 @@ fn relay_session_progress(
                     format!("Contacting {address}…")
                 }
             }
-            "ended" => format!("Connection to {address} ended ({detail})"),
+            "ended" => {
+                // Peer re-epoch: the child names the banned epoch it died
+                // on. Clear our zombie state loudly; the poll loop adopts
+                // the peer's fresh inbound epoch below. The link_id equality
+                // keeps a lagging relay from killing a NEWER child that was
+                // started since this one died.
+                if let Some(banned) = parse_ban_epoch(detail) {
+                    let ours = session
+                        .lock()
+                        .ok()
+                        .and_then(|slot| slot.as_ref().and_then(|current| current.link_id));
+                    if ours == banned {
+                        stop_session(weak, session, "Peer started a fresh link");
+                        ui_log(&format!(
+                            "link: peer ended epoch {} — redialling on their fresh link automatically",
+                            banned.map(|id| id.to_string()).unwrap_or_else(|| "none".into())
+                        ));
+                        set_status(
+                            weak,
+                            "Peer ended this link (fresh link on their side) — redialling automatically…".into(),
+                        );
+                        "Peer ended this link (fresh link on their side) — redialling automatically…".into()
+                    } else {
+                        format!("Connection to {address} ended ({detail})")
+                    }
+                } else {
+                    format!("Connection to {address} ended ({detail})")
+                }
+            }
             _ => continue,
         };
         if text != last_shown {
@@ -3541,7 +3639,7 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{edge_mode_name, edge_name, pair_status_text, should_dial_back};
+    use super::{edge_mode_name, edge_name, pair_status_text, parse_ban_epoch, should_dial_back};
     use kvm_core::EdgeMode;
 
     #[test]
@@ -3574,8 +3672,7 @@ mod tests {
     }
 
     #[test]
-    fn dial_back_arms_only_live_links_we_may_drive() {
-        use kvm_core::Mode::{Bidirectional, ClientOnly, ServerClient};
+    fn dial_back_arms_only_live_links_we_may_drive() {        use kvm_core::Mode::{Bidirectional, ClientOnly, ServerClient};
         // May drive + no ceremony: arm.
         assert!(should_dial_back(Bidirectional, false));
         assert!(should_dial_back(ServerClient, false));
@@ -3608,6 +3705,23 @@ mod tests {
             Some(fp)
         );
         assert_eq!(layout.validate(), Ok(()));
+    }
+
+    #[test]
+    fn ban_epoch_parses_the_shared_contract() {
+        // Outer None = not a ban line; inner None = ban without epoch.
+        assert_eq!(
+            parse_ban_epoch("ban 16824951138575866452 (link ended by the other side)"),
+            Some(Some(16824951138575866452))
+        );
+        assert_eq!(
+            parse_ban_epoch("ban none (link ended by the other side)"),
+            Some(None)
+        );
+        assert_eq!(parse_ban_epoch("ban"), Some(None));
+        assert_eq!(parse_ban_epoch("link ended by the other side"), None);
+        assert_eq!(parse_ban_epoch("bandwidth exceeded"), None);
+        assert_eq!(parse_ban_epoch("interrupted"), None);
     }
 }
 

@@ -178,6 +178,16 @@ fn is_link_ended_rejection(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("link ended"))
 }
 
+/// Shared ban-exit status line: `THEKVM_STATUS ended ban <epoch>` so the
+/// supervising UI can tell a deliberate remote Disconnect (auto-redial on
+/// the peer's fresh epoch) from a crash (report, stay down).
+fn ban_ended_status(link_id: Option<u64>) -> String {
+    match link_id {
+        Some(id) => format!("ended ban {id} (link ended by the other side)"),
+        None => "ended ban none (link ended by the other side)".to_owned(),
+    }
+}
+
 /// Wait for a process-level stop request when the daemon is running outside a
 /// service manager. Windows SCM shutdown is delivered through
 /// `shutdown_notifier`; Ctrl+C remains useful for foreground development, and
@@ -1099,11 +1109,13 @@ pub async fn connect(
             }
             Err(error) => {
                 // A banned epoch is a deliberate remote Disconnect, not an
-                // outage: exit instead of retrying forever, or the dead link
-                // resurrects as a zombie the moment the peer comes back.
+                // outage: exit nonzero instead of retrying forever, or the
+                // dead link resurrects as a zombie the moment the peer comes
+                // back. The ban status names the dead epoch for the UI's
+                // auto-redial.
                 if is_link_ended_rejection(&error) {
-                    eprintln!("THEKVM_STATUS ended link ended by the other side");
-                    return Ok(());
+                    eprintln!("THEKVM_STATUS {}", ban_ended_status(link_id));
+                    return Err(error);
                 }
                 tracing::warn!(%error, peer = %address, "peer unavailable; retrying");
                 eprintln!("THEKVM_STATUS waiting {error:#}");
@@ -1450,7 +1462,17 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
             local_geometry,
         );
         parked = match tokio::time::timeout(Duration::from_secs(5), prewarm).await {
-            Ok(stream) => stream,
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => {
+                // The peer deliberately ended this epoch: exit now instead
+                // of parking at edge-ready as a zombie that rejects every
+                // later push. The UI redials on the peer's fresh epoch.
+                eprintln!(
+                    "THEKVM_STATUS {}",
+                    ban_ended_status(link.link_id)
+                );
+                return Err(error);
+            }
             Err(_) => {
                 tracing::debug!("pre-warm timed out; first push opens cold");
                 None
@@ -1471,6 +1493,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut last_resync: Option<std::time::Instant> = None;
     // Last backend-census journal line (see the keep-alive tick).
     let mut last_census_log: Option<std::time::Instant> = None;
+    // Last peer-app heartbeat on the active episode (see Progress): None
+    // until the first Pong, so legacy peers that never Pong keep today's
+    // behavior instead of tripping the watchdog.
+    let mut last_peer_progress: Option<std::time::Instant> = None;
     // Whether local-input suppression is currently requested for a drive.
     // Every release clears it; the keep-alive reaper heals any hold that
     // outlives its drive (the total-freeze class).
@@ -1622,7 +1648,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                     // disconnected on purpose); anything else
                                     // just returns control locally.
                                     if is_link_ended_rejection(&error) {
-                                        eprintln!("THEKVM_STATUS ended link ended by the other side");
+                                        eprintln!(
+                                            "THEKVM_STATUS {}",
+                                            ban_ended_status(
+                                                link.as_ref().and_then(|link| link.link_id)
+                                            )
+                                        );
                                         return Err(error);
                                     }
                                     let _ = router.restore_local(target);
@@ -1636,6 +1667,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         if let Some(session) = session {
                                 capture_control.set_exclusive(true)?;
                                 suppression_requested = true;
+                                // Fresh episode: grace until the first Pong
+                                // proves the peer app end (then the watchdog
+                                // enforces continued proof).
+                                last_peer_progress = None;
                                 active = Some(session);
                                 let name = router
                                     .screen(target)
@@ -1645,8 +1680,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                 eprintln!("THEKVM_STATUS driving {name}");
                             }
                         }
-                    Some(RemoteSignal::Clipboard { revision, text }) => {
-                        let Some(session) = active.as_mut() else {
+                    Some(RemoteSignal::Progress) => {
+                        // Peer-app heartbeat: the episode stream is alive
+                        // end-to-end. The only signal separating a healthy
+                        // idle drive from a wedged peer app (transport ACKs
+                        // either way).
+                        last_peer_progress = Some(Instant::now());
+                    }
+                    Some(RemoteSignal::Clipboard { revision, text }) => {                        let Some(session) = active.as_mut() else {
                             continue;
                         };
                         if !session.clipboard_enabled || revision <= session.remote_clipboard_revision {
@@ -1706,6 +1747,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     local_wheel_dropped: &mut local_wheel_dropped,
                     last_resync: &mut last_resync,
                     suppression_requested: &mut suppression_requested,
+                    last_peer_progress: &mut last_peer_progress,
                 })
                 .await?;
             }
@@ -1741,6 +1783,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     local_wheel_dropped: &mut local_wheel_dropped,
                     last_resync: &mut last_resync,
                     suppression_requested: &mut suppression_requested,
+                    last_peer_progress: &mut last_peer_progress,
                 })
                 .await?;
             }
@@ -1790,8 +1833,37 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
             },
             _ = keep_alive.tick() => {
                 if let Some(session) = active.as_mut() {
-                    if let Err(error) = write_frame(&mut session.send, &WireMessage::Ping { nonce: sequence }).await {
-                        tracing::warn!(%error, "topology peer keep-alive failed");
+                    // Bounded keep-alive: an unbounded write pends forever
+                    // on a half-dead association and stalls this whole task
+                    // (no routing, no release, grabs held) — the persistent
+                    // freeze shape. 3s, then the association is dead.
+                    let ping = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        write_frame(&mut session.send, &WireMessage::Ping { nonce: sequence }),
+                    )
+                    .await;
+                    let ping_error: Option<String> = match ping {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(format!("{error:#}")),
+                        Err(_) => Some("keep-alive write timed out after 3s".to_owned()),
+                    };
+                    // Silent-episode watchdog: Pongs proved the peer app end
+                    // before, then stopped — transport ACKs either way, so
+                    // only app-level silence proves the wedge. Legacy peers
+                    // that never Pong stay on today's behavior (None).
+                    // 60s = a dozen missed heartbeats; healthy idle drives
+                    // Pong every 5s and never trip it.
+                    let episode_silent = last_peer_progress
+                        .is_some_and(|when| when.elapsed() > Duration::from_secs(60));
+                    if episode_silent {
+                        tracing::warn!(
+                            "drive peer app silent 60s (heartbeats stopped); ending the episode locally"
+                        );
+                    }
+                    if ping_error.is_some() || episode_silent {
+                        if let Some(detail) = ping_error {
+                            tracing::warn!(detail, "topology peer keep-alive failed");
+                        }
                         let session = active.take().expect("active session exists");
                         let target = session.target;
                         session.finish().await;
@@ -1813,9 +1885,15 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     // A parked stream still holds the peer's input slot and
                     // provisioned injector: ping it so the lease never
                     // reaps it and a silent death is noticed within seconds
-                    // instead of on the next push.
-                    if let Err(error) = write_frame(&mut session.send, &WireMessage::Ping { nonce: sequence }).await {
-                        tracing::debug!(%error, "parked drive stream died; next push reopens");
+                    // instead of on the next push. Bounded like the active
+                    // Ping above: never stall the task on a half-dead peer.
+                    let parked_ping = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        write_frame(&mut session.send, &WireMessage::Ping { nonce: sequence }),
+                    )
+                    .await;
+                    if !matches!(parked_ping, Ok(Ok(()))) {
+                        tracing::debug!("parked drive stream died; next push reopens");
                         if let Some(stale) = parked.take() {
                             stale.finish().await;
                         }
@@ -1839,6 +1917,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     last_census_log = Some(Instant::now());
                     let (hook_key, hook_button, hook_move, hook_wheel, raw_move, raw_wheel) =
                         kvm_platform::capture::backend_census();
+                    // Sender hold snapshot alongside the channel census: the
+                    // mystery-freeze triage line — a stuck drive shows here
+                    // as drive_active with an ancient peer heartbeat.
+                    // peer_progress_age_secs: -1 = no Pong yet this episode
+                    // (grace / legacy peer).
+                    let peer_progress_age_secs = last_peer_progress
+                        .map(|when| when.elapsed().as_secs() as i64)
+                        .unwrap_or(-1);
                     tracing::info!(
                         hook_key,
                         hook_button,
@@ -1846,6 +1932,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         hook_wheel,
                         raw_move,
                         raw_wheel,
+                        drive_active = active.is_some(),
+                        suppression_requested,
+                        parked = parked.is_some(),
+                        peer_progress_age_secs,
                         "capture backend census"
                     );
                 }
@@ -1909,6 +1999,11 @@ enum RemoteSignal {
     Handoff(RemoteHandoff),
     Clipboard { revision: u64, text: String },
     Closed,
+    /// The peer app answered a keep-alive Ping: the episode stream is
+    /// alive end-to-end, not just the QUIC association (which the kernel
+    /// ACKs even when the peer app is wedged). Feeds the silent-episode
+    /// watchdog below.
+    Progress,
 }
 
 impl TopologySession {
@@ -1999,16 +2094,18 @@ fn transfer_debounced(last_transfer: Option<std::time::Instant>) -> bool {
 
 /// Best-effort release of local-input suppression. A failed ungrab must
 /// NEVER abort drive teardown (or kill the child): the cleanup after it
-/// (warp, status, barriers) still has to run, and the keep-alive reaper
-/// below retries a resisting hold until it lifts. Loud, so a stuck
-/// server-side hold is visible in the journal instead of a mystery
-/// freeze where the cursor moves but nothing responds.
+/// (warp, status, barriers) still has to run. Belief follows reality —
+/// the flag clears ONLY on success, so the keep-alive reaper keeps
+/// retrying a resisting hold every 5s instead of forgetting it. The old
+/// unconditional clear wedged the hold forever: daemon belief false while
+/// the platform grab stayed held (keys/clicks dead, cursor moving).
 fn release_suppression(
     capture_control: &CaptureGuard,
     requested: Option<&mut bool>,
 ) {
     if let Err(error) = capture_control.set_exclusive(false) {
-        tracing::warn!(%error, "suppression release failed; reaper will retry");
+        tracing::warn!(%error, "suppression release failed; belief kept, reaper will retry");
+        return;
     }
     if let Some(requested) = requested {
         *requested = false;
@@ -2077,6 +2174,10 @@ struct TopologyEventContext<'a> {
     /// Belief flag for the suppression-hold reaper: set on drive start,
     /// cleared on every release.
     suppression_requested: &'a mut bool,
+    /// Peer-app heartbeat for the silent-episode watchdog: reset to None
+    /// on every drive start (grace until the first Pong), stamped by the
+    /// Progress signal.
+    last_peer_progress: &'a mut Option<std::time::Instant>,
 }
 
 async fn handle_topology_event(
@@ -2106,6 +2207,7 @@ async fn handle_topology_event(
         local_wheel_dropped,
         last_resync,
         suppression_requested,
+        last_peer_progress,
     } = context;
     // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
     // Raw deltas keep flowing after the OS pointer has stopped at the edge,
@@ -2377,11 +2479,16 @@ async fn handle_topology_event(
                         // the child so the UI reports it, instead of warning
                         // locally and retrying a dead link forever.
                         if is_link_ended_rejection(&error) {
-                            eprintln!("THEKVM_STATUS ended link ended by the other side");
+                            eprintln!(
+                                "THEKVM_STATUS {}",
+                                ban_ended_status(link.and_then(|link| link.link_id))
+                            );
                             return Err(error);
                         }
                         *last_failed_episode = Some(std::time::Instant::now());
-                        let _ = capture_control.set_exclusive(false);
+                        // Single release path (belief-aware): the reaper
+                        // heals any hold that outlives this either way.
+                        release_suppression(capture_control, Some(&mut *suppression_requested));
                         let _ = router.restore_local(target);
                         park_inside(router, edge);
                         tracing::warn!(%error, ?target, "topology target unavailable; control remains local");
@@ -2391,6 +2498,9 @@ async fn handle_topology_event(
             if let Some(session) = session {
                 capture_control.set_exclusive(true)?;
                 *suppression_requested = true;
+                // Fresh episode: grace until the first Pong (see the
+                // Progress signal); the watchdog enforces continued proof.
+                *last_peer_progress = None;
                 *last_transfer = Some(std::time::Instant::now());
                 *active = Some(session);
                 let name = router
@@ -2715,44 +2825,59 @@ async fn prewarm_link_stream(
     link: &TopologyLink,
     dir: &std::path::Path,
     local_geometry: Option<ScreenGeometry>,
-) -> Option<TopologySession> {
+) -> Result<Option<TopologySession>> {
     let screen = router.layout().screens.iter().find(|screen| {
         screen.peer_fingerprint.as_deref() == Some(link.fingerprint.as_str())
-    })?;
+    });
+    let Some(screen) = screen else {
+        return Ok(None);
+    };
     let target = screen.id;
     let policy = episode_policy(config, Some(link), local_geometry);
     let (conn, send, recv, capabilities) = match take_warm_link(&link.fingerprint) {
         Some(warm) => match open_episode_stream(&warm, policy).await {
             Ok((send, recv, capabilities)) => (warm, send, recv, capabilities),
             Err(error) => {
+                // A ban on the warm link is final (peer re-epoch'd): fail
+                // the child loudly instead of idling a zombie that can
+                // never drive again.
+                if is_link_ended_rejection(&error) {
+                    return Err(error);
+                }
                 tracing::debug!(%error, "pre-warm on the warm link failed; dialling cold");
-                let (conn, send, recv, capabilities, _) =
-                    cold_topology_dial(identity, peers, &link.fingerprint, &screen.name, policy, dir)
-                        .await
-                        .map_err(|error| {
-                            tracing::debug!(%error, "pre-warm cold dial failed");
-                            error
-                        })
-                        .ok()?;
-                store_warm_link(&conn, &link.fingerprint);
-                (conn, send, recv, capabilities)
+                match cold_topology_dial(identity, peers, &link.fingerprint, &screen.name, policy, dir).await {
+                    Ok((conn, send, recv, capabilities, _)) => {
+                        store_warm_link(&conn, &link.fingerprint);
+                        (conn, send, recv, capabilities)
+                    }
+                    Err(error) => {
+                        if is_link_ended_rejection(&error) {
+                            return Err(error);
+                        }
+                        tracing::debug!(%error, "pre-warm cold dial failed");
+                        return Ok(None);
+                    }
+                }
             }
         },
         None => {
-            let (conn, send, recv, capabilities, _) =
-                cold_topology_dial(identity, peers, &link.fingerprint, &screen.name, policy, dir)
-                    .await
-                    .map_err(|error| {
-                        tracing::debug!(%error, "pre-warm cold dial failed");
-                        error
-                    })
-                    .ok()?;
-            store_warm_link(&conn, &link.fingerprint);
-            (conn, send, recv, capabilities)
+            match cold_topology_dial(identity, peers, &link.fingerprint, &screen.name, policy, dir).await {
+                Ok((conn, send, recv, capabilities, _)) => {
+                    store_warm_link(&conn, &link.fingerprint);
+                    (conn, send, recv, capabilities)
+                }
+                Err(error) => {
+                    if is_link_ended_rejection(&error) {
+                        return Err(error);
+                    }
+                    tracing::debug!(%error, "pre-warm cold dial failed");
+                    return Ok(None);
+                }
+            }
         }
     };
     tracing::info!(?target, "link drive stream pre-warmed; first crossing needs no dial");
-    Some(spawn_episode_driver(conn, send, recv, capabilities, target, 0))
+    Ok(Some(spawn_episode_driver(conn, send, recv, capabilities, target, 0)))
 }
 
 /// Map an edge-entry point into the peer's current geometry and name the
@@ -2879,6 +3004,9 @@ async fn drain_peer_responses(
             }
             WireMessage::ClipboardText { revision, text } => {
                 let _ = signal.send(RemoteSignal::Clipboard { revision, text });
+            }
+            WireMessage::Pong { .. } => {
+                let _ = signal.send(RemoteSignal::Progress);
             }
             WireMessage::Reject { .. } => break,
             _ => {}
@@ -5804,6 +5932,26 @@ mod tests {
             None
         );
         assert_eq!(parse_sidecar_xauthority(r#"{"xauthority":""}"#), None);
+    }
+
+    #[test]
+    fn ban_exit_status_names_the_dead_epoch() {
+        // The supervising UI parses this exact shape to auto-redial, so
+        // the wording is a contract, not prose.
+        assert_eq!(
+            ban_ended_status(Some(16824951138575866452)),
+            "ended ban 16824951138575866452 (link ended by the other side)"
+        );
+        assert_eq!(
+            ban_ended_status(None),
+            "ended ban none (link ended by the other side)"
+        );
+        assert!(is_link_ended_rejection(&anyhow::anyhow!(
+            "peer rejected session: link ended by this computer"
+        )));
+        assert!(!is_link_ended_rejection(&anyhow::anyhow!(
+            "connection refused"
+        )));
     }
 
     #[test]

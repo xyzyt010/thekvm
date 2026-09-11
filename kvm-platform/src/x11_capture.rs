@@ -249,25 +249,35 @@ impl CaptureBackend for X11Capture {
                     self.grab_kind = GrabKind::Core;
                 }
             }
+            tracing::info!(grab = ?self.grab_kind, "X11 local suppression engaged");
         } else {
-            match self.grab_kind {
-                GrabKind::None => {}
-                GrabKind::Xi => {
-                    self.connection
-                        .xinput_xi_ungrab_device(0u32, ALL_MASTER_DEVICES)
-                        .map_err(|error| {
-                            PlatformError::Capture(format!("ungrab XInput2 devices: {error}"))
-                        })?
-                        .check()
-                        .map_err(|error| {
-                            PlatformError::Capture(format!("ungrab XInput2 devices: {error}"))
-                        })?;
-                }
-                GrabKind::Core => {
-                    core_ungrab(&self.connection)?;
-                }
-            }
+            // Total release: attempt BOTH ungrab paths regardless of the
+            // recorded kind. After a failed acquire the record may not
+            // match reality, and a half-held grab wedges local
+            // keys/clicks while the cursor still moves (the mystery-freeze
+            // shape). Ungrabbing a non-held device is a server-side no-op,
+            // so this is safe; any failure still errors (the capture
+            // worker rebuilds, the daemon reaper retries) instead of
+            // forgetting a held grab.
+            let previous = self.grab_kind;
             self.grab_kind = GrabKind::None;
+            let xi = self
+                .connection
+                .xinput_xi_ungrab_device(0u32, ALL_MASTER_DEVICES)
+                .map_err(|error| format!("XInput2 ungrab send: {error:?}"))
+                .and_then(|cookie| {
+                    cookie
+                        .check()
+                        .map_err(|error| format!("XInput2 ungrab check: {error:?}"))
+                });
+            let core = core_ungrab(&self.connection)
+                .map_err(|error| format!("core ungrab: {error:?}"));
+            if let Err(error) = xi.and(core) {
+                return Err(PlatformError::Capture(format!(
+                    "release all X grabs (held {previous:?}): {error}"
+                )));
+            }
+            tracing::debug!(previous = ?previous, "X11 local suppression released");
         }
         self.connection.flush().map_err(|error| {
             PlatformError::Capture(format!("flush XInput2 grab state: {error}"))

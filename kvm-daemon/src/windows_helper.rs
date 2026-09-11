@@ -26,6 +26,10 @@ enum HelperMessage {
     ReleaseAll,
     WarpCursor { x: u32, y: u32 },
     SetExclusive(bool),
+    /// Helper-to-service reply for WarpCursor: whether this helper
+    /// actually moved the visible cursor. Without it a skipped warp
+    /// (idle desktop) reads as success and entries land stale.
+    WarpDone { placed: bool, detail: String },
 }
 
 /// The service-side fan-out connection to the interactive helpers.
@@ -114,9 +118,53 @@ impl ServiceInputProxy {
     }
 
     pub fn warp_cursor(&mut self, x: u32, y: u32) -> Result<()> {
+        self.ensure_session()?;
         let message = serde_json::to_vec(&HelperMessage::WarpCursor { x, y })?;
-        fan_out(&mut self.streams, "warp cursor in Windows helper", &message)
+        fan_out(&mut self.streams, "warp cursor in Windows helper", &message)?;
+        collect_warp_acks(&mut self.streams, x, y)
     }
+}
+
+/// Request/response over the helper command streams: every current
+/// helper answers WarpCursor with WarpDone. Fails only when helpers
+/// explicitly report the cursor was NOT placed, so the receiver logs a
+/// truthful warning (and drives unplaced) instead of a fake success.
+/// Silent streams are legacy pre-ack helpers: tolerated as Ok to stay
+/// mixed-version compatible during upgrades. Each stream waits at most
+/// 500ms; crossings are human-paced, so the stall is bounded and rare.
+fn collect_warp_acks(streams: &mut Vec<TcpStream>, x: u32, y: u32) -> Result<()> {
+    const ACK_TIMEOUT: Duration = Duration::from_millis(500);
+    const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+    let mut placed = false;
+    let mut answered = false;
+    let mut details: Vec<String> = Vec::new();
+    streams.retain_mut(|stream| {
+        let _ = stream.set_read_timeout(Some(ACK_TIMEOUT));
+        let reply = read_ipc_frame(stream)
+            .ok()
+            .and_then(|frame| serde_json::from_slice::<HelperMessage>(&frame).ok());
+        let _ = stream.set_read_timeout(Some(STREAM_TIMEOUT));
+        match reply {
+            Some(HelperMessage::WarpDone { placed: ok, detail }) => {
+                answered = true;
+                placed |= ok;
+                details.push(detail);
+                true
+            }
+            _ => {
+                details.push("no acknowledgement (legacy helper?)".to_owned());
+                true
+            }
+        }
+    });
+    if placed || !answered {
+        tracing::info!(x, y, placed, details = ?details, "Windows helper entry warp outcome");
+        return Ok(());
+    }
+    bail!(
+        "no Windows helper placed the entry warp at ({x}, {y}): {}",
+        details.join("; ")
+    );
 }
 
 /// Best-effort fan-out to the interactive helpers: a dead helper is
@@ -340,22 +388,49 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
             }
             HelperMessage::ReleaseAll => injector.release_all()?,
             HelperMessage::WarpCursor { x, y } => {
-                // Like input: only the desktop that currently owns input
-                // may move the visible cursor. The idle helper (typically
-                // winlogon) must no-op SUCCESSFULLY — its SetCursorPos
-                // fails on a desktop nobody sees, and the old
-                // unconditional warp killed that helper, broke the
-                // fan-out pipe, and ended every inbound session
-                // milliseconds after it was accepted (Mint could never
-                // drive Windows).
-                match current_desktop_is_input() {
-                    Ok(true) => warp_cursor(x, y)?,
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::debug!(%error, "cannot identify active Windows input desktop");
-                    }
+                // Only the desktop that currently owns input may move the
+                // visible cursor. The idle helper (typically winlogon)
+                // must REPORT its skip — a silent success here logs fake
+                // placement upstream and entries land stale. A failed
+                // SetCursorPos must not kill this helper either: the old
+                // `?` ended the whole inbound session over one bad warp.
+                // Placement is read back, not assumed: SetCursorPos can
+                // report success while the cursor stays put.
+                let (placed, detail) = match current_desktop_is_input() {
+                    Ok(true) => match warp_cursor(x, y) {
+                        Ok(()) => match kvm_platform::capture::current_cursor_position() {
+                            Ok(Some((actual_x, actual_y))) if actual_x == x && actual_y == y => {
+                                (true, format!("warped on {desktop}"))
+                            }
+                            Ok(actual) => (
+                                false,
+                                format!("warp unverified on {desktop}: cursor at {actual:?}"),
+                            ),
+                            Err(error) => (
+                                false,
+                                format!("warp read-back failed on {desktop}: {error:?}"),
+                            ),
+                        },
+                        Err(error) => (
+                            false,
+                            format!("SetCursorPos failed on {desktop}: {error:#}"),
+                        ),
+                    },
+                    Ok(false) => (false, format!("skipped: {desktop} does not own input")),
+                    Err(error) => (
+                        false,
+                        format!("cannot identify active Windows input desktop: {error:#}"),
+                    ),
+                };
+                if let Ok(reply) = serde_json::to_vec(&HelperMessage::WarpDone { placed, detail })
+                {
+                    // Fire-and-forget: if the service is gone the next
+                    // read ends this helper anyway.
+                    let _ = write_ipc_frame(&mut stream, &reply);
                 }
             }
+            // Service-to-helper only in reverse: never arrives here.
+            HelperMessage::WarpDone { .. } => {}
             HelperMessage::SetExclusive(_) => {}
         }
     }
@@ -729,5 +804,47 @@ mod tests {
     fn fan_out_fails_only_when_no_helper_remains() {
         let mut streams: Vec<TcpStream> = Vec::new();
         assert!(fan_out(&mut streams, "test", b"ping").is_err());
+    }
+
+    /// Fake helper answering WarpDone: the proxy round-trip reports Ok.
+    fn drive_fake_helper(helper_side: &mut TcpStream, placed: bool) {
+        let frame = read_ipc_frame(helper_side).unwrap();
+        let message: HelperMessage = serde_json::from_slice(&frame).unwrap();
+        assert!(matches!(message, HelperMessage::WarpCursor { .. }));
+        let reply = serde_json::to_vec(&HelperMessage::WarpDone {
+            placed,
+            detail: "test helper".to_owned(),
+        })
+        .unwrap();
+        write_ipc_frame(helper_side, &reply).unwrap();
+    }
+
+    #[test]
+    fn warp_ack_placed_reports_success() {
+        let (proxy_side, mut helper_side) = loopback_pair();
+        std::thread::spawn(move || drive_fake_helper(&mut helper_side, true));
+        let mut streams = vec![proxy_side];
+        let message = serde_json::to_vec(&HelperMessage::WarpCursor { x: 10, y: 20 }).unwrap();
+        fan_out(&mut streams, "test", &message).unwrap();
+        collect_warp_acks(&mut streams, 10, 20).unwrap();
+    }
+
+    #[test]
+    fn warp_ack_all_skipped_is_an_error() {
+        let (proxy_side, mut helper_side) = loopback_pair();
+        std::thread::spawn(move || drive_fake_helper(&mut helper_side, false));
+        let mut streams = vec![proxy_side];
+        let message = serde_json::to_vec(&HelperMessage::WarpCursor { x: 10, y: 20 }).unwrap();
+        fan_out(&mut streams, "test", &message).unwrap();
+        assert!(collect_warp_acks(&mut streams, 10, 20).is_err());
+    }
+
+    #[test]
+    fn warp_ack_silent_helper_stays_compatible() {
+        // No reply at all (legacy pre-ack helper): still Ok after the
+        // bounded ack wait, never a hang.
+        let (proxy_side, _silent) = loopback_pair();
+        let mut streams = vec![proxy_side];
+        collect_warp_acks(&mut streams, 1, 2).unwrap();
     }
 }
