@@ -264,7 +264,7 @@ pub fn create_capture(
 mod win32_hooks {
     use super::{CaptureBackend, InputEvent, PlatformError};
     use kvm_core::{KeyEvent, MouseButton};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Mutex, OnceLock};
     use windows::core::PCWSTR;
@@ -273,7 +273,8 @@ mod win32_hooks {
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Input::{
         GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUTDEVICE,
-        RAWINPUTHEADER, RAWMOUSE, RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEMOUSE,
+        RAWINPUTHEADER, RAWMOUSE, RIDEV_INPUTSINK, RIDEV_NOLEGACY, RIDEV_REMOVE, RID_INPUT,
+        RIM_TYPEMOUSE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -290,6 +291,15 @@ mod win32_hooks {
     static LAST_POINT: OnceLock<Mutex<Option<POINT>>> = OnceLock::new();
     static BLOCK_LOCAL: AtomicBool = AtomicBool::new(false);
     static RAW_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+    // Hook-thread rendezvous for the trackpad-scroll suppression toggle:
+    // the daemon flips exclusivity from any thread, but RawInput
+    // registration belongs to the thread that owns the RawInput window.
+    static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+    static RAW_WINDOW: AtomicIsize = AtomicIsize::new(0);
+    static RAW_NOLEGACY: AtomicBool = AtomicBool::new(false);
+    /// Private thread message (WM_APP range): wparam != 0 enables RawInput
+    /// legacy suppression while driving, 0 restores normal delivery.
+    const WM_THEKVM_NOLEGACY: u32 = 0x8000 + 11;
 
     /// Backend receipt census: what each OS channel actually delivered
     /// into our channel (hook keys/buttons/fallback-motion/wheel, raw
@@ -316,6 +326,22 @@ mod win32_hooks {
 
     pub(super) fn set_exclusive(exclusive: bool) {
         BLOCK_LOCAL.store(exclusive, Ordering::Release);
+        // Precision-touchpad scroll never produces a hook-visible wheel
+        // event, so the hook swallow above cannot stop it reaching local
+        // windows. Ask the hook thread (which owns the RawInput window)
+        // to toggle legacy suppression; the WM_INPUT channel keeps
+        // flowing, so forwarding is unaffected.
+        let thread_id = HOOK_THREAD_ID.load(Ordering::Acquire);
+        if thread_id != 0 {
+            unsafe {
+                let _ = PostThreadMessageW(
+                    thread_id,
+                    WM_THEKVM_NOLEGACY,
+                    WPARAM(exclusive as usize),
+                    LPARAM(0),
+                );
+            }
+        }
     }
 
     fn sender() -> &'static Mutex<Option<Sender<InputEvent>>> {
@@ -459,6 +485,12 @@ mod win32_hooks {
         unsafe {
             let _ = PeekMessageW(&mut queue_probe, None, 0, 0, PM_NOREMOVE);
         }
+        // Publish the rendezvous only after the queue exists, so a posted
+        // WM_THEKVM_NOLEGACY can never land on a queue-less thread.
+        HOOK_THREAD_ID.store(thread_id, Ordering::Release);
+        if let Some(window) = raw_input_window {
+            RAW_WINDOW.store(window.0 as isize, Ordering::Release);
+        }
         let _ = ready.send(Ok(thread_id));
 
         let mut message = MSG::default();
@@ -466,6 +498,12 @@ mod win32_hooks {
             let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
             if result.0 <= 0 {
                 break;
+            }
+            // Thread message from set_exclusive: toggle RawInput legacy
+            // suppression on the thread that owns the RawInput window.
+            if message.hwnd.0.is_null() && message.message == WM_THEKVM_NOLEGACY {
+                apply_raw_legacy_suppression(message.wParam.0 != 0);
+                continue;
             }
             unsafe {
                 let _ = TranslateMessage(&message);
@@ -475,8 +513,11 @@ mod win32_hooks {
         unsafe {
             let _ = UnhookWindowsHookEx(keyboard);
             let _ = UnhookWindowsHookEx(mouse);
+            RAW_INPUT_ACTIVE.store(false, Ordering::Release);
+            RAW_NOLEGACY.store(false, Ordering::Release);
+            RAW_WINDOW.store(0, Ordering::Release);
+            HOOK_THREAD_ID.store(0, Ordering::Release);
             if let Some(window) = raw_input_window {
-                RAW_INPUT_ACTIVE.store(false, Ordering::Release);
                 let removal = RAWINPUTDEVICE {
                     usUsagePage: 0x01,
                     usUsage: 0x02,
@@ -663,6 +704,55 @@ mod win32_hooks {
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    /// Trackpad-scroll local suppression. Precision touchpads report
+    /// two-finger scroll only through the raw HID channel (WM_INPUT),
+    /// which is observe-only: the OS still delivers the matching legacy
+    /// WM_MOUSEWHEEL to the window under the parked cursor, so the local
+    /// machine scrolls while we drive the peer. Re-registering our mouse
+    /// usage with RIDEV_NOLEGACY stops legacy delivery (the low-level
+    /// hook still fires, so buttons/keys keep their hook swallow path,
+    /// and WM_INPUT keeps flowing, so remote forwarding is untouched).
+    /// Runs on the hook thread; idempotent across repeated transitions.
+    fn apply_raw_legacy_suppression(suppress: bool) {
+        if RAW_NOLEGACY.swap(suppress, Ordering::AcqRel) == suppress {
+            return;
+        }
+        if !RAW_INPUT_ACTIVE.load(Ordering::Acquire) {
+            return;
+        }
+        let hwnd = HWND(RAW_WINDOW.load(Ordering::Acquire) as *mut std::ffi::c_void);
+        if hwnd.0.is_null() {
+            return;
+        }
+        let flags = if suppress {
+            RIDEV_INPUTSINK | RIDEV_NOLEGACY
+        } else {
+            RIDEV_INPUTSINK
+        };
+        let device = RAWINPUTDEVICE {
+            usUsagePage: 0x01,
+            usUsage: 0x02,
+            dwFlags: flags,
+            hwndTarget: hwnd,
+        };
+        match unsafe {
+            RegisterRawInputDevices(
+                std::slice::from_ref(&device),
+                std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+            )
+        } {
+            Ok(_) => tracing::info!(
+                suppress,
+                "RawInput legacy delivery toggled for the drive session"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                suppress,
+                "RawInput legacy toggle failed; trackpad scroll may apply locally while driving"
+            ),
+        }
     }
 
     fn create_raw_input_window(module: HINSTANCE) -> Result<HWND, String> {

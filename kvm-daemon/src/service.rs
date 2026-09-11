@@ -4490,17 +4490,45 @@ impl ReceiverInjector {
                 // unplaced rather than failing the episode.
                 #[cfg(target_os = "linux")]
                 {
-                    let Some(display) = receiver_display() else {
+                    // Cookie first: without it a dead xhost grant fails the
+                    // connect below, which used to surface as entries at
+                    // the stored position (notably on the lockscreen).
+                    seed_session_xauthority();
+                    let display = receiver_display().or_else(|| {
+                        // Never silently drive unplaced when the ordinary
+                        // local display is worth one attempt: a failed
+                        // :0 warp warns at the call site and drives
+                        // unplaced exactly like before, while a missing
+                        // sidecar on a live desktop still gets its warp.
+                        tracing::warn!(x, y, "no session display for entry warp; trying :0");
+                        Some(":0".to_owned())
+                    });
+                    // The let-else above always yields Some; keep the shape
+                    // total so a future None stays drive-unplaced, not a
+                    // panic in the input path.
+                    let Some(display) = display else {
                         tracing::debug!(x, y, "no session display for entry warp; driving unplaced");
                         return Ok(());
                     };
                     return kvm_platform::capture::warp_cursor_on(Some(&display), x, y)
                         .map_err(anyhow::Error::from);
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
                     let _ = (x, y);
                     Ok(())
+                }
+                // Windows receivers in the interactive session warp exactly
+                // like Linux ones (entry edge at the sender's exit height):
+                // without this the peer drives relative motion from the
+                // stale OS position, so Mint->Windows entries land where
+                // the Windows cursor was last parked instead of matching
+                // the Mint exit height. The service path above already
+                // warped; only the interactive-session Native path no-oped.
+                #[cfg(target_os = "windows")]
+                {
+                    return kvm_platform::capture::warp_cursor(x, y)
+                        .map_err(anyhow::Error::from);
                 }
             }
             #[cfg(target_os = "windows")]
@@ -5139,6 +5167,48 @@ fn parse_sidecar_display(text: &str) -> Option<String> {
     Some(display.to_owned())
 }
 
+/// Parse the session X cookie path from the sidecar body. Validated
+/// hard: this path is trusted for X authentication, so only absolute
+/// paths without NUL bytes pass. Existence is checked at use time, not
+/// here, to keep this pure for tests.
+fn parse_sidecar_xauthority(text: &str) -> Option<std::path::PathBuf> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let path = value.get("xauthority")?.as_str()?;
+    if path.len() > 256
+        || !path.starts_with('/')
+        || path.contains('\0')
+        || path.contains("..")
+    {
+        return None;
+    }
+    Some(std::path::PathBuf::from(path))
+}
+
+/// Seed XAUTHORITY from the session sidecar when the process has none.
+/// Headless daemons (User=thekvm, no session environment) otherwise lean
+/// entirely on the UI-startup xhost grant; when that grant stops working
+/// — lock greeters, X resets — every entry warp fails closed into
+/// drive-unplaced. The cookie file itself survives all of that. Once the
+/// environment carries a value this is a no-op, so the process-wide set
+/// happens at most once per process lifetime in practice.
+#[cfg(target_os = "linux")]
+fn seed_session_xauthority() {
+    if std::env::var("XAUTHORITY")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let cookie = std::fs::read_to_string(data_dir().join(GEOMETRY_SIDECAR))
+        .ok()
+        .and_then(|text| parse_sidecar_xauthority(&text))
+        .filter(|path| path.is_file());
+    if let Some(cookie) = cookie {
+        std::env::set_var("XAUTHORITY", &cookie);
+        tracing::debug!(path = %cookie.display(), "seeded session X cookie for entry warp");
+    }
+}
+
 /// Display the receiver should warp on: our own environment first, else
 /// the session-published sidecar display (headless daemons have no
 /// DISPLAY of their own). None means "no session display known".
@@ -5214,7 +5284,15 @@ fn publish_local_geometry(router: &EdgeRouter) {
         let name = name.trim();
         !name.is_empty() && name.len() <= 32
     });
-    let body = serde_json::json!({ "width": geometry.width, "height": geometry.height, "display": display }).to_string();
+    // The session X cookie travels too: the daemon authenticates with the
+    // one-shot xhost grant otherwise, and anything that invalidates that
+    // grant (lock greeters, X resets) silently unplaces every later entry
+    // warp — driving continues from the stale cursor, i.e. entries land
+    // at the stored position. Cookie auth survives all of that.
+    let xauthority = std::env::var("XAUTHORITY")
+        .ok()
+        .filter(|path| !path.trim().is_empty() && path.len() <= 256);
+    let body = serde_json::json!({ "width": geometry.width, "height": geometry.height, "display": display, "xauthority": xauthority }).to_string();
     if let Err(error) = std::fs::write(
         std::path::Path::new(&daemon_dir).join(GEOMETRY_SIDECAR),
         body,
@@ -5700,6 +5778,32 @@ mod tests {
             parse_sidecar_display(r#"{"display":"; rm -rf ~"}"#),
             None
         );
+    }
+
+    #[test]
+    fn sidecar_xauthority_parses_strictly() {
+        // Absolute cookie paths pass; relative paths, traversal, NUL
+        // bytes, and overlong values are rejected — this path is trusted
+        // for X authentication.
+        assert_eq!(
+            parse_sidecar_xauthority(
+                r#"{"width":1536,"height":864,"xauthority":"/home/hs01/.Xauthority"}"#
+            ),
+            Some(std::path::PathBuf::from("/home/hs01/.Xauthority"))
+        );
+        assert_eq!(
+            parse_sidecar_xauthority(r#"{"width":1536,"height":864}"#),
+            None
+        );
+        assert_eq!(
+            parse_sidecar_xauthority(r#"{"xauthority":"relative/.Xauthority"}"#),
+            None
+        );
+        assert_eq!(
+            parse_sidecar_xauthority(r#"{"xauthority":"/tmp/../etc/passwd"}"#),
+            None
+        );
+        assert_eq!(parse_sidecar_xauthority(r#"{"xauthority":""}"#), None);
     }
 
     #[test]
