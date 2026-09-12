@@ -1037,9 +1037,13 @@ impl EdgeRouter {
 
 /// Inward settle distance that arms the entry edge for return (px). Below
 /// this, post-entry jitter and fling tails can never fire a return; above
-/// it, one deliberate push back out comes home. A firm flick exceeds it in
-/// a single event; resting trackpad noise never reaches it.
-const SETTLE_PX: u32 = 12;
+/// it, one deliberate push back out comes home. Deliberately generous:
+/// a twitchy threshold (12px) armed on the entry shove itself, so every
+/// corrective pullback instantly killed the drive and humans could never
+/// hold a crossing — each micro-correction re-warped the cursor to the
+/// edge, which reads as "pinned". A firm deliberate roam exceeds 48px in
+/// one gesture; resting trackpad noise never reaches it.
+const SETTLE_PX: u32 = 48;
 
 /// Sustained outward pressure (px of accumulated edge overflow) required
 /// to OPEN a crossing. Deskflow's half of this is the jump zone (the
@@ -1760,20 +1764,20 @@ mod tests {
         let mut router = EdgeRouter::new(layout).unwrap();
         // Peer on the right: enter at its left edge (x=0), entry edge Left.
         let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
-        // 11px inside: still disarmed — facing overflow clamps.
+        // 47px inside: still disarmed — facing overflow clamps.
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 11, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: 47, dy: 0 }),
             RoutedEvent::Forward { .. }
         ));
-        let clamped = router.route(InputEvent::MouseMove { dx: -50, dy: 0 });
+        let clamped = router.route(InputEvent::MouseMove { dx: -100, dy: 0 });
         assert!(matches!(clamped, RoutedEvent::Forward { .. }));
         assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
-        // One step to exactly 12px inside: armed — facing overflow home.
+        // One step to exactly 48px inside: armed — facing overflow home.
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 12, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: 48, dy: 0 }),
             RoutedEvent::Forward { .. }
         ));
-        let back = router.route(InputEvent::MouseMove { dx: -50, dy: 0 });
+        let back = router.route(InputEvent::MouseMove { dx: -100, dy: 0 });
         assert!(matches!(
             back,
             RoutedEvent::ReturnHome { edge: Edge::Left, .. }
