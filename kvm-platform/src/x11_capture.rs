@@ -32,6 +32,15 @@ pub struct X11Capture {
     grab_kind: GrabKind,
     motion_x: f64,
     motion_y: f64,
+    /// Invisible override-redirect input-only window that owns grabbed
+    /// core events while driving (see GrabKind::Core): the grab targets
+    /// this window so the grabbed stream has somewhere to be read from.
+    /// Grabbing root suppresses equally well, but then nobody receives.
+    grab_window: xproto::Window,
+    /// Last grabbed-core pointer position (root coords): relative steps
+    /// derive from successive MotionNotify events. Reset on every grab
+    /// engage so a stale anchor can never teleport the cursor.
+    core_last: Option<(i16, i16)>,
     /// Slave-device ids owned by our own uinput injector ("TheKVM Virtual
     /// Mouse/Keyboard"). Raw events carry only numeric source ids, so the
     /// set is resolved by device name and refreshed periodically: the
@@ -153,6 +162,33 @@ impl X11Capture {
             ignored = ignored_sources.len(),
             "X11 capture armed; own injector devices excluded from capture"
         );
+        // Invisible grab window (see the field): input-only,
+        // override-redirect, mapped but zero pixels on screen.
+        let grab_window = connection
+            .generate_id()
+            .map_err(|error| PlatformError::Capture(format!("allocate grab window id: {error}")))?;
+        connection
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                grab_window,
+                root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                xproto::WindowClass::INPUT_ONLY,
+                x11rb::COPY_FROM_PARENT,
+                &xproto::CreateWindowAux::new().override_redirect(1),
+            )
+            .map_err(|error| PlatformError::Capture(format!("create grab window: {error}")))?
+            .check()
+            .map_err(|error| PlatformError::Capture(format!("create grab window: {error}")))?;
+        connection
+            .map_window(grab_window)
+            .map_err(|error| PlatformError::Capture(format!("map grab window: {error}")))?
+            .check()
+            .map_err(|error| PlatformError::Capture(format!("map grab window: {error}")))?;
         Ok(Self {
             connection,
             root,
@@ -160,6 +196,8 @@ impl X11Capture {
             grab_kind: GrabKind::None,
             motion_x: 0.0,
             motion_y: 0.0,
+            grab_window,
+            core_last: None,
             ignored_sources,
             last_source_refresh: std::time::Instant::now(),
         })
@@ -168,6 +206,13 @@ impl X11Capture {
     fn translate(&mut self, event: x11rb::protocol::Event) -> Option<InputEvent> {
         match event {
             x11rb::protocol::Event::XinputRawKeyPress(event) => {
+                // Core-grabbed: this server stops XI raw delivery under
+                // our own core grab, and the grabbed core stream below is
+                // the live tap — reading both would double-deliver where
+                // a server provides both.
+                if self.grab_kind == GrabKind::Core {
+                    return None;
+                }
                 if self.ignored_sources.contains(&event.sourceid) {
                     return None;
                 }
@@ -175,6 +220,9 @@ impl X11Capture {
                 key_event(event.detail, true)
             }
             x11rb::protocol::Event::XinputRawKeyRelease(event) => {
+                if self.grab_kind == GrabKind::Core {
+                    return None;
+                }
                 if self.ignored_sources.contains(&event.sourceid) {
                     return None;
                 }
@@ -182,18 +230,27 @@ impl X11Capture {
                 key_event(event.detail, false)
             }
             x11rb::protocol::Event::XinputRawButtonPress(event) => {
+                if self.grab_kind == GrabKind::Core {
+                    return None;
+                }
                 if self.ignored_sources.contains(&event.sourceid) {
                     return None;
                 }
                 count_button_event(button_event(event.detail, true))
             }
             x11rb::protocol::Event::XinputRawButtonRelease(event) => {
+                if self.grab_kind == GrabKind::Core {
+                    return None;
+                }
                 if self.ignored_sources.contains(&event.sourceid) {
                     return None;
                 }
                 count_button_event(button_event(event.detail, false))
             }
             x11rb::protocol::Event::XinputRawMotion(event) => {
+                if self.grab_kind == GrabKind::Core {
+                    return None;
+                }
                 if self.ignored_sources.contains(&event.sourceid) {
                     return None;
                 }
@@ -205,6 +262,51 @@ impl X11Capture {
                     .map(|value| take_integer(&mut self.motion_y, value))
                     .unwrap_or(0);
                 (dx != 0 || dy != 0).then_some(InputEvent::MouseMove { dx, dy })
+            }
+            // Grabbed-core stream (see GrabKind::Core): live ONLY while
+            // core-grabbed. Core events carry no source id, so no
+            // own-device filter applies — while driving, the receiver
+            // injector is idle on this machine, so everything grabbed is
+            // physical user input by construction.
+            x11rb::protocol::Event::MotionNotify(event) => {
+                if self.grab_kind != GrabKind::Core {
+                    return None;
+                }
+                XI_MOTION.fetch_add(1, Ordering::Relaxed);
+                let anchor = self.core_last.replace((event.root_x, event.root_y));
+                let Some((last_x, last_y)) = anchor else {
+                    return None;
+                };
+                let (dx, dy) = core_motion_step((last_x, last_y), (event.root_x, event.root_y));
+                let dx = take_integer(&mut self.motion_x, dx as f64);
+                let dy = take_integer(&mut self.motion_y, dy as f64);
+                (dx != 0 || dy != 0).then_some(InputEvent::MouseMove { dx, dy })
+            }
+            x11rb::protocol::Event::ButtonPress(event) => {
+                if self.grab_kind != GrabKind::Core {
+                    return None;
+                }
+                count_button_event(button_event(u32::from(event.detail), true))
+            }
+            x11rb::protocol::Event::ButtonRelease(event) => {
+                if self.grab_kind != GrabKind::Core {
+                    return None;
+                }
+                count_button_event(button_event(u32::from(event.detail), false))
+            }
+            x11rb::protocol::Event::KeyPress(event) => {
+                if self.grab_kind != GrabKind::Core {
+                    return None;
+                }
+                XI_KEY.fetch_add(1, Ordering::Relaxed);
+                key_event(u32::from(event.detail), true)
+            }
+            x11rb::protocol::Event::KeyRelease(event) => {
+                if self.grab_kind != GrabKind::Core {
+                    return None;
+                }
+                XI_KEY.fetch_add(1, Ordering::Relaxed);
+                key_event(u32::from(event.detail), false)
             }
             _ => None,
         }
@@ -272,10 +374,14 @@ impl CaptureBackend for X11Capture {
                     // so a later kind-matched release cannot skip a real
                     // hold (or chase a phantom one).
                     self.grab_kind = GrabKind::None;
-                    core_grab(&self.connection, self.root)?;
+                    core_grab(&self.connection, self.grab_window)?;
                     self.grab_kind = GrabKind::Core;
                 }
             }
+            // Fresh anchor for grabbed-core relative steps (see
+            // translate): without this the first step after engage
+            // teleports from a stale position.
+            self.core_last = None;
             tracing::info!(grab = ?self.grab_kind, "X11 local suppression engaged");
         } else {
             // Kind-matched release: ungrab ONLY the hold we actually own.
@@ -386,13 +492,18 @@ fn xi_grab(connection: &RustConnection, root: xproto::Window) -> Result<(), Plat
 }
 
 /// Deskflow-parity core grabs (pointer + keyboard), Async/Async with no
-/// event owner: local apps receive nothing while held, and the XI raw
-/// selection underneath keeps feeding capture untouched.
-fn core_grab(connection: &RustConnection, root: xproto::Window) -> Result<(), PlatformError> {
+/// event owner: local apps receive nothing while held. The grab targets
+/// our own invisible window (not root) so the grabbed core stream has a
+/// reader: this server stops XI raw delivery under our own core grab,
+/// which made XI-only capture go deaf the instant a drive opened (every
+/// freeze-with-visible-cursor). The XI raw selection underneath is left
+/// in place; translate() reads exactly one source per grab kind, so no
+/// server can double-deliver.
+fn core_grab(connection: &RustConnection, grab_window: xproto::Window) -> Result<(), PlatformError> {
     let pointer = connection
         .grab_pointer(
             false,
-            root,
+            grab_window,
             xproto::EventMask::BUTTON_PRESS
                 | xproto::EventMask::BUTTON_RELEASE
                 | xproto::EventMask::POINTER_MOTION,
@@ -412,7 +523,7 @@ fn core_grab(connection: &RustConnection, root: xproto::Window) -> Result<(), Pl
         )));
     }
     let keyboard = connection
-        .grab_keyboard(false, root, 0u32, xproto::GrabMode::ASYNC, xproto::GrabMode::ASYNC)
+        .grab_keyboard(false, grab_window, 0u32, xproto::GrabMode::ASYNC, xproto::GrabMode::ASYNC)
         .map_err(|error| PlatformError::Capture(format!("grab core keyboard: {error}")))?
         .reply()
         .map_err(|error| PlatformError::Capture(format!("read core keyboard grab status: {error}")))?
@@ -514,6 +625,16 @@ fn axis_value(mask: &[u32], values: &[xinput::Fp3232], axis: usize) -> Option<f6
     Some(value.integral as f64 + f64::from(value.frac) / FIXED_POINT_SCALE)
 }
 
+/// Relative step between two grabbed-core pointer positions (root
+/// coords, y down). Pure: pins the sign convention the drive router
+/// depends on (right/down positive, matching XI raw deltas).
+fn core_motion_step(last: (i16, i16), current: (i16, i16)) -> (i32, i32) {
+    (
+        i32::from(current.0) - i32::from(last.0),
+        i32::from(current.1) - i32::from(last.1),
+    )
+}
+
 fn take_integer(remainder: &mut f64, value: f64) -> i32 {
     if !value.is_finite() {
         return 0;
@@ -564,8 +685,15 @@ mod tests {
     }
 
     #[test]
-    fn own_injector_devices_match_case_insensitively() {
-        assert!(is_own_device_name(b"TheKVM Virtual Mouse"));
+    fn grabbed_core_steps_match_xi_raw_signs() {
+        // Right/down positive (screen coords, y down), like XI raw deltas.
+        assert_eq!(core_motion_step((100, 100), (112, 96)), (12, -4));
+        assert_eq!(core_motion_step((100, 100), (100, 100)), (0, 0));
+        assert_eq!(core_motion_step((0, 0), (-5, 300)), (-5, 300));
+    }
+
+    #[test]
+    fn own_injector_devices_match_case_insensitively() {        assert!(is_own_device_name(b"TheKVM Virtual Mouse"));
         assert!(is_own_device_name(b"TheKVM Virtual Keyboard"));
         assert!(is_own_device_name(b"thekvm virtual mouse"));
         assert!(!is_own_device_name(b"Logitech USB Receiver"));
