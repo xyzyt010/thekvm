@@ -1513,7 +1513,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    tracing::info!(screen = ?router.current_screen(), "topology capture ready; move to a configured screen edge");
+    tracing::info!(screen = ?router.current_screen(), version = env!("CARGO_PKG_VERSION"), "topology capture ready; move to a configured screen edge");
     eprintln!("THEKVM_STATUS edge-ready");
     loop {
         tokio::select! {
@@ -2205,7 +2205,12 @@ fn park_inside(router: &mut EdgeRouter, edge: kvm_core::Edge) {
         kvm_core::Edge::Bottom => y = y.saturating_sub(PARK_PX),
     }
     // Best effort: a failure here just leaves the cursor where it was.
-    let _ = router.set_local_cursor_position(x, y);
+    // Deliberately gate-free (see place_local_cursor): this pin exists
+    // so the next outward push retries from just inside, and arming the
+    // fresh-entry gate here would swallow exactly that push — the
+    // "stuck at the edge until wiggled inside" shape. The short transfer
+    // debounce already paces re-crossings; no state gate is needed.
+    let _ = router.place_local_cursor(x, y);
 }
 
 struct TopologyEventContext<'a> {
@@ -4285,6 +4290,18 @@ async fn handle_connection(
                                 );
                                 remote_screen = Some(target);
                                 remote_cursor = Some((x, y));
+                                // Arm ballistics-proof absolute motion BEFORE
+                                // the warp (Windows-service bridge only):
+                                // the helper integrates the same deltas the
+                                // tracker does from this entry point, so
+                                // tracked and visible agree by construction
+                                // and phantom hop-ends vanish. Best-effort:
+                                // unheard helpers stay relative (today).
+                                #[cfg(target_os = "windows")]
+                                injector.set_target_size(
+                                    target_geometry.width,
+                                    target_geometry.height,
+                                );
                                 // Proves entry exactness per crossing: the OS
                                 // cursor was just placed here, so a later
                                 // "exited mid-screen" report can be checked
@@ -4812,6 +4829,17 @@ impl ReceiverInjector {
         match self {
             Self::Service(proxy) => proxy.take_receipts(),
             Self::Native(_) => crate::windows_helper::InjectionReceipts::default(),
+        }
+    }
+
+    /// Announce the drive target's dims for ballistics-proof absolute
+    /// motion (Windows-service bridge only; native injectors keep
+    /// relative motion). Best-effort: helpers that never hear it stay
+    /// relative, which is today's behavior.
+    #[cfg(target_os = "windows")]
+    fn set_target_size(&mut self, width: u32, height: u32) {
+        if let Self::Service(proxy) = self {
+            proxy.set_target_size(width, height);
         }
     }
 

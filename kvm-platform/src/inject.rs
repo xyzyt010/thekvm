@@ -547,15 +547,78 @@ mod win32_inject {
     use windows::Win32::Foundation::GetLastError;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-        MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+        MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CMONITORS, SM_CXSCREEN, SM_CYSCREEN,
     };
 
     pub struct Win32Injector {
         pressed_keys: Mutex<BTreeSet<u16>>,
         pressed_buttons: Mutex<BTreeSet<MouseButton>>,
+        absolute: Mutex<AbsoluteState>,
+    }
+
+    /// Ballistics-proof absolute-motion state. Windows applies pointer
+    /// acceleration ("enhance pointer precision") to RELATIVE SendInput
+    /// motion, so the real cursor overshoots the receiver's tracked
+    /// cursor on fast roams and undershoots on slow ones. The tracked
+    /// cursor then cries "24px past the home edge" while the visible one
+    /// sits mid-screen: phantom hop requests end the session, the cursor
+    /// stops at a fluctuating limit, and re-entry warps it back to the
+    /// edge (the glitchy-horizontal shape). ABSOLUTE motion sets exact
+    /// pixels per event — acceleration never applies — so tracked and
+    /// real agree by construction and the desync class vanishes.
+    /// Single-monitor primaries only (see absolute_eligible): without a
+    /// layout-to-monitor map, multi-monitor targets stay relative
+    /// (today's behavior, no regression).
+    #[derive(Debug, Default)]
+    struct AbsoluteState {
+        /// Target screen dims in px (from the drive's entry warp).
+        target: Option<(u32, u32)>,
+        /// Integrated cursor position in target px. Reset by every entry
+        /// warp; both sides integrate identical deltas from there, so no
+        /// drift can accumulate (each event recomputes absolute units
+        /// from this position — rounding never compounds).
+        pos: (i64, i64),
+    }
+
+    /// Absolute units (0..=65535) for one axis. `span` is dim-1; a
+    /// degenerate span maps to the origin instead of dividing by zero.
+    fn absolute_units(pos: i64, span: i64) -> i32 {
+        if span <= 0 {
+            return 0;
+        }
+        ((pos.clamp(0, span) * 65535) / span)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    }
+
+    fn primary_dims() -> Option<(i32, i32)> {
+        static DIMS: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+        *DIMS.get_or_init(|| {
+            let w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+            let h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+            (w > 0 && h > 0).then_some((w, h))
+        })
+    }
+
+    fn single_monitor() -> bool {
+        static SINGLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SINGLE.get_or_init(|| unsafe { GetSystemMetrics(SM_CMONITORS) } == 1)
+    }
+
+    /// True when absolute injection is exact on this machine: one
+    /// physical monitor whose primary dims equal the drive target. Any
+    /// other shape (multi-monitor, mismatched dims, unknown metrics)
+    /// stays relative — fail-open, never a wrong-screen warp.
+    fn absolute_eligible(target: (u32, u32)) -> bool {
+        single_monitor()
+            && primary_dims().is_some_and(|(w, h)| {
+                u64::from(target.0) == w as u64 && u64::from(target.1) == h as u64
+            })
     }
 
     impl Win32Injector {
@@ -563,6 +626,69 @@ mod win32_inject {
             Ok(Self {
                 pressed_keys: Mutex::new(BTreeSet::new()),
                 pressed_buttons: Mutex::new(BTreeSet::new()),
+                absolute: Mutex::new(AbsoluteState::default()),
+            })
+        }
+
+        /// Arm absolute motion for the drive target (px). Called on every
+        /// entry warp via SetTargetSize; a zero/degenerate target disables
+        /// (falls back to relative on the next event).
+        pub fn set_absolute_target(&self, width: u32, height: u32) {
+            if let Ok(mut guard) = self.absolute.lock() {
+                guard.target = (width >= 2 && height >= 2).then_some((width, height));
+            }
+        }
+
+        /// Re-anchor the absolute accumulator to an entry warp
+        /// destination (same point both sides integrate from).
+        pub fn note_warp(&self, x: u32, y: u32) {
+            if let Ok(mut guard) = self.absolute.lock() {
+                guard.pos = (i64::from(x), i64::from(y));
+            }
+        }
+
+        /// Build the motion INPUT: absolute when armed and exact (see
+        /// absolute_eligible), relative otherwise. Returns None only when
+        /// the motion state is unavailable (lock poisoned): the caller
+        /// then skips the event rather than injecting a stale position.
+        fn motion_input(&self, dx: i32, dy: i32) -> Option<INPUT> {
+            let mut guard = self.absolute.lock().ok()?;
+            if let Some(target) = guard.target {
+                if absolute_eligible(target) {
+                    guard.pos.0 += i64::from(dx);
+                    guard.pos.1 += i64::from(dy);
+                    let span_x = i64::from(target.0) - 1;
+                    let span_y = i64::from(target.1) - 1;
+                    let input = INPUT {
+                        r#type: INPUT_MOUSE,
+                        Anonymous: INPUT_0 {
+                            mi: MOUSEINPUT {
+                                dx: absolute_units(guard.pos.0, span_x),
+                                dy: absolute_units(guard.pos.1, span_y),
+                                mouseData: 0,
+                                dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+                                time: 0,
+                                dwExtraInfo: crate::ECHO_TAG,
+                            },
+                        },
+                    };
+                    return Some(input);
+                }
+                // Armed but not exact on this machine (multi-monitor or
+                // dims drift): relative, exactly as before.
+            }
+            Some(INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx,
+                        dy,
+                        mouseData: 0,
+                        dwFlags: MOUSEEVENTF_MOVE,
+                        time: 0,
+                        dwExtraInfo: crate::ECHO_TAG,
+                    },
+                },
             })
         }
 
@@ -571,19 +697,12 @@ mod win32_inject {
             // horizontal): the old code sent only one axis and dropped the
             // other, losing diagonal trackpad scroll.
             let inputs: Vec<INPUT> = match event {
-                InputEvent::MouseMove { dx, dy } => vec![INPUT {
-                    r#type: INPUT_MOUSE,
-                    Anonymous: INPUT_0 {
-                        mi: MOUSEINPUT {
-                            dx,
-                            dy,
-                            mouseData: 0,
-                            dwFlags: MOUSEEVENTF_MOVE,
-                            time: 0,
-                            dwExtraInfo: crate::ECHO_TAG,
-                        },
-                    },
-                }],
+                InputEvent::MouseMove { dx, dy } => {
+                    // Absolute when armed (ballistics-proof); relative
+                    // otherwise. A poisoned motion lock skips the event
+                    // rather than injecting from a stale accumulator.
+                    self.motion_input(dx, dy).into_iter().collect()
+                }
                 InputEvent::MouseButton { button, pressed } => {
                     let (flags, mouse_data) = mouse_button_flags(button, pressed);
                     vec![INPUT {
@@ -950,8 +1069,39 @@ mod win32_inject {
         }
 
         #[test]
-        fn media_keys_and_pause_travel_as_virtual_keys() {
-            // No AT scancode exists for these; the VK path must carry them
+        fn absolute_units_span_the_full_range() {
+            // 1536-wide target: origin maps to 0, far edge to 65535,
+            // midpoint near half scale; out-of-range clamps; degenerate
+            // spans map to the origin instead of dividing by zero.
+            assert_eq!(super::absolute_units(0, 1535), 0);
+            assert_eq!(super::absolute_units(1535, 1535), 65535);
+            assert_eq!(super::absolute_units(767, 1535), 32746);
+            assert_eq!(super::absolute_units(-40, 1535), 0);
+            assert_eq!(super::absolute_units(99999, 1535), 65535);
+            assert_eq!(super::absolute_units(100, 0), 0);
+            assert_eq!(super::absolute_units(100, -5), 0);
+        }
+
+        #[test]
+        fn motion_without_target_stays_relative() {
+            // No SetTargetSize seen (or a degenerate one): byte-identical
+            // relative motion to every previous release — the fail-open
+            // path for multi-monitor and mismatched machines.
+            let injector = super::Win32Injector::create().unwrap();
+            injector.set_absolute_target(0, 0);
+            let input = injector.motion_input(3, -2).unwrap();
+            let mouse = unsafe { input.Anonymous.mi };
+            assert_eq!(mouse.dx, 3);
+            assert_eq!(mouse.dy, -2);
+            assert_eq!(
+                mouse.dwFlags,
+                super::MOUSEEVENTF_MOVE,
+                "relative motion must not carry ABSOLUTE"
+            );
+        }
+
+        #[test]
+        fn media_keys_and_pause_travel_as_virtual_keys() {            // No AT scancode exists for these; the VK path must carry them
             // or Mint driving Windows can never mute/adjust volume.
             assert_eq!(key_virtual_key(0x48), Some((0x13, 0, false))); // Pause
             assert_eq!(key_virtual_key(0x7f), Some((0xAD, 0, false))); // mute

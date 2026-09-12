@@ -591,7 +591,22 @@ impl EdgeRouter {
     /// Seed the local cursor from the platform's current pointer position.
     /// This is intentionally allowed only while control is local; a remote
     /// handoff owns the router's current coordinate until it returns.
-    pub fn set_local_cursor_position(&mut self, x: u32, y: u32) -> Result<(), String> {        if self.active_remote.is_some() {
+    /// Seeds at a facing edge arm the fresh-entry gate (see the field).
+    pub fn set_local_cursor_position(&mut self, x: u32, y: u32) -> Result<(), String> {
+        self.seed_position(x, y, true)
+    }
+
+    /// Nudge the local cursor without touching the fresh-entry gate (see
+    /// park_inside): a deliberate re-pin just inside after a refused push
+    /// must not arm the gate — the very next gesture is the outward push
+    /// itself, which a fresh gate would swallow and read as "stuck at the
+    /// edge, cannot cross until wiggled inside first".
+    pub fn place_local_cursor(&mut self, x: u32, y: u32) -> Result<(), String> {
+        self.seed_position(x, y, false)
+    }
+
+    fn seed_position(&mut self, x: u32, y: u32, apply_gate: bool) -> Result<(), String> {
+        if self.active_remote.is_some() {
             return Err("cannot seed cursor while a remote screen is active".into());
         }
         let (width, height) = self
@@ -607,19 +622,22 @@ impl EdgeRouter {
         self.push_accum = 0;
         // Arm the fresh-entry gate when the seed sits at a facing edge
         // (see the field): the first gestures after (re)start must come
-        // inside before any outward run can open a crossing.
-        self.startup_gate = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
-            .iter()
-            .any(|edge| {
-                self.crossing_target(self.local_screen, *edge).is_some()
-                    && distance_from_edge(
-                        *edge,
-                        self.cursor_x,
-                        self.cursor_y,
-                        width,
-                        height,
-                    ) < EDGE_PUSH_PX as u32
-            });
+        // inside before any outward run can open a crossing. Deliberate
+        // re-pins (see place_local_cursor) skip this: their next gesture
+        // IS the outward push.
+        self.startup_gate = apply_gate
+            && [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
+                .iter()
+                .any(|edge| {
+                    self.crossing_target(self.local_screen, *edge).is_some()
+                        && distance_from_edge(
+                            *edge,
+                            self.cursor_x,
+                            self.cursor_y,
+                            width,
+                            height,
+                        ) < EDGE_PUSH_PX as u32
+                });
         Ok(())
     }
 
@@ -1300,6 +1318,38 @@ mod tests {
         let result = router.route(InputEvent::MouseMove { dx: -400, dy: 0 });
         assert!(matches!(result, RoutedEvent::Local(_)));
         // ...and a deliberate outward run crosses again.
+        let mut crossed = false;
+        for _ in 0..40 {
+            if matches!(
+                router.route(InputEvent::MouseMove { dx: 30, dy: 0 }),
+                RoutedEvent::Handoff { .. }
+            ) {
+                crossed = true;
+                break;
+            }
+        }
+        assert!(crossed);
+    }
+
+    #[test]
+    fn park_inside_retry_crosses_without_wiggling_first() {
+        // A refused push parks the cursor just inside and the very next
+        // gesture is the outward push itself: that pin must not arm the
+        // fresh-entry gate, or every refused push wedges the edge until
+        // the user wiggles inside first ("stuck, cannot cross").
+        let layout = Layout {
+            screens: vec![screen(1, "main", 0, 0), screen(2, "right", 1, 0)],
+            self_screen: Some(ScreenId(1)),
+        };
+        let mut router = EdgeRouter::new(layout).unwrap();
+        // Seed at the facing edge (gate on, like a (re)start there).
+        router.set_local_cursor_position(1919, 540).unwrap();
+        let refused = router.route(InputEvent::MouseMove { dx: 4, dy: 0 });
+        assert!(matches!(refused, RoutedEvent::Local(_)));
+        // The refused-push pin 8px inside: no gate from the pin itself.
+        let (x, _) = router.cursor_position();
+        router.place_local_cursor(x, 540).unwrap();
+        // The immediate outward run crosses — no inside detour needed.
         let mut crossed = false;
         for _ in 0..40 {
             if matches!(

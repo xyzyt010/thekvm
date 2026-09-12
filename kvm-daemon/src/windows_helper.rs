@@ -25,6 +25,13 @@ enum HelperMessage {
     Input(InputEvent),
     ReleaseAll,
     WarpCursor { x: u32, y: u32 },
+    /// Service-to-helper drive-target announce: the entry warp's screen
+    /// dims in px. Arms ballistics-proof absolute motion in the helper
+    /// (see Win32Injector): without it every injection rides relative
+    /// deltas through pointer acceleration and the tracked cursor
+    /// desyncs from the visible one. Unknown to pre-absolute helpers,
+    /// which drop the frame and stay relative — mixed-version safe.
+    SetTargetSize { width: u32, height: u32 },
     SetExclusive(bool),
     /// Helper-to-service reply for WarpCursor: whether this helper
     /// actually moved the visible cursor. Without it a skipped warp
@@ -155,6 +162,23 @@ impl ServiceInputProxy {
         let message = serde_json::to_vec(&HelperMessage::WarpCursor { x, y })?;
         fan_out(&mut self.streams, &mut self.desktops, "warp cursor in Windows helper", &message)?;
         collect_warp_acks(&mut self.streams, x, y)
+    }
+
+    /// Announce the drive target's dims so helpers can inject absolute
+    /// (ballistics-proof) motion. Fire-and-forget: helpers without the
+    /// message stay relative, and dead streams are already gone or going
+    /// (the warp acks report them).
+    pub fn set_target_size(&mut self, width: u32, height: u32) {
+        let Ok(message) = serde_json::to_vec(&HelperMessage::SetTargetSize { width, height })
+        else {
+            return;
+        };
+        let _ = fan_out(
+            &mut self.streams,
+            &mut self.desktops,
+            "announce drive target size to Windows helper",
+            &message,
+        );
     }
 
     /// Ask every helper what happened to its Input messages since the
@@ -611,6 +635,9 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                 }
             }
             HelperMessage::ReleaseAll => injector.release_all()?,
+            HelperMessage::SetTargetSize { width, height } => {
+                injector.set_absolute_target(width, height);
+            }
             HelperMessage::WarpCursor { x, y } => {
                 // Only the desktop that currently owns input may move the
                 // visible cursor. The idle helper (typically winlogon)
@@ -622,19 +649,30 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                 // report success while the cursor stays put.
                 let (placed, detail) = match current_desktop_is_input() {
                     Ok(true) => match warp_cursor(x, y) {
-                        Ok(()) => match kvm_platform::capture::current_cursor_position() {
-                            Ok(Some((actual_x, actual_y))) if actual_x == x && actual_y == y => {
-                                (true, format!("warped on {desktop}"))
+                        Ok(()) => {
+                            // Re-anchor the absolute accumulator to the
+                            // entry both sides integrate from: without
+                            // this the first absolute event jumps from a
+                            // stale position.
+                            injector.note_warp(x, y);
+                            match kvm_platform::capture::current_cursor_position() {
+                                Ok(Some((actual_x, actual_y)))
+                                    if actual_x == x && actual_y == y =>
+                                {
+                                    (true, format!("warped on {desktop}"))
+                                }
+                                Ok(actual) => (
+                                    false,
+                                    format!(
+                                        "warp unverified on {desktop}: cursor at {actual:?}"
+                                    ),
+                                ),
+                                Err(error) => (
+                                    false,
+                                    format!("warp read-back failed on {desktop}: {error:?}"),
+                                ),
                             }
-                            Ok(actual) => (
-                                false,
-                                format!("warp unverified on {desktop}: cursor at {actual:?}"),
-                            ),
-                            Err(error) => (
-                                false,
-                                format!("warp read-back failed on {desktop}: {error:?}"),
-                            ),
-                        },
+                        }
                         Err(error) => (
                             false,
                             format!("SetCursorPos failed on {desktop}: {error:#}"),
@@ -1201,6 +1239,27 @@ mod tests {
         assert!(matches!(
             serde_json::from_slice::<HelperMessage>(&receipt).unwrap(),
             HelperMessage::InputReceipt { ok: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn target_size_announce_reaches_helper() {
+        // The drive-target dims must survive the bridge intact: a wrong
+        // size silently maps absolute motion onto the wrong pixels.
+        let (mut proxy_side, mut helper_side) = loopback_pair();
+        let message = serde_json::to_vec(&HelperMessage::SetTargetSize {
+            width: 1536,
+            height: 960,
+        })
+        .unwrap();
+        write_ipc_frame(&mut proxy_side, &message).unwrap();
+        let frame = read_ipc_frame(&mut helper_side).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<HelperMessage>(&frame).unwrap(),
+            HelperMessage::SetTargetSize {
+                width: 1536,
+                height: 960
+            }
         ));
     }
 
