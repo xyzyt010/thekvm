@@ -2010,6 +2010,11 @@ struct TopologySession {
     /// the journal instead of a mystery.
     motion_captured: u64,
     motion_forwarded: u64,
+    /// QUIC datagrams emitted on this episode's association (motion and
+    /// wheel ride datagrams; keys ride the stream). Logged at teardown:
+    /// sent>0 with receiver motion=0 proves wire/task loss instead of a
+    /// sender-side drop.
+    datagrams_sent: u64,
     /// The peer's self-reported geometry (for re-mapping re-entry points
     /// when this stream is reused after parking).
     peer_geometry: Option<ScreenGeometry>,
@@ -2051,6 +2056,7 @@ impl TopologySession {
                 wheel_forwarded = self.wheel_forwarded,
                 motion_captured = self.motion_captured,
                 motion_forwarded = self.motion_forwarded,
+                datagrams_sent = self.datagrams_sent,
                 peer_smooth = self.peer_smooth,
                 "topology episode ended",
             );
@@ -2368,6 +2374,10 @@ async fn handle_topology_event(
                 session.wheel_forwarded += 1;
             }
             let outgoing_is_motion = matches!(outgoing, InputEvent::MouseMove { .. });
+            let outgoing_is_datagram = matches!(
+                outgoing,
+                InputEvent::MouseMove { .. } | InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
+            );
             *sequence = sequence.wrapping_add(1);
             if let Err(error) =
                 send_input(&session.connection, &mut session.send, *sequence, outgoing).await
@@ -2394,8 +2404,15 @@ async fn handle_topology_event(
                 let _ = capture_control.warp_cursor(x, y);
                 *last_failed_episode = Some(std::time::Instant::now());
                 eprintln!("THEKVM_STATUS local");
-            } else if outgoing_is_motion {
-                session.motion_forwarded += 1;
+            } else {
+                // Success path (the Err branch above tore the episode
+                // down instead): count what actually left on the wire.
+                if outgoing_is_motion {
+                    session.motion_forwarded += 1;
+                }
+                if outgoing_is_datagram {
+                    session.datagrams_sent += 1;
+                }
             }
         }
         RoutedEvent::ReturnHome { from, edge } => {
@@ -3007,6 +3024,7 @@ fn spawn_episode_driver(
         wheel_forwarded: 0,
         motion_captured: 0,
         motion_forwarded: 0,
+        datagrams_sent: 0,
     }
 }
 
@@ -4110,6 +4128,11 @@ async fn handle_connection(
             // never tracks" names its dropping line instead of guessing.
             let mut dropped_duplicate = 0u64;
             let mut dropped_stale = 0u64;
+            // Datagrams that decoded cleanly off the association socket:
+            // received>0 with motion=0 names the drop logic; received=0
+            // with sender datagrams_sent>0 names the wire/task; the warn
+            // below counts undecodable payloads separately.
+            let mut datagrams_received = 0u64;
             let mut remote_screen = None;
             let mut remote_cursor = None;
             // Push-through run for the stateless receiver hop (same
@@ -4272,13 +4295,16 @@ async fn handle_connection(
                         // corrupt or future-version datagram is dropped, never
                         // fatal. Killing the whole input session over one bad
                         // packet turned wire noise into visible control snaps.
+                        // Warn (not debug): an undecodable datagram with
+                        // motion=0 at session end is the whole diagnosis.
                         let packet = match decode_input_datagram(&payload) {
                             Ok(packet) => packet,
                             Err(error) => {
-                                tracing::debug!(%error, bytes = payload.len(), "dropping undecodable input datagram");
+                                tracing::warn!(%error, bytes = payload.len(), "dropping undecodable input datagram");
                                 continue;
                             }
                         };
+                        datagrams_received += 1;
                         match packet.event {
                             InputEvent::MouseMove { .. } => motion_count += 1,
                             InputEvent::Wheel(_) => wheel_count += 1,
@@ -4372,6 +4398,7 @@ async fn handle_connection(
                 smooth = smooth_count,
                 dropped_duplicate,
                 dropped_stale,
+                datagrams_received,
                 reason = end_reason,
                 error = session_result
                     .as_ref()

@@ -1367,7 +1367,7 @@ mod win32_hooks {
         value_caps: &[windows::Win32::Devices::HumanInterfaceDevice::HIDP_VALUE_CAPS],
     ) -> (i64, i64) {
         let first = fingers.first().copied().unwrap_or(0);
-        let mut scale = |usage: u16| -> i64 {
+        let scale = |usage: u16| -> i64 {
             for caps in value_caps {
                 if caps.UsagePage != PTP_GENERIC_PAGE || caps.LinkCollection != first {
                     continue;
