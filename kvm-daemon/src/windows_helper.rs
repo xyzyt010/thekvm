@@ -35,6 +35,9 @@ enum HelperMessage {
 /// The service-side fan-out connection to the interactive helpers.
 pub struct ServiceInputProxy {
     streams: Vec<TcpStream>,
+    /// Desktop name per stream, index-aligned with `streams`: fan-out
+    /// drop warnings name the departed helper instead of a bare count.
+    desktops: Vec<String>,
     session_id: u32,
 }
 
@@ -90,6 +93,7 @@ impl ServiceInputProxy {
         );
         Ok(Self {
             streams,
+            desktops: desktops.iter().map(|name| name.to_string()).collect(),
             session_id,
         })
     }
@@ -97,7 +101,8 @@ impl ServiceInputProxy {
     pub fn send(&mut self, event: InputEvent) -> Result<()> {
         self.ensure_session()?;
         let message = serde_json::to_vec(&HelperMessage::Input(event))?;
-        fan_out(&mut self.streams, "send event to Windows helper", &message)
+        fan_out(&mut self.streams, &mut self.desktops, "send event to Windows helper", &message)
+            .map(|_| ())
     }
 
     pub fn ensure_session(&self) -> Result<()> {
@@ -114,13 +119,14 @@ impl ServiceInputProxy {
 
     pub fn release_all(&mut self) -> Result<()> {
         let message = serde_json::to_vec(&HelperMessage::ReleaseAll)?;
-        fan_out(&mut self.streams, "release input in Windows helper", &message)
+        fan_out(&mut self.streams, &mut self.desktops, "release input in Windows helper", &message)
+            .map(|_| ())
     }
 
     pub fn warp_cursor(&mut self, x: u32, y: u32) -> Result<()> {
         self.ensure_session()?;
         let message = serde_json::to_vec(&HelperMessage::WarpCursor { x, y })?;
-        fan_out(&mut self.streams, "warp cursor in Windows helper", &message)?;
+        fan_out(&mut self.streams, &mut self.desktops, "warp cursor in Windows helper", &message)?;
         collect_warp_acks(&mut self.streams, x, y)
     }
 }
@@ -171,12 +177,34 @@ fn collect_warp_acks(streams: &mut Vec<TcpStream>, x: u32, y: u32) -> Result<()>
 /// dropped, never fatal. The old fail-on-first-dead stream turned one
 /// departed helper (e.g. the winlogon helper after a desktop switch)
 /// into a dead input session even though the other helper was healthy.
-fn fan_out(streams: &mut Vec<TcpStream>, context: &str, payload: &[u8]) -> Result<()> {
-    streams.retain_mut(|stream| write_ipc_frame(stream, payload).is_ok());
+/// Drops warn with the desktop name (streams/desktops stay
+/// index-aligned): a helper dying mid-drive used to be invisible, and
+/// its motion died with it while every counter upstream stayed green.
+/// Returns the live helper count so the sender can name total blindness.
+fn fan_out(
+    streams: &mut Vec<TcpStream>,
+    desktops: &mut Vec<String>,
+    context: &str,
+    payload: &[u8],
+) -> Result<usize> {
+    let mut dead = Vec::new();
+    for (index, stream) in streams.iter_mut().enumerate() {
+        if write_ipc_frame(stream, payload).is_err() {
+            dead.push(index);
+        }
+    }
+    for index in dead.iter().rev() {
+        let name = desktops.get(*index).map(String::as_str).unwrap_or("?");
+        tracing::warn!(desktop = name, context, "Windows helper stream failed; dropping it");
+        streams.remove(*index);
+        if *index < desktops.len() {
+            desktops.remove(*index);
+        }
+    }
     if streams.is_empty() {
         bail!("{context}: all Windows helpers are gone");
     }
-    Ok(())
+    Ok(streams.len())
 }
 
 fn active_console_session_id() -> Result<u32> {
@@ -361,11 +389,29 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
     let injector = Injector::create().context("create helper input injector")?;
     tracing::info!(desktop, "Windows interactive helper started");
     loop {
-        let Some(frame) = read_ipc_frame_optional(&mut stream)? else {
-            injector.release_all()?;
-            return Ok(());
+        let frame = match read_ipc_frame_optional(&mut stream) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                injector.release_all()?;
+                return Ok(());
+            }
+            Err(error) => {
+                // A transient bridge hiccup must not kill the helper (the
+                // old `?` turned one bad read into a dead drive with every
+                // upstream counter green). Back off briefly and keep
+                // reading; a truly dead bridge ends via EOF above.
+                tracing::warn!(%error, "helper bridge read failed; continuing");
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
         };
-        let message: HelperMessage = serde_json::from_slice(&frame).context("decode helper IPC")?;
+        let message: HelperMessage = match serde_json::from_slice(&frame) {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!(%error, bytes = frame.len(), "helper dropping undecodable frame; continuing");
+                continue;
+            }
+        };
         match message {
             HelperMessage::Input(event) => {
                 // Both helpers stay alive so a desktop transition does not
@@ -374,7 +420,16 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                 // whose desktop currently owns input may inject. The other
                 // helper releases any state it previously held and waits.
                 match current_desktop_is_input() {
-                    Ok(true) => injector.send(event)?,
+                    Ok(true) => {
+                        // Never die on one bad injection: a transient
+                        // SendInput failure used to exit the whole helper,
+                        // and every later motion vanished silently into the
+                        // dropped pipe while the session looked alive. The
+                        // failure itself now logs with its cause.
+                        if let Err(error) = injector.send(event) {
+                            tracing::warn!(%error, "helper input injection failed; continuing");
+                        }
+                    }
                     Ok(false) => injector.release_all()?,
                     Err(error) => {
                         // Desktop transitions can briefly make the user
@@ -782,8 +837,10 @@ mod tests {
         let (left_tx, mut left_rx) = loopback_pair();
         let (right_tx, mut right_rx) = loopback_pair();
         let mut streams = vec![left_tx, right_tx];
-        fan_out(&mut streams, "test", b"ping").unwrap();
+        let mut desktops = vec!["winlogon".to_owned(), "default".to_owned()];
+        assert_eq!(fan_out(&mut streams, &mut desktops, "test", b"ping").unwrap(), 2);
         assert_eq!(streams.len(), 2);
+        assert_eq!(desktops, vec!["winlogon".to_owned(), "default".to_owned()]);
         assert_eq!(read_ipc_frame(&mut left_rx).unwrap(), b"ping");
         assert_eq!(read_ipc_frame(&mut right_rx).unwrap(), b"ping");
     }
@@ -795,15 +852,19 @@ mod tests {
         dead_tx.shutdown(Shutdown::Both).unwrap();
         let (live_tx, mut live_rx) = loopback_pair();
         let mut streams = vec![dead_tx, live_tx];
-        fan_out(&mut streams, "test", b"ping").unwrap();
+        let mut desktops = vec!["winlogon".to_owned(), "default".to_owned()];
+        assert_eq!(fan_out(&mut streams, &mut desktops, "test", b"ping").unwrap(), 1);
         assert_eq!(streams.len(), 1);
+        // Names stay index-aligned with the surviving streams.
+        assert_eq!(desktops, vec!["default".to_owned()]);
         assert_eq!(read_ipc_frame(&mut live_rx).unwrap(), b"ping");
     }
 
     #[test]
     fn fan_out_fails_only_when_no_helper_remains() {
         let mut streams: Vec<TcpStream> = Vec::new();
-        assert!(fan_out(&mut streams, "test", b"ping").is_err());
+        let mut desktops: Vec<String> = Vec::new();
+        assert!(fan_out(&mut streams, &mut desktops, "test", b"ping").is_err());
     }
 
     /// Fake helper answering WarpDone: the proxy round-trip reports Ok.
@@ -825,7 +886,8 @@ mod tests {
         std::thread::spawn(move || drive_fake_helper(&mut helper_side, true));
         let mut streams = vec![proxy_side];
         let message = serde_json::to_vec(&HelperMessage::WarpCursor { x: 10, y: 20 }).unwrap();
-        fan_out(&mut streams, "test", &message).unwrap();
+        let mut desktops = vec!["default".to_owned()];
+        fan_out(&mut streams, &mut desktops, "test", &message).unwrap();
         collect_warp_acks(&mut streams, 10, 20).unwrap();
     }
 
@@ -835,7 +897,8 @@ mod tests {
         std::thread::spawn(move || drive_fake_helper(&mut helper_side, false));
         let mut streams = vec![proxy_side];
         let message = serde_json::to_vec(&HelperMessage::WarpCursor { x: 10, y: 20 }).unwrap();
-        fan_out(&mut streams, "test", &message).unwrap();
+        let mut desktops = vec!["default".to_owned()];
+        fan_out(&mut streams, &mut desktops, "test", &message).unwrap();
         assert!(collect_warp_acks(&mut streams, 10, 20).is_err());
     }
 
