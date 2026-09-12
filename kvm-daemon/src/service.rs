@@ -9,7 +9,7 @@ use kvm_platform::inject::Injector;
 use kvm_protocol::pairing::{Identity, PeerBook};
 use kvm_protocol::transport;
 use kvm_protocol::wire::{
-    decode_input_datagram, encode_input_datagram, read_frame, write_frame, DatagramInput, Hello,
+    decode_input_datagram, read_frame, write_frame, DatagramInput, Hello,
     ScreenGeometry, WireMessage,
 };
 use kvm_protocol::DEFAULT_PORT;
@@ -5572,21 +5572,20 @@ fn scale_coordinate(value: u32, source_span: u32, target_span: u32) -> u32 {
 }
 
 async fn send_input(
-    connection: &quinn::Connection,
+    _connection: &quinn::Connection,
     send: &mut quinn::SendStream,
     sequence: u64,
     event: InputEvent,
 ) -> Result<()> {
-    if matches!(
-        event,
-        InputEvent::MouseMove { .. } | InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
-    ) {
-        let payload = encode_input_datagram(DatagramInput { sequence, event })?;
-        connection
-            .send_datagram(payload.into())
-            .map_err(|error| anyhow::anyhow!("send input datagram: {error}"))?;
-        return Ok(());
-    }
+    // All input rides the ordered episode stream. QUIC datagrams proved
+    // lossy in exactly one direction on real links (live-traced: streams
+    // land, datagrams vanish with zero errors on either side), and a
+    // motion update that never arrives freezes the driven cursor while
+    // the driver still believes it drives. On LAN the stream costs ~0ms;
+    // under loss the sequence filter still drops stale motion, so a
+    // stalled packet delays the cursor by one RTT instead of teleporting
+    // it. The receiver still accepts datagrams from older peers (shared
+    // dedup sets cover both arms).
     write_frame(
         &mut *send,
         &WireMessage::Input(InputPacket { sequence, event }),

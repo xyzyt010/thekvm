@@ -415,6 +415,10 @@ pub struct EdgeRouter {
     /// edge (or the peer placed us while driving). Only an armed,
     /// home-facing overflow returns.
     return_armed: bool,
+    /// Net home-ward overflow px accumulated while UNARMED (see
+    /// RETURN_PUSH_PX): the escape hatch. Reset on any inside movement,
+    /// on arming, and on every new handoff.
+    return_accum: i64,
     /// Which edges may open a crossing (Single = arranged facing edge
     /// only; Double = both horizontal outer edges on a lone-peer link).
     /// Return hysteresis is identical in both modes.
@@ -462,6 +466,7 @@ impl EdgeRouter {
             active_remote: None,
             entry_edge: None,
             return_armed: false,
+            return_accum: 0,
             edge_mode: EdgeMode::Single,
             push_edge: None,
             push_accum: 0,
@@ -704,6 +709,9 @@ impl EdgeRouter {
                     None => {
                         self.cursor_x = next_x as u32;
                         self.cursor_y = next_y as u32;
+                        // Inside movement cancels any unarmed escape run:
+                        // only sustained home-ward pressure returns.
+                        self.return_accum = 0;
                         // Settling inside arms the entry edge (see above):
                         // a firm flick arms in one event, resting noise
                         // never reaches the threshold.
@@ -736,6 +744,27 @@ impl EdgeRouter {
                             // lands mid-screen.
                             let _ = self.restore_local(target);
                             return RoutedEvent::ReturnHome { from, edge };
+                        }
+                        if faces_home {
+                            // Escape hatch (see RETURN_PUSH_PX): sustained
+                            // home-ward shove from a parked, unarmed cursor
+                            // accumulates to a return. A deliberate escape
+                            // crosses in a few events; jitter alternates
+                            // with inside movement (reset above) and can
+                            // never save up.
+                            let overflow = match edge {
+                                Edge::Left => -next_x,
+                                Edge::Right => next_x - (i64::from(remote.width) - 1),
+                                Edge::Top => -next_y,
+                                Edge::Bottom => next_y - (i64::from(remote.height) - 1),
+                            };
+                            self.return_accum += overflow.max(0);
+                            if self.return_accum >= RETURN_PUSH_PX {
+                                let _ = self.restore_local(target);
+                                return RoutedEvent::ReturnHome { from, edge };
+                            }
+                        } else {
+                            self.return_accum = 0;
                         }
                         // Any other edge (or the still-disarmed entry):
                         // stop at the border and keep driving. Local
@@ -862,6 +891,7 @@ impl EdgeRouter {
         // exit edge's opposite, and it starts disarmed (see route()).
         self.entry_edge = Some(edge.opposite());
         self.return_armed = false;
+        self.return_accum = 0;
         // Preserve the overshoot as a relative event. The receiver can use
         // the handoff coordinates to establish its own logical pointer and
         // then apply this small remainder.
@@ -1022,6 +1052,17 @@ const SETTLE_PX: u32 = 12;
 /// The streak resets the moment motion comes back inside or changes
 /// edge, so drift can never save up for a phantom crossing.
 pub const EDGE_PUSH_PX: i64 = 24;
+
+/// Sustained home-ward pressure (px of net edge overflow) that returns an
+/// UNARMED drive. Entry parks disarmed so post-entry jitter and fling
+/// tails pin instead of snapping back — but a parked cursor whose owner
+/// shoves home-ward must get out: every escape attempt would otherwise
+/// clamp forever and the drive wedges with the cursor visible (the whole
+/// freeze class). Net accumulation (not a streak): jitter self-cancels
+/// across inside/outside alternation, while a deliberate shove crosses
+/// the threshold in a few events. Armed returns stay instant; this only
+/// adds the escape hatch the disarmed state was missing.
+pub const RETURN_PUSH_PX: i64 = 64;
 
 /// A truth re-pin that moves the cursor further than this keeps the
 /// position but restarts the push run (the old position was phantom);
@@ -1199,6 +1240,55 @@ mod tests {
             }
         }
         assert!(crossed);
+    }
+
+    #[test]
+    fn unarmed_home_shove_returns_without_settling_first() {
+        let layout = Layout {
+            screens: vec![screen(1, "main", 0, 0), screen(2, "right", 1, 0)],
+            self_screen: Some(ScreenId(1)),
+        };
+        let mut router = EdgeRouter::new(layout).unwrap();
+        let handoff = router.route(InputEvent::MouseMove { dx: 1000, dy: 0 });
+        assert!(matches!(handoff, RoutedEvent::Handoff { .. }));
+        // Parked unarmed at the entry boundary: small shoves clamp...
+        for _ in 0..6 {
+            let result = router.route(InputEvent::MouseMove { dx: -10, dy: 0 });
+            assert!(!matches!(result, RoutedEvent::ReturnHome { .. }));
+        }
+        // ...but a sustained home-ward shove escapes without ever
+        // settling inside first.
+        let result = router.route(InputEvent::MouseMove { dx: -10, dy: 0 });
+        assert!(matches!(
+            result,
+            RoutedEvent::ReturnHome {
+                from: ScreenId(2),
+                edge: Edge::Left
+            }
+        ));
+        assert_eq!(router.active_remote(), None);
+    }
+
+    #[test]
+    fn unarmed_boundary_jitter_never_returns() {
+        let layout = Layout {
+            screens: vec![screen(1, "main", 0, 0), screen(2, "right", 1, 0)],
+            self_screen: Some(ScreenId(1)),
+        };
+        let mut router = EdgeRouter::new(layout).unwrap();
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 1000, dy: 0 }),
+            RoutedEvent::Handoff { .. }
+        ));
+        // Alternating jitter around the parked boundary self-cancels:
+        // inside moves reset the escape run every time.
+        for _ in 0..30 {
+            let out = router.route(InputEvent::MouseMove { dx: -3, dy: 0 });
+            assert!(!matches!(out, RoutedEvent::ReturnHome { .. }));
+            let back = router.route(InputEvent::MouseMove { dx: 3, dy: 0 });
+            assert!(!matches!(back, RoutedEvent::ReturnHome { .. }));
+        }
+        assert_eq!(router.active_remote(), Some(ScreenId(2)));
     }
 
     #[test]
