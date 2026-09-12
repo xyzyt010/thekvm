@@ -1165,6 +1165,7 @@ mod win32_hooks {
         use windows::Win32::Storage::FileSystem as fs;
         use windows::Win32::UI::Input as raw;
 
+        let mut fail_stage = "ok";
         let device = (|| -> Option<PtpDevice> {
             // 1. Find the digitizer touchpad collection among raw devices.
             let mut count = 0u32;
@@ -1172,6 +1173,7 @@ mod win32_hooks {
             if unsafe { raw::GetRawInputDeviceList(None, &mut count, size) } == u32::MAX
                 || count == 0
             {
+                fail_stage = "device-list";
                 return None;
             }
             let mut list = vec![raw::RAWINPUTDEVICELIST::default(); count as usize];
@@ -1179,6 +1181,7 @@ mod win32_hooks {
                 raw::GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut count, size)
             } == u32::MAX
             {
+                fail_stage = "device-list-read";
                 return None;
             }
             let mut touchpad: Option<isize> = None;
@@ -1208,7 +1211,10 @@ mod win32_hooks {
                     break;
                 }
             }
-            let handle_value = touchpad?;
+            let handle_value = touchpad.or_else(|| {
+                fail_stage = "no-digitizer-collection";
+                None
+            })?;
             // 2. Open the device path for preparsed-data queries. One
             // fixed buffer: device paths are always well under this.
             let mut name = vec![0u16; 512];
@@ -1223,6 +1229,7 @@ mod win32_hooks {
             } == 0
                 || name_len == 0
             {
+                fail_stage = "device-name";
                 return None;
             }
             let handle = unsafe {
@@ -1236,12 +1243,17 @@ mod win32_hooks {
                     None,
                 )
             }
-            .ok()?;
+            .ok()
+            .or_else(|| {
+                fail_stage = "device-open";
+                None
+            })?;
             // 3. Preparsed data + caps: report length, finger collections,
             // per-axis scale from the sensor logical maximum.
             let mut preparsed = hid::PHIDP_PREPARSED_DATA::default();
             if !unsafe { hid::HidD_GetPreparsedData(handle, &mut preparsed) }.as_bool() {
                 let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
+                fail_stage = "preparsed-data";
                 return None;
             }
             let mut caps = hid::HIDP_CAPS::default();
@@ -1252,6 +1264,7 @@ mod win32_hooks {
                     hid::HidD_FreePreparsedData(preparsed);
                     let _ = windows::Win32::Foundation::CloseHandle(handle);
                 }
+                fail_stage = "caps";
                 return None;
             }
             let node_len = caps.NumberLinkCollectionNodes as usize;
@@ -1281,6 +1294,7 @@ mod win32_hooks {
                     hid::HidD_FreePreparsedData(preparsed);
                     let _ = windows::Win32::Foundation::CloseHandle(handle);
                 }
+                fail_stage = "finger-collections";
                 return None;
             }
             // Value caps once (bounded by the descriptor's own count):
@@ -1319,6 +1333,7 @@ mod win32_hooks {
                     hid::HidD_FreePreparsedData(preparsed);
                     let _ = windows::Win32::Foundation::CloseHandle(handle);
                 }
+                fail_stage = "register-sink";
                 return None;
             }
             Some(PtpDevice {
@@ -1344,7 +1359,7 @@ mod win32_hooks {
                     "precision-touchpad scroll channel armed (HID digitizer tap)"
                 );
             }
-            None => tracing::debug!("no precision-touchpad digitizer found; legacy wheel channels only"),
+            None => tracing::warn!(stage = fail_stage, "precision-touchpad scroll channel unavailable; trackpad scroll falls back to legacy wheel channels"),
         }
     }
 
@@ -1494,6 +1509,12 @@ mod win32_hooks {
             let now = std::time::Instant::now();
             let (x, y) = ptp_pan_slot().feed(&contacts);
             if x != 0 || y != 0 {
+                // First live report proves the digitizer tap delivers on
+                // THIS hardware (once per process; the census counts on).
+                static FIRST_REPORT: std::sync::Once = std::sync::Once::new();
+                FIRST_REPORT.call_once(|| {
+                    tracing::info!(contacts = contacts.len(), x, y, "precision-touchpad first scroll report");
+                });
                 let (fx, fy) = wheel_dedup().filter_raw(x, y, now);
                 if fx != 0 || fy != 0 {
                     PTP_SCROLL.fetch_add(1, Ordering::Relaxed);

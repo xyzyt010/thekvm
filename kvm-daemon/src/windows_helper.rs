@@ -571,7 +571,7 @@ fn warp_cursor(x: u32, y: u32) -> Result<()> {
 fn current_desktop_is_input() -> Result<bool> {
     use windows::Win32::Foundation::{BOOL, HANDLE};
     use windows::Win32::System::StationsAndDesktops::{
-        GetThreadDesktop, GetUserObjectInformationW, UOI_IO,
+        GetThreadDesktop, GetUserObjectInformationW, UOI_IO, UOI_NAME,
     };
     use windows::Win32::System::Threading::GetCurrentThreadId;
 
@@ -588,7 +588,36 @@ fn current_desktop_is_input() -> Result<bool> {
         )
     }
     .context("query helper desktop input ownership")?;
-    Ok(receives_input.as_bool())
+    let owns = receives_input.as_bool();
+    // Name the desktop on first check and on every ownership change: a
+    // helper serving the wrong desktop (or losing input mid-drive)
+    // explains motion that vanishes past every upstream counter, and the
+    // name tells exactly which desktop each helper is parked on.
+    let mut name = vec![0u16; 256];
+    let desktop_name = if unsafe {
+        GetUserObjectInformationW(
+            HANDLE(desktop.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            (name.len() * std::mem::size_of::<u16>()) as u32,
+            None,
+        )
+    }
+    .is_ok()
+    {
+        let len = name.iter().position(|unit| *unit == 0).unwrap_or(name.len());
+        String::from_utf16_lossy(&name[..len])
+    } else {
+        "<unnamed>".to_owned()
+    };
+    static LAST: std::sync::Mutex<Option<(String, bool)>> = std::sync::Mutex::new(None);
+    if let Ok(mut guard) = LAST.lock() {
+        if guard.as_ref().is_none_or(|last| last.0 != desktop_name || last.1 != owns) {
+            tracing::info!(desktop = %desktop_name, owns_input = owns, "Windows helper desktop ownership");
+            *guard = Some((desktop_name, owns));
+        }
+    }
+    Ok(owns)
 }
 
 #[cfg(target_os = "windows")]

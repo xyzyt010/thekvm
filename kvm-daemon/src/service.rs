@@ -2010,6 +2010,15 @@ struct TopologySession {
     /// the journal instead of a mystery.
     motion_captured: u64,
     motion_forwarded: u64,
+    /// Motion VALUE probe: the first forwarded delta, how many forwarded
+    /// deltas were exactly zero, and the signed sums. Counts prove flow;
+    /// only values prove the cursor CAN track: a drive whose warp lands
+    /// while every forwarded delta is (0,0) pins the peer cursor at the
+    /// entry pixel with every counter green. Logged at teardown.
+    motion_first: Option<(i32, i32)>,
+    motion_zero_deltas: u64,
+    motion_sum_dx: i64,
+    motion_sum_dy: i64,
     /// QUIC datagrams emitted on this episode's association (motion and
     /// wheel ride datagrams; keys ride the stream). Logged at teardown:
     /// sent>0 with receiver motion=0 proves wire/task loss instead of a
@@ -2056,6 +2065,10 @@ impl TopologySession {
                 wheel_forwarded = self.wheel_forwarded,
                 motion_captured = self.motion_captured,
                 motion_forwarded = self.motion_forwarded,
+                motion_first = ?self.motion_first,
+                motion_zero_deltas = self.motion_zero_deltas,
+                motion_sum_dx = self.motion_sum_dx,
+                motion_sum_dy = self.motion_sum_dy,
                 datagrams_sent = self.datagrams_sent,
                 peer_smooth = self.peer_smooth,
                 "topology episode ended",
@@ -2359,7 +2372,17 @@ async fn handle_topology_event(
             match event {
                 InputEvent::Wheel(_) => session.wheel_captured += 1,
                 InputEvent::SmoothWheel { .. } => session.smooth_captured += 1,
-                InputEvent::MouseMove { .. } => session.motion_captured += 1,
+                InputEvent::MouseMove { dx, dy } => {
+                    session.motion_captured += 1;
+                    if session.motion_first.is_none() {
+                        session.motion_first = Some((dx, dy));
+                    }
+                    if dx == 0 && dy == 0 {
+                        session.motion_zero_deltas += 1;
+                    }
+                    session.motion_sum_dx += i64::from(dx);
+                    session.motion_sum_dy += i64::from(dy);
+                }
                 _ => {}
             }
             let Some(outgoing) =
@@ -3024,6 +3047,10 @@ fn spawn_episode_driver(
         wheel_forwarded: 0,
         motion_captured: 0,
         motion_forwarded: 0,
+        motion_first: None,
+        motion_zero_deltas: 0,
+        motion_sum_dx: 0,
+        motion_sum_dy: 0,
         datagrams_sent: 0,
     }
 }
@@ -4122,6 +4149,7 @@ async fn handle_connection(
             let mut motion_count = 0u64;
             let mut wheel_count = 0u64;
             let mut smooth_count = 0u64;
+            let mut applied_motion = AppliedMotion::default();
             // Receiver-side drop census: motion datagrams that arrived but
             // were discarded (duplicate sequence vs stale ordering). Logged
             // at session end next to motion_count, so "warp lands, cursor
@@ -4187,6 +4215,7 @@ async fn handle_connection(
                                     &mut hop_accum,
                                     &mut dropped_duplicate,
                                     &mut dropped_stale,
+                                    &mut applied_motion,
                                 )
                                 .await?
                                 {
@@ -4325,6 +4354,7 @@ async fn handle_connection(
                             &mut hop_accum,
                             &mut dropped_duplicate,
                             &mut dropped_stale,
+                            &mut applied_motion,
                         )
                         .await?
                         {
@@ -4394,6 +4424,11 @@ async fn handle_connection(
             tracing::info!(
                 peer = %peer_fingerprint,
                 motion = motion_count,
+                applied_first = ?applied_motion.first,
+                applied_total = applied_motion.total,
+                applied_zero = applied_motion.zero,
+                applied_sum_dx = applied_motion.sum_dx,
+                applied_sum_dy = applied_motion.sum_dy,
                 wheel = wheel_count,
                 smooth = smooth_count,
                 dropped_duplicate,
@@ -4443,6 +4478,7 @@ async fn process_remote_input(
     hop_accum: &mut i64,
     dropped_duplicate: &mut u64,
     dropped_stale: &mut u64,
+    applied: &mut AppliedMotion,
 ) -> Result<bool> {
     if !seen_sequences.insert(packet.sequence) {
         *dropped_duplicate += 1;
@@ -4573,7 +4609,16 @@ async fn process_remote_input(
             *remote_cursor = Some((next_x, next_y));
         }
     }
-    injector.send(packet.event)?;
+    // The value probe records what actually reaches the OS injector
+    // (not what arrived: duplicates/stale returned above never get here).
+    // Send failures carry the event values: a failing injector with real
+    // values is a different bug than a passing injector fed zeros.
+    if let InputEvent::MouseMove { dx, dy } = packet.event {
+        applied.record(dx, dy);
+    }
+    injector
+        .send(packet.event)
+        .with_context(|| format!("inject {:?} failed", packet.event))?;
     Ok(false)
 }
 
@@ -4646,6 +4691,35 @@ impl MotionSequence {
             self.latest = Some(sequence);
         }
         accepted
+    }
+}
+
+/// Receiver-side motion VALUE probe: the first applied delta, how many
+/// applied deltas were exactly zero, and the signed sums. Sits beside the
+/// arrival census (`motion`), so one session teardown line separates the
+/// three failure shapes: wire zeros (sender probe all-zero), gate drops
+/// (applied far below motion), and dead injection (applied real, cursor
+/// still pinned — the OS ate it past our last call).
+#[derive(Debug, Default)]
+struct AppliedMotion {
+    first: Option<(i32, i32)>,
+    total: u64,
+    zero: u64,
+    sum_dx: i64,
+    sum_dy: i64,
+}
+
+impl AppliedMotion {
+    fn record(&mut self, dx: i32, dy: i32) {
+        if self.first.is_none() {
+            self.first = Some((dx, dy));
+        }
+        self.total += 1;
+        if dx == 0 && dy == 0 {
+            self.zero += 1;
+        }
+        self.sum_dx += i64::from(dx);
+        self.sum_dy += i64::from(dy);
     }
 }
 
