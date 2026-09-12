@@ -736,6 +736,26 @@ fn warp_cursor(x: u32, y: u32) -> Result<()> {
         .context("set cursor position on target Windows desktop")
 }
 
+/// Desktop access rights the helpers open. SendInput (the entire
+/// injection path: motion, buttons, keys, wheel) requires
+/// DESKTOP_JOURNALPLAYBACK on the thread desktop — without it every
+/// SendInput fails with ERROR_ACCESS_DENIED (5) while SetCursorPos
+/// warps keep working, which reads as "entries land, cursor pinned,
+/// clicks dead" with every upstream counter green (live-proven).
+/// Extracted (not inline) so the requirement is unit-pinned, not lore.
+#[cfg(target_os = "windows")]
+fn helper_desktop_access() -> u32 {
+    use windows::Win32::System::StationsAndDesktops::{
+        DESKTOP_CREATEWINDOW, DESKTOP_HOOKCONTROL, DESKTOP_JOURNALPLAYBACK, DESKTOP_READOBJECTS,
+        DESKTOP_WRITEOBJECTS,
+    };
+    DESKTOP_CREATEWINDOW.0
+        | DESKTOP_HOOKCONTROL.0
+        | DESKTOP_READOBJECTS.0
+        | DESKTOP_WRITEOBJECTS.0
+        | DESKTOP_JOURNALPLAYBACK.0
+}
+
 #[cfg(target_os = "windows")]
 fn current_desktop_is_input() -> Result<bool> {
     use windows::Win32::Foundation::{BOOL, HANDLE};
@@ -792,10 +812,7 @@ fn current_desktop_is_input() -> Result<bool> {
 #[cfg(target_os = "windows")]
 fn attach_to_desktop(desktop: &str) -> Result<()> {
     use windows::core::PCWSTR;
-    use windows::Win32::System::StationsAndDesktops::{
-        CloseDesktop, OpenDesktopW, SetThreadDesktop, DESKTOP_CREATEWINDOW, DESKTOP_HOOKCONTROL,
-        DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS,
-    };
+    use windows::Win32::System::StationsAndDesktops::{CloseDesktop, OpenDesktopW, SetThreadDesktop};
 
     let name = desktop
         .rsplit('\\')
@@ -805,11 +822,14 @@ fn attach_to_desktop(desktop: &str) -> Result<()> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let access = DESKTOP_CREATEWINDOW.0
-        | DESKTOP_HOOKCONTROL.0
-        | DESKTOP_READOBJECTS.0
-        | DESKTOP_WRITEOBJECTS.0;
-    let handle = unsafe { OpenDesktopW(PCWSTR(wide.as_ptr()), Default::default(), false, access) }
+    let handle = unsafe {
+        OpenDesktopW(
+            PCWSTR(wide.as_ptr()),
+            Default::default(),
+            false,
+            helper_desktop_access(),
+        )
+    }
         .context("open target Windows desktop")?;
     let result = unsafe { SetThreadDesktop(handle) }.context("set helper thread desktop");
     let _ = unsafe { CloseDesktop(handle) };
@@ -1182,5 +1202,25 @@ mod tests {
             serde_json::from_slice::<HelperMessage>(&receipt).unwrap(),
             HelperMessage::InputReceipt { ok: 7, .. }
         ));
+    }
+
+    /// The injection path lives or dies on this mask: SendInput demands
+    /// DESKTOP_JOURNALPLAYBACK, and without it every injection fails
+    /// with ERROR_ACCESS_DENIED while SetCursorPos warps keep working.
+    /// If anyone trims this mask, this test names the regression before
+    /// a release does.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn helper_desktop_access_covers_sendinput() {
+        use windows::Win32::System::StationsAndDesktops::{
+            DESKTOP_CREATEWINDOW, DESKTOP_HOOKCONTROL, DESKTOP_JOURNALPLAYBACK,
+            DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS,
+        };
+        let access = helper_desktop_access();
+        assert_ne!(access & DESKTOP_JOURNALPLAYBACK.0, 0);
+        assert_ne!(access & DESKTOP_CREATEWINDOW.0, 0);
+        assert_ne!(access & DESKTOP_HOOKCONTROL.0, 0);
+        assert_ne!(access & DESKTOP_READOBJECTS.0, 0);
+        assert_ne!(access & DESKTOP_WRITEOBJECTS.0, 0);
     }
 }
