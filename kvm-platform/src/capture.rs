@@ -1082,6 +1082,12 @@ mod win32_hooks {
         handle: isize,
         /// HidD preparsed data: hook-thread-only, freed on unsubscribe.
         preparsed: windows::Win32::Devices::HumanInterfaceDevice::PHIDP_PREPARSED_DATA,
+        /// RIDI-sourced preparsed blob: owns the bytes `preparsed` points
+        /// into. Some exactly when the descriptor came from
+        /// RIDI_PREPARSEDDATA (no device open): that memory must NOT go
+        /// through HidD_FreePreparsedData, which only releases
+        /// HidD_GetPreparsedData allocations.
+        preparsed_blob: Option<Vec<u8>>,
         report_len: usize,
         /// Link-collection ids of the per-finger digitizer collections.
         fingers: Vec<u16>,
@@ -1159,6 +1165,47 @@ mod win32_hooks {
     /// Subscribe the raw window to the precision-touchpad digitizer
     /// collection. Best-effort with a log line per outcome: desktops
     /// without a touchpad simply keep the two legacy channels.
+    /// Fetch HID preparsed data straight from the raw-input device
+    /// handle (RIDI_PREPARSEDDATA): no CreateFileW open involved, so
+    /// drivers that deny opens (live-proven on precision touchpads:
+    /// subscribe died at stage=device-open) still yield their
+    /// descriptor. Returns the owned blob plus a preparsed pointer into
+    /// it — the caller must keep the blob alive (PtpDevice owns it) and
+    /// must never free the pointer with HidD_FreePreparsedData.
+    fn ptp_preparsed_via_ridi(
+        handle_value: isize,
+    ) -> Option<(
+        windows::Win32::Devices::HumanInterfaceDevice::PHIDP_PREPARSED_DATA,
+        Vec<u8>,
+    )> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::UI::Input as raw;
+        let handle = HANDLE(handle_value as *mut std::ffi::c_void);
+        let mut len = 0u32;
+        let _ = unsafe { raw::GetRawInputDeviceInfoW(handle, raw::RIDI_PREPARSEDDATA, None, &mut len) };
+        if len == 0 || len > 1024 * 1024 {
+            return None;
+        }
+        let mut blob = vec![0u8; len as usize];
+        let mut fetch = len;
+        let got = unsafe {
+            raw::GetRawInputDeviceInfoW(
+                handle,
+                raw::RIDI_PREPARSEDDATA,
+                Some(blob.as_mut_ptr() as *mut std::ffi::c_void),
+                &mut fetch,
+            )
+        };
+        if got == 0 || fetch == 0 {
+            return None;
+        }
+        blob.truncate(fetch as usize);
+        let preparsed = windows::Win32::Devices::HumanInterfaceDevice::PHIDP_PREPARSED_DATA(
+            blob.as_mut_ptr() as isize,
+        );
+        Some((preparsed, blob))
+    }
+
     fn ptp_subscribe(window: HWND) {
         use windows::Win32::Devices::HumanInterfaceDevice as hid;
         use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
@@ -1166,6 +1213,7 @@ mod win32_hooks {
         use windows::Win32::UI::Input as raw;
 
         let mut fail_stage = "ok";
+        let mut preparsed_source = "ridi";
         let device = (|| -> Option<PtpDevice> {
             // 1. Find the digitizer touchpad collection among raw devices.
             let mut count = 0u32;
@@ -1215,55 +1263,87 @@ mod win32_hooks {
                 fail_stage = "no-digitizer-collection";
                 None
             })?;
-            // 2. Open the device path for preparsed-data queries. One
-            // fixed buffer: device paths are always well under this.
-            let mut name = vec![0u16; 512];
-            let mut name_len = name.len() as u32;
-            if unsafe {
-                raw::GetRawInputDeviceInfoW(
-                    windows::Win32::Foundation::HANDLE(handle_value as *mut std::ffi::c_void),
-                    raw::RIDI_DEVICENAME,
-                    Some(name.as_mut_ptr() as *mut std::ffi::c_void),
-                    &mut name_len,
-                )
-            } == 0
-                || name_len == 0
-            {
-                fail_stage = "device-name";
-                return None;
-            }
-            let handle = unsafe {
-                fs::CreateFileW(
-                    windows::core::PCWSTR(name.as_ptr()),
-                    (GENERIC_READ | GENERIC_WRITE).0,
-                    fs::FILE_SHARE_READ | fs::FILE_SHARE_WRITE,
-                    None,
-                    fs::OPEN_EXISTING,
-                    fs::FILE_FLAGS_AND_ATTRIBUTES(0),
-                    None,
-                )
-            }
-            .ok()
-            .or_else(|| {
-                fail_stage = "device-open";
-                None
-            })?;
+            // 2. Preparsed data: RIDI first (no device open — drivers
+            // routinely deny CreateFileW while RIDI answers freely),
+            // falling back to the open path below. The open file handle
+            // below exists ONLY to feed HidD_GetPreparsedData; it is
+            // closed on every exit including success (reports arrive via
+            // WM_INPUT, never via this handle).
+            let mut preparsed_blob: Option<Vec<u8>> = None;
+            let mut open_file: Option<windows::Win32::Foundation::HANDLE> = None;
+            let preparsed = match ptp_preparsed_via_ridi(handle_value) {
+                Some((parsed, blob)) => {
+                    preparsed_blob = Some(blob);
+                    parsed
+                }
+                None => {
+                    preparsed_source = "open";
+                    // 2b. Open the device path for preparsed-data queries. One
+                    // fixed buffer: device paths are always well under this.
+                    let mut name = vec![0u16; 512];
+                    let mut name_len = name.len() as u32;
+                    if unsafe {
+                        raw::GetRawInputDeviceInfoW(
+                            windows::Win32::Foundation::HANDLE(
+                                handle_value as *mut std::ffi::c_void,
+                            ),
+                            raw::RIDI_DEVICENAME,
+                            Some(name.as_mut_ptr() as *mut std::ffi::c_void),
+                            &mut name_len,
+                        )
+                    } == 0
+                        || name_len == 0
+                    {
+                        fail_stage = "device-name";
+                        return None;
+                    }
+                    let handle = unsafe {
+                        fs::CreateFileW(
+                            windows::core::PCWSTR(name.as_ptr()),
+                            (GENERIC_READ | GENERIC_WRITE).0,
+                            fs::FILE_SHARE_READ | fs::FILE_SHARE_WRITE,
+                            None,
+                            fs::OPEN_EXISTING,
+                            fs::FILE_FLAGS_AND_ATTRIBUTES(0),
+                            None,
+                        )
+                    }
+                    .ok()
+                    .or_else(|| {
+                        fail_stage = "device-open";
+                        None
+                    })?;
+                    let mut parsed = hid::PHIDP_PREPARSED_DATA::default();
+                    if !unsafe { hid::HidD_GetPreparsedData(handle, &mut parsed) }.as_bool() {
+                        let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
+                        fail_stage = "preparsed-data";
+                        return None;
+                    }
+                    open_file = Some(handle);
+                    parsed
+                }
+            };
+            // RIDI blobs are borrowed bytes, not HidD allocations: only
+            // the open path's pointer may go through HidD_FreePreparsedData.
+            // (The open file handle closes alongside on every exit below.)
+            let free_preparsed = preparsed_blob.is_none();
+            let mut close_open_file = || {
+                if let Some(handle) = open_file.take() {
+                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
+                }
+            };
             // 3. Preparsed data + caps: report length, finger collections,
             // per-axis scale from the sensor logical maximum.
-            let mut preparsed = hid::PHIDP_PREPARSED_DATA::default();
-            if !unsafe { hid::HidD_GetPreparsedData(handle, &mut preparsed) }.as_bool() {
-                let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
-                fail_stage = "preparsed-data";
-                return None;
-            }
             let mut caps = hid::HIDP_CAPS::default();
             if unsafe { hid::HidP_GetCaps(preparsed, &mut caps) }.is_err()
                 || caps.InputReportByteLength == 0
             {
                 unsafe {
-                    hid::HidD_FreePreparsedData(preparsed);
-                    let _ = windows::Win32::Foundation::CloseHandle(handle);
+                    if free_preparsed {
+                        hid::HidD_FreePreparsedData(preparsed);
+                    }
                 }
+                close_open_file();
                 fail_stage = "caps";
                 return None;
             }
@@ -1291,9 +1371,11 @@ mod win32_hooks {
             }
             if fingers.is_empty() {
                 unsafe {
-                    hid::HidD_FreePreparsedData(preparsed);
-                    let _ = windows::Win32::Foundation::CloseHandle(handle);
+                    if free_preparsed {
+                        hid::HidD_FreePreparsedData(preparsed);
+                    }
                 }
+                close_open_file();
                 fail_stage = "finger-collections";
                 return None;
             }
@@ -1330,15 +1412,21 @@ mod win32_hooks {
             .is_err()
             {
                 unsafe {
-                    hid::HidD_FreePreparsedData(preparsed);
-                    let _ = windows::Win32::Foundation::CloseHandle(handle);
+                    if free_preparsed {
+                        hid::HidD_FreePreparsedData(preparsed);
+                    }
                 }
+                close_open_file();
                 fail_stage = "register-sink";
                 return None;
             }
+            // The open path's file handle has served its only purpose
+            // (feeding HidD_GetPreparsedData); reports arrive via WM_INPUT.
+            close_open_file();
             Some(PtpDevice {
                 handle: handle_value,
                 preparsed,
+                preparsed_blob,
                 report_len: caps.InputReportByteLength as usize,
                 fingers,
                 units_per_detent_x: units_x,
@@ -1356,6 +1444,7 @@ mod win32_hooks {
                 *ptp_device_slot() = Some(found);
                 tracing::info!(
                     contacts,
+                    preparsed_source,
                     "precision-touchpad scroll channel armed (HID digitizer tap)"
                 );
             }
@@ -1418,8 +1507,10 @@ mod win32_hooks {
             )
         };
         if let Some(previous) = ptp_device_slot().take() {
-            unsafe {
-                hid::HidD_FreePreparsedData(previous.preparsed);
+            if previous.preparsed_blob.is_none() {
+                unsafe {
+                    hid::HidD_FreePreparsedData(previous.preparsed);
+                }
             }
         }
     }

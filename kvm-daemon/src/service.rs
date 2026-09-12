@@ -4421,6 +4421,7 @@ async fn handle_connection(
             // The guard below unregisters (panic-safe); the census names
             // what actually arrived over the wire this session, WHY it
             // ended, and the error when it ended badly.
+            let receipts = injector.take_receipts().unwrap_or_default();
             tracing::info!(
                 peer = %peer_fingerprint,
                 motion = motion_count,
@@ -4429,6 +4430,11 @@ async fn handle_connection(
                 applied_zero = applied_motion.zero,
                 applied_sum_dx = applied_motion.sum_dx,
                 applied_sum_dy = applied_motion.sum_dy,
+                helper_ok = receipts.ok,
+                helper_failed = receipts.failed,
+                helper_skipped = receipts.skipped,
+                helper_answered = receipts.answered,
+                helper_last_error = %receipts.last_error,
                 wheel = wheel_count,
                 smooth = smooth_count,
                 dropped_duplicate,
@@ -4783,6 +4789,19 @@ impl ReceiverInjector {
             #[cfg(target_os = "windows")]
             Self::Service(proxy) => proxy.ensure_session(),
         }
+    }
+
+    /// Collect per-helper injection receipts at session teardown. Native
+    /// injectors report inline (send errors already carry values), so
+    /// only the service bridge — whose helper verdicts otherwise never
+    /// reach the journal — answers here.
+    fn take_receipts(&mut self) -> Option<crate::windows_helper::InjectionReceipts> {
+        #[cfg(target_os = "windows")]
+        if let Self::Service(proxy) = self {
+            return Some(proxy.take_receipts());
+        }
+        let _ = self;
+        None
     }
 
     fn warp_cursor(&mut self, x: u32, y: u32) -> Result<()> {

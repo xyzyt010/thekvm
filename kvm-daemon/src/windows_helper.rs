@@ -30,6 +30,33 @@ enum HelperMessage {
     /// actually moved the visible cursor. Without it a skipped warp
     /// (idle desktop) reads as success and entries land stale.
     WarpDone { placed: bool, detail: String },
+    /// Service-to-helper request at input-session teardown: report what
+    /// happened to the Input messages since the last request. The
+    /// helper's own logs never reach the service journal (stderr is a
+    /// black hole for session-0-spawned children), so without this the
+    /// service cannot tell injected-ok from SendInput-failed from
+    /// gate-skipped — all three read identically green upstream.
+    TakeReceipts,
+    /// Helper-to-service reply for TakeReceipts. Counters reset on send,
+    /// so each report covers exactly one session.
+    InputReceipt {
+        ok: u64,
+        failed: u64,
+        skipped: u64,
+        last_error: String,
+    },
+}
+
+/// Summed injection receipts across the helpers that answered. Helpers
+/// that stay silent are pre-receipt builds: tolerated (the session
+/// census notes them) so upgrades never hang on a mixed fleet.
+#[derive(Debug, Default)]
+pub struct InjectionReceipts {
+    pub ok: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    pub answered: u64,
+    pub last_error: String,
 }
 
 /// The service-side fan-out connection to the interactive helpers.
@@ -129,6 +156,24 @@ impl ServiceInputProxy {
         fan_out(&mut self.streams, &mut self.desktops, "warp cursor in Windows helper", &message)?;
         collect_warp_acks(&mut self.streams, x, y)
     }
+
+    /// Ask every helper what happened to its Input messages since the
+    /// last request. Best-effort like everything here: dead streams drop
+    /// with a named warning, silent streams count as legacy, and the
+    /// summed taxpayer-visible numbers go into the session census.
+    pub fn take_receipts(&mut self) -> InjectionReceipts {
+        let message = serde_json::to_vec(&HelperMessage::TakeReceipts);
+        let Ok(message) = message else {
+            return InjectionReceipts::default();
+        };
+        let _ = fan_out(
+            &mut self.streams,
+            &mut self.desktops,
+            "take input receipts from Windows helper",
+            &message,
+        );
+        collect_receipts(&mut self.streams)
+    }
 }
 
 /// Request/response over the helper command streams: every current
@@ -173,7 +218,41 @@ fn collect_warp_acks(streams: &mut Vec<TcpStream>, x: u32, y: u32) -> Result<()>
     );
 }
 
-/// Best-effort fan-out to the interactive helpers: a dead helper is
+/// Bounded receipt collection mirroring collect_warp_acks: every current
+/// helper answers TakeReceipts with InputReceipt. Silent streams are
+/// legacy pre-receipt helpers: tolerated, counted by absence (answered
+/// < live streams at the call site if it cares).
+fn collect_receipts(streams: &mut Vec<TcpStream>) -> InjectionReceipts {
+    const RECEIPT_TIMEOUT: Duration = Duration::from_millis(250);
+    const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+    let mut receipts = InjectionReceipts::default();
+    streams.retain_mut(|stream| {
+        let _ = stream.set_read_timeout(Some(RECEIPT_TIMEOUT));
+        let reply = read_ipc_frame(stream)
+            .ok()
+            .and_then(|frame| serde_json::from_slice::<HelperMessage>(&frame).ok());
+        let _ = stream.set_read_timeout(Some(STREAM_TIMEOUT));
+        match reply {
+            Some(HelperMessage::InputReceipt {
+                ok,
+                failed,
+                skipped,
+                last_error,
+            }) => {
+                receipts.answered += 1;
+                receipts.ok += ok;
+                receipts.failed += failed;
+                receipts.skipped += skipped;
+                if !last_error.is_empty() {
+                    receipts.last_error = last_error;
+                }
+                true
+            }
+            _ => true,
+        }
+    });
+    receipts
+}
 /// dropped, never fatal. The old fail-on-first-dead stream turned one
 /// departed helper (e.g. the winlogon helper after a desktop switch)
 /// into a dead input session even though the other helper was healthy.
@@ -372,6 +451,70 @@ impl Drop for ServiceCaptureProxy {
     }
 }
 
+/// Per-helper injection receipts: what happened to Input messages since
+/// the last TakeReceipts. Single-threaded use (the helper loop is
+/// sequential), but statics must be Sync: plain atomics plus one short
+/// mutex for the latest error text (bounded, replaced not appended).
+struct HelperReceipts {
+    ok: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+    skipped: std::sync::atomic::AtomicU64,
+    last_error: std::sync::Mutex<String>,
+}
+
+static RECEIPTS: HelperReceipts = HelperReceipts {
+    ok: std::sync::atomic::AtomicU64::new(0),
+    failed: std::sync::atomic::AtomicU64::new(0),
+    skipped: std::sync::atomic::AtomicU64::new(0),
+    last_error: std::sync::Mutex::new(String::new()),
+};
+
+impl HelperReceipts {
+    fn ok(&self) -> u64 {
+        self.ok.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn failed(&self) -> u64 {
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn skipped(&self) -> u64 {
+        self.skipped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn take_last_error(&self) -> String {
+        self.last_error
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+    fn reset(&self) {
+        self.ok.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.failed.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.skipped.store(0, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut guard) = self.last_error.lock() {
+            guard.clear();
+        }
+    }
+}
+
+fn receipt_ok() {
+    RECEIPTS.ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn receipt_failed(error: String) {
+    RECEIPTS
+        .failed
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut guard) = RECEIPTS.last_error.lock() {
+        guard.clear();
+        guard.push_str(&error.chars().take(256).collect::<String>());
+    }
+}
+
+fn receipt_skipped() {
+    RECEIPTS
+        .skipped
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Entry point used by the same executable when SCM starts an interactive
 /// helper. The arguments are private service-to-helper IPC credentials.
 pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
@@ -425,20 +568,46 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                         // SendInput failure used to exit the whole helper,
                         // and every later motion vanished silently into the
                         // dropped pipe while the session looked alive. The
-                        // failure itself now logs with its cause.
-                        if let Err(error) = injector.send(event) {
-                            tracing::warn!(%error, "helper input injection failed; continuing");
+                        // failure itself now logs with its cause, and every
+                        // outcome feeds the receipts the service collects
+                        // at session teardown (the only channel whose
+                        // contents provably reach the journal).
+                        match injector.send(event) {
+                            Ok(()) => receipt_ok(),
+                            Err(error) => {
+                                tracing::warn!(%error, "helper input injection failed; continuing");
+                                receipt_failed(error.to_string());
+                            }
                         }
                     }
-                    Ok(false) => injector.release_all()?,
+                    Ok(false) => {
+                        receipt_skipped();
+                        injector.release_all()?;
+                    }
                     Err(error) => {
                         // Desktop transitions can briefly make the user
                         // object query unavailable. Keep the helper alive,
                         // but fail safe by releasing anything it believes it
                         // owns instead of injecting into an unknown desktop.
                         tracing::debug!(%error, "cannot identify active Windows input desktop");
+                        receipt_skipped();
                         injector.release_all()?;
                     }
+                }
+            }
+            HelperMessage::TakeReceipts => {
+                let reply = serde_json::to_vec(&HelperMessage::InputReceipt {
+                    ok: RECEIPTS.ok(),
+                    failed: RECEIPTS.failed(),
+                    skipped: RECEIPTS.skipped(),
+                    last_error: RECEIPTS.take_last_error(),
+                });
+                // Take-then-reset keeps each report to exactly one session.
+                // Reset even if the reply itself fails: a stale count in
+                // the next session is worse than a lost one.
+                RECEIPTS.reset();
+                if let Ok(reply) = reply {
+                    let _ = write_ipc_frame(&mut stream, &reply);
                 }
             }
             HelperMessage::ReleaseAll => injector.release_all()?,
@@ -485,7 +654,7 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                 }
             }
             // Service-to-helper only in reverse: never arrives here.
-            HelperMessage::WarpDone { .. } => {}
+            HelperMessage::WarpDone { .. } | HelperMessage::InputReceipt { .. } => {}
             HelperMessage::SetExclusive(_) => {}
         }
     }
@@ -938,5 +1107,80 @@ mod tests {
         let (proxy_side, _silent) = loopback_pair();
         let mut streams = vec![proxy_side];
         collect_warp_acks(&mut streams, 1, 2).unwrap();
+    }
+
+    /// Fake helper answering TakeReceipts with fixed counts.
+    fn drive_receipt_helper(helper_side: &mut TcpStream, ok: u64, failed: u64, skipped: u64) {
+        let frame = read_ipc_frame(helper_side).unwrap();
+        let message: HelperMessage = serde_json::from_slice(&frame).unwrap();
+        assert!(matches!(message, HelperMessage::TakeReceipts));
+        let reply = serde_json::to_vec(&HelperMessage::InputReceipt {
+            ok,
+            failed,
+            skipped,
+            last_error: if failed > 0 {
+                "test injection failure".to_owned()
+            } else {
+                String::new()
+            },
+        })
+        .unwrap();
+        write_ipc_frame(helper_side, &reply).unwrap();
+    }
+
+    #[test]
+    fn receipts_sum_across_helpers() {
+        let (left_proxy, mut left_helper) = loopback_pair();
+        let (right_proxy, mut right_helper) = loopback_pair();
+        std::thread::spawn(move || drive_receipt_helper(&mut left_helper, 120, 0, 3));
+        std::thread::spawn(move || drive_receipt_helper(&mut right_helper, 0, 2, 40));
+        let mut proxy = ServiceInputProxy {
+            streams: vec![left_proxy, right_proxy],
+            desktops: vec!["default".to_owned(), "winlogon".to_owned()],
+            session_id: 1,
+        };
+        let receipts = proxy.take_receipts();
+        assert_eq!(receipts.ok, 120);
+        assert_eq!(receipts.failed, 2);
+        assert_eq!(receipts.skipped, 43);
+        assert_eq!(receipts.answered, 2);
+        assert_eq!(receipts.last_error, "test injection failure");
+    }
+
+    #[test]
+    fn receipts_silent_helper_stays_compatible() {
+        // No reply at all (legacy pre-receipt helper): zeros, answered=0,
+        // never a hang past the bounded wait.
+        let (proxy_side, _silent) = loopback_pair();
+        let mut proxy = ServiceInputProxy {
+            streams: vec![proxy_side],
+            desktops: vec!["default".to_owned()],
+            session_id: 1,
+        };
+        let receipts = proxy.take_receipts();
+        assert_eq!(receipts.answered, 0);
+        assert_eq!(receipts.ok, 0);
+        assert_eq!(receipts.failed, 0);
+        assert_eq!(receipts.skipped, 0);
+    }
+
+    #[test]
+    fn receipt_variants_round_trip() {
+        let take = serde_json::to_vec(&HelperMessage::TakeReceipts).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<HelperMessage>(&take).unwrap(),
+            HelperMessage::TakeReceipts
+        ));
+        let receipt = serde_json::to_vec(&HelperMessage::InputReceipt {
+            ok: 7,
+            failed: 1,
+            skipped: 2,
+            last_error: "e".to_owned(),
+        })
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<HelperMessage>(&receipt).unwrap(),
+            HelperMessage::InputReceipt { ok: 7, .. }
+        ));
     }
 }
