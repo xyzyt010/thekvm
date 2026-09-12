@@ -195,26 +195,27 @@ pub fn screen_size() -> Result<Option<(u32, u32)>, PlatformError> {
 }
 
 /// Backend receipt census: (hook keys, hook buttons, hook fallback
-/// motion, hook wheel, raw motion, raw wheel) delivered into our
-/// channel since process start. Zeros elsewhere; the daemon logs it
-/// once a minute so input-path reports are evidence, not guesses.
+/// motion, hook wheel, raw motion, raw wheel, precision-touchpad scroll)
+/// delivered into our channel since process start. Zeros elsewhere; the
+/// daemon logs it once a minute so input-path reports are evidence, not
+/// guesses.
 #[cfg(target_os = "windows")]
-pub fn backend_census() -> (u64, u64, u64, u64, u64, u64) {
+pub fn backend_census() -> (u64, u64, u64, u64, u64, u64, u64) {
     win32_hooks::census()
 }
 
 /// Platforms without channel split report no census.
 #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
-pub fn backend_census() -> (u64, u64, u64, u64, u64, u64) {
-    (0, 0, 0, 0, 0, 0)
+pub fn backend_census() -> (u64, u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0, 0)
 }
 
 /// Linux census: X11 translated arrivals fill the key/button/move/wheel
 /// slots (raw slots stay zero — no hook/RAW split here).
 #[cfg(target_os = "linux")]
-pub fn backend_census() -> (u64, u64, u64, u64, u64, u64) {
+pub fn backend_census() -> (u64, u64, u64, u64, u64, u64, u64) {
     let (key, button, motion, wheel) = crate::x11_capture::census();
-    (key, button, motion, wheel, 0, 0)
+    (key, button, motion, wheel, 0, 0, 0)
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
@@ -282,7 +283,7 @@ mod win32_hooks {
     use windows::Win32::UI::Input::{
         GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUTDEVICE,
         RAWINPUTHEADER, RAWMOUSE, RIDEV_INPUTSINK, RIDEV_NOLEGACY, RIDEV_REMOVE, RID_INPUT,
-        RIM_TYPEMOUSE,
+        RIM_TYPEHID, RIM_TYPEMOUSE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -320,8 +321,13 @@ mod win32_hooks {
     static HOOK_WHEEL: AtomicU64 = AtomicU64::new(0);
     static RAW_MOVE: AtomicU64 = AtomicU64::new(0);
     static RAW_WHEEL: AtomicU64 = AtomicU64::new(0);
+    /// Precision-touchpad two-finger scroll ticks derived from the HID
+    /// digitizer channel (0x0D/0x05). The third wheel source alongside
+    /// hook and raw-mouse: gestures the OS synthesizes straight into
+    /// app windows reach neither of those taps.
+    static PTP_SCROLL: AtomicU64 = AtomicU64::new(0);
 
-    pub(super) fn census() -> (u64, u64, u64, u64, u64, u64) {
+    pub(super) fn census() -> (u64, u64, u64, u64, u64, u64, u64) {
         (
             HOOK_KEY.load(Ordering::Relaxed),
             HOOK_BUTTON.load(Ordering::Relaxed),
@@ -329,6 +335,7 @@ mod win32_hooks {
             HOOK_WHEEL.load(Ordering::Relaxed),
             RAW_MOVE.load(Ordering::Relaxed),
             RAW_WHEEL.load(Ordering::Relaxed),
+            PTP_SCROLL.load(Ordering::Relaxed),
         )
     }
 
@@ -526,6 +533,7 @@ mod win32_hooks {
             RAW_WINDOW.store(0, Ordering::Release);
             HOOK_THREAD_ID.store(0, Ordering::Release);
             if let Some(window) = raw_input_window {
+                ptp_unsubscribe();
                 let removal = RAWINPUTDEVICE {
                     usUsagePage: 0x01,
                     usUsage: 0x02,
@@ -811,6 +819,11 @@ mod win32_hooks {
                 let _ = DestroyWindow(window);
                 return Err(format!("RegisterRawInputDevices failed: {error}"));
             }
+            // Precision-touchpad digitizer tap (best-effort, logged): the
+            // third wheel source for gestures the mouse channel never sees.
+            // A missing touchpad is normal (desktops); failure here must
+            // never fail capture startup.
+            ptp_subscribe(window);
             Ok(window)
         }
     }
@@ -847,6 +860,16 @@ mod win32_hooks {
         );
         if result == u32::MAX || result as usize > buffer.len() {
             return;
+        }
+        // Precision-touchpad digitizer reports (HID, not mouse): route to
+        // the PTP scroll channel before the mouse decoders (which reject
+        // non-mouse types anyway).
+        if buffer.len() >= std::mem::size_of::<RAWINPUTHEADER>() {
+            let header = std::ptr::read_unaligned(buffer.as_ptr() as *const RAWINPUTHEADER);
+            if header.dwType == RIM_TYPEHID.0 {
+                handle_ptp_input(&buffer[..result as usize]);
+                return;
+            }
         }
         if let Some((dx, dy)) = decode_raw_mouse_motion(&buffer[..result as usize]) {
             RAW_MOVE.fetch_add(1, Ordering::Relaxed);
@@ -1028,10 +1051,462 @@ mod win32_hooks {
         }
     }
 
+    /// Precision-touchpad (PTP) scroll channel. Microsoft precision
+    /// touchpads report two-finger scroll ONLY through the HID digitizer
+    /// collection (usage page 0x0D, usage 0x05): the low-level mouse hook
+    /// never fires and the mouse-usage RawInput channel carries no wheel
+    /// bits, so both legacy taps read zero while local apps scroll (the
+    /// OS synthesizes scroll straight into the target window). This
+    /// channel subscribes to the digitizer collection and derives
+    /// two-finger pan into SmoothWheel on the shared dedup path, so a
+    /// gesture the driver ALSO reports as mouse wheel is still sent once.
+    /// Everything here runs on the hook thread (raw window proc) and is
+    /// best-effort: any failure degrades to the two legacy channels,
+    /// never fatal to capture startup.
+    const PTP_USAGE_PAGE: u16 = 0x0D;
+    const PTP_USAGE_TOUCHPAD: u16 = 0x05;
+    /// Digitizer-page contact usages (HID usage tables).
+    const PTP_USAGE_TIP: u16 = 0x42;
+    /// Generic-desktop axis usages.
+    const PTP_USAGE_X: u16 = 0x30;
+    const PTP_USAGE_Y: u16 = 0x31;
+    const PTP_GENERIC_PAGE: u16 = 0x01;
+    /// Full-span swipe earns this many detents: smooth enough to feel
+    /// analog through the 120ths accumulator, coarse enough that sensor
+    /// noise never emits.
+    const PTP_DETENTS_PER_SPAN: i64 = 48;
+
+    struct PtpDevice {
+        /// Raw device handle as isize (HWND-style rendezvous precedent:
+        /// handles cross threads here only as integers).
+        handle: isize,
+        /// HidD preparsed data: hook-thread-only, freed on unsubscribe.
+        preparsed: windows::Win32::Devices::HumanInterfaceDevice::PHIDP_PREPARSED_DATA,
+        report_len: usize,
+        /// Link-collection ids of the per-finger digitizer collections.
+        fingers: Vec<u16>,
+        units_per_detent_x: i64,
+        units_per_detent_y: i64,
+    }
+
+    fn ptp_device_slot() -> std::sync::MutexGuard<'static, Option<PtpDevice>> {
+        static PTP_DEVICE: Mutex<Option<PtpDevice>> = Mutex::new(None);
+        PTP_DEVICE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn ptp_pan_slot() -> std::sync::MutexGuard<'static, PtpPan> {
+        static PAN: Mutex<PtpPan> = Mutex::new(PtpPan::new());
+        PAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Two-finger pan → scroll accumulator. Pure apart from construction,
+    /// so the gesture math is unit-tested without HID hardware.
+    #[derive(Debug)]
+    struct PtpPan {
+        prev: Option<(i64, i64)>,
+        acc_x: i64,
+        acc_y: i64,
+        units_per_detent_x: i64,
+        units_per_detent_y: i64,
+    }
+
+    impl PtpPan {
+        const fn new() -> Self {
+            Self {
+                prev: None,
+                acc_x: 0,
+                acc_y: 0,
+                units_per_detent_x: 64,
+                units_per_detent_y: 64,
+            }
+        }
+
+        /// Feed one report's down-contact positions (logical sensor
+        /// units). Returns scroll in WHEEL_DELTA 120ths. Only a steady
+        /// two-contact pan scrolls; contact-count changes reset the
+        /// anchor and the remainder so lifts never jump.
+        fn feed(&mut self, contacts: &[(i32, i32)]) -> (i32, i32) {
+            if contacts.len() != 2 {
+                self.prev = None;
+                self.acc_x = 0;
+                self.acc_y = 0;
+                return (0, 0);
+            }
+            let avg = (
+                (i64::from(contacts[0].0) + i64::from(contacts[1].0)) / 2,
+                (i64::from(contacts[0].1) + i64::from(contacts[1].1)) / 2,
+            );
+            let Some(prev) = self.prev else {
+                self.prev = Some(avg);
+                return (0, 0);
+            };
+            self.prev = Some(avg);
+            // Fingers up (sensor y falls) scrolls up (+120ths);
+            // fingers right scrolls right (+120ths).
+            self.acc_x += avg.0 - prev.0;
+            self.acc_y += prev.1 - avg.1;
+            let det_x = self.acc_x / self.units_per_detent_x.max(1);
+            let det_y = self.acc_y / self.units_per_detent_y.max(1);
+            self.acc_x -= det_x * self.units_per_detent_x.max(1);
+            self.acc_y -= det_y * self.units_per_detent_y.max(1);
+            (
+                det_x.clamp(-1000, 1000) as i32 * 120,
+                det_y.clamp(-1000, 1000) as i32 * 120,
+            )
+        }
+    }
+
+    /// Subscribe the raw window to the precision-touchpad digitizer
+    /// collection. Best-effort with a log line per outcome: desktops
+    /// without a touchpad simply keep the two legacy channels.
+    fn ptp_subscribe(window: HWND) {
+        use windows::Win32::Devices::HumanInterfaceDevice as hid;
+        use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows::Win32::Storage::FileSystem as fs;
+        use windows::Win32::UI::Input as raw;
+
+        let device = (|| -> Option<PtpDevice> {
+            // 1. Find the digitizer touchpad collection among raw devices.
+            let mut count = 0u32;
+            let size = std::mem::size_of::<raw::RAWINPUTDEVICELIST>() as u32;
+            if unsafe { raw::GetRawInputDeviceList(None, &mut count, size) } == u32::MAX
+                || count == 0
+            {
+                return None;
+            }
+            let mut list = vec![raw::RAWINPUTDEVICELIST::default(); count as usize];
+            if unsafe {
+                raw::GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut count, size)
+            } == u32::MAX
+            {
+                return None;
+            }
+            let mut touchpad: Option<isize> = None;
+            for entry in list.iter().take(count as usize) {
+                if entry.dwType != raw::RIM_TYPEHID {
+                    continue;
+                }
+                let mut info_size = std::mem::size_of::<raw::RID_DEVICE_INFO>() as u32;
+                let mut info = raw::RID_DEVICE_INFO::default();
+                info.cbSize = info_size;
+                if unsafe {
+                    raw::GetRawInputDeviceInfoW(
+                        entry.hDevice,
+                        raw::RIDI_DEVICEINFO,
+                        Some(&mut info as *mut _ as *mut std::ffi::c_void),
+                        &mut info_size,
+                    )
+                } == 0
+                {
+                    continue;
+                }
+                let hid_info = unsafe { info.Anonymous.hid };
+                if hid_info.usUsagePage == PTP_USAGE_PAGE
+                    && hid_info.usUsage == PTP_USAGE_TOUCHPAD
+                {
+                    touchpad = Some(entry.hDevice.0 as isize);
+                    break;
+                }
+            }
+            let handle_value = touchpad?;
+            // 2. Open the device path for preparsed-data queries. One
+            // fixed buffer: device paths are always well under this.
+            let mut name = vec![0u16; 512];
+            let mut name_len = name.len() as u32;
+            if unsafe {
+                raw::GetRawInputDeviceInfoW(
+                    windows::Win32::Foundation::HANDLE(handle_value as *mut std::ffi::c_void),
+                    raw::RIDI_DEVICENAME,
+                    Some(name.as_mut_ptr() as *mut std::ffi::c_void),
+                    &mut name_len,
+                )
+            } == 0
+                || name_len == 0
+            {
+                return None;
+            }
+            let handle = unsafe {
+                fs::CreateFileW(
+                    windows::core::PCWSTR(name.as_ptr()),
+                    (GENERIC_READ | GENERIC_WRITE).0,
+                    fs::FILE_SHARE_READ | fs::FILE_SHARE_WRITE,
+                    None,
+                    fs::OPEN_EXISTING,
+                    fs::FILE_FLAGS_AND_ATTRIBUTES(0),
+                    None,
+                )
+            }
+            .ok()?;
+            // 3. Preparsed data + caps: report length, finger collections,
+            // per-axis scale from the sensor logical maximum.
+            let mut preparsed = hid::PHIDP_PREPARSED_DATA::default();
+            if !unsafe { hid::HidD_GetPreparsedData(handle, &mut preparsed) }.as_bool() {
+                let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
+                return None;
+            }
+            let mut caps = hid::HIDP_CAPS::default();
+            if unsafe { hid::HidP_GetCaps(preparsed, &mut caps) }.is_err()
+                || caps.InputReportByteLength == 0
+            {
+                unsafe {
+                    hid::HidD_FreePreparsedData(preparsed);
+                    let _ = windows::Win32::Foundation::CloseHandle(handle);
+                }
+                return None;
+            }
+            let node_len = caps.NumberLinkCollectionNodes as usize;
+            let mut fingers = Vec::new();
+            if node_len > 1 {
+                let mut nodes = vec![hid::HIDP_LINK_COLLECTION_NODE::default(); node_len];
+                let mut nodes_len = node_len as u32;
+                if unsafe {
+                    hid::HidP_GetLinkCollectionNodes(nodes.as_mut_ptr(), &mut nodes_len, preparsed)
+                }
+                .is_ok()
+                {
+                    for node in nodes.iter().take(nodes_len as usize).skip(1) {
+                        if node.Parent == 0
+                            && node.LinkUsagePage == PTP_USAGE_PAGE
+                            && fingers.len() < 10
+                        {
+                            // CollectionNumber is the node index for
+                            // HidP_GetUsageValue's LinkCollection.
+                            fingers.push(node_index(nodes.as_slice(), node));
+                        }
+                    }
+                }
+            }
+            if fingers.is_empty() {
+                unsafe {
+                    hid::HidD_FreePreparsedData(preparsed);
+                    let _ = windows::Win32::Foundation::CloseHandle(handle);
+                }
+                return None;
+            }
+            // Value caps once (bounded by the descriptor's own count):
+            // per-axis scroll scale derives from the sensor logical
+            // maximum below.
+            let mut value_len = caps.NumberInputValueCaps;
+            let mut value_caps = vec![hid::HIDP_VALUE_CAPS::default(); value_len.min(512) as usize];
+            value_len = value_caps.len() as u16;
+            if unsafe {
+                hid::HidP_GetValueCaps(hid::HidP_Input, value_caps.as_mut_ptr(), &mut value_len, preparsed)
+            }
+            .is_err()
+            {
+                value_len = 0;
+            }
+            let (units_x, units_y) =
+                ptp_axis_scale(&fingers, &value_caps[..value_len as usize]);
+            // 4. Register the digitizer usage on our sink window. Observe
+            // only (no NOLEGACY): touchpad delivery to local apps is
+            // untouched; we only listen.
+            let device_reg = RAWINPUTDEVICE {
+                usUsagePage: PTP_USAGE_PAGE,
+                usUsage: PTP_USAGE_TOUCHPAD,
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: window,
+            };
+            if unsafe {
+                RegisterRawInputDevices(
+                    std::slice::from_ref(&device_reg),
+                    std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+                )
+            }
+            .is_err()
+            {
+                unsafe {
+                    hid::HidD_FreePreparsedData(preparsed);
+                    let _ = windows::Win32::Foundation::CloseHandle(handle);
+                }
+                return None;
+            }
+            Some(PtpDevice {
+                handle: handle_value,
+                preparsed,
+                report_len: caps.InputReportByteLength as usize,
+                fingers,
+                units_per_detent_x: units_x,
+                units_per_detent_y: units_y,
+            })
+        })();
+        match device {
+            Some(found) => {
+                let contacts = found.fingers.len();
+                {
+                    let mut pan = ptp_pan_slot();
+                    pan.units_per_detent_x = found.units_per_detent_x;
+                    pan.units_per_detent_y = found.units_per_detent_y;
+                }
+                *ptp_device_slot() = Some(found);
+                tracing::info!(
+                    contacts,
+                    "precision-touchpad scroll channel armed (HID digitizer tap)"
+                );
+            }
+            None => tracing::debug!("no precision-touchpad digitizer found; legacy wheel channels only"),
+        }
+    }
+
+    /// Index of a link-collection node within its node array: the
+    /// LinkCollection id HidP_GetUsageValue expects.
+    fn node_index(
+        nodes: &[windows::Win32::Devices::HumanInterfaceDevice::HIDP_LINK_COLLECTION_NODE],
+        node: &windows::Win32::Devices::HumanInterfaceDevice::HIDP_LINK_COLLECTION_NODE,
+    ) -> u16 {
+        let base = nodes.as_ptr() as usize;
+        let at = node as *const _ as usize;
+        ((at - base) / std::mem::size_of_val(node)) as u16
+    }
+
+    /// Logical-maximum-derived scroll scale per finger collection axis:
+    /// full sensor span earns PTP_DETENTS_PER_SPAN detents. Pure over the
+    /// fetched value caps (no HID calls), so scale math stays testable.
+    fn ptp_axis_scale(
+        fingers: &[u16],
+        value_caps: &[windows::Win32::Devices::HumanInterfaceDevice::HIDP_VALUE_CAPS],
+    ) -> (i64, i64) {
+        let first = fingers.first().copied().unwrap_or(0);
+        let mut scale = |usage: u16| -> i64 {
+            for caps in value_caps {
+                if caps.UsagePage != PTP_GENERIC_PAGE || caps.LinkCollection != first {
+                    continue;
+                }
+                let covers = if caps.IsRange.as_bool() {
+                    let range = unsafe { caps.Anonymous.Range };
+                    usage >= range.UsageMin && usage <= range.UsageMax
+                } else {
+                    unsafe { caps.Anonymous.NotRange }.Usage == usage
+                };
+                if covers && caps.LogicalMax > 0 {
+                    return (i64::from(caps.LogicalMax) / PTP_DETENTS_PER_SPAN).max(1);
+                }
+            }
+            64
+        };
+        (scale(PTP_USAGE_X), scale(PTP_USAGE_Y))
+    }
+
+    /// Stop listening to the digitizer collection (capture teardown).
+    fn ptp_unsubscribe() {
+        use windows::Win32::Devices::HumanInterfaceDevice as hid;
+        let removal = RAWINPUTDEVICE {
+            usUsagePage: PTP_USAGE_PAGE,
+            usUsage: PTP_USAGE_TOUCHPAD,
+            dwFlags: RIDEV_REMOVE,
+            hwndTarget: HWND::default(),
+        };
+        let _ = unsafe {
+            RegisterRawInputDevices(
+                std::slice::from_ref(&removal),
+                std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+            )
+        };
+        if let Some(previous) = ptp_device_slot().take() {
+            unsafe {
+                hid::HidD_FreePreparsedData(previous.preparsed);
+            }
+        }
+    }
+
+    /// One WM_INPUT buffer already known (by header peek) to carry a HID
+    /// report from our touchpad device: parse contacts, feed the pan
+    /// accumulator, forward surviving scroll on the shared dedup path.
+    fn handle_ptp_input(buffer: &[u8]) {
+        use windows::Win32::Devices::HumanInterfaceDevice as hid;
+        let header_size = std::mem::size_of::<RAWINPUTHEADER>();
+        if buffer.len() < header_size + 8 {
+            return;
+        }
+        let size_hid = u32::from_le_bytes([buffer[header_size], buffer[header_size + 1], buffer[header_size + 2], buffer[header_size + 3]]) as usize;
+        let count = u32::from_le_bytes([buffer[header_size + 4], buffer[header_size + 5], buffer[header_size + 6], buffer[header_size + 7]]) as usize;
+        if !(8..=1024).contains(&size_hid) || !(1..=64).contains(&count) {
+            return;
+        }
+        let Some(device) = ptp_device_slot().as_ref().map(|slot| {
+            (slot.preparsed, slot.report_len, slot.fingers.clone(), slot.handle)
+        }) else {
+            return;
+        };
+        // NOTE: the slot lock drops before parsing (HidP calls below take
+        // no locks; the gesture accumulator has its own slot).
+        let (preparsed, report_len, fingers, _handle) = device;
+        let data_at = header_size + 8;
+        for index in 0..count {
+            let at = data_at + index * size_hid;
+            if at + size_hid > buffer.len() || size_hid < report_len {
+                continue;
+            }
+            let report = &buffer[at..at + size_hid];
+            let mut contacts = Vec::with_capacity(fingers.len().min(10));
+            for collection in fingers.iter().take(10) {
+                let mut tip = 0u32;
+                let tip_ok = unsafe {
+                    hid::HidP_GetUsageValue(
+                        hid::HidP_Input,
+                        PTP_USAGE_PAGE,
+                        *collection,
+                        PTP_USAGE_TIP,
+                        &mut tip,
+                        preparsed,
+                        report,
+                    )
+                }
+                .is_ok();
+                if !tip_ok || tip == 0 {
+                    continue;
+                }
+                let mut x = 0u32;
+                let mut y = 0u32;
+                let x_ok = unsafe {
+                    hid::HidP_GetUsageValue(
+                        hid::HidP_Input,
+                        PTP_GENERIC_PAGE,
+                        *collection,
+                        PTP_USAGE_X,
+                        &mut x,
+                        preparsed,
+                        report,
+                    )
+                }
+                .is_ok();
+                let y_ok = unsafe {
+                    hid::HidP_GetUsageValue(
+                        hid::HidP_Input,
+                        PTP_GENERIC_PAGE,
+                        *collection,
+                        PTP_USAGE_Y,
+                        &mut y,
+                        preparsed,
+                        report,
+                    )
+                }
+                .is_ok();
+                if x_ok && y_ok {
+                    contacts.push((x as i32, y as i32));
+                }
+            }
+            if contacts.is_empty() {
+                // All fingers lifted: reset the anchor, no scroll.
+                ptp_pan_slot().feed(&[]);
+                continue;
+            }
+            let now = std::time::Instant::now();
+            let (x, y) = ptp_pan_slot().feed(&contacts);
+            if x != 0 || y != 0 {
+                let (fx, fy) = wheel_dedup().filter_raw(x, y, now);
+                if fx != 0 || fy != 0 {
+                    PTP_SCROLL.fetch_add(1, Ordering::Relaxed);
+                    send(InputEvent::SmoothWheel { x: fx, y: fy });
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     mod raw_input_tests {
         use super::decode_raw_mouse_motion;
-        use super::{decode_raw_mouse_wheel, WheelDedup};
+        use super::{decode_raw_mouse_wheel, PtpPan, WheelDedup};
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::UI::Input::{
             MOUSE_MOVE_ABSOLUTE, MOUSE_STATE, RAWINPUT, RAWINPUTHEADER, RAWINPUT_0, RAWMOUSE,
@@ -1058,6 +1533,47 @@ mod win32_hooks {
                     },
                 },
             }
+        }
+
+        #[test]
+        fn ptp_two_fingers_up_scrolls_up() {
+            let mut pan = PtpPan::new();
+            pan.units_per_detent_x = 10;
+            pan.units_per_detent_y = 10;
+            assert_eq!(pan.feed(&[(0, 100), (0, 100)]), (0, 0));
+            // Sensor y falls as fingers rise: scroll up is +120ths.
+            assert_eq!(pan.feed(&[(0, 90), (0, 90)]), (0, 120));
+        }
+
+        #[test]
+        fn ptp_two_fingers_right_scrolls_right() {
+            let mut pan = PtpPan::new();
+            pan.units_per_detent_x = 10;
+            pan.units_per_detent_y = 10;
+            assert_eq!(pan.feed(&[(100, 0), (100, 0)]), (0, 0));
+            assert_eq!(pan.feed(&[(110, 0), (110, 0)]), (120, 0));
+        }
+
+        #[test]
+        fn ptp_count_changes_reset_without_jumps() {
+            let mut pan = PtpPan::new();
+            assert_eq!(pan.feed(&[(0, 100), (0, 100)]), (0, 0));
+            assert_eq!(pan.feed(&[(0, 0)]), (0, 0));
+            // Re-touch anchors anew: no scroll from the gap.
+            assert_eq!(pan.feed(&[(0, 0), (0, 0)]), (0, 0));
+            assert_eq!(pan.feed(&[]), (0, 0));
+        }
+
+        #[test]
+        fn ptp_sub_detent_motion_accumulates() {
+            let mut pan = PtpPan::new();
+            pan.units_per_detent_x = 10;
+            pan.units_per_detent_y = 10;
+            assert_eq!(pan.feed(&[(0, 100), (0, 100)]), (0, 0));
+            assert_eq!(pan.feed(&[(0, 96), (0, 96)]), (0, 0));
+            assert_eq!(pan.feed(&[(0, 92), (0, 92)]), (0, 0));
+            // 4 + 4 + 4 = 12 >= 10: one detent, remainder kept.
+            assert_eq!(pan.feed(&[(0, 88), (0, 88)]), (0, 120));
         }
 
         #[test]

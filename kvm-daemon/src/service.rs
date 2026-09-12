@@ -1934,14 +1934,15 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     tracing::info!("suppression reaper: released stale hold with no active drive");
                 }
                 // Backend receipt census, once a minute: which OS channel
-                // speaks (hook vs raw HID). Scroll-silence reports end
-                // here — hook_wheel/raw_wheel name the guilty channel.
+                // speaks (hook vs raw HID vs precision touchpad).
+                // Scroll-silence reports end here — hook_wheel/raw_wheel/
+                // ptp_scroll name the guilty channel.
                 let census_due = last_census_log
                     .map(|when| when.elapsed() >= Duration::from_secs(60))
                     .unwrap_or(true);
                 if census_due {
                     last_census_log = Some(Instant::now());
-                    let (hook_key, hook_button, hook_move, hook_wheel, raw_move, raw_wheel) =
+                    let (hook_key, hook_button, hook_move, hook_wheel, raw_move, raw_wheel, ptp_scroll) =
                         kvm_platform::capture::backend_census();
                     // Sender hold snapshot alongside the channel census: the
                     // mystery-freeze triage line — a stuck drive shows here
@@ -1958,6 +1959,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         hook_wheel,
                         raw_move,
                         raw_wheel,
+                        ptp_scroll,
                         drive_active = active.is_some(),
                         suppression_requested,
                         parked = parked.is_some(),
@@ -2002,6 +2004,12 @@ struct TopologySession {
     wheel_captured: u64,
     smooth_captured: u64,
     wheel_forwarded: u64,
+    /// Sender-side motion census: captured vs forwarded MouseMove events.
+    /// Logged at teardown next to the scroll census, so a silent motion
+    /// drop (entry warp lands, cursor never tracks) is diagnosable from
+    /// the journal instead of a mystery.
+    motion_captured: u64,
+    motion_forwarded: u64,
     /// The peer's self-reported geometry (for re-mapping re-entry points
     /// when this stream is reused after parking).
     peer_geometry: Option<ScreenGeometry>,
@@ -2041,6 +2049,8 @@ impl TopologySession {
                 wheel_captured = self.wheel_captured,
                 smooth_captured = self.smooth_captured,
                 wheel_forwarded = self.wheel_forwarded,
+                motion_captured = self.motion_captured,
+                motion_forwarded = self.motion_forwarded,
                 peer_smooth = self.peer_smooth,
                 "topology episode ended",
             );
@@ -2343,6 +2353,7 @@ async fn handle_topology_event(
             match event {
                 InputEvent::Wheel(_) => session.wheel_captured += 1,
                 InputEvent::SmoothWheel { .. } => session.smooth_captured += 1,
+                InputEvent::MouseMove { .. } => session.motion_captured += 1,
                 _ => {}
             }
             let Some(outgoing) =
@@ -2356,6 +2367,7 @@ async fn handle_topology_event(
             ) {
                 session.wheel_forwarded += 1;
             }
+            let outgoing_is_motion = matches!(outgoing, InputEvent::MouseMove { .. });
             *sequence = sequence.wrapping_add(1);
             if let Err(error) =
                 send_input(&session.connection, &mut session.send, *sequence, outgoing).await
@@ -2382,6 +2394,8 @@ async fn handle_topology_event(
                 let _ = capture_control.warp_cursor(x, y);
                 *last_failed_episode = Some(std::time::Instant::now());
                 eprintln!("THEKVM_STATUS local");
+            } else if outgoing_is_motion {
+                session.motion_forwarded += 1;
             }
         }
         RoutedEvent::ReturnHome { from, edge } => {
@@ -2991,6 +3005,8 @@ fn spawn_episode_driver(
         wheel_captured: 0,
         smooth_captured: 0,
         wheel_forwarded: 0,
+        motion_captured: 0,
+        motion_forwarded: 0,
     }
 }
 
@@ -4088,6 +4104,12 @@ async fn handle_connection(
             let mut motion_count = 0u64;
             let mut wheel_count = 0u64;
             let mut smooth_count = 0u64;
+            // Receiver-side drop census: motion datagrams that arrived but
+            // were discarded (duplicate sequence vs stale ordering). Logged
+            // at session end next to motion_count, so "warp lands, cursor
+            // never tracks" names its dropping line instead of guessing.
+            let mut dropped_duplicate = 0u64;
+            let mut dropped_stale = 0u64;
             let mut remote_screen = None;
             let mut remote_cursor = None;
             // Push-through run for the stateless receiver hop (same
@@ -4140,6 +4162,8 @@ async fn handle_connection(
                                     peer_screen_geometry,
                                     &mut hop_edge,
                                     &mut hop_accum,
+                                    &mut dropped_duplicate,
+                                    &mut dropped_stale,
                                 )
                                 .await?
                                 {
@@ -4273,6 +4297,8 @@ async fn handle_connection(
                             peer_screen_geometry,
                             &mut hop_edge,
                             &mut hop_accum,
+                            &mut dropped_duplicate,
+                            &mut dropped_stale,
                         )
                         .await?
                         {
@@ -4344,6 +4370,8 @@ async fn handle_connection(
                 motion = motion_count,
                 wheel = wheel_count,
                 smooth = smooth_count,
+                dropped_duplicate,
+                dropped_stale,
                 reason = end_reason,
                 error = session_result
                     .as_ref()
@@ -4386,8 +4414,11 @@ async fn process_remote_input(
     peer_screen_geometry: Option<ScreenGeometry>,
     hop_edge: &mut Option<kvm_core::Edge>,
     hop_accum: &mut i64,
+    dropped_duplicate: &mut u64,
+    dropped_stale: &mut u64,
 ) -> Result<bool> {
     if !seen_sequences.insert(packet.sequence) {
+        *dropped_duplicate += 1;
         return Ok(false);
     }
     if matches!(
@@ -4398,6 +4429,7 @@ async fn process_remote_input(
         // QUIC DATAGRAM is intentionally unordered and lossy. Applying an
         // older motion after a newer one can visibly move the cursor backward,
         // especially during a topology handoff, so stale motion is discarded.
+        *dropped_stale += 1;
         return Ok(false);
     }
     while seen_sequences.len() > 4096 {

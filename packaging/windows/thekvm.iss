@@ -13,7 +13,7 @@
 ; Build: iscc packaging\windows\thekvm.iss   (output: dist\thekvm-<ver>-setup.exe)
 
 #define MyAppName "TheKVM"
-#define MyAppVersion "0.9.13"
+#define MyAppVersion "0.9.14"
 #define MyAppPublisher "TheKVM project"
 #define MyAppURL "https://github.com/xyzyt010/thekvm"
 #define ServiceName "TheKVM"
@@ -172,6 +172,19 @@ begin
   { DPAPI machine-protected identity: only LocalSystem + Administrators. }
   SoftRun('icacls.exe', AddQuotes(DataDir()) +
     ' /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"');
+  { Service diagnostics stay readable by everyone: the service log lives
+    in a dedicated Logs directory with Users read access (created here,
+    in the path the setup actually executes — NOT install-service.ps1,
+    which Inno never runs). The locked-down data directory above holds
+    identity keys and stays restricted. }
+  if not ForceDirectories(DataDir() + '\Logs') then
+  begin
+    MsgBox('Could not create the TheKVM log directory. The install cannot continue.', mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+  SoftRun('icacls.exe', AddQuotes(DataDir() + '\Logs') +
+    ' /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-1-0:(OI)(CI)R"');
   Result := True;
 end;
 

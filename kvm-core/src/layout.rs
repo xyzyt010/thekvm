@@ -430,6 +430,14 @@ pub struct EdgeRouter {
     /// strands control remotely: engaging it returns home first (see the
     /// daemon handoff arm), so the lock always means "held locally".
     locked: bool,
+    /// Fresh-entry gate: a controller born with its cursor already parked
+    /// at a facing edge must not cross on resting noise — the cursor has
+    /// to come comfortably inside first, then push out deliberately.
+    /// (Live shape: a respawned child inherits the pointer sitting at the
+    /// edge from a previous session and instantly re-opens a zombie
+    /// drive.) Cleared once the cursor is observed beyond EDGE_PUSH_PX
+    /// of every crossable edge; set only by set_local_cursor_position.
+    startup_gate: bool,
 }
 
 impl EdgeRouter {
@@ -458,6 +466,7 @@ impl EdgeRouter {
             push_edge: None,
             push_accum: 0,
             locked: false,
+            startup_gate: false,
         })
     }
 
@@ -579,6 +588,21 @@ impl EdgeRouter {
         self.local_cursor_y = self.cursor_y;
         self.push_edge = None;
         self.push_accum = 0;
+        // Arm the fresh-entry gate when the seed sits at a facing edge
+        // (see the field): the first gestures after (re)start must come
+        // inside before any outward run can open a crossing.
+        self.startup_gate = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
+            .iter()
+            .any(|edge| {
+                self.crossing_target(self.local_screen, *edge).is_some()
+                    && distance_from_edge(
+                        *edge,
+                        self.cursor_x,
+                        self.cursor_y,
+                        width,
+                        height,
+                    ) < EDGE_PUSH_PX as u32
+            });
         Ok(())
     }
 
@@ -757,6 +781,12 @@ impl EdgeRouter {
             // and jitter can never save up for a phantom crossing.
             self.push_edge = None;
             self.push_accum = 0;
+            // Comfortably inside (beyond push range of every crossable
+            // edge) lifts the fresh-entry gate: the next deliberate
+            // outward run may cross.
+            if !self.near_crossing_edge(EDGE_PUSH_PX as u32) {
+                self.startup_gate = false;
+            }
             return RoutedEvent::Local(event);
         };
         // Locked screens never open a handoff: clamp like an unlinked edge
@@ -771,6 +801,14 @@ impl EdgeRouter {
             self.push_accum = 0;
             return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
         };
+        // Fresh-entry gate (see the field): a controller seeded at the
+        // edge clamps until the cursor has come inside once. Resting
+        // noise at the boundary can never open the first crossing.
+        if self.startup_gate {
+            self.push_edge = None;
+            self.push_accum = 0;
+            return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
+        }
         // Push-through (Deskflow jump-zone + switch-delay spirit): one
         // stray delta never crosses. The outward run on THIS edge must
         // accumulate EDGE_PUSH_PX before the Handoff fires; a firm push
@@ -1129,6 +1167,38 @@ mod tests {
         router.return_to_local(ScreenId(2), 10, 20).unwrap();
         assert_eq!(router.active_remote(), None);
         assert_eq!(router.cursor_position(), (10, 20));
+    }
+
+    #[test]
+    fn seeded_at_facing_edge_requires_a_fresh_entry_before_crossing() {
+        let layout = Layout {
+            screens: vec![screen(1, "main", 0, 0), screen(2, "right", 1, 0)],
+            self_screen: Some(ScreenId(1)),
+        };
+        let mut router = EdgeRouter::new(layout).unwrap();
+        // Controller (re)starts with the pointer already parked at the
+        // facing edge: resting noise must clamp, never cross.
+        router.set_local_cursor_position(1919, 540).unwrap();
+        for _ in 0..10 {
+            let result = router.route(InputEvent::MouseMove { dx: 4, dy: 0 });
+            assert!(matches!(result, RoutedEvent::Local(_)));
+        }
+        assert_eq!(router.active_remote(), None);
+        // Come comfortably inside once: the gate lifts...
+        let result = router.route(InputEvent::MouseMove { dx: -400, dy: 0 });
+        assert!(matches!(result, RoutedEvent::Local(_)));
+        // ...and a deliberate outward run crosses again.
+        let mut crossed = false;
+        for _ in 0..40 {
+            if matches!(
+                router.route(InputEvent::MouseMove { dx: 30, dy: 0 }),
+                RoutedEvent::Handoff { .. }
+            ) {
+                crossed = true;
+                break;
+            }
+        }
+        assert!(crossed);
     }
 
     #[test]

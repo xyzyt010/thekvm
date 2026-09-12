@@ -2819,6 +2819,32 @@ fn relay_session_progress(
             set_status(weak, text);
         }
     }
+    // Reap a silently-dead child: SIGTERM/SIGKILL (or any exit without a
+    // final THEKVM_STATUS line) ends stderr with EOF, which ends the loop
+    // above — but the session slot still holds the dead Child, so the poll
+    // loop believes a link is running and never redials (the wedged
+    // "connected" that only an app restart fixed). Reap here: if the child
+    // in the slot has exited, clear the slot so the poll re-arms the
+    // dial-back on the still-live inbound link. A newer supervised child
+    // that is still running is never touched: try_wait reports None.
+    let reaped = session.lock().ok().and_then(|mut slot| {
+        let dead = slot
+            .as_mut()
+            .and_then(|current| current.child.try_wait().ok().flatten());
+        match dead {
+            Some(status) => {
+                slot.take();
+                Some(status)
+            }
+            _ => None,
+        }
+    });
+    if let Some(status) = reaped {
+        ui_log(&format!(
+            "session: child for {address} exited silently ({status}); clearing for redial"
+        ));
+        set_driving(weak, String::new());
+    }
 }
 
 fn stop_session(
