@@ -233,6 +233,54 @@ impl X11Capture {
         })
     }
 
+    /// Hide the local pointer for the drive (see the engage path).
+    /// Strictly paired with show_cursor via cursor_hidden: at most one
+    /// outstanding hide per backend, so counts can never leak upward.
+    fn hide_cursor(&mut self) {
+        if self.cursor_hidden || !self.xfixes_cursor {
+            return;
+        }
+        let hidden = self
+            .connection
+            .xfixes_hide_cursor(self.root)
+            .map_err(|error| format!("send XFixes hide cursor: {error}"))
+            .and_then(|cookie| {
+                cookie
+                    .check()
+                    .map_err(|error| format!("hide X cursor: {error}"))
+            })
+            .map(|()| true)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "local cursor stays visible while driving");
+                false
+            });
+        self.cursor_hidden = hidden;
+    }
+
+    /// Restore the local pointer after the drive (see the release path).
+    /// A failed show keeps the flag so the next release re-tries; every
+    /// path (including Drop) funnels here.
+    fn show_cursor(&mut self) {
+        if !self.cursor_hidden {
+            return;
+        }
+        if self
+            .connection
+            .xfixes_show_cursor(self.root)
+            .map_err(|error| format!("send XFixes show cursor: {error}"))
+            .and_then(|cookie| {
+                cookie
+                    .check()
+                    .map_err(|error| format!("show X cursor: {error}"))
+            })
+            .is_err()
+        {
+            tracing::warn!("local cursor restore failed; will retry on next release");
+            return;
+        }
+        self.cursor_hidden = false;
+    }
+
     fn translate(&mut self, event: x11rb::protocol::Event) -> Option<InputEvent> {
         match event {
             x11rb::protocol::Event::XinputRawKeyPress(event) => {
@@ -474,54 +522,6 @@ impl CaptureBackend for X11Capture {
             }
         }
         Ok(())
-    }
-
-    /// Hide the local pointer for the drive (see the engage path).
-    /// Strictly paired with show_cursor via cursor_hidden: at most one
-    /// outstanding hide per backend, so counts can never leak upward.
-    fn hide_cursor(&mut self) {
-        if self.cursor_hidden || !self.xfixes_cursor {
-            return;
-        }
-        let hidden = self
-            .connection
-            .xfixes_hide_cursor(self.root)
-            .map_err(|error| format!("send XFixes hide cursor: {error}"))
-            .and_then(|cookie| {
-                cookie
-                    .check()
-                    .map_err(|error| format!("hide X cursor: {error}"))
-            })
-            .map(|()| true)
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "local cursor stays visible while driving");
-                false
-            });
-        self.cursor_hidden = hidden;
-    }
-
-    /// Restore the local pointer after the drive (see the release path).
-    /// A failed show keeps the flag so the next release re-tries; every
-    /// path (including Drop) funnels here.
-    fn show_cursor(&mut self) {
-        if !self.cursor_hidden {
-            return;
-        }
-        if self
-            .connection
-            .xfixes_show_cursor(self.root)
-            .map_err(|error| format!("send XFixes show cursor: {error}"))
-            .and_then(|cookie| {
-                cookie
-                    .check()
-                    .map_err(|error| format!("show X cursor: {error}"))
-            })
-            .is_err()
-        {
-            tracing::warn!("local cursor restore failed; will retry on next release");
-            return;
-        }
-        self.cursor_hidden = false;
     }
 
     fn release(&mut self) -> Result<(), PlatformError> {
