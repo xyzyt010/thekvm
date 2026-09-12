@@ -28,7 +28,7 @@ futures = "0.3"
 input-capture = { version = "0.4.0", default-features = false, features = ["libei"] }
 input-event = { version = "0.4.0", default-features = false }
 tokio = { workspace = true }
-x11rb = { version = "0.13", default-features = false, features = ["xinput"] }
+x11rb = { version = "0.13", default-features = false, features = ["xinput", "xfixes"] }
 
 [target.'cfg(target_os = "freebsd")'.dependencies]
 arboard = { version = "3.6.1", default-features = false }

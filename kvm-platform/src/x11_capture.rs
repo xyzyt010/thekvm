@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use x11rb::connection::Connection;
+use x11rb::protocol::xfixes::ConnectionExt as XFixesConnectionExt;
 use x11rb::protocol::xinput::{self, ConnectionExt as XInputConnectionExt};
 use x11rb::protocol::xproto::{self, ConnectionExt as XprotoConnectionExt};
 use x11rb::rust_connection::RustConnection;
@@ -48,6 +49,15 @@ pub struct X11Capture {
     /// this capture backend.
     ignored_sources: Vec<xinput::DeviceId>,
     last_source_refresh: std::time::Instant,
+    /// Whether the server answered XFixes version negotiation (probed
+    /// once at creation): gates cursor hiding, which has no fallback.
+    xfixes_cursor: bool,
+    /// Whether we currently hold one XFixes hide on the root cursor.
+    /// Hide/show counts are strictly paired here (hide only when false,
+    /// show only when true) across every engage/release path plus Drop,
+    /// so a failed show retries on the next release instead of leaking
+    /// an invisible cursor.
+    cursor_hidden: bool,
 }
 
 /// True when an XI device name is one of our own virtual injector devices.
@@ -157,6 +167,24 @@ impl X11Capture {
             .flush()
             .map_err(|error| PlatformError::Capture(format!("flush XInput2 setup: {error}")))?;
 
+        // XFixes cursor hide/show for drives (best-effort, probed once):
+        // grabs redirect EVENTS but the visible cursor keeps roaming, so
+        // without hiding every drive shows two live cursors. A server
+        // without XFixes simply keeps the visible cursor (fail-open).
+        let xfixes_cursor = connection
+            .xfixes_query_version(5, 0)
+            .map_err(|error| format!("query XFixes version: {error}"))
+            .and_then(|cookie| {
+                cookie
+                    .reply()
+                    .map_err(|error| format!("read XFixes version: {error}"))
+            })
+            .map(|_| true)
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "XFixes unavailable; local cursor stays visible while driving");
+                false
+            });
+
         let ignored_sources = query_own_sources(&connection).unwrap_or_default();
         tracing::info!(
             ignored = ignored_sources.len(),
@@ -200,6 +228,8 @@ impl X11Capture {
             core_last: None,
             ignored_sources,
             last_source_refresh: std::time::Instant::now(),
+            xfixes_cursor,
+            cursor_hidden: false,
         })
     }
 
@@ -382,6 +412,11 @@ impl CaptureBackend for X11Capture {
             // translate): without this the first step after engage
             // teleports from a stale position.
             self.core_last = None;
+            // The grab suppresses local DELIVERY, not the visible
+            // cursor: hide it so the drive shows exactly one pointer
+            // (on the peer). Best-effort — a failed hide warns and the
+            // drive proceeds with dual cursors rather than no drive.
+            self.hide_cursor();
             tracing::info!(grab = ?self.grab_kind, "X11 local suppression engaged");
         } else {
             // Kind-matched release: ungrab ONLY the hold we actually own.
@@ -416,6 +451,12 @@ impl CaptureBackend for X11Capture {
             if let Err(error) = released {
                 return Err(error);
             }
+            // Release the drive cursor hide (paired with the engage
+            // above): runs on every release path, including Drop via
+            // release(), so no path strands an invisible cursor. A
+            // failed show keeps the flag set so the next release (or
+            // Drop) retries instead of leaking the hide.
+            self.show_cursor();
             tracing::debug!(previous = ?previous, "X11 local suppression released");
         }
         self.connection.flush().map_err(|error| {
@@ -433,6 +474,54 @@ impl CaptureBackend for X11Capture {
             }
         }
         Ok(())
+    }
+
+    /// Hide the local pointer for the drive (see the engage path).
+    /// Strictly paired with show_cursor via cursor_hidden: at most one
+    /// outstanding hide per backend, so counts can never leak upward.
+    fn hide_cursor(&mut self) {
+        if self.cursor_hidden || !self.xfixes_cursor {
+            return;
+        }
+        let hidden = self
+            .connection
+            .xfixes_hide_cursor(self.root)
+            .map_err(|error| format!("send XFixes hide cursor: {error}"))
+            .and_then(|cookie| {
+                cookie
+                    .check()
+                    .map_err(|error| format!("hide X cursor: {error}"))
+            })
+            .map(|()| true)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "local cursor stays visible while driving");
+                false
+            });
+        self.cursor_hidden = hidden;
+    }
+
+    /// Restore the local pointer after the drive (see the release path).
+    /// A failed show keeps the flag so the next release re-tries; every
+    /// path (including Drop) funnels here.
+    fn show_cursor(&mut self) {
+        if !self.cursor_hidden {
+            return;
+        }
+        if self
+            .connection
+            .xfixes_show_cursor(self.root)
+            .map_err(|error| format!("send XFixes show cursor: {error}"))
+            .and_then(|cookie| {
+                cookie
+                    .check()
+                    .map_err(|error| format!("show X cursor: {error}"))
+            })
+            .is_err()
+        {
+            tracing::warn!("local cursor restore failed; will retry on next release");
+            return;
+        }
+        self.cursor_hidden = false;
     }
 
     fn release(&mut self) -> Result<(), PlatformError> {
@@ -538,8 +627,7 @@ fn core_grab(connection: &RustConnection, grab_window: xproto::Window) -> Result
 }
 
 /// Release a core hold (pointer first, then keyboard).
-fn core_ungrab(connection: &RustConnection) -> Result<(), PlatformError> {
-    connection
+fn core_ungrab(connection: &RustConnection) -> Result<(), PlatformError> {    connection
         .ungrab_pointer(0u32)
         .map_err(|error| PlatformError::Capture(format!("ungrab core pointer: {error}")))?
         .check()

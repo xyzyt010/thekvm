@@ -419,6 +419,16 @@ pub struct EdgeRouter {
     /// RETURN_PUSH_PX): the escape hatch. Reset on any inside movement,
     /// on arming, and on every new handoff.
     return_accum: i64,
+    /// Armed-return brush guard: overflow px past the home-facing edge
+    /// on the current outward run (see RETURN_EDGE_PX). A 1px brush of
+    /// the boundary after settling must not end the drive — entries land
+    /// ON the edge, so all early roaming happens right beside it, and an
+    /// instant rule turns every roam into a snap-back cycle (push, cross,
+    /// brush, die, re-push: the sticky-entry feel). Only sustained
+    /// outward pressure returns. Reset on any inside movement, on edge
+    /// switch, and on every new handoff.
+    return_edge: Option<Edge>,
+    return_edge_accum: i64,
     /// Which edges may open a crossing (Single = arranged facing edge
     /// only; Double = both horizontal outer edges on a lone-peer link).
     /// Return hysteresis is identical in both modes.
@@ -467,6 +477,8 @@ impl EdgeRouter {
             entry_edge: None,
             return_armed: false,
             return_accum: 0,
+            return_edge: None,
+            return_edge_accum: 0,
             edge_mode: EdgeMode::Single,
             push_edge: None,
             push_accum: 0,
@@ -709,9 +721,12 @@ impl EdgeRouter {
                     None => {
                         self.cursor_x = next_x as u32;
                         self.cursor_y = next_y as u32;
-                        // Inside movement cancels any unarmed escape run:
-                        // only sustained home-ward pressure returns.
+                        // Inside movement cancels any unarmed escape run
+                        // AND any armed brush run: only sustained home-ward
+                        // pressure returns.
                         self.return_accum = 0;
+                        self.return_edge = None;
+                        self.return_edge_accum = 0;
                         // Settling inside arms the entry edge (see above):
                         // a firm flick arms in one event, resting noise
                         // never reaches the threshold.
@@ -739,11 +754,37 @@ impl EdgeRouter {
                         let faces_home = self.layout.neighbor_for_edge(from, edge)
                             == Some(self.local_screen);
                         if faces_home && !unarmed_entry {
-                            // Park on the saved local position
-                            // (jump-position semantics): a return never
-                            // lands mid-screen.
-                            let _ = self.restore_local(target);
-                            return RoutedEvent::ReturnHome { from, edge };
+                            // Brush-proof armed return (see RETURN_EDGE_PX):
+                            // accumulate same-edge overflow instead of
+                            // firing on 1px. A brush pins at the border
+                            // and keeps driving; a deliberate shove comes
+                            // home. Inside movement or an edge switch
+                            // restarts the run from zero.
+                            let overflow = match edge {
+                                Edge::Left => -next_x,
+                                Edge::Right => next_x - (i64::from(remote.width) - 1),
+                                Edge::Top => -next_y,
+                                Edge::Bottom => next_y - (i64::from(remote.height) - 1),
+                            }
+                            .max(0);
+                            if self.return_edge == Some(edge) {
+                                self.return_edge_accum += overflow;
+                            } else {
+                                self.return_edge = Some(edge);
+                                self.return_edge_accum = overflow;
+                            }
+                            if self.return_edge_accum >= RETURN_EDGE_PX {
+                                // Park on the saved local position
+                                // (jump-position semantics): a return never
+                                // lands mid-screen.
+                                let _ = self.restore_local(target);
+                                return RoutedEvent::ReturnHome { from, edge };
+                            }
+                            self.cursor_x =
+                                next_x.clamp(0, i64::from(remote.width) - 1) as u32;
+                            self.cursor_y =
+                                next_y.clamp(0, i64::from(remote.height) - 1) as u32;
+                            return RoutedEvent::Forward { target, event };
                         }
                         if faces_home {
                             // Escape hatch (see RETURN_PUSH_PX): sustained
@@ -765,6 +806,8 @@ impl EdgeRouter {
                             }
                         } else {
                             self.return_accum = 0;
+                            self.return_edge = None;
+                            self.return_edge_accum = 0;
                         }
                         // Any other edge (or the still-disarmed entry):
                         // stop at the border and keep driving. Local
@@ -892,6 +935,8 @@ impl EdgeRouter {
         self.entry_edge = Some(edge.opposite());
         self.return_armed = false;
         self.return_accum = 0;
+        self.return_edge = None;
+        self.return_edge_accum = 0;
         // Preserve the overshoot as a relative event. The receiver can use
         // the handoff coordinates to establish its own logical pointer and
         // then apply this small remainder.
@@ -966,6 +1011,8 @@ impl EdgeRouter {
         self.return_armed = false;
         self.push_edge = None;
         self.push_accum = 0;
+        self.return_edge = None;
+        self.return_edge_accum = 0;
         Ok(())
     }
 
@@ -995,6 +1042,8 @@ impl EdgeRouter {
         self.return_armed = false;
         self.push_edge = None;
         self.push_accum = 0;
+        self.return_edge = None;
+        self.return_edge_accum = 0;
         Ok((self.cursor_x, self.cursor_y))
     }
 
@@ -1017,6 +1066,8 @@ impl EdgeRouter {
             self.return_armed = false;
             self.push_edge = None;
             self.push_accum = 0;
+            self.return_edge = None;
+            self.return_edge_accum = 0;
             return Ok(false);
         }
         if self.current_screen == self.local_screen {
@@ -1028,9 +1079,12 @@ impl EdgeRouter {
         self.cursor_y = y.min(target_screen.height - 1);
         self.active_remote = Some(target);
         // Peer-placed drive: no entry edge is known, so arm the return —
-        // any home-facing overflow comes home; anything else clamps.
+        // any sustained home-facing shove comes home (see RETURN_EDGE_PX);
+        // anything else clamps. Brushes can never fire it.
         self.entry_edge = None;
         self.return_armed = true;
+        self.return_edge = None;
+        self.return_edge_accum = 0;
         Ok(true)
     }
 }
@@ -1064,9 +1118,22 @@ pub const EDGE_PUSH_PX: i64 = 24;
 /// clamp forever and the drive wedges with the cursor visible (the whole
 /// freeze class). Net accumulation (not a streak): jitter self-cancels
 /// across inside/outside alternation, while a deliberate shove crosses
-/// the threshold in a few events. Armed returns stay instant; this only
-/// adds the escape hatch the disarmed state was missing.
+/// the threshold in a few events. Armed returns use the shallower
+/// RETURN_EDGE_PX streak instead; this only adds the escape hatch the
+/// disarmed state was missing.
 pub const RETURN_PUSH_PX: i64 = 64;
+
+/// Armed-return brush guard (px of same-edge overflow streak): an ARMED
+/// drive returns only once outward pressure on the home-facing edge
+/// accumulates to this depth. Entries land ON the edge, so all early
+/// roaming happens right beside it — a 1px rule turns every roam into a
+/// snap-back cycle (push, cross, brush, die, re-push: the sticky-entry
+/// feel). Brushes pin at the border and keep driving; one deliberate
+/// shove (or a slow sustained push, which saves up across events)
+/// comes home. Inside movement or an edge switch restarts the streak,
+/// so oscillation can never save up for a phantom return. Unarmed
+/// drives keep the deeper RETURN_PUSH_PX escape hatch instead.
+const RETURN_EDGE_PX: i64 = 12;
 
 /// A truth re-pin that moves the cursor further than this keeps the
 /// position but restarts the push run (the old position was phantom);
@@ -1780,6 +1847,64 @@ mod tests {
         let back = router.route(InputEvent::MouseMove { dx: -100, dy: 0 });
         assert!(matches!(
             back,
+            RoutedEvent::ReturnHome { edge: Edge::Left, .. }
+        ));
+        assert_eq!(router.active_remote(), None);
+    }
+
+    #[test]
+    fn armed_boundary_brushes_clamp_until_a_sustained_shove() {
+        // Entries land ON the edge, so early roaming happens right
+        // beside it: a small brush after settling must not end the drive
+        // (the push/cross/brush/die/re-push sticky-entry cycle), while a
+        // sustained shove still comes home.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        // Peer on the right: enter at its left edge (x=0), entry edge Left.
+        let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        // Settle 48px inside: armed.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 48, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        // Brush the boundary (3px overflow) with inside resets between:
+        // every one clamps at x=0 and the drive survives.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -28, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        for _ in 0..5 {
+            assert!(matches!(
+                router.route(InputEvent::MouseMove { dx: -23, dy: 0 }),
+                RoutedEvent::Forward { .. }
+            ));
+            assert!(matches!(
+                router.route(InputEvent::MouseMove { dx: 20, dy: 0 }),
+                RoutedEvent::Forward { .. }
+            ));
+            assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
+        }
+        // Fresh run from the boundary: 5px + 5px still clamps (10 < 12),
+        // the third shove (15 >= 12) comes home.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 30, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -50, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -5, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -5, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        let home = router.route(InputEvent::MouseMove { dx: -5, dy: 0 });
+        assert!(matches!(
+            home,
             RoutedEvent::ReturnHome { edge: Edge::Left, .. }
         ));
         assert_eq!(router.active_remote(), None);
