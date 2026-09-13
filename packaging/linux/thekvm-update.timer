@@ -1,0 +1,10 @@
+[Unit]
+Description=TheKVM daily update poll
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

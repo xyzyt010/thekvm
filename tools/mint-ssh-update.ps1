@@ -149,58 +149,10 @@ else { Invoke-MintSsh -Target $mint -Key $key -RemoteCommand ($installScript -re
 
 if ($AutoUpdate) {
   Write-Step "Installing daily auto-update timer on Mint"
-  $watcher = @'
-set -eu
-cat <<'EOF' | sudo tee /usr/local/bin/thekvm-auto-update >/dev/null
-#!/bin/sh
-# TheKVM unattended updater: rebuild+restart only when GitHub HEAD moved.
-set -eu
-REPO="__REPO__"
-BRANCH="__BRANCH__"
-CHECKOUT="/home/__DESKTOP__/thekvm"
-STAMP="/var/lib/thekvm-built-commit"
-LOG="/var/log/thekvm-auto-update.log"
-export PATH="/home/__DESKTOP__/.cargo/bin:/usr/bin:/bin"
-REMOTE="$(git ls-remote "$REPO" "$BRANCH" | awk '{print $1}')"
-BUILT="$(cat "$STAMP" 2>/dev/null || echo none)"
-if [ "$REMOTE" = "$BUILT" ]; then exit 0; fi
-{
-  echo "$(date -u): $BUILT -> $REMOTE"
-  git -C "$CHECKOUT" fetch --prune origin
-  git -C "$CHECKOUT" checkout "$BRANCH"
-  git -C "$CHECKOUT" pull --ff-only origin "$BRANCH"
-  sudo -u __DESKTOP__ env PATH="$PATH" sh -c "cd \"$CHECKOUT\" && cargo build --release -p kvm-daemon -p kvm-ui"
-  sh "$CHECKOUT/packaging/linux/install.sh --desktop-user __DESKTOP__ --no-dependencies"
-  systemctl restart thekvmd
-  echo "$REMOTE" > "$STAMP"
-  echo "$(date -u): updated ok"
-} >>"$LOG" 2>&1
-EOF
-sudo chmod 0755 /usr/local/bin/thekvm-auto-update
-cat <<'EOF' | sudo tee /etc/systemd/system/thekvm-update.service >/dev/null
-[Unit]
-Description=TheKVM unattended updater (GitHub HEAD poll)
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/thekvm-auto-update
-EOF
-cat <<'EOF' | sudo tee /etc/systemd/system/thekvm-update.timer >/dev/null
-[Unit]
-Description=TheKVM daily update poll
-[Timer]
-OnCalendar=daily
-RandomizedDelaySec=30m
-Persistent=true
-[Install]
-WantedBy=timers.target
-EOF
-sudo systemctl daemon-reload
-sudo systemctl enable --now thekvm-update.timer
-git -C ~/thekvm rev-parse HEAD | sudo tee /var/lib/thekvm-built-commit >/dev/null
-systemctl list-timers thekvm-update.timer --no-pager
-'@ -replace '__REPO__', $RepoUrl -replace '__BRANCH__', $Branch -replace '__DESKTOP__', $DesktopUser
+  # Everything installs from the Mint checkout (no quoting-sensitive
+  # heredocs over SSH): the watcher from tools/, the units from
+  # packaging/linux/ (see those files for what runs daily at ~04:00).
+  $watcher = 'sudo -n install -m 0755 ~/thekvm/tools/thekvm-auto-update.sh /usr/local/bin/thekvm-auto-update 2>/dev/null || sudo install -m 0755 ~/thekvm/tools/thekvm-auto-update.sh /usr/local/bin/thekvm-auto-update; sudo install -m 0644 ~/thekvm/packaging/linux/thekvm-update.service ~/thekvm/packaging/linux/thekvm-update.timer /etc/systemd/system/; sudo systemctl daemon-reload; sudo systemctl enable --now thekvm-update.timer; git -C ~/thekvm rev-parse HEAD | sudo tee /var/lib/thekvm-built-commit >/dev/null; systemctl list-timers thekvm-update.timer --no-pager'
   if ($needsSudo) { Invoke-MintSsh -Target $mint -Key $key -NeedTty -RemoteCommand $watcher }
   else { Invoke-MintSsh -Target $mint -Key $key -RemoteCommand ($watcher -replace 'sudo ', 'sudo -n ') }
 }
