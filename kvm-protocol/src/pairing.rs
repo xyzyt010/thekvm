@@ -622,7 +622,21 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 #[cfg(unix)]
 fn harden_private_key(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    // Strip everything outside owner read/write, except an existing
+    // group-read bit: the Linux installer deliberately grants group read
+    // so the enrolled desktop user (thekvm group) can run
+    // identity-loading commands, and forcing exactly 0600 here both
+    // fought that grant (the owner re-stripped it on every load) and
+    // hard-failed group-member loads with a bare EPERM (only the owner
+    // may chmod). Skipping the syscall when already clean is what lets
+    // group readers load at all. World/group-write/other access is what
+    // must never survive on a private key.
+    let current = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    let hardened = 0o600 | (current & 0o040);
+    if hardened != current {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(hardened))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -718,12 +732,22 @@ mod unix_tests {
         let root = std::env::temp_dir().join(format!("thekvm-key-permissions-{nonce}"));
         let identity = Identity::load_or_create(&root).unwrap();
         let key_path = root.join("identity.key");
+        // World-readable legacy state loses other-access but keeps the
+        // installer-granted group read (see harden_private_key).
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let loaded = Identity::load_or_create(&root).unwrap();
         assert_eq!(loaded.fingerprint, identity.fingerprint);
         assert_eq!(
-            std::fs::metadata(key_path).unwrap().permissions().mode() & 0o777,
-            0o600
+            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        // An already-clean key performs no chmod at all, so group-member
+        // loads (which may not chmod) succeed.
+        let reloaded = Identity::load_or_create(&root).unwrap();
+        assert_eq!(reloaded.fingerprint, identity.fingerprint);
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o640
         );
         let _ = std::fs::remove_dir_all(root);
     }
