@@ -333,6 +333,12 @@ impl X11Capture {
         let screen_info = setup.roots.get(screen).ok_or_else(|| {
             PlatformError::Capture("X11 screen does not exist".into())
         })?;
+        // Copy out: the setup borrow must end before `connection`
+        // moves into Self below.
+        let screen_dims = (
+            screen_info.width_in_pixels,
+            screen_info.height_in_pixels,
+        );
         // Invisible grab window (see the field): input-only,
         // override-redirect, mapped but zero pixels on screen.
         let grab_window = connection
@@ -373,10 +379,7 @@ impl X11Capture {
             last_source_refresh: std::time::Instant::now(),
             scroll_axes,
             scroll_bank: HashMap::new(),
-            screen_dims: (
-                screen_info.width_in_pixels,
-                screen_info.height_in_pixels,
-            ),
+            screen_dims,
             cage_quiet: 0,
             xfixes_cursor,
             cursor_hidden: false,
