@@ -4297,11 +4297,26 @@ async fn handle_connection(
                                 // tracked and visible agree by construction
                                 // and phantom hop-ends vanish. Best-effort:
                                 // unheard helpers stay relative (today).
+                                //
+                                // Dims MUST be truthful (sidecar/measured),
+                                // never the configured fallback: the helper
+                                // engages absolute only on exact equality
+                                // with its physical primary, and a fallback
+                                // announce would silently disarm it (or
+                                // worse, map onto wrong pixels). The warp
+                                // above keeps its own mapping untouched.
                                 #[cfg(target_os = "windows")]
-                                injector.set_target_size(
-                                    target_geometry.width,
-                                    target_geometry.height,
-                                );
+                                {
+                                    let (size, source) =
+                                        truthful_target_size(&config.layout, target);
+                                    tracing::info!(
+                                        width = size.0,
+                                        height = size.1,
+                                        source,
+                                        "announcing drive target size to helpers",
+                                    );
+                                    injector.set_target_size(size.0, size.1);
+                                }
                                 // Proves entry exactness per crossing: the OS
                                 // cursor was just placed here, so a later
                                 // "exited mid-screen" report can be checked
@@ -4455,6 +4470,7 @@ async fn handle_connection(
                     helper_absolute = receipts.absolute,
                     helper_relative = receipts.relative,
                     helper_versions = ?receipts.versions,
+                    helper_absolute_detail = %receipts.absolute_detail,
                     "helper injection receipts",
                 );
             }
@@ -5617,6 +5633,36 @@ fn pick_geometry(
         });
     }
     configured
+}
+
+/// Truthful dims for ONE layout screen (see truthful_local_geometry),
+/// for the absolute-motion announce: sidecar, then a live measure, then
+/// the configured fallback. Returns the source tag for the journal — a
+/// fallback announce that disagrees with the helper's physical primary
+/// silently disarms absolute motion, and the tag names it instead of a
+/// mystery. (0,0) disables (the helper treats degenerate targets as
+/// relative), never maps.
+fn truthful_target_size(
+    layout: &kvm_core::Layout,
+    screen_id: ScreenId,
+) -> ((u32, u32), &'static str) {
+    let sidecar = std::fs::read_to_string(data_dir().join(GEOMETRY_SIDECAR))
+        .ok()
+        .and_then(|text| parse_geometry_sidecar(&text));
+    if let Some((width, height)) = sidecar {
+        return ((width, height), "sidecar");
+    }
+    let measured = kvm_platform::capture::screen_size()
+        .ok()
+        .flatten()
+        .filter(|(width, height)| *width != 0 && *height != 0);
+    if let Some((width, height)) = measured {
+        return ((width, height), "measured");
+    }
+    if let Some(geometry) = screen_geometry_for(layout, screen_id) {
+        return ((geometry.width, geometry.height), "configured-fallback");
+    }
+    ((0, 0), "unknown")
 }
 
 /// Truthful local geometry for advertisements (Deskflow getShape parity).

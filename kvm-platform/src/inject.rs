@@ -624,6 +624,33 @@ mod win32_inject {
             })
     }
 
+    /// Pure verdict behind absolute_detail (machine state injected for
+    /// tests): no target, multi-monitor, unknown metrics, dims
+    /// mismatch, or armed. Mirrors absolute_eligible exactly — keep the
+    /// two in sync when either changes.
+    fn describe_absolute(
+        target: Option<(u32, u32)>,
+        single: bool,
+        primary: Option<(i32, i32)>,
+    ) -> String {
+        let Some((width, height)) = target else {
+            return "relative: no target announced".to_owned();
+        };
+        if !single {
+            return "relative: multi-monitor".to_owned();
+        }
+        let Some((primary_width, primary_height)) = primary else {
+            return "relative: primary metrics unknown".to_owned();
+        };
+        if u64::from(width) == primary_width as u64
+            && u64::from(height) == primary_height as u64
+        {
+            format!("absolute armed {width}x{height}")
+        } else {
+            format!("relative: primary {primary_width}x{primary_height} != target {width}x{height}")
+        }
+    }
+
     impl Win32Injector {
         pub fn create() -> Result<Self, PlatformError> {
             Ok(Self {
@@ -658,6 +685,18 @@ mod win32_inject {
                 .lock()
                 .map(|guard| guard.last_absolute)
                 .unwrap_or(false)
+        }
+
+        /// Human-readable absolute-motion verdict for the journal (via
+        /// the helper receipts): names WHY motion rides absolute or
+        /// relative on this machine — the one line that settles
+        /// dims/DPI/multi-monitor questions without remote debugging.
+        pub fn absolute_detail(&self) -> String {
+            let (target, single, primary) = match self.absolute.lock() {
+                Ok(guard) => (guard.target, single_monitor(), primary_dims()),
+                Err(_) => (None, false, None),
+            };
+            describe_absolute(target, single, primary)
         }
 
         /// Build the motion INPUT: absolute when armed and exact (see
@@ -1112,6 +1151,32 @@ mod win32_inject {
                 mouse.dwFlags,
                 super::MOUSEEVENTF_MOVE,
                 "relative motion must not carry ABSOLUTE"
+            );
+        }
+
+        #[test]
+        fn describe_absolute_names_every_verdict() {
+            // The journal line operators read: each shape names its cause.
+            use super::describe_absolute;
+            assert_eq!(
+                describe_absolute(None, true, Some((1536, 960))),
+                "relative: no target announced"
+            );
+            assert_eq!(
+                describe_absolute(Some((1536, 960)), false, Some((1536, 960))),
+                "relative: multi-monitor"
+            );
+            assert_eq!(
+                describe_absolute(Some((1536, 960)), true, None),
+                "relative: primary metrics unknown"
+            );
+            assert_eq!(
+                describe_absolute(Some((1536, 960)), true, Some((1229, 768))),
+                "relative: primary 1229x768 != target 1536x960"
+            );
+            assert_eq!(
+                describe_absolute(Some((1536, 960)), true, Some((1536, 960))),
+                "absolute armed 1536x960"
             );
         }
 

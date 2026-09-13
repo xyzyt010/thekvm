@@ -59,6 +59,8 @@ enum HelperMessage {
         relative: u64,
         #[serde(default)]
         version: String,
+        #[serde(default)]
+        absolute_detail: String,
     },
 }
 
@@ -75,6 +77,7 @@ pub struct InjectionReceipts {
     pub absolute: u64,
     pub relative: u64,
     pub versions: Vec<String>,
+    pub absolute_detail: String,
 }
 
 /// The service-side fan-out connection to the interactive helpers.
@@ -276,6 +279,7 @@ fn collect_receipts(streams: &mut Vec<TcpStream>) -> InjectionReceipts {
                 absolute,
                 relative,
                 version,
+                absolute_detail,
             }) => {
                 receipts.answered += 1;
                 receipts.ok += ok;
@@ -288,6 +292,9 @@ fn collect_receipts(streams: &mut Vec<TcpStream>) -> InjectionReceipts {
                 }
                 if !version.is_empty() && !receipts.versions.contains(&version) {
                     receipts.versions.push(version);
+                }
+                if !absolute_detail.is_empty() {
+                    receipts.absolute_detail = absolute_detail;
                 }
                 true
             }
@@ -588,6 +595,7 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
     if !matches!(desktop, "winsta0\\winlogon" | "winsta0\\default") {
         bail!("unsupported helper desktop");
     }
+    claim_physical_pixels();
 
     attach_to_desktop(desktop).context("attach helper thread to target desktop")?;
 
@@ -685,6 +693,7 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                     absolute: RECEIPTS.absolute(),
                     relative: RECEIPTS.relative(),
                     version: env!("CARGO_PKG_VERSION").to_owned(),
+                    absolute_detail: injector.absolute_detail(),
                 });
                 // Take-then-reset keeps each report to exactly one session.
                 // Reset even if the reply itself fails: a stale count in
@@ -755,6 +764,24 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
             HelperMessage::WarpDone { .. } | HelperMessage::InputReceipt { .. } => {}
             HelperMessage::SetExclusive(_) => {}
         }
+    }
+}
+
+/// Read physical (not DPI-scaled) metrics in this helper. A DPI-unaware
+/// process reads SCALED GetSystemMetrics on zoomed displays, which can
+/// never equal the drive target and silently pins motion to relative —
+/// while cursor/hook APIs stay physical either way, so awareness
+/// changes nothing else. Fail-open: without it the eligibility check
+/// simply falls back to relative, today's behavior.
+#[cfg(target_os = "windows")]
+fn claim_physical_pixels() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    if let Err(error) =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    {
+        tracing::debug!(?error, "DPI awareness unavailable; metrics may be scaled");
     }
 }
 
@@ -1251,6 +1278,7 @@ mod tests {
             absolute,
             relative,
             version: "9.9.9-test".to_owned(),
+            absolute_detail: "test-detail".to_owned(),
         })
         .unwrap();
         write_ipc_frame(helper_side, &reply).unwrap();
@@ -1276,6 +1304,7 @@ mod tests {
         assert_eq!(receipts.absolute, 100);
         assert_eq!(receipts.relative, 20);
         assert_eq!(receipts.versions, vec!["9.9.9-test".to_owned()]);
+        assert_eq!(receipts.absolute_detail, "test-detail");
     }
 
     #[test]
@@ -1310,6 +1339,7 @@ mod tests {
             absolute: 5,
             relative: 2,
             version: "v".to_owned(),
+            absolute_detail: "d".to_owned(),
         })
         .unwrap();
         assert!(matches!(
