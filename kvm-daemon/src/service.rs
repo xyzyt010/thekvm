@@ -1952,11 +1952,17 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     // Sender hold snapshot alongside the channel census: the
                     // mystery-freeze triage line — a stuck drive shows here
                     // as drive_active with an ancient peer heartbeat.
-                    // peer_progress_age_secs: -1 = no Pong yet this episode
-                    // (grace / legacy peer).
-                    let peer_progress_age_secs = last_peer_progress
-                        .map(|when| when.elapsed().as_secs() as i64)
-                        .unwrap_or(-1);
+                    // peer_progress_age_secs: -1 = no active drive, or no
+                    // Pong yet this episode (grace / legacy peer). Gating
+                    // on the active drive keeps an idle link from
+                    // reporting a centuries-old heartbeat as current.
+                    let peer_progress_age_secs = if active.is_none() {
+                        -1
+                    } else {
+                        last_peer_progress
+                            .map(|when| when.elapsed().as_secs() as i64)
+                            .unwrap_or(-1)
+                    };
                     tracing::info!(
                         hook_key,
                         hook_button,

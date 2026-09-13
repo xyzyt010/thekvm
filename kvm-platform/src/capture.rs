@@ -1108,6 +1108,56 @@ mod win32_hooks {
         PAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Tip-switch state for one finger collection. The MS PTP spec
+    /// exposes Tip (0x42) as a digitizer-page BUTTON, so HidP_GetUsages
+    /// is the correct probe: HidP_GetUsageValue only answers value
+    /// caps and fails on buttons, which parsed as "no contacts" on
+    /// every report and silently held ptp_scroll at zero while the
+    /// channel was armed and buffers arrived. A value-style fallback
+    /// covers descriptors that expose tip as a value instead.
+    fn ptp_tip_down(
+        preparsed: windows::Win32::Devices::HumanInterfaceDevice::PHIDP_PREPARSED_DATA,
+        collection: u16,
+        report: &mut [u8],
+    ) -> bool {
+        use windows::Win32::Devices::HumanInterfaceDevice as hid;
+        let mut usages = [0u16; 16];
+        let mut usage_len = usages.len() as u32;
+        if unsafe {
+            hid::HidP_GetUsages(
+                hid::HidP_Input,
+                PTP_USAGE_PAGE,
+                collection,
+                usages.as_mut_ptr(),
+                &mut usage_len,
+                preparsed,
+                report,
+            )
+        }
+        .is_ok()
+            && usages
+                .iter()
+                .take(usage_len as usize)
+                .any(|usage| *usage == PTP_USAGE_TIP)
+        {
+            return true;
+        }
+        let mut tip = 0u32;
+        unsafe {
+            hid::HidP_GetUsageValue(
+                hid::HidP_Input,
+                PTP_USAGE_PAGE,
+                collection,
+                PTP_USAGE_TIP,
+                &mut tip,
+                preparsed,
+                report,
+            )
+        }
+        .is_ok()
+            && tip != 0
+    }
+
     /// Two-finger pan → scroll accumulator. Pure apart from construction,
     /// so the gesture math is unit-tested without HID hardware.
     #[derive(Debug)]
@@ -1241,8 +1291,10 @@ mod win32_hooks {
                     continue;
                 }
                 let mut info_size = std::mem::size_of::<raw::RID_DEVICE_INFO>() as u32;
-                let mut info = raw::RID_DEVICE_INFO::default();
-                info.cbSize = info_size;
+                let mut info = raw::RID_DEVICE_INFO {
+                    cbSize: info_size,
+                    ..Default::default()
+                };
                 if unsafe {
                     raw::GetRawInputDeviceInfoW(
                         entry.hDevice,
@@ -1543,6 +1595,10 @@ mod win32_hooks {
     /// accumulator, forward surviving scroll on the shared dedup path.
     fn handle_ptp_input(buffer: &[u8]) {
         use windows::Win32::Devices::HumanInterfaceDevice as hid;
+        // Delivery-without-contacts watchdog state (see the empty-contacts
+        // branch below): buffers arriving while parsing never succeeded.
+        static PTP_EVER_PARSED: AtomicBool = AtomicBool::new(false);
+        static PTP_EMPTY_BEFORE_PARSE: AtomicU64 = AtomicU64::new(0);
         let header_size = std::mem::size_of::<RAWINPUTHEADER>();
         if buffer.len() < header_size + 8 {
             return;
@@ -1574,22 +1630,13 @@ mod win32_hooks {
                 tracing::info!("precision-touchpad first HID buffer delivered");
             });
             let report = &buffer[at..at + size_hid];
+            // HidP_GetUsages (the tip-button probe below) requires a
+            // mutable report buffer: one copy serves every finger
+            // collection in this report.
+            let mut mutable_report = report.to_vec();
             let mut contacts = Vec::with_capacity(fingers.len().min(10));
             for collection in fingers.iter().take(10) {
-                let mut tip = 0u32;
-                let tip_ok = unsafe {
-                    hid::HidP_GetUsageValue(
-                        hid::HidP_Input,
-                        PTP_USAGE_PAGE,
-                        *collection,
-                        PTP_USAGE_TIP,
-                        &mut tip,
-                        preparsed,
-                        report,
-                    )
-                }
-                .is_ok();
-                if !tip_ok || tip == 0 {
+                if !ptp_tip_down(preparsed, *collection, &mut mutable_report) {
                     continue;
                 }
                 let mut x = 0u32;
@@ -1625,6 +1672,18 @@ mod win32_hooks {
             if contacts.is_empty() {
                 // All fingers lifted: reset the anchor, no scroll.
                 ptp_pan_slot().feed(&[]);
+                // Delivery-without-contacts watchdog: buffers arrive but
+                // no contact ever parses (wrong collections or tip
+                // probe). Fires once, only while parsing never
+                // succeeded, so the next miss is one grep away instead
+                // of another silent zero-scroll session.
+                if !PTP_EVER_PARSED.load(Ordering::Relaxed)
+                    && PTP_EMPTY_BEFORE_PARSE.fetch_add(1, Ordering::Relaxed) == 600
+                {
+                    tracing::warn!(
+                        "precision-touchpad HID reports arrive but no contacts parse; tip/collection probe may mismatch this descriptor"
+                    );
+                }
                 continue;
             }
             // Parse proof (once per process): buffers arrive but TIP/X/Y
@@ -1632,6 +1691,7 @@ mod win32_hooks {
             // that held ptp_scroll at zero while "armed").
             static FIRST_CONTACTS_SEEN: std::sync::Once = std::sync::Once::new();
             FIRST_CONTACTS_SEEN.call_once(|| {
+                PTP_EVER_PARSED.store(true, Ordering::Relaxed);
                 tracing::info!(contacts = contacts.len(), "precision-touchpad first parsed contacts");
             });
             let now = std::time::Instant::now();

@@ -32,6 +32,11 @@ pub struct X11Capture {
     /// set_exclusive): the XI2 active grab where servers accept it, else
     /// Deskflow-style core pointer+keyboard grabs.
     grab_kind: GrabKind,
+    /// XI device selectors this backend actually holds while
+    /// grab_kind is Xi (see xi_grab_sweep): Mint's Xorg answers
+    /// XIUngrabDevice for never-held abstract selectors with BadValue,
+    /// so release must target exactly these, never the full sweep.
+    grab_held: Vec<u16>,
     motion_x: f64,
     motion_y: f64,
     /// Invisible override-redirect input-only window that owns grabbed
@@ -371,6 +376,7 @@ impl X11Capture {
             root,
             exclusive: false,
             grab_kind: GrabKind::None,
+            grab_held: Vec::new(),
             motion_x: 0.0,
             motion_y: 0.0,
             grab_window,
@@ -696,7 +702,10 @@ impl CaptureBackend for X11Capture {
             // resort, with the recenter cage keeping their
             // position-derived deltas unbounded (see maybe_recenter_cage).
             match xi_grab_sweep(&self.connection, self.grab_window) {
-                Ok(()) => self.grab_kind = GrabKind::Xi,
+                Ok(held) => {
+                    self.grab_held = held;
+                    self.grab_kind = GrabKind::Xi;
+                }
                 Err(xi_error) => {
                     tracing::info!(%xi_error, "XIGrabDevice refused; falling back to core pointer+keyboard grab");
                     // A failed acquire holds nothing: clear a stale record
@@ -730,8 +739,18 @@ impl CaptureBackend for X11Capture {
             // hold still releases only when actually held.
             let previous = self.grab_kind;
             self.grab_kind = GrabKind::None;
+            // Release exactly what the sweep holds (see grab_held):
+            // Mint's Xorg fails XIUngrabDevice for never-held abstract
+            // selectors, and the old full-sweep release turned that
+            // harmless refusal into a failed release plus a backend
+            // rebuild (a blind window) on every drive end. An empty
+            // held set with an Xi kind cannot happen through engage;
+            // sweep then, exactly like before, so a hold is never
+            // stranded by an empty record.
+            let held = std::mem::take(&mut self.grab_held);
             let released = match previous {
-                GrabKind::Xi => xi_ungrab_all(&self.connection),
+                GrabKind::Xi if !held.is_empty() => xi_ungrab_selectors(&self.connection, &held),
+                GrabKind::Xi => xi_ungrab_selectors(&self.connection, &XI_UNGRAB_SWEEP),
                 GrabKind::Core => core_ungrab(&self.connection),
                 GrabKind::None => Ok(()),
             };
@@ -842,17 +861,20 @@ fn xi_grab(
     Ok(())
 }
 
-/// Try every XI device selector in order, returning on the first
-/// armed hold. A partial concrete-master pair (pointer grabbed,
-/// keyboard refused or vice versa) is unwound before the next
+/// Try every XI device selector in order, returning the held selectors
+/// on the first armed hold. A partial concrete-master pair (pointer
+/// grabbed, keyboard refused or vice versa) is unwound before the next
 /// attempt: a half hold would leak local keys while driving. Errors
 /// join into one message so the journal names every refused
 /// selector, not just the last.
-fn xi_grab_sweep(connection: &RustConnection, grab_window: xproto::Window) -> Result<(), PlatformError> {
+fn xi_grab_sweep(
+    connection: &RustConnection,
+    grab_window: xproto::Window,
+) -> Result<Vec<u16>, PlatformError> {
     let mut refusals = Vec::new();
     for deviceid in XI_GRAB_SINGLETONS {
         match xi_grab(connection, grab_window, deviceid) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(vec![deviceid]),
             Err(error) => {
                 tracing::debug!(deviceid, %error, "XI grab selector refused");
                 refusals.push(format!("{deviceid}: {error}"));
@@ -865,7 +887,7 @@ fn xi_grab_sweep(connection: &RustConnection, grab_window: xproto::Window) -> Re
         .map(|deviceid| xi_grab(connection, grab_window, deviceid))
         .collect::<Vec<_>>();
     if pair.iter().all(|result| result.is_ok()) {
-        return Ok(());
+        return Ok(XI_GRAB_MASTER_PAIR.to_vec());
     }
     for result in &pair {
         if let Err(error) = result {
@@ -873,18 +895,22 @@ fn xi_grab_sweep(connection: &RustConnection, grab_window: xproto::Window) -> Re
             refusals.push(format!("master-pair: {error}"));
         }
     }
-    let _ = xi_ungrab_all(connection);
+    let _ = xi_ungrab_selectors(connection, &XI_UNGRAB_SWEEP);
     Err(PlatformError::Capture(format!(
         "XInput2 device grab was rejected ({})",
         refusals.join("; ")
     )))
 }
-/// Release every XI selector we may hold (see XI_UNGRAB_SWEEP):
+/// Release exactly the XI selectors a sweep holds (see grab_held):
 /// best-effort per selector, errors collected into one message so a
-/// half-released hold can never strand suppression silently.
-fn xi_ungrab_all(connection: &RustConnection) -> Result<(), PlatformError> {
+/// half-released hold can never strand suppression silently. Callers
+/// pass only held selectors — never the full sweep — because servers
+/// like Mint's Xorg refuse XIUngrabDevice for never-held selectors
+/// and that refusal must not fail the release of the held ones.
+fn xi_ungrab_selectors(connection: &RustConnection, held: &[u16]) -> Result<(), PlatformError> {
     let mut failures = Vec::new();
-    for deviceid in XI_UNGRAB_SWEEP {
+    for deviceid in held {
+        let deviceid = *deviceid;
         if let Err(error) = connection
             .xinput_xi_ungrab_device(0u32, deviceid)
             .map_err(|error| format!("XInput2 ungrab send: {error:?}"))

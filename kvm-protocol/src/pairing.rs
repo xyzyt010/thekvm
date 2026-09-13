@@ -162,7 +162,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 /// a truncated pipe fails here, never as a mystery TLS error later.
 pub fn hex_decode(hex: &str) -> std::io::Result<Vec<u8>> {
     let hex = hex.trim();
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "identity hex has an odd length",

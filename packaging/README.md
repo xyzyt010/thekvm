@@ -1,5 +1,28 @@
 # Deployment templates
 
+Source of truth (download, issues, history):
+https://github.com/xyzyt010/thekvm
+
+## Updating a Linux Mint machine over SSH
+
+From Windows PowerShell, against the Mint host (default `hs01@192.168.1.7`,
+extra candidates are probed in order, so a changed DHCP lease only needs
+`-MintHosts` with the new address):
+
+```powershell
+powershell -File tools/mint-ssh-update.ps1
+powershell -File tools/mint-ssh-update.ps1 -MintHosts 192.168.1.9 -AutoUpdate
+```
+
+The script clones/pulls the GitHub repo on Mint, installs the build
+dependencies, runs `cargo build --release`, reinstalls through
+`packaging/linux/install.sh` (peers and config in `/var/lib/thekvm` are
+preserved), restarts `thekvmd`, and verifies `status`. `-AutoUpdate`
+additionally installs a daily systemd timer on Mint that rebuilds and
+restarts only when the GitHub HEAD moved. Mint sudo still asks for the
+user password once unless scoped `NOPASSWD` is configured; see the
+script help for the exact sudoers line.
+
 The files in this directory include a small Linux installer and platform
 service templates for the first privileged receiver deployment. They are not
 distribution packages: review the service account, device policy, firewall,
