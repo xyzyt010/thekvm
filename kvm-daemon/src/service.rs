@@ -2754,14 +2754,18 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         }
     }
     let clipboard_enabled = capabilities.clipboard_enabled;
+    // The session IS with this peer (fingerprint verified at dial), so
+    // its Hello advertisement IS this target's geometry: match by
+    // session, never by screen number. Local numbers never agree
+    // across machines (both sides number themselves 2 here), so the
+    // old screen_id filter dropped every advertisement and every wire
+    // point flew blind (wire=None fleet-wide, entries clamped wrong).
     let (target_name, target_x, target_y, wire_geometry) = handoff_wire_target(
         router,
         target,
         target_x,
         target_y,
-        capabilities
-            .screen_geometry
-            .filter(|geometry| geometry.screen_id == target.0),
+        capabilities.screen_geometry,
     )?;
     write_frame(
         &mut send,
@@ -2877,14 +2881,15 @@ async fn resume_parked_session(
     let mut session = session;
     while session.signals.try_recv().is_ok() {}
     session.event_barrier = event_barrier;
+    // Same session-scoping as the fresh open above: the parked
+    // session's capabilities are this peer's advertisement (see
+    // above) — never screen-number filtered.
     let (target_name, target_x, target_y, wire_geometry) = handoff_wire_target(
         router,
         target,
         target_x,
         target_y,
-        session
-            .peer_geometry
-            .filter(|geometry| geometry.screen_id == target.0),
+        session.peer_geometry,
     )?;
     write_frame(
         &mut session.send,
@@ -4248,6 +4253,12 @@ async fn handle_connection(
             let mut motion_count = 0u64;
             let mut wheel_count = 0u64;
             let mut smooth_count = 0u64;
+            // Click/key flow proof: motion arriving while buttons never
+            // do is the whole "moves but won't click" freeze class, and
+            // until now no counter separated "never sent" from "dropped
+            // on receipt" for either.
+            let mut button_count = 0u64;
+            let mut key_count = 0u64;
             let mut applied_motion = AppliedMotion::default();
             // Receiver-side drop census: motion datagrams that arrived but
             // were discarded (duplicate sequence vs stale ordering). Logged
@@ -4295,6 +4306,8 @@ async fn handle_connection(
                                     InputEvent::MouseMove { .. } => motion_count += 1,
                                     InputEvent::Wheel(_) => wheel_count += 1,
                                     InputEvent::SmoothWheel { .. } => smooth_count += 1,
+                                    InputEvent::MouseButton { .. } => button_count += 1,
+                                    InputEvent::Key(_) => key_count += 1,
                                     _ => {}
                                 }
                                 if process_remote_input(
@@ -4475,6 +4488,8 @@ async fn handle_connection(
                             InputEvent::MouseMove { .. } => motion_count += 1,
                             InputEvent::Wheel(_) => wheel_count += 1,
                             InputEvent::SmoothWheel { .. } => smooth_count += 1,
+                            InputEvent::MouseButton { .. } => button_count += 1,
+                            InputEvent::Key(_) => key_count += 1,
                             _ => {}
                         }
                         if process_remote_input(
@@ -4588,6 +4603,8 @@ async fn handle_connection(
                 applied_sum_dy = applied_motion.sum_dy,
                 wheel = wheel_count,
                 smooth = smooth_count,
+                buttons = button_count,
+                keys = key_count,
                 dropped_duplicate,
                 dropped_stale,
                 datagrams_received,
@@ -4726,8 +4743,14 @@ async fn process_remote_input(
                 .screen(handoff.target)
                 .map(|screen| screen.name.clone())
                 .unwrap_or_default();
+            // The tracked point lives in the sender's space (see the
+            // terminal branch: remote_cursor integrates sender deltas),
+            // and this hop request carries it onward in that same space:
+            // attach the sender's advertisement as-is. The old
+            // screen-number filter compared the sender's self number
+            // against our local target number (never equal across
+            // machines) and dropped every advertisement (wire=None).
             let (target_x, target_y, screen_geometry) = match peer_screen_geometry
-                .filter(|geometry| geometry.screen_id == handoff.target.0)
             {
                 Some(peer_geometry) => {
                     let (x, y) = remap_position(

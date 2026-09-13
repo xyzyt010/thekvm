@@ -41,8 +41,18 @@ pub struct X11Capture {
     grab_window: xproto::Window,
     /// Last grabbed-core pointer position (root coords): relative steps
     /// derive from successive MotionNotify events. Reset on every grab
-    /// engage so a stale anchor can never teleport the cursor.
+    /// engage so a stale position can never teleport the cursor. Doubles
+    /// as the recenter-cage sensor (see maybe_recenter_cage).
     core_last: Option<(i16, i16)>,
+    /// Root pixel dims (measured once at creation): the recenter cage
+    /// and edge math work in these, never in fallback dims.
+    screen_dims: (u16, u16),
+    /// Swallowing a cage warp's echo (see maybe_recenter_cage): events
+    /// remaining to anchor-but-never-emit. A radius check would eat an
+    /// unbounded fling that starts right at the warp; a small count
+    /// swallows the warp echo plus in-flight pre-warp positions and
+    /// then resumes with a correct anchor either way.
+    cage_quiet: u8,
     /// Slave-device ids owned by our own uinput injector ("TheKVM Virtual
     /// Mouse/Keyboard"). Raw events carry only numeric source ids, so the
     /// set is resolved by device name and refreshed periodically: the
@@ -234,6 +244,30 @@ enum GrabKind {
     Core,
 }
 
+/// Recenter target when the grabbed-core cursor crowds an edge: the
+/// screen center, or None when comfortably inside. Pure for tests.
+/// Core MotionNotify deltas derive from successive POSITIONS, so once
+/// the (hidden, still-roaming) local cursor parks at an edge, further
+/// physical motion toward that edge reports identical coords — zero
+/// deltas — and the driven cursor pins at a phantom border mid-roam
+/// (the "cannot move beyond a certain line" stuck shape). Raw XI
+/// motion never pins (true device deltas), which is why only the Core
+/// hold needs this FPS-style cage.
+fn recenter_point_if_near_edge(last: (i16, i16), dims: (u16, u16), margin: i16) -> Option<(i16, i16)> {
+    let (width, height) = (dims.0 as i32, dims.1 as i32);
+    let (x, y) = (i32::from(last.0), i32::from(last.1));
+    let near = x < i32::from(margin)
+        || y < i32::from(margin)
+        || x > width.saturating_sub(i32::from(margin))
+        || y > height.saturating_sub(i32::from(margin));
+    near.then(|| {
+        (
+            (width / 2).clamp(0, i32::from(i16::MAX)) as i16,
+            (height / 2).clamp(0, i32::from(i16::MAX)) as i16,
+        )
+    })
+}
+
 impl X11Capture {
     pub fn create() -> Result<Self, PlatformError> {
         let (connection, screen) = x11rb::connect(None)
@@ -295,6 +329,10 @@ impl X11Capture {
             axes = scroll_axes.values().map(Vec::len).sum::<usize>(),
             "X11 smooth-scroll valuators resolved (trackpads without button emulation scroll through these)"
         );
+        let setup = connection.setup();
+        let screen_info = setup.roots.get(screen).ok_or_else(|| {
+            PlatformError::Capture("X11 screen does not exist".into())
+        })?;
         // Invisible grab window (see the field): input-only,
         // override-redirect, mapped but zero pixels on screen.
         let grab_window = connection
@@ -335,9 +373,62 @@ impl X11Capture {
             last_source_refresh: std::time::Instant::now(),
             scroll_axes,
             scroll_bank: HashMap::new(),
+            screen_dims: (
+                screen_info.width_in_pixels,
+                screen_info.height_in_pixels,
+            ),
+            cage_quiet: 0,
             xfixes_cursor,
             cursor_hidden: false,
         })
+    }
+
+    /// FPS-style recenter cage for the Core hold (see
+    /// recenter_point_if_near_edge): when the hidden local cursor
+    /// crowds an edge, warp it back to center, so position-derived
+    /// deltas never pin at a phantom border. The warp's own MotionNotify
+    /// (plus any in-flight pre-warp events) is swallowed by the quiet
+    /// count below — anchoring to the warp point directly would turn
+    /// those in-flight edge coords into a giant phantom fling. The
+    /// cursor is XFixes-hidden while driving, so the teleport is
+    /// invisible. Best-effort: a failed warp just retries next poll —
+    /// capture never dies for the cage.
+    fn maybe_recenter_cage(&mut self) {
+        const CAGE_MARGIN_PX: i16 = 64;
+        let Some(last) = self.core_last else {
+            return;
+        };
+        let Some(point) = recenter_point_if_near_edge(last, self.screen_dims, CAGE_MARGIN_PX)
+        else {
+            return;
+        };
+        let warped = self
+            .connection
+            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, point.0, point.1)
+            .map_err(|error| format!("cage warp send: {error}"))
+            .and_then(|cookie| {
+                cookie
+                    .check()
+                    .map_err(|error| format!("cage warp check: {error}"))
+            })
+            .and_then(|()| {
+                self.connection
+                    .flush()
+                    .map_err(|error| format!("cage warp flush: {error}"))
+            });
+        match warped {
+            Ok(()) => {
+                // Do NOT re-anchor here (see above): swallow the next
+                // few arrivals (warp echo + in-flight pre-warp edge
+                // positions) while the anchor keeps tracking, then
+                // resume jump-free either way.
+                self.cage_quiet = 3;
+                tracing::debug!(from = ?last, to = ?point, "core capture cage recentered the hidden cursor");
+            }
+            Err(error) => {
+                tracing::debug!(%error, "core capture cage warp failed; retrying next poll");
+            }
+        }
     }
 
     /// Hide the local pointer for the drive (see the engage path).
@@ -481,6 +572,17 @@ impl X11Capture {
                     return None;
                 }
                 XI_MOTION.fetch_add(1, Ordering::Relaxed);
+                // Cage-warp echo swallow (see maybe_recenter_cage):
+                // anchor to the warp's own arrival (and any in-flight
+                // pre-warp positions), emit nothing, for a few events.
+                // Without this the anchor reset turns edge coords into
+                // a phantom fling; the count (not a radius) bounds the
+                // loss even if the user flings straight out of the warp.
+                if self.cage_quiet > 0 {
+                    self.core_last = Some((event.root_x, event.root_y));
+                    self.cage_quiet -= 1;
+                    return None;
+                }
                 let anchor = self.core_last.replace((event.root_x, event.root_y));
                 let Some((last_x, last_y)) = anchor else {
                     return None;
@@ -556,6 +658,12 @@ impl CaptureBackend for X11Capture {
             if desired_exclusive != self.exclusive {
                 self.set_exclusive(desired_exclusive)?;
             }
+            // The cage runs on every poll while core-grabbed (see
+            // maybe_recenter_cage): cheap integer compares mid-screen,
+            // one warp per edge visit — never per event.
+            if self.grab_kind == GrabKind::Core {
+                self.maybe_recenter_cage();
+            }
             if let Some(event) = self
                 .connection
                 .poll_for_event()
@@ -575,15 +683,16 @@ impl CaptureBackend for X11Capture {
             return Ok(());
         }
         if exclusive {
-            // XI2 active grab first, on OUR OWN window (a root-windowed
-            // grab is refused wholesale on this Xorg — BadValue naming
-            // the root id — while the client-owned window succeeds);
-            // Deskflow-style core grabs when the server refuses XI
-            // outright (live-proven: this Xorg answers every XIGrabDevice
-            // with BadValue while XGrabPointer succeeds). Either hold
-            // suppresses local delivery; the XI raw selection underneath
-            // keeps feeding capture in both cases.
-            match xi_grab(&self.connection, self.grab_window) {
+            // XI2 active grab first, sweeping device selectors: some
+            // servers refuse the abstract XIAllDevices/XIAllMasterDevices
+            // selectors while accepting the concrete master ids (and vice
+            // versa — live-proven: this Xorg answers every XIGrabDevice
+            // variant with BadValue while XGrabPointer succeeds). Either
+            // XI hold suppresses local delivery with raw XI capture
+            /// flowing underneath; Deskflow-style core grabs are the last
+            // resort, with the recenter cage keeping their
+            // position-derived deltas unbounded (see maybe_recenter_cage).
+            match xi_grab_sweep(&self.connection, self.grab_window) {
                 Ok(()) => self.grab_kind = GrabKind::Xi,
                 Err(xi_error) => {
                     tracing::info!(%xi_error, "XIGrabDevice refused; falling back to core pointer+keyboard grab");
@@ -613,25 +722,13 @@ impl CaptureBackend for X11Capture {
             // too — poisoning an otherwise successful core release into a
             // reported failure, which threw capture into rebuild churn with
             // suppression bookkeeping stuck (the freeze-with-visible-cursor
-            // shape). Ungrabbing a non-held device is a server-side no-op,
-            // so a stale None record is safe by construction.
+            // shape). Ungrabbing a non-held XI selector is a server-side
+            // no-op, so the sweep below is safe by construction; the core
+            // hold still releases only when actually held.
             let previous = self.grab_kind;
             self.grab_kind = GrabKind::None;
             let released = match previous {
-                GrabKind::Xi => self
-                    .connection
-                    .xinput_xi_ungrab_device(0u32, ALL_MASTER_DEVICES)
-                    .map_err(|error| format!("XInput2 ungrab send: {error:?}"))
-                    .and_then(|cookie| {
-                        cookie
-                            .check()
-                            .map_err(|error| format!("XInput2 ungrab check: {error:?}"))
-                    })
-                    .map_err(|error| {
-                        PlatformError::Capture(format!(
-                            "release XI grab (held {previous:?}): {error}"
-                        ))
-                    }),
+                GrabKind::Xi => xi_ungrab_all(&self.connection),
                 GrabKind::Core => core_ungrab(&self.connection),
                 GrabKind::None => Ok(()),
             };
@@ -644,7 +741,11 @@ impl CaptureBackend for X11Capture {
             // failed show keeps the flag set so the next release (or
             // Drop) retries instead of leaking the hide.
             self.show_cursor();
-            tracing::debug!(previous = ?previous, "X11 local suppression released");
+            // INFO, not debug: engage/release pairing is the whole
+            // stuck-suppression (click-dead freeze) diagnosis — an
+            // engage without a matching release in the journal names
+            // the leaked hold instead of another mystery.
+            tracing::info!(previous = ?previous, "X11 local suppression released");
         }
         self.connection.flush().map_err(|error| {
             PlatformError::Capture(format!("flush XInput2 grab state: {error}"))
@@ -692,23 +793,35 @@ fn raw_mask() -> u32 {
         | u32::from(xinput::XIEventMask::RAW_MOTION)
 }
 
+/// XI2 device selectors tried in order (see xi_grab): XIAllDevices
+/// first (the whole tree in one hold), then XIAllMasterDevices (the
+/// historical selector), then each concrete master (some servers
+/// refuse the abstract selectors while accepting real device ids).
+/// Ungrabbing a non-held selector is a server-side no-op, so release
+/// sweeps all four unconditionally instead of tracking which armed.
+const XI_GRAB_SINGLETONS: [u16; 2] = [0, 1];
+const XI_GRAB_MASTER_PAIR: [u16; 2] = [2, 3];
+const XI_UNGRAB_SWEEP: [u16; 4] = [0, 1, 2, 3];
+
 /// XI2 active grab of all master devices (raw-device semantics). Free
 /// function so the capture trait keeps only the backend interface.
-/// The grab targets OUR OWN invisible window, never root: this Xorg
-/// answers every root-windowed XIGrabDevice with BadValue (the grab
-/// window id itself is the rejected value) while the identical grab on
-/// our client-owned window succeeds — and raw XI delivery (including
-/// smooth-scroll valuators) keeps flowing under an XI hold, which a
-/// core hold kills. Core stays the fallback for servers that refuse
-/// XI grabs outright.
-fn xi_grab(connection: &RustConnection, grab_window: xproto::Window) -> Result<(), PlatformError> {
+/// The grab targets OUR OWN invisible window, never root: a
+/// root-windowed grab is refused outright on strict servers, and raw
+/// XI delivery (including smooth-scroll valuators) keeps flowing
+/// under an XI hold, which a core hold kills. Core stays the fallback
+/// for servers that refuse XI grabs outright.
+fn xi_grab(
+    connection: &RustConnection,
+    grab_window: xproto::Window,
+    deviceid: u16,
+) -> Result<(), PlatformError> {
     let mask = [raw_mask()];
     let status = connection
         .xinput_xi_grab_device(
             grab_window,
             0u32,
             0u32,
-            ALL_MASTER_DEVICES,
+            deviceid,
             xproto::GrabMode::ASYNC,
             xproto::GrabMode::ASYNC,
             xinput::GrabOwner::NO_OWNER,
@@ -724,6 +837,71 @@ fn xi_grab(connection: &RustConnection, grab_window: xproto::Window) -> Result<(
         )));
     }
     Ok(())
+}
+
+/// Try every XI device selector in order, returning on the first
+/// armed hold. A partial concrete-master pair (pointer grabbed,
+/// keyboard refused or vice versa) is unwound before the next
+/// attempt: a half hold would leak local keys while driving. Errors
+/// join into one message so the journal names every refused
+/// selector, not just the last.
+fn xi_grab_sweep(connection: &RustConnection, grab_window: xproto::Window) -> Result<(), PlatformError> {
+    let mut refusals = Vec::new();
+    for deviceid in XI_GRAB_SINGLETONS {
+        match xi_grab(connection, grab_window, deviceid) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::debug!(deviceid, %error, "XI grab selector refused");
+                refusals.push(format!("{deviceid}: {error}"));
+            }
+        }
+    }
+    // Concrete masters last: two holds or none (see above).
+    let pair = XI_GRAB_MASTER_PAIR
+        .into_iter()
+        .map(|deviceid| xi_grab(connection, grab_window, deviceid))
+        .collect::<Vec<_>>();
+    if pair.iter().all(|result| result.is_ok()) {
+        return Ok(());
+    }
+    for result in &pair {
+        if let Err(error) = result {
+            tracing::debug!(%error, "XI concrete-master grab refused");
+            refusals.push(format!("master-pair: {error}"));
+        }
+    }
+    let _ = xi_ungrab_all(connection);
+    Err(PlatformError::Capture(format!(
+        "XInput2 device grab was rejected ({})",
+        refusals.join("; ")
+    )))
+}
+/// Release every XI selector we may hold (see XI_UNGRAB_SWEEP):
+/// best-effort per selector, errors collected into one message so a
+/// half-released hold can never strand suppression silently.
+fn xi_ungrab_all(connection: &RustConnection) -> Result<(), PlatformError> {
+    let mut failures = Vec::new();
+    for deviceid in XI_UNGRAB_SWEEP {
+        if let Err(error) = connection
+            .xinput_xi_ungrab_device(0u32, deviceid)
+            .map_err(|error| format!("XInput2 ungrab send: {error:?}"))
+            .and_then(|cookie| {
+                cookie
+                    .check()
+                    .map_err(|error| format!("XInput2 ungrab check: {error:?}"))
+            })
+        {
+            failures.push(format!("{deviceid}: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(PlatformError::Capture(format!(
+            "release XI grab (held selectors): {}",
+            failures.join("; ")
+        )))
+    }
 }
 
 /// Deskflow-parity core grabs (pointer + keyboard), Async/Async with no
@@ -965,6 +1143,34 @@ mod tests {
         assert_eq!(
             derive_scroll_wheel(13, &hmask, &[one], &vertical, &mut banks),
             None
+        );
+    }
+
+    #[test]
+    fn cage_recenter_fires_only_near_edges() {
+        // 1536x864 with a 64px margin: corners and edge crowds recenter
+        // to the middle; comfortable interior never warps (a mid-screen
+        // warp would read as a cursor jump).
+        use super::recenter_point_if_near_edge;
+        let dims = (1536u16, 864u16);
+        assert_eq!(
+            recenter_point_if_near_edge((1535, 400), dims, 64),
+            Some((768, 432))
+        );
+        assert_eq!(
+            recenter_point_if_near_edge((10, 10), dims, 64),
+            Some((768, 432))
+        );
+        assert_eq!(
+            recenter_point_if_near_edge((800, 860), dims, 64),
+            Some((768, 432))
+        );
+        assert_eq!(recenter_point_if_near_edge((800, 400), dims, 64), None);
+        assert_eq!(recenter_point_if_near_edge((64, 64), dims, 64), None);
+        // Degenerate dims never divide: still centers (0,0).
+        assert_eq!(
+            recenter_point_if_near_edge((5, 5), (0, 0), 64),
+            Some((0, 0))
         );
     }
 
