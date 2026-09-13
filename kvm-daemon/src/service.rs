@@ -4308,7 +4308,6 @@ async fn handle_connection(
                                     InputEvent::SmoothWheel { .. } => smooth_count += 1,
                                     InputEvent::MouseButton { .. } => button_count += 1,
                                     InputEvent::Key(_) => key_count += 1,
-                                    _ => {}
                                 }
                                 if process_remote_input(
                                     DatagramInput {
@@ -4490,7 +4489,6 @@ async fn handle_connection(
                             InputEvent::SmoothWheel { .. } => smooth_count += 1,
                             InputEvent::MouseButton { .. } => button_count += 1,
                             InputEvent::Key(_) => key_count += 1,
-                            _ => {}
                         }
                         if process_remote_input(
                             packet,
@@ -6306,7 +6304,6 @@ mod tests {
         assert!(!is_link_ended_rejection(&anyhow::anyhow!("Link ended")));
     }
 
-    #[test]
     #[test]
     fn stale_hold_reaper_fires_only_without_a_drive() {        // The total-freeze invariant: suppression requested + no active
         // drive = release now. Any other combination leaves the hold

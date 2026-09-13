@@ -692,7 +692,7 @@ impl CaptureBackend for X11Capture {
             // versa — live-proven: this Xorg answers every XIGrabDevice
             // variant with BadValue while XGrabPointer succeeds). Either
             // XI hold suppresses local delivery with raw XI capture
-            /// flowing underneath; Deskflow-style core grabs are the last
+            // flowing underneath; Deskflow-style core grabs are the last
             // resort, with the recenter cage keeping their
             // position-derived deltas unbounded (see maybe_recenter_cage).
             match xi_grab_sweep(&self.connection, self.grab_window) {
