@@ -18,8 +18,9 @@
        rebuilds and restarts only when the GitHub HEAD moved.
 
   Sudo on Mint: hs01 needs a password (no NOPASSWD by default). The script
-  detects that and runs the privileged steps with an interactive TTY so you
-  type the Mint password once (sudo timestamp caching covers the rest).
+  runs each privileged step in one SSH session with an interactive TTY
+  fallback, so you may type the Mint password up to a few times (once per
+  privileged step: dependencies, install, timer).
   For fully unattended runs, add this sudoers line on Mint (via visudo):
     hs01 ALL=(ALL) NOPASSWD: /usr/bin/apt-get, /bin/systemctl, /usr/bin/systemctl, /bin/sh
 
