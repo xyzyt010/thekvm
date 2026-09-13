@@ -4452,6 +4452,9 @@ async fn handle_connection(
                     helper_skipped = receipts.skipped,
                     helper_answered = receipts.answered,
                     helper_last_error = %receipts.last_error,
+                    helper_absolute = receipts.absolute,
+                    helper_relative = receipts.relative,
+                    helper_versions = ?receipts.versions,
                     "helper injection receipts",
                 );
             }

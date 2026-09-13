@@ -45,12 +45,20 @@ enum HelperMessage {
     /// gate-skipped — all three read identically green upstream.
     TakeReceipts,
     /// Helper-to-service reply for TakeReceipts. Counters reset on send,
-    /// so each report covers exactly one session.
+    /// so each report covers exactly one session. Newer fields default
+    /// so pre-absolute helpers still decode on a mixed fleet (their
+    /// counts land in ok/failed/skipped, absolute stays zero).
     InputReceipt {
         ok: u64,
         failed: u64,
         skipped: u64,
         last_error: String,
+        #[serde(default)]
+        absolute: u64,
+        #[serde(default)]
+        relative: u64,
+        #[serde(default)]
+        version: String,
     },
 }
 
@@ -64,6 +72,9 @@ pub struct InjectionReceipts {
     pub skipped: u64,
     pub answered: u64,
     pub last_error: String,
+    pub absolute: u64,
+    pub relative: u64,
+    pub versions: Vec<String>,
 }
 
 /// The service-side fan-out connection to the interactive helpers.
@@ -262,13 +273,21 @@ fn collect_receipts(streams: &mut Vec<TcpStream>) -> InjectionReceipts {
                 failed,
                 skipped,
                 last_error,
+                absolute,
+                relative,
+                version,
             }) => {
                 receipts.answered += 1;
                 receipts.ok += ok;
                 receipts.failed += failed;
                 receipts.skipped += skipped;
+                receipts.absolute += absolute;
+                receipts.relative += relative;
                 if !last_error.is_empty() {
                     receipts.last_error = last_error;
+                }
+                if !version.is_empty() && !receipts.versions.contains(&version) {
+                    receipts.versions.push(version);
                 }
                 true
             }
@@ -483,6 +502,8 @@ struct HelperReceipts {
     ok: std::sync::atomic::AtomicU64,
     failed: std::sync::atomic::AtomicU64,
     skipped: std::sync::atomic::AtomicU64,
+    absolute: std::sync::atomic::AtomicU64,
+    relative: std::sync::atomic::AtomicU64,
     last_error: std::sync::Mutex<String>,
 }
 
@@ -490,6 +511,8 @@ static RECEIPTS: HelperReceipts = HelperReceipts {
     ok: std::sync::atomic::AtomicU64::new(0),
     failed: std::sync::atomic::AtomicU64::new(0),
     skipped: std::sync::atomic::AtomicU64::new(0),
+    absolute: std::sync::atomic::AtomicU64::new(0),
+    relative: std::sync::atomic::AtomicU64::new(0),
     last_error: std::sync::Mutex::new(String::new()),
 };
 
@@ -503,6 +526,12 @@ impl HelperReceipts {
     fn skipped(&self) -> u64 {
         self.skipped.load(std::sync::atomic::Ordering::Relaxed)
     }
+    fn absolute(&self) -> u64 {
+        self.absolute.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn relative(&self) -> u64 {
+        self.relative.load(std::sync::atomic::Ordering::Relaxed)
+    }
     fn take_last_error(&self) -> String {
         self.last_error
             .lock()
@@ -513,6 +542,8 @@ impl HelperReceipts {
         self.ok.store(0, std::sync::atomic::Ordering::Relaxed);
         self.failed.store(0, std::sync::atomic::Ordering::Relaxed);
         self.skipped.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.absolute.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.relative.store(0, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut guard) = self.last_error.lock() {
             guard.clear();
         }
@@ -536,6 +567,18 @@ fn receipt_failed(error: String) {
 fn receipt_skipped() {
     RECEIPTS
         .skipped
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn receipt_absolute() {
+    RECEIPTS
+        .absolute
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn receipt_relative() {
+    RECEIPTS
+        .relative
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -597,7 +640,21 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                         // at session teardown (the only channel whose
                         // contents provably reach the journal).
                         match injector.send(event) {
-                            Ok(()) => receipt_ok(),
+                            Ok(()) => {
+                                receipt_ok();
+                                // Absolute vs relative is decided inside
+                                // the injector per event (see
+                                // Win32Injector::motion_input): count the
+                                // mode so the journal proves which path
+                                // carried the drive.
+                                if matches!(event, InputEvent::MouseMove { .. }) {
+                                    if injector.last_motion_absolute() {
+                                        receipt_absolute();
+                                    } else {
+                                        receipt_relative();
+                                    }
+                                }
+                            }
                             Err(error) => {
                                 tracing::warn!(%error, "helper input injection failed; continuing");
                                 receipt_failed(error.to_string());
@@ -625,6 +682,9 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                     failed: RECEIPTS.failed(),
                     skipped: RECEIPTS.skipped(),
                     last_error: RECEIPTS.take_last_error(),
+                    absolute: RECEIPTS.absolute(),
+                    relative: RECEIPTS.relative(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
                 });
                 // Take-then-reset keeps each report to exactly one session.
                 // Reset even if the reply itself fails: a stale count in
@@ -1168,7 +1228,14 @@ mod tests {
     }
 
     /// Fake helper answering TakeReceipts with fixed counts.
-    fn drive_receipt_helper(helper_side: &mut TcpStream, ok: u64, failed: u64, skipped: u64) {
+    fn drive_receipt_helper(
+        helper_side: &mut TcpStream,
+        ok: u64,
+        failed: u64,
+        skipped: u64,
+        absolute: u64,
+        relative: u64,
+    ) {
         let frame = read_ipc_frame(helper_side).unwrap();
         let message: HelperMessage = serde_json::from_slice(&frame).unwrap();
         assert!(matches!(message, HelperMessage::TakeReceipts));
@@ -1181,6 +1248,9 @@ mod tests {
             } else {
                 String::new()
             },
+            absolute,
+            relative,
+            version: "9.9.9-test".to_owned(),
         })
         .unwrap();
         write_ipc_frame(helper_side, &reply).unwrap();
@@ -1190,8 +1260,8 @@ mod tests {
     fn receipts_sum_across_helpers() {
         let (left_proxy, mut left_helper) = loopback_pair();
         let (right_proxy, mut right_helper) = loopback_pair();
-        std::thread::spawn(move || drive_receipt_helper(&mut left_helper, 120, 0, 3));
-        std::thread::spawn(move || drive_receipt_helper(&mut right_helper, 0, 2, 40));
+        std::thread::spawn(move || drive_receipt_helper(&mut left_helper, 120, 0, 3, 100, 20));
+        std::thread::spawn(move || drive_receipt_helper(&mut right_helper, 0, 2, 40, 0, 0));
         let mut proxy = ServiceInputProxy {
             streams: vec![left_proxy, right_proxy],
             desktops: vec!["default".to_owned(), "winlogon".to_owned()],
@@ -1203,6 +1273,9 @@ mod tests {
         assert_eq!(receipts.skipped, 43);
         assert_eq!(receipts.answered, 2);
         assert_eq!(receipts.last_error, "test injection failure");
+        assert_eq!(receipts.absolute, 100);
+        assert_eq!(receipts.relative, 20);
+        assert_eq!(receipts.versions, vec!["9.9.9-test".to_owned()]);
     }
 
     #[test]
@@ -1234,11 +1307,24 @@ mod tests {
             failed: 1,
             skipped: 2,
             last_error: "e".to_owned(),
+            absolute: 5,
+            relative: 2,
+            version: "v".to_owned(),
         })
         .unwrap();
         assert!(matches!(
             serde_json::from_slice::<HelperMessage>(&receipt).unwrap(),
             HelperMessage::InputReceipt { ok: 7, .. }
+        ));
+        // Pre-absolute helpers omit the newer fields: still decodable.
+        let legacy = br#"{"InputReceipt":{"ok":7,"failed":0,"skipped":0,"last_error":""}}"#;
+        assert!(matches!(
+            serde_json::from_slice::<HelperMessage>(legacy).unwrap(),
+            HelperMessage::InputReceipt {
+                ok: 7,
+                absolute: 0,
+                ..
+            }
         ));
     }
 

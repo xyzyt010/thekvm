@@ -174,6 +174,11 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Binary identity first: every journal (service file, child link
+    // log) opens with the exact build version, so a stale binary
+    // anywhere in the fleet is one grep away instead of detective work.
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "kvm-daemon starting");
+
     #[cfg(target_os = "windows")]
     {
         let arguments = std::env::args().collect::<Vec<_>>();

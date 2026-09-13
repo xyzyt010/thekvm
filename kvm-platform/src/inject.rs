@@ -584,6 +584,9 @@ mod win32_inject {
         /// drift can accumulate (each event recomputes absolute units
         /// from this position — rounding never compounds).
         pos: (i64, i64),
+        /// Whether the most recent motion_input took the absolute path
+        /// (read by the helper for per-session mode receipts).
+        last_absolute: bool,
     }
 
     /// Absolute units (0..=65535) for one axis. `span` is dim-1; a
@@ -647,6 +650,16 @@ mod win32_inject {
             }
         }
 
+        /// Whether the latest motion_input injected absolute units.
+        /// Drives the helper's per-session mode receipts (the journal
+        /// proof of which path carried the drive).
+        pub fn last_motion_absolute(&self) -> bool {
+            self.absolute
+                .lock()
+                .map(|guard| guard.last_absolute)
+                .unwrap_or(false)
+        }
+
         /// Build the motion INPUT: absolute when armed and exact (see
         /// absolute_eligible), relative otherwise. Returns None only when
         /// the motion state is unavailable (lock poisoned): the caller
@@ -657,6 +670,7 @@ mod win32_inject {
                 if absolute_eligible(target) {
                     guard.pos.0 += i64::from(dx);
                     guard.pos.1 += i64::from(dy);
+                    guard.last_absolute = true;
                     let span_x = i64::from(target.0) - 1;
                     let span_y = i64::from(target.1) - 1;
                     let input = INPUT {
@@ -677,6 +691,7 @@ mod win32_inject {
                 // Armed but not exact on this machine (multi-monitor or
                 // dims drift): relative, exactly as before.
             }
+            guard.last_absolute = false;
             Some(INPUT {
                 r#type: INPUT_MOUSE,
                 Anonymous: INPUT_0 {

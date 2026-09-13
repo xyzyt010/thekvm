@@ -792,9 +792,10 @@ impl EdgeRouter {
                                 self.return_edge_accum = overflow;
                             }
                             if self.return_edge_accum >= RETURN_EDGE_PX {
-                                // Park on the saved local position
-                                // (jump-position semantics): a return never
-                                // lands mid-screen.
+                                // Park at the edge with the roamed height
+                                // (mapped vertical, saved edge x): a return
+                                // never lands mid-screen, nor teleports
+                                // back to the stale exit height.
                                 let _ = self.restore_local(target);
                                 return RoutedEvent::ReturnHome { from, edge };
                             }
@@ -1050,9 +1051,21 @@ impl EdgeRouter {
             .layout
             .screen(local)
             .ok_or_else(|| "local screen is missing from layout".to_string())?;
+        // Proportional vertical return: the user roamed the remote screen
+        // since exiting, so coming home at the stale exit height reads as
+        // a teleport (entries map proportionally; returns must too). The
+        // x stays the saved edge pixel — a return never lands mid-screen —
+        // while y maps the CURRENT remote height onto the local one,
+        // exactly like entry mapping in reverse.
+        let remote_height = self
+            .layout
+            .screen(from)
+            .map(|remote| remote.height)
+            .unwrap_or(screen.height);
+        let mapped_y = map_coordinate(self.cursor_y, remote_height, screen.height);
         self.current_screen = local;
         self.cursor_x = self.local_cursor_x.min(screen.width - 1);
-        self.cursor_y = self.local_cursor_y.min(screen.height - 1);
+        self.cursor_y = mapped_y.min(screen.height - 1);
         self.local_cursor_x = self.cursor_x;
         self.local_cursor_y = self.cursor_y;
         self.active_remote = None;
@@ -1730,7 +1743,6 @@ mod tests {
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
         let _ = router.route(InputEvent::MouseMove { dx: 200, dy: 0 });
-        let home = router.cursor_position();
         // Exit right into the peer: entry at the peer's left edge.
         let handoff = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert!(matches!(
@@ -1752,8 +1764,10 @@ mod tests {
             RoutedEvent::Forward { .. }
         ));
         assert_eq!(router.cursor_position(), (100, 590));
-        // Pushing back past the facing edge returns to the saved home —
-        // never mid-screen — with no network round trip.
+        // Pushing back past the facing edge returns: x stays the saved
+        // edge pixel (never mid-screen), y maps the roamed remote height
+        // back (100,590 roamed -> same spans -> (1160,590) home) — with
+        // no network round trip.
         let back = router.route(InputEvent::MouseMove {
             dx: -5000,
             dy: 0,
@@ -1766,7 +1780,7 @@ mod tests {
             } if from == FIRST_PEER_SCREEN_ID
         ));
         assert_eq!(router.active_remote(), None);
-        assert_eq!(router.cursor_position(), home);
+        assert_eq!(router.cursor_position(), (1160, 590));
     }
 
     #[test]
@@ -1820,7 +1834,6 @@ mod tests {
             self_screen: Some(ScreenId(2)),
         };
         let mut router = EdgeRouter::new(layout).unwrap();
-        let home = router.cursor_position();
         let handoff = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
         assert!(matches!(
             handoff,
@@ -1858,7 +1871,9 @@ mod tests {
             assert_eq!(router.active_remote(), Some(ScreenId(1)));
         }
         // Settle inside (arms the entry), then push back out through the
-        // shared edge: now it comes home, to the exact saved pixel.
+        // shared edge: now it comes home — x to the saved edge pixel,
+        // y mapped from the roamed remote height (the clamps above roamed
+        // to y=1079, so home keeps that height, not the exit one).
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: 500, dy: 0 }),
             RoutedEvent::Forward { .. }
@@ -1872,7 +1887,7 @@ mod tests {
             } if from == ScreenId(1)
         ));
         assert_eq!(router.active_remote(), None);
-        assert_eq!(router.cursor_position(), home);
+        assert_eq!(router.cursor_position(), (960, 1079));
     }
 
     #[test]
@@ -1958,6 +1973,55 @@ mod tests {
             RoutedEvent::ReturnHome { edge: Edge::Left, .. }
         ));
         assert_eq!(router.active_remote(), None);
+    }
+
+    #[test]
+    fn return_home_maps_the_roamed_height() {
+        // Exit right from local center (960, 540). Coming home keeps
+        // the CURRENT remote height (see restore_local), not the exit one.
+        let layout = Layout {
+            screens: vec![
+                Screen {
+                    id: ScreenId(1),
+                    name: "main".into(),
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    peer_fingerprint: None,
+                },
+                Screen {
+                    id: ScreenId(2),
+                    name: "right".into(),
+                    x: 1,
+                    y: 0,
+                    width: 1536,
+                    height: 960,
+                    peer_fingerprint: None,
+                },
+            ],
+            self_screen: Some(ScreenId(1)),
+        };
+        let mut router = EdgeRouter::new(layout).unwrap();
+        // Exit right from local center (960, 540).
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 2000, dy: 0 }),
+            RoutedEvent::Handoff { .. }
+        ));
+        // Roam the remote screen down to y=800 (and settle, arming).
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 500, dy: 321 }),
+            RoutedEvent::Forward { .. }
+        ));
+        // Sustained shove home returns at the roamed height mapped back:
+        // 800/960 -> 900/1080, x stays the saved edge pixel.
+        let home = router.route(InputEvent::MouseMove { dx: -600, dy: 0 });
+        assert!(matches!(
+            home,
+            RoutedEvent::ReturnHome { edge: Edge::Left, .. }
+        ));
+        assert_eq!(router.active_remote(), None);
+        assert_eq!(router.cursor_position(), (960, 900));
     }
 
     #[test]
