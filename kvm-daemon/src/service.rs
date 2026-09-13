@@ -1679,6 +1679,11 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                 // enforces continued proof).
                                 last_peer_progress = None;
                                 unacked_pings = 0;
+                                adopt_peer_geometry(
+                                    &mut router,
+                                    link.as_ref().map(|link| link.fingerprint.as_str()),
+                                    session.peer_geometry,
+                                );
                                 active = Some(session);
                                 let name = router
                                     .screen(target)
@@ -2443,7 +2448,12 @@ async fn handle_topology_event(
                 }
             }
         }
-        RoutedEvent::ReturnHome { from, edge } => {
+        RoutedEvent::ReturnHome {
+            from,
+            edge,
+            entry_edge,
+            armed,
+        } => {
             // Deskflow-style edge return: the virtual remote cursor came
             // back past the facing edge, so park the episode and re-enter
             // at the exact saved pixel — no network round trip, no
@@ -2462,13 +2472,11 @@ async fn handle_topology_event(
             *last_transfer = Some(std::time::Instant::now());
             let (x, y) = router.cursor_position();
             let _ = capture_control.warp_cursor(x, y);
-            // Armed-state telemetry: `armed=false` here means the drive
-            // never settled (escape-hatch or peer-placed return);
-            // `armed=true` means the cursor settled inside and then
-            // pushed back out past the brush guard — the specified
-            // return gesture, however surprising it feels without edge
-            // feedback.
-            let (entry_edge, armed) = router.return_state();
+            // Pre-restore Schmitt state rides the variant (see layout):
+            // `armed=false` here means the drive never settled
+            // (escape-hatch or peer-placed return); `armed=true` means
+            // the cursor settled inside and then pushed back out past
+            // the brush guard — the specified return gesture.
             tracing::info!(?from, ?edge, ?entry_edge, armed, x, y, "topology edge return; control is local");
             eprintln!("THEKVM_STATUS local");
         }
@@ -2610,6 +2618,11 @@ async fn handle_topology_event(
                 *last_peer_progress = None;
                 *unacked_pings = 0;
                 *last_transfer = Some(std::time::Instant::now());
+                adopt_peer_geometry(
+                    router,
+                    link.map(|link| link.fingerprint.as_str()),
+                    session.peer_geometry,
+                );
                 *active = Some(session);
                 let name = router
                     .screen(target)
@@ -2988,11 +3001,45 @@ async fn prewarm_link_stream(
     Ok(Some(spawn_episode_driver(conn, send, recv, capabilities, target, 0)))
 }
 
+/// Adopt the linked peer's advertised dims into the driver router (see
+/// EdgeRouter::adopt_peer_screen_size). The driver maps entry points,
+/// virtual bounds, and return heights against the PEER screen: with the
+/// stale configured fallback in force while both ends measure smaller
+/// truth, entries land clamped to wrong heights, the virtual cursor
+/// roams a screen that does not exist (phantom mid-screen exits), and
+/// returns map through an identity that preserves nothing. Best-effort:
+/// a missing/degenerate advertisement keeps the fallback and logs why.
+fn adopt_peer_geometry(
+    router: &mut EdgeRouter,
+    fingerprint: Option<&str>,
+    peer_geometry: Option<ScreenGeometry>,
+) {
+    let (Some(fingerprint), Some(geometry)) = (fingerprint, peer_geometry) else {
+        tracing::debug!("peer geometry unavailable; keeping configured peer dims");
+        return;
+    };
+    if geometry.width < 2 || geometry.height < 2 {
+        tracing::debug!(?geometry, "peer geometry degenerate; keeping configured peer dims");
+        return;
+    }
+    match router.adopt_peer_screen_size(fingerprint, geometry.width, geometry.height) {
+        Some((width, height)) => tracing::info!(
+            peer = fingerprint,
+            width,
+            height,
+            "topology peer geometry adopted"
+        ),
+        None => tracing::debug!(
+            peer = fingerprint,
+            "peer geometry matches no linked screen; keeping configured peer dims"
+        ),
+    }
+}
+
 /// Map an edge-entry point into the peer's current geometry and name the
 /// target screen. Shared by fresh opens and parked resumes so both land
 /// identically — entry at the proportional edge point, never mid-screen.
-fn handoff_wire_target(
-    router: &EdgeRouter,
+fn handoff_wire_target(    router: &EdgeRouter,
     target: ScreenId,
     target_x: u32,
     target_y: u32,
@@ -4039,7 +4086,45 @@ async fn handle_connection(
             let mut input_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
 
             let peer_screen_geometry = hello.screen_geometry;
-            let local_geometry = truthful_local_geometry(&config.layout);
+            // Receiver truth for THIS stream: the dialer's Hello carries
+            // its measured dims — adopt them instead of the configured
+            // fallback, or every tracking bound, hop bound, and warp map
+            // below runs in a fantasy screen (entries clamped to wrong
+            // heights, phantom mid-screen exits). Per-stream clone, so no
+            // cross-stream races: each Hello re-teaches current truth.
+            let mut config = config;
+            if let Some(geometry) = peer_screen_geometry
+                .filter(|geometry| geometry.width >= 2 && geometry.height >= 2)
+            {
+                let adopted = config
+                    .layout
+                    .screens
+                    .iter_mut()
+                    .find(|screen| {
+                        screen.peer_fingerprint.as_deref() == Some(peer_fingerprint.as_str())
+                    })
+                    .map(|screen| {
+                        screen.width = geometry.width;
+                        screen.height = geometry.height;
+                        (geometry.width, geometry.height)
+                    });
+                match adopted {
+                    Some((width, height)) => tracing::info!(
+                        peer = %peer_fingerprint,
+                        width,
+                        height,
+                        "receiver peer geometry adopted"
+                    ),
+                    None => tracing::debug!(
+                        peer = %peer_fingerprint,
+                        "hello geometry matches no linked screen; keeping configured peer dims"
+                    ),
+                }
+            }
+            // Bound below at injector creation (after helper priming on
+            // Windows): the Accepted advertisement must already carry
+            // interactive-desktop truth, never session-0 fantasy.
+            let local_geometry: Option<ScreenGeometry>;
             let mut clipboard = if config.clipboard_enabled && hello.clipboard_enabled {
                 start_clipboard_agent(true)
             } else {
@@ -4067,6 +4152,14 @@ async fn handle_connection(
                     return Err(error);
                 }
             };
+            // Prime interactive-desktop truth BEFORE advertising it: the
+            // first session's Accepted geometry must already be truthful.
+            // (Session children never prime — their own measure rules.)
+            #[cfg(target_os = "windows")]
+            {
+                injector.prime_helper_dims();
+            }
+            local_geometry = truthful_local_geometry(&config.layout);
             write_frame(
                 &mut send,
                 &WireMessage::Accepted {
@@ -4280,35 +4373,46 @@ async fn handle_connection(
                                     }
                                     ScreenId(screen_id)
                                 };
-                                let target_geometry = screen_geometry_for(&config.layout, target)
+                                // Receiver truth, never headless fantasy: the
+                                // sender already mapped this point into OUR
+                                // advertised geometry (see
+                                // handoff_wire_target), so map the wire
+                                // point into truthful LOCAL dims.
+                                // Remapping truth through the configured
+                                // fallback is the whole wrong-height-entry
+                                // class (a bottom-edge exit landing at
+                                // y=767 on a 960-tall screen). Without wire
+                                // geometry there is no honest source
+                                // space: remap_position clamps into truth
+                                // (entries pin to the edge, never
+                                // teleport).
+                                let truthful = truthful_local_geometry(&config.layout)
+                                    .or_else(|| screen_geometry_for(&config.layout, target))
                                     .context("local screen geometry is unavailable")?;
-                                let (x, y) = remap_position(
-                                    x,
-                                    y,
-                                    screen_geometry,
-                                    target_geometry,
-                                );
+                                let (x, y) = remap_position(x, y, screen_geometry, truthful);
                                 remote_screen = Some(target);
                                 remote_cursor = Some((x, y));
-                                // Arm ballistics-proof absolute motion BEFORE
+                                // Arm proportional absolute motion BEFORE
                                 // the warp (Windows-service bridge only):
-                                // the helper integrates the same deltas the
-                                // tracker does from this entry point, so
-                                // tracked and visible agree by construction
-                                // and phantom hop-ends vanish. Best-effort:
-                                // unheard helpers stay relative (today).
+                                // the helper tracks the REMOTE cursor in
+                                // the sender's dims and injects the same
+                                // fraction locally, so tracked and visible
+                                // agree by construction and phantom
+                                // hop-ends vanish. Best-effort: unheard
+                                // helpers stay relative (today).
                                 //
-                                // Dims MUST be truthful (sidecar/measured),
-                                // never the configured fallback: the helper
-                                // engages absolute only on exact equality
-                                // with its physical primary, and a fallback
-                                // announce would silently disarm it (or
-                                // worse, map onto wrong pixels). The warp
-                                // above keeps its own mapping untouched.
+                                // The announce names the SENDER's space,
+                                // never ours: a local-fantasy announce
+                                // (the old session-0 1024x768 "measured")
+                                // silently disarms — or mis-maps — every
+                                // drive. (0,0) disables instead of lying.
                                 #[cfg(target_os = "windows")]
                                 {
-                                    let (size, source) =
-                                        truthful_target_size(&config.layout, target);
+                                    let (size, source) = remote_truth_for_announce(
+                                        &config.layout,
+                                        &peer_fingerprint,
+                                        peer_screen_geometry,
+                                    );
                                     tracing::info!(
                                         width = size.0,
                                         height = size.1,
@@ -4325,7 +4429,7 @@ async fn handle_connection(
                                 // episode — driving unplaced beats not
                                 // driving at all.
                                 match injector.warp_cursor(x, y) {
-                                    Ok(()) => tracing::info!(x, y, "receiver placed cursor at entry"),
+                                    Ok(()) => tracing::info!(x, y, wire = ?screen_geometry, "receiver placed cursor at entry"),
                                     Err(error) => tracing::warn!(%error, x, y, "receiver entry warp failed; cursor starts unplaced"),
                                 }
                             }
@@ -4860,6 +4964,25 @@ impl ReceiverInjector {
         if let Self::Service(proxy) = self {
             proxy.set_target_size(width, height);
         }
+    }
+
+    /// Prime the interactive-desktop truth cache from the helpers (see
+    /// HELPER_DISPLAY_DIMS): logical dims + DPI the Session-0 service
+    /// can never measure itself. Cached process-wide after the first
+    /// answer (dims are boot-stable); a silent fleet keeps None and
+    /// every consumer falls back exactly as before.
+    #[cfg(target_os = "windows")]
+    fn prime_helper_dims(&mut self) -> Option<(u32, u32)> {
+        if let Some((width, height, _)) = helper_display_dims() {
+            return Some((width, height));
+        }
+        if let Self::Service(proxy) = self {
+            if let Some((_, _, logical_width, logical_height, dpi)) = proxy.primary_dims() {
+                note_helper_display_dims(logical_width, logical_height, dpi);
+                return Some((logical_width, logical_height));
+            }
+        }
+        None
     }
 
     fn warp_cursor(&mut self, x: u32, y: u32) -> Result<()> {
@@ -5525,6 +5648,41 @@ fn screen_geometry_for(layout: &kvm_core::Layout, screen_id: ScreenId) -> Option
 /// `{"width":1536,"height":864}` in the daemon data dir.
 const GEOMETRY_SIDECAR: &str = "local-geometry.json";
 
+/// Interactive-desktop truth reported by the Windows helpers (logical
+/// dims + DPI): the service runs in Session 0, where GetSystemMetrics
+/// answers a 1024x768 fantasy that silently disarmed absolute motion
+/// and clamped every entry warp. Primed from the helper bridge
+/// (ReceiverInjector::prime_helper_dims); per-process, so session
+/// children (which measure their own desktop directly) never see it.
+#[cfg(target_os = "windows")]
+static HELPER_DISPLAY_DIMS: std::sync::OnceLock<std::sync::Mutex<Option<(u32, u32, u32)>>> =
+    std::sync::OnceLock::new();
+
+/// Cached helper-reported logical dims + DPI, if any helper answered yet.
+#[cfg(target_os = "windows")]
+fn helper_display_dims() -> Option<(u32, u32, u32)> {
+    HELPER_DISPLAY_DIMS
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+}
+
+/// Remember the first helper answer (dims are boot-stable; later answers
+/// agree). Logs once so the journal proves which truth the daemon maps in.
+#[cfg(target_os = "windows")]
+fn note_helper_display_dims(width: u32, height: u32, dpi: u32) {
+    if let Ok(mut guard) = HELPER_DISPLAY_DIMS
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+    {
+        if guard.is_none() {
+            *guard = Some((width, height, dpi));
+            tracing::info!(width, height, dpi, "helper reported interactive display dims");
+        }
+    }
+}
+
 /// Parse sidecar body into dims. Pure for tests.
 fn parse_geometry_sidecar(text: &str) -> Option<(u32, u32)> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
@@ -5635,32 +5793,31 @@ fn pick_geometry(
     configured
 }
 
-/// Truthful dims for ONE layout screen (see truthful_local_geometry),
-/// for the absolute-motion announce: sidecar, then a live measure, then
-/// the configured fallback. Returns the source tag for the journal — a
-/// fallback announce that disagrees with the helper's physical primary
-/// silently disarms absolute motion, and the tag names it instead of a
-/// mystery. (0,0) disables (the helper treats degenerate targets as
-/// relative), never maps.
-fn truthful_target_size(
+/// Dims the helper must track the remote cursor in (see proportional
+/// absolute motion): the SENDER's truth. The Hello advertisement names
+/// it directly; otherwise this stream's adopted peer screen (the same
+/// truth one handshake later — see the receiver adoption above);
+/// otherwise (0,0), which DISABLES absolute instead of mapping through
+/// a fantasy. A local-space announce (the old session-0 1024x768
+/// "measured") is what silently disarmed — or mis-mapped — every
+/// drive, so this function can only name the peer's space. Pure for
+/// tests; the source tag rides the journal line beside the announce.
+fn remote_truth_for_announce(
     layout: &kvm_core::Layout,
-    screen_id: ScreenId,
+    peer_fingerprint: &str,
+    peer_geometry: Option<ScreenGeometry>,
 ) -> ((u32, u32), &'static str) {
-    let sidecar = std::fs::read_to_string(data_dir().join(GEOMETRY_SIDECAR))
-        .ok()
-        .and_then(|text| parse_geometry_sidecar(&text));
-    if let Some((width, height)) = sidecar {
-        return ((width, height), "sidecar");
+    if let Some(geometry) = peer_geometry.filter(|geometry| geometry.width >= 2 && geometry.height >= 2)
+    {
+        return ((geometry.width, geometry.height), "hello");
     }
-    let measured = kvm_platform::capture::screen_size()
-        .ok()
-        .flatten()
-        .filter(|(width, height)| *width != 0 && *height != 0);
-    if let Some((width, height)) = measured {
-        return ((width, height), "measured");
-    }
-    if let Some(geometry) = screen_geometry_for(layout, screen_id) {
-        return ((geometry.width, geometry.height), "configured-fallback");
+    if let Some(screen) = layout
+        .screens
+        .iter()
+        .find(|screen| screen.peer_fingerprint.as_deref() == Some(peer_fingerprint))
+        .filter(|screen| screen.width >= 2 && screen.height >= 2)
+    {
+        return ((screen.width, screen.height), "layout-peer");
     }
     ((0, 0), "unknown")
 }
@@ -5674,6 +5831,18 @@ fn truthful_local_geometry(layout: &kvm_core::Layout) -> Option<ScreenGeometry> 
     let screen_id = layout
         .self_screen
         .or_else(|| layout.screens.first().map(|screen| screen.id))?;
+    // Session-0 services measure a headless fantasy (1024x768): the
+    // helpers' interactive-desktop answer wins wherever one exists.
+    // (Per-process cache: session children measure directly and never
+    // prime it, so their own truth is untouched.)
+    #[cfg(target_os = "windows")]
+    if let Some((width, height, _)) = helper_display_dims() {
+        return Some(ScreenGeometry {
+            screen_id: screen_id.0,
+            width,
+            height,
+        });
+    }
     let sidecar = std::fs::read_to_string(data_dir().join(GEOMETRY_SIDECAR))
         .ok()
         .and_then(|text| parse_geometry_sidecar(&text));
@@ -6162,6 +6331,69 @@ mod tests {
             pick_geometry(2, None, None, configured)
                 .map(|geometry| (geometry.width, geometry.height)),
             Some((1920, 1080))
+        );
+    }
+
+    #[test]
+    fn announce_names_the_sender_space() {
+        // The helper tracks the REMOTE cursor: the announce must name
+        // the sender's dims — a local-space announce is the whole
+        // silent-disarm class. Hello first, adopted layout second,
+        // disabled never fantasy.
+        use kvm_core::{Layout, Screen, ScreenId};
+        let fingerprint = "cd".repeat(32);
+        let layout = Layout {
+            screens: vec![
+                Screen {
+                    id: ScreenId(2),
+                    name: "local".into(),
+                    x: 0,
+                    y: 0,
+                    width: 1536,
+                    height: 960,
+                    peer_fingerprint: None,
+                },
+                Screen {
+                    id: ScreenId(1),
+                    name: "peer".into(),
+                    x: -1,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    peer_fingerprint: Some(fingerprint.clone()),
+                },
+            ],
+            self_screen: Some(ScreenId(2)),
+        };
+        let hello = Some(kvm_protocol::wire::ScreenGeometry {
+            screen_id: 7,
+            width: 1536,
+            height: 864,
+        });
+        assert_eq!(
+            remote_truth_for_announce(&layout, &fingerprint, hello),
+            ((1536, 864), "hello")
+        );
+        // No Hello: the adopted peer screen (same truth one handshake
+        // later) — never the local screen.
+        assert_eq!(
+            remote_truth_for_announce(&layout, &fingerprint, None),
+            ((1920, 1080), "layout-peer")
+        );
+        // Unknown peer and no Hello: disabled, never fantasy.
+        assert_eq!(
+            remote_truth_for_announce(&layout, "unknown", None),
+            ((0, 0), "unknown")
+        );
+        // Degenerate Hello falls through to layout, not onto the wire.
+        let degenerate = Some(kvm_protocol::wire::ScreenGeometry {
+            screen_id: 7,
+            width: 0,
+            height: 864,
+        });
+        assert_eq!(
+            remote_truth_for_announce(&layout, &fingerprint, degenerate),
+            ((1920, 1080), "layout-peer")
         );
     }
 

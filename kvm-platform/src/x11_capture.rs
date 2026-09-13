@@ -9,6 +9,7 @@
 
 use crate::{capture::CaptureBackend, PlatformError};
 use kvm_core::{InputEvent, KeyEvent, MouseButton};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -49,6 +50,18 @@ pub struct X11Capture {
     /// this capture backend.
     ignored_sources: Vec<xinput::DeviceId>,
     last_source_refresh: std::time::Instant,
+    /// XI2 smooth-scroll valuators per slave device (axis number +
+    /// 120ths per raw unit): trackpads whose scroll classes carry
+    /// NO_EMULATION emit no button 4-7 events at all, so without this
+    /// map two-finger scroll is uncapturable in every grab kind. Keyed
+    /// by source id (valuator layouts differ per device); refreshed
+    /// with the own-device set. Empty on servers without scroll
+    /// classes — the button path below is untouched.
+    scroll_axes: HashMap<xinput::DeviceId, Vec<ScrollAxis>>,
+    /// Fractional 120ths remainder per (device, scroll axis): raw
+    /// valuator deltas arrive fractional, and truncating each event
+    /// would eat slow scrolls whole.
+    scroll_bank: HashMap<(xinput::DeviceId, usize), f64>,
     /// Whether the server answered XFixes version negotiation (probed
     /// once at creation): gates cursor hiding, which has no fallback.
     xfixes_cursor: bool,
@@ -118,6 +131,92 @@ fn query_own_sources(connection: &RustConnection) -> Option<Vec<xinput::DeviceId
             None
         }
     }
+}
+
+/// One XI2 smooth-scroll valuator: which raw axis carries it, which
+/// direction it scrolls, and how many 120ths one raw unit earns (120 /
+/// increment — robust to detent-unit and pixel-distance conventions).
+#[derive(Debug, Clone, Copy)]
+struct ScrollAxis {
+    axis: usize,
+    horizontal: bool,
+    units_120ths: f64,
+}
+
+/// Resolve smooth-scroll valuators via XIQueryDevice (0 = all devices).
+/// Devices without scroll classes simply contribute nothing; a failed
+/// query keeps the previous map (same contract as query_own_sources).
+fn query_scroll_axes(connection: &RustConnection) -> HashMap<xinput::DeviceId, Vec<ScrollAxis>> {
+    let mut axes = HashMap::new();
+    let Ok(reply) = connection
+        .xinput_xi_query_device(0u16)
+        .map_err(|error| format!("query XInput2 scroll classes: {error}"))
+        .and_then(|cookie| {
+            cookie
+                .reply()
+                .map_err(|error| format!("read XInput2 scroll classes: {error}"))
+        })
+    else {
+        return axes;
+    };
+    for info in &reply.infos {
+        let mut device_axes = Vec::new();
+        for class in &info.classes {
+            let xinput::DeviceClassData::Scroll(scroll) = &class.data else {
+                continue;
+            };
+            let increment = f64::from(scroll.increment.integral)
+                + f64::from(scroll.increment.frac) / FIXED_POINT_SCALE;
+            // A zero increment would divide by zero below: fall back to
+            // one-detent-per-unit (the common detent convention).
+            let units_120ths = if increment > 0.0 { 120.0 / increment } else { 120.0 };
+            device_axes.push(ScrollAxis {
+                axis: scroll.number as usize,
+                horizontal: scroll.scroll_type == xinput::ScrollType::HORIZONTAL,
+                units_120ths,
+            });
+        }
+        if !device_axes.is_empty() {
+            axes.insert(info.deviceid, device_axes);
+        }
+    }
+    axes
+}
+
+/// Derive SmoothWheel 120ths from one raw motion's scroll valuators.
+/// Pure apart from the bank map: fractional deltas accumulate across
+/// events (slow scrolls survive), whole 120ths emit. Sign convention:
+/// XI positive scroll = fingers down/right = legacy buttons 5/7 =
+/// negative 120ths (buttons 4/6 are +120). Returns None when no scroll
+/// valuator on this device moved a whole unit yet.
+fn derive_scroll_wheel(
+    sourceid: xinput::DeviceId,
+    mask: &[u32],
+    values: &[xinput::Fp3232],
+    axes: &[ScrollAxis],
+    banks: &mut HashMap<(xinput::DeviceId, usize), f64>,
+) -> Option<InputEvent> {
+    let mut wheel_x = 0i32;
+    let mut wheel_y = 0i32;
+    for axis in axes {
+        let Some(delta) = axis_value(mask, values, axis.axis) else {
+            continue;
+        };
+        if delta == 0.0 {
+            continue;
+        }
+        let bank = banks.entry((sourceid, axis.axis)).or_insert(0.0);
+        let whole = take_integer(bank, delta * axis.units_120ths);
+        if axis.horizontal {
+            wheel_x -= whole;
+        } else {
+            wheel_y -= whole;
+        }
+    }
+    (wheel_x != 0 || wheel_y != 0).then_some(InputEvent::SmoothWheel {
+        x: wheel_x,
+        y: wheel_y,
+    })
 }
 
 /// Which hold suppresses local delivery while driving remotely.
@@ -190,6 +289,12 @@ impl X11Capture {
             ignored = ignored_sources.len(),
             "X11 capture armed; own injector devices excluded from capture"
         );
+        let scroll_axes = query_scroll_axes(&connection);
+        tracing::info!(
+            devices = scroll_axes.len(),
+            axes = scroll_axes.values().map(Vec::len).sum::<usize>(),
+            "X11 smooth-scroll valuators resolved (trackpads without button emulation scroll through these)"
+        );
         // Invisible grab window (see the field): input-only,
         // override-redirect, mapped but zero pixels on screen.
         let grab_window = connection
@@ -228,6 +333,8 @@ impl X11Capture {
             core_last: None,
             ignored_sources,
             last_source_refresh: std::time::Instant::now(),
+            scroll_axes,
+            scroll_bank: HashMap::new(),
             xfixes_cursor,
             cursor_hidden: false,
         })
@@ -332,6 +439,29 @@ impl X11Capture {
                 if self.ignored_sources.contains(&event.sourceid) {
                     return None;
                 }
+                // Smooth-scroll valuators FIRST: a scroll gesture carries
+                // no pointer motion, and motion below derives nothing —
+                // but when both move, the wheel wins (a scroll that also
+                // nudges the pointer must still scroll). Disjoint field
+                // borrows: the axes map reads while only the bank writes.
+                if let Some(axes) = self.scroll_axes.get(&event.sourceid) {
+                    if let Some(wheel) = derive_scroll_wheel(
+                        event.sourceid,
+                        &event.valuator_mask,
+                        &event.axisvalues_raw,
+                        axes,
+                        &mut self.scroll_bank,
+                    ) {
+                        static FIRST_SMOOTH: std::sync::Once = std::sync::Once::new();
+                        FIRST_SMOOTH.call_once(|| {
+                            tracing::info!(
+                                source = event.sourceid,
+                                "x11 smooth-scroll valuator derived into wheel events"
+                            );
+                        });
+                        return count_button_event(Some(wheel));
+                    }
+                }
                 XI_MOTION.fetch_add(1, Ordering::Relaxed);
                 let dx = axis_value(&event.valuator_mask, &event.axisvalues_raw, 0)
                     .map(|value| take_integer(&mut self.motion_x, value))
@@ -412,6 +542,12 @@ impl CaptureBackend for X11Capture {
                 if let Some(refreshed) = query_own_sources(&self.connection) {
                     self.ignored_sources = refreshed;
                 }
+                // Hot-plugged scroll devices (or a server that grows
+                // scroll classes late) join without a restart.
+                let refreshed_axes = query_scroll_axes(&self.connection);
+                if !refreshed_axes.is_empty() {
+                    self.scroll_axes = refreshed_axes;
+                }
             }
             if release.swap(false, Ordering::AcqRel) {
                 self.release()?;
@@ -439,12 +575,15 @@ impl CaptureBackend for X11Capture {
             return Ok(());
         }
         if exclusive {
-            // XI2 active grab first; Deskflow-style core grabs when the
-            // server refuses it (live-proven: this Xorg answers every
-            // XIGrabDevice with BadValue while XGrabPointer succeeds).
-            // Either hold suppresses local delivery; the XI raw selection
-            // underneath keeps feeding capture in both cases.
-            match xi_grab(&self.connection, self.root) {
+            // XI2 active grab first, on OUR OWN window (a root-windowed
+            // grab is refused wholesale on this Xorg — BadValue naming
+            // the root id — while the client-owned window succeeds);
+            // Deskflow-style core grabs when the server refuses XI
+            // outright (live-proven: this Xorg answers every XIGrabDevice
+            // with BadValue while XGrabPointer succeeds). Either hold
+            // suppresses local delivery; the XI raw selection underneath
+            // keeps feeding capture in both cases.
+            match xi_grab(&self.connection, self.grab_window) {
                 Ok(()) => self.grab_kind = GrabKind::Xi,
                 Err(xi_error) => {
                     tracing::info!(%xi_error, "XIGrabDevice refused; falling back to core pointer+keyboard grab");
@@ -555,11 +694,18 @@ fn raw_mask() -> u32 {
 
 /// XI2 active grab of all master devices (raw-device semantics). Free
 /// function so the capture trait keeps only the backend interface.
-fn xi_grab(connection: &RustConnection, root: xproto::Window) -> Result<(), PlatformError> {
+/// The grab targets OUR OWN invisible window, never root: this Xorg
+/// answers every root-windowed XIGrabDevice with BadValue (the grab
+/// window id itself is the rejected value) while the identical grab on
+/// our client-owned window succeeds — and raw XI delivery (including
+/// smooth-scroll valuators) keeps flowing under an XI hold, which a
+/// core hold kills. Core stays the fallback for servers that refuse
+/// XI grabs outright.
+fn xi_grab(connection: &RustConnection, grab_window: xproto::Window) -> Result<(), PlatformError> {
     let mask = [raw_mask()];
     let status = connection
         .xinput_xi_grab_device(
-            root,
+            grab_window,
             0u32,
             0u32,
             ALL_MASTER_DEVICES,
@@ -757,6 +903,68 @@ mod tests {
                 button: MouseButton::Forward,
                 pressed: false,
             })
+        );
+    }
+
+    #[test]
+    fn smooth_valuator_deltas_derive_signed_wheels() {
+        // Trackpads without button emulation scroll purely through XI2
+        // scroll valuators: +1 vertical unit is one detent DOWN
+        // (button-5 parity, -120), horizontal mirrors on x. Sign and
+        // banking pin here so an inversion or a dropped slow scroll
+        // fails the gate instead of shipping silently unscrolled.
+        use super::{derive_scroll_wheel, ScrollAxis};
+        use std::collections::HashMap;
+        let vertical = vec![ScrollAxis {
+            axis: 2,
+            horizontal: false,
+            units_120ths: 120.0,
+        }];
+        let mut banks = HashMap::new();
+        let mask = [0b100u32];
+        let one = xinput::Fp3232 {
+            integral: 1,
+            frac: 0,
+        };
+        assert_eq!(
+            derive_scroll_wheel(13, &mask, &[one], &vertical, &mut banks),
+            Some(InputEvent::SmoothWheel { x: 0, y: -120 })
+        );
+        // Sub-detent fractions bank across events (1/256-unit ticks =
+        // 0.46875 120ths each: silent, silent, then -1 on the third).
+        let tick = xinput::Fp3232 {
+            integral: 0,
+            frac: 16_777_216,
+        };
+        let mut banks = HashMap::new();
+        assert_eq!(
+            derive_scroll_wheel(13, &mask, &[tick], &vertical, &mut banks),
+            None
+        );
+        assert_eq!(
+            derive_scroll_wheel(13, &mask, &[tick], &vertical, &mut banks),
+            None
+        );
+        assert_eq!(
+            derive_scroll_wheel(13, &mask, &[tick], &vertical, &mut banks),
+            Some(InputEvent::SmoothWheel { x: 0, y: -1 })
+        );
+        // Horizontal valuators drive x with the same right-negative sign.
+        let horizontal = vec![ScrollAxis {
+            axis: 3,
+            horizontal: true,
+            units_120ths: 120.0,
+        }];
+        let mut banks = HashMap::new();
+        let hmask = [0b1000u32];
+        assert_eq!(
+            derive_scroll_wheel(13, &hmask, &[one], &horizontal, &mut banks),
+            Some(InputEvent::SmoothWheel { x: -120, y: 0 })
+        );
+        // Axes the device never advertised contribute nothing.
+        assert_eq!(
+            derive_scroll_wheel(13, &hmask, &[one], &vertical, &mut banks),
+            None
         );
     }
 

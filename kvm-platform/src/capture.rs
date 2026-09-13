@@ -1067,6 +1067,9 @@ mod win32_hooks {
     const PTP_USAGE_TOUCHPAD: u16 = 0x05;
     /// Digitizer-page contact usages (HID usage tables).
     const PTP_USAGE_TIP: u16 = 0x42;
+    /// Digitizer-page finger-collection usage (MS PTP spec: every
+    /// contact lives in a child collection with this usage).
+    const PTP_USAGE_FINGER: u16 = 0x22;
     /// Generic-desktop axis usages.
     const PTP_USAGE_X: u16 = 0x30;
     const PTP_USAGE_Y: u16 = 0x31;
@@ -1348,7 +1351,18 @@ mod win32_hooks {
                 return None;
             }
             let node_len = caps.NumberLinkCollectionNodes as usize;
+            // Finger collections, spec-first: the MS PTP spec puts every
+            // contact in a digitizer-page collection with the Finger
+            // usage (0x22). The old Parent==0 heuristic matched
+            // whatever sat at the root (often the touchpad collection
+            // itself), so TIP/X/Y lookups failed on every report and
+            // two-finger scroll silently never derived — armed, zero
+            // scroll, no log naming the miss. Prefer Finger-usage
+            // collections; keep the root heuristic ONLY as a fallback
+            // for descriptors that hide the usage, and LOG what was
+            // picked either way so the next miss is one grep away.
             let mut fingers = Vec::new();
+            let mut finger_usages: Vec<u16> = Vec::new();
             if node_len > 1 {
                 let mut nodes = vec![hid::HIDP_LINK_COLLECTION_NODE::default(); node_len];
                 let mut nodes_len = node_len as u32;
@@ -1357,15 +1371,29 @@ mod win32_hooks {
                 }
                 .is_ok()
                 {
-                    for node in nodes.iter().take(nodes_len as usize).skip(1) {
-                        if node.Parent == 0
-                            && node.LinkUsagePage == PTP_USAGE_PAGE
-                            && fingers.len() < 10
-                        {
-                            // CollectionNumber is the node index for
-                            // HidP_GetUsageValue's LinkCollection.
-                            fingers.push(node_index(nodes.as_slice(), node));
+                    let mut spec_fingers = Vec::new();
+                    let mut heuristic_fingers = Vec::new();
+                    for (index, node) in nodes.iter().take(nodes_len as usize).enumerate().skip(1)
+                    {
+                        if node.LinkUsagePage != PTP_USAGE_PAGE {
+                            continue;
                         }
+                        // CollectionNumber is the node index for
+                        // HidP_GetUsageValue's LinkCollection.
+                        if node.LinkUsage == PTP_USAGE_FINGER {
+                            spec_fingers.push((index as u16, node.LinkUsage));
+                        } else if node.Parent == 0 {
+                            heuristic_fingers.push((index as u16, node.LinkUsage));
+                        }
+                    }
+                    let picked = if spec_fingers.is_empty() {
+                        heuristic_fingers
+                    } else {
+                        spec_fingers
+                    };
+                    for (collection, usage) in picked.into_iter().take(10) {
+                        fingers.push(collection);
+                        finger_usages.push(usage);
                     }
                 }
             }
@@ -1423,6 +1451,12 @@ mod win32_hooks {
             // The open path's file handle has served its only purpose
             // (feeding HidD_GetPreparsedData); reports arrive via WM_INPUT.
             close_open_file();
+            tracing::info!(
+                contacts = fingers.len(),
+                usages = ?finger_usages,
+                preparsed_source,
+                "precision-touchpad finger collections resolved"
+            );
             Some(PtpDevice {
                 handle: handle_value,
                 preparsed,
@@ -1450,17 +1484,6 @@ mod win32_hooks {
             }
             None => tracing::warn!(stage = fail_stage, "precision-touchpad scroll channel unavailable; trackpad scroll falls back to legacy wheel channels"),
         }
-    }
-
-    /// Index of a link-collection node within its node array: the
-    /// LinkCollection id HidP_GetUsageValue expects.
-    fn node_index(
-        nodes: &[windows::Win32::Devices::HumanInterfaceDevice::HIDP_LINK_COLLECTION_NODE],
-        node: &windows::Win32::Devices::HumanInterfaceDevice::HIDP_LINK_COLLECTION_NODE,
-    ) -> u16 {
-        let base = nodes.as_ptr() as usize;
-        let at = node as *const _ as usize;
-        ((at - base) / std::mem::size_of_val(node)) as u16
     }
 
     /// Logical-maximum-derived scroll scale per finger collection axis:
@@ -1543,6 +1566,13 @@ mod win32_hooks {
             if at + size_hid > buffer.len() || size_hid < report_len {
                 continue;
             }
+            // Delivery proof (once per process): armed + silent meant
+            // nobody could tell missing reports from failed parsing.
+            // Contacts proof lands beside the parse loop below.
+            static FIRST_BUFFER_SEEN: std::sync::Once = std::sync::Once::new();
+            FIRST_BUFFER_SEEN.call_once(|| {
+                tracing::info!("precision-touchpad first HID buffer delivered");
+            });
             let report = &buffer[at..at + size_hid];
             let mut contacts = Vec::with_capacity(fingers.len().min(10));
             for collection in fingers.iter().take(10) {
@@ -1597,6 +1627,13 @@ mod win32_hooks {
                 ptp_pan_slot().feed(&[]);
                 continue;
             }
+            // Parse proof (once per process): buffers arrive but TIP/X/Y
+            // lookups fail = wrong finger collections (the silent miss
+            // that held ptp_scroll at zero while "armed").
+            static FIRST_CONTACTS_SEEN: std::sync::Once = std::sync::Once::new();
+            FIRST_CONTACTS_SEEN.call_once(|| {
+                tracing::info!(contacts = contacts.len(), "precision-touchpad first parsed contacts");
+            });
             let now = std::time::Instant::now();
             let (x, y) = ptp_pan_slot().feed(&contacts);
             if x != 0 || y != 0 {

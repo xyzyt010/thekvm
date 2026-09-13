@@ -25,14 +25,32 @@ enum HelperMessage {
     Input(InputEvent),
     ReleaseAll,
     WarpCursor { x: u32, y: u32 },
-    /// Service-to-helper drive-target announce: the entry warp's screen
-    /// dims in px. Arms ballistics-proof absolute motion in the helper
-    /// (see Win32Injector): without it every injection rides relative
-    /// deltas through pointer acceleration and the tracked cursor
-    /// desyncs from the visible one. Unknown to pre-absolute helpers,
-    /// which drop the frame and stay relative — mixed-version safe.
+    /// Service-to-helper drive-target announce: the REMOTE (driver-side)
+    /// logical screen dims in px. The helper tracks the remote cursor in
+    /// this space and injects the same fraction locally (proportional
+    /// absolute motion, ballistics-proof on any DPI or peer size — see
+    /// Win32Injector). Unknown to pre-absolute helpers, which drop the
+    /// frame and stay relative — mixed-version safe.
     SetTargetSize { width: u32, height: u32 },
     SetExclusive(bool),
+    /// Service-to-helper request: report this helper's own display dims
+    /// (physical metrics + DPI-derived logical space). The service runs
+    /// in Session 0 and cannot measure the interactive desktop itself —
+    /// its session-0 "measured" 1024x768 fantasy is what silently
+    /// disarmed absolute motion and clamped entry warps fleet-wide.
+    /// Unknown to older helpers (dropped frame, fallback dims).
+    TakePrimaryDims,
+    /// Helper-to-service reply for TakePrimaryDims. Physical dims come
+    /// from DPI-aware metrics; logical dims divide by the DPI scale
+    /// (the daemon's coordinate space); dpi names the scale (96 = 100%).
+    /// Zeros when the helper cannot measure (service falls back).
+    PrimaryDims {
+        phys_width: u32,
+        phys_height: u32,
+        logical_width: u32,
+        logical_height: u32,
+        dpi: u32,
+    },
     /// Helper-to-service reply for WarpCursor: whether this helper
     /// actually moved the visible cursor. Without it a skipped warp
     /// (idle desktop) reads as success and entries land stale.
@@ -193,6 +211,49 @@ impl ServiceInputProxy {
             "announce drive target size to Windows helper",
             &message,
         );
+    }
+
+    /// Ask one helper round for its display dims (see TakePrimaryDims):
+    /// first sane reply wins; silence keeps None (fallback dims). The
+    /// reply is small and helpers answer from cached metrics, so the
+    /// 250ms bound from receipts applies.
+    pub fn primary_dims(&mut self) -> Option<(u32, u32, u32, u32, u32)> {
+        let message = serde_json::to_vec(&HelperMessage::TakePrimaryDims).ok()?;
+        let _ = fan_out(
+            &mut self.streams,
+            &mut self.desktops,
+            "take primary dims from Windows helper",
+            &message,
+        );
+        const DIMS_TIMEOUT: Duration = Duration::from_millis(250);
+        const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+        let mut dims = None;
+        self.streams.retain_mut(|stream| {
+            let _ = stream.set_read_timeout(Some(DIMS_TIMEOUT));
+            let reply = read_ipc_frame(stream)
+                .ok()
+                .and_then(|frame| serde_json::from_slice::<HelperMessage>(&frame).ok());
+            let _ = stream.set_read_timeout(Some(STREAM_TIMEOUT));
+            if let Some(HelperMessage::PrimaryDims {
+                phys_width,
+                phys_height,
+                logical_width,
+                logical_height,
+                dpi,
+            }) = reply
+            {
+                if phys_width >= 2
+                    && phys_height >= 2
+                    && logical_width >= 2
+                    && logical_height >= 2
+                    && dims.is_none()
+                {
+                    dims = Some((phys_width, phys_height, logical_width, logical_height, dpi));
+                }
+            }
+            true
+        });
+        dims
     }
 
     /// Ask every helper what happened to its Input messages since the
@@ -707,6 +768,26 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
             HelperMessage::SetTargetSize { width, height } => {
                 injector.set_absolute_target(width, height);
             }
+            HelperMessage::TakePrimaryDims => {
+                // The service (Session 0) cannot measure the interactive
+                // desktop: answer from DPI-aware metrics + DPI scale so
+                // the daemon maps warps and entries in truthful logical
+                // pixels instead of its 1024x768 fantasy.
+                let (phys_width, phys_height) =
+                    kvm_platform::inject::display_physical_dims().unwrap_or((0, 0));
+                let (logical_width, logical_height) =
+                    kvm_platform::inject::display_logical_dims().unwrap_or((0, 0));
+                let reply = serde_json::to_vec(&HelperMessage::PrimaryDims {
+                    phys_width,
+                    phys_height,
+                    logical_width,
+                    logical_height,
+                    dpi: kvm_platform::inject::display_dpi(),
+                });
+                if let Ok(reply) = reply {
+                    let _ = write_ipc_frame(&mut stream, &reply);
+                }
+            }
             HelperMessage::WarpCursor { x, y } => {
                 // Only the desktop that currently owns input may move the
                 // visible cursor. The idle helper (typically winlogon)
@@ -724,10 +805,9 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                             // this the first absolute event jumps from a
                             // stale position.
                             injector.note_warp(x, y);
+                            let expected = warp_readback_expectation(x, y);
                             match kvm_platform::capture::current_cursor_position() {
-                                Ok(Some((actual_x, actual_y)))
-                                    if actual_x == x && actual_y == y =>
-                                {
+                                Ok(Some(actual)) if actual == expected => {
                                     (true, format!("warped on {desktop}"))
                                 }
                                 Ok(actual) => (
@@ -761,7 +841,9 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                 }
             }
             // Service-to-helper only in reverse: never arrives here.
-            HelperMessage::WarpDone { .. } | HelperMessage::InputReceipt { .. } => {}
+            HelperMessage::WarpDone { .. }
+            | HelperMessage::InputReceipt { .. }
+            | HelperMessage::PrimaryDims { .. } => {}
             HelperMessage::SetExclusive(_) => {}
         }
     }
@@ -855,10 +937,26 @@ pub fn run_capture_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn warp_cursor(x: u32, y: u32) -> Result<()> {
+    // The daemon speaks LOGICAL pixels; this helper runs DPI-aware, so
+    // SetCursorPos speaks PHYSICAL. Scale here — an unscaled warp lands
+    // up-left of the entry (1536-logical on a 1920-physical primary)
+    // while read-back still "verifies", the silent-misplacement class.
+    use kvm_platform::inject::{display_dpi, scale_warp_to_physical};
     use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
 
-    unsafe { SetCursorPos(x.min(i32::MAX as u32) as i32, y.min(i32::MAX as u32) as i32) }
+    let (physical_x, physical_y) = scale_warp_to_physical(x, y, display_dpi());
+    unsafe { SetCursorPos(physical_x, physical_y) }
         .context("set cursor position on target Windows desktop")
+}
+
+/// The physical point a logical warp must read back at (see
+/// warp_cursor): placement is verified in the helper's own pixel
+/// space, never by comparing physical truth against logical intent.
+#[cfg(target_os = "windows")]
+fn warp_readback_expectation(x: u32, y: u32) -> (u32, u32) {
+    use kvm_platform::inject::{display_dpi, scale_warp_to_physical};
+    let (physical_x, physical_y) = scale_warp_to_physical(x, y, display_dpi());
+    (physical_x.max(0) as u32, physical_y.max(0) as u32)
 }
 
 /// Desktop access rights the helpers open. SendInput (the entire
@@ -1365,7 +1463,7 @@ mod tests {
         let (mut proxy_side, mut helper_side) = loopback_pair();
         let message = serde_json::to_vec(&HelperMessage::SetTargetSize {
             width: 1536,
-            height: 960,
+            height: 864,
         })
         .unwrap();
         write_ipc_frame(&mut proxy_side, &message).unwrap();
@@ -1374,7 +1472,77 @@ mod tests {
             serde_json::from_slice::<HelperMessage>(&frame).unwrap(),
             HelperMessage::SetTargetSize {
                 width: 1536,
-                height: 960
+                height: 864
+            }
+        ));
+    }
+
+    /// Fake helper answering TakePrimaryDims with fixed dims.
+    fn drive_dims_helper(helper_side: &mut TcpStream) {
+        let frame = read_ipc_frame(helper_side).unwrap();
+        let message: HelperMessage = serde_json::from_slice(&frame).unwrap();
+        assert!(matches!(message, HelperMessage::TakePrimaryDims));
+        let reply = serde_json::to_vec(&HelperMessage::PrimaryDims {
+            phys_width: 1920,
+            phys_height: 1200,
+            logical_width: 1536,
+            logical_height: 960,
+            dpi: 120,
+        })
+        .unwrap();
+        write_ipc_frame(helper_side, &reply).unwrap();
+    }
+
+    #[test]
+    fn primary_dims_query_returns_helper_truth() {
+        // Session-0 fantasy dies here: the first sane helper answer wins
+        // and carries physical + logical + DPI for the daemon's maps.
+        let (proxy_side, mut helper_side) = loopback_pair();
+        std::thread::spawn(move || drive_dims_helper(&mut helper_side));
+        let mut proxy = ServiceInputProxy {
+            streams: vec![proxy_side],
+            desktops: vec!["default".to_owned()],
+            session_id: 1,
+        };
+        assert_eq!(
+            proxy.primary_dims(),
+            Some((1920, 1200, 1536, 960, 120))
+        );
+    }
+
+    #[test]
+    fn primary_dims_silent_helper_stays_compatible() {
+        // No reply at all (pre-dims helper): None, never a hang past the
+        // bounded wait — every consumer falls back exactly as before.
+        let (proxy_side, _silent) = loopback_pair();
+        let mut proxy = ServiceInputProxy {
+            streams: vec![proxy_side],
+            desktops: vec!["default".to_owned()],
+            session_id: 1,
+        };
+        assert_eq!(proxy.primary_dims(), None);
+    }
+
+    #[test]
+    fn dims_variants_round_trip() {
+        let take = serde_json::to_vec(&HelperMessage::TakePrimaryDims).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<HelperMessage>(&take).unwrap(),
+            HelperMessage::TakePrimaryDims
+        ));
+        let dims = serde_json::to_vec(&HelperMessage::PrimaryDims {
+            phys_width: 1920,
+            phys_height: 1200,
+            logical_width: 1536,
+            logical_height: 960,
+            dpi: 120,
+        })
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<HelperMessage>(&dims).unwrap(),
+            HelperMessage::PrimaryDims {
+                logical_width: 1536,
+                ..
             }
         ));
     }

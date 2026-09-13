@@ -572,17 +572,26 @@ mod win32_inject {
     /// edge (the glitchy-horizontal shape). ABSOLUTE motion sets exact
     /// pixels per event — acceleration never applies — so tracked and
     /// real agree by construction and the desync class vanishes.
+    ///
+    /// PROPORTIONAL, not 1:1: `target` is the REMOTE (driver-side)
+    /// logical screen, `pos` the remote cursor inside it, and each event
+    /// injects the same FRACTION locally (0..=65535 spans the local
+    /// primary whatever its size). Local physical dims cancel out, so
+    /// DPI-scaled primaries (1536x960 logical over 1920x1200 physical)
+    /// and mismatched peer sizes (1536x864 remote) both ride exact —
+    /// the old exact-equality gate could never arm on a scaled fleet.
     /// Single-monitor primaries only (see absolute_eligible): without a
     /// layout-to-monitor map, multi-monitor targets stay relative
     /// (today's behavior, no regression).
     #[derive(Debug, Default)]
     struct AbsoluteState {
-        /// Target screen dims in px (from the drive's entry warp).
+        /// Remote drive-target dims in px (announced per entry warp).
         target: Option<(u32, u32)>,
-        /// Integrated cursor position in target px. Reset by every entry
-        /// warp; both sides integrate identical deltas from there, so no
-        /// drift can accumulate (each event recomputes absolute units
-        /// from this position — rounding never compounds).
+        /// Integrated cursor position in REMOTE px. Reset by every entry
+        /// warp (mapped from the local warp point); both sides integrate
+        /// identical deltas from there, so no drift can accumulate (each
+        /// event recomputes absolute units from this position — rounding
+        /// never compounds).
         pos: (i64, i64),
         /// Whether the most recent motion_input took the absolute path
         /// (read by the helper for per-session mode receipts).
@@ -599,6 +608,67 @@ mod win32_inject {
             .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
     }
 
+    /// Map a coordinate across pixel spaces, edges preserved (0 maps to
+    /// 0, last source pixel to last target pixel). Pure for tests.
+    fn map_span(value: u32, from_span: u32, to_span: u32) -> u32 {
+        if from_span <= 1 || to_span <= 1 {
+            return 0;
+        }
+        (u64::from(value.min(from_span - 1)) * u64::from(to_span - 1)
+            / u64::from(from_span - 1)) as u32
+    }
+
+    /// System DPI for scaling (helpers run per-monitor-aware, so cursor
+    /// APIs speak PHYSICAL pixels while the daemon speaks LOGICAL).
+    /// Once per process; 96 (100%) when the API is unavailable.
+    pub fn display_dpi() -> u32 {
+        use windows::Win32::UI::HiDpi::GetDpiForSystem;
+        static DPI: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *DPI.get_or_init(|| {
+            let dpi = unsafe { GetDpiForSystem() };
+            if dpi == 0 {
+                96
+            } else {
+                dpi
+            }
+        })
+    }
+
+    /// Physical primary dims in px (DPI-aware metrics). None when the
+    /// platform exposes no truth.
+    pub fn display_physical_dims() -> Option<(u32, u32)> {
+        primary_dims().and_then(|(w, h)| {
+            (w > 0 && h > 0).then_some((w as u32, h as u32))
+        })
+    }
+
+    /// Logical (DPI-unscaled) primary dims: the coordinate space the
+    /// daemon's warps arrive in. Physical metrics divided by the DPI
+    /// scale; unknown metrics map to None (callers fall back 1:1).
+    pub fn display_logical_dims() -> Option<(u32, u32)> {
+        let (width, height) = primary_dims()?;
+        let dpi = u64::from(display_dpi());
+        if dpi == 0 {
+            return None;
+        }
+        Some((
+            (u64::from(width as u32) * 96 / dpi) as u32,
+            (u64::from(height as u32) * 96 / dpi) as u32,
+        ))
+    }
+
+    /// Scale a daemon-logical warp point into the physical pixels this
+    /// (DPI-aware) helper's SetCursorPos expects. Pure for tests.
+    pub fn scale_warp_to_physical(x: u32, y: u32, dpi: u32) -> (i32, i32) {
+        if dpi == 0 {
+            return (x.min(i32::MAX as u32) as i32, y.min(i32::MAX as u32) as i32);
+        }
+        (
+            ((u64::from(x) * u64::from(dpi) / 96).min(u64::from(i32::MAX as u32)) as i32),
+            ((u64::from(y) * u64::from(dpi) / 96).min(u64::from(i32::MAX as u32)) as i32),
+        )
+    }
+
     fn primary_dims() -> Option<(i32, i32)> {
         static DIMS: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
         *DIMS.get_or_init(|| {
@@ -613,42 +683,32 @@ mod win32_inject {
         *SINGLE.get_or_init(|| unsafe { GetSystemMetrics(SM_CMONITORS) } == 1)
     }
 
-    /// True when absolute injection is exact on this machine: one
-    /// physical monitor whose primary dims equal the drive target. Any
-    /// other shape (multi-monitor, mismatched dims, unknown metrics)
-    /// stays relative — fail-open, never a wrong-screen warp.
+    /// True when absolute injection is meaningful on this machine: one
+    /// monitor and a sane announced REMOTE target. The fraction mapping
+    /// needs no local comparison at all — local physical dims cancel
+    /// out — so DPI scaling and mismatched peer sizes stay absolute
+    /// (the old equality gate pinned every scaled fleet to relative).
+    /// Multi-monitor and degenerate targets stay relative: fail-open,
+    /// never a wrong-screen warp.
     fn absolute_eligible(target: (u32, u32)) -> bool {
-        single_monitor()
-            && primary_dims().is_some_and(|(w, h)| {
-                u64::from(target.0) == w as u64 && u64::from(target.1) == h as u64
-            })
+        single_monitor() && target.0 >= 2 && target.1 >= 2
     }
 
-    /// Pure verdict behind absolute_detail (machine state injected for
-    /// tests): no target, multi-monitor, unknown metrics, dims
-    /// mismatch, or armed. Mirrors absolute_eligible exactly — keep the
-    /// two in sync when either changes.
-    fn describe_absolute(
-        target: Option<(u32, u32)>,
-        single: bool,
-        primary: Option<(i32, i32)>,
-    ) -> String {
-        let Some((width, height)) = target else {
+    /// Pure verdict behind absolute_detail (state injected for tests):
+    /// no target, multi-monitor, or armed with the remote dims. Mirrors
+    /// absolute_eligible exactly — keep the two in sync when either
+    /// changes.
+    fn describe_absolute(target: Option<(u32, u32)>, single: bool) -> String {
+        // The setter only ever stores sane dims; a degenerate announce
+        // reads as "no target" here too, so the verdict can never claim
+        // armed on a target the injector itself would refuse.
+        let Some((width, height)) = target.filter(|(w, h)| *w >= 2 && *h >= 2) else {
             return "relative: no target announced".to_owned();
         };
         if !single {
             return "relative: multi-monitor".to_owned();
         }
-        let Some((primary_width, primary_height)) = primary else {
-            return "relative: primary metrics unknown".to_owned();
-        };
-        if u64::from(width) == primary_width as u64
-            && u64::from(height) == primary_height as u64
-        {
-            format!("absolute armed {width}x{height}")
-        } else {
-            format!("relative: primary {primary_width}x{primary_height} != target {width}x{height}")
-        }
+        format!("absolute armed remote {width}x{height}")
     }
 
     impl Win32Injector {
@@ -662,7 +722,10 @@ mod win32_inject {
 
         /// Arm absolute motion for the drive target (px). Called on every
         /// entry warp via SetTargetSize; a zero/degenerate target disables
-        /// (falls back to relative on the next event).
+        /// (falls back to relative on the next event). The dims are the
+        /// REMOTE (driver-side) logical screen: the accumulator tracks
+        /// the remote cursor and each event injects the same fraction
+        /// locally, so local physical size never matters.
         pub fn set_absolute_target(&self, width: u32, height: u32) {
             if let Ok(mut guard) = self.absolute.lock() {
                 guard.target = (width >= 2 && height >= 2).then_some((width, height));
@@ -670,10 +733,27 @@ mod win32_inject {
         }
 
         /// Re-anchor the absolute accumulator to an entry warp
-        /// destination (same point both sides integrate from).
+        /// destination. The warp arrives in LOCAL-logical pixels (the
+        /// daemon's space); map it into the remote space both sides
+        /// integrate in. Unknown local dims fall back 1:1 (today's
+        /// behavior on unscaled primaries).
         pub fn note_warp(&self, x: u32, y: u32) {
             if let Ok(mut guard) = self.absolute.lock() {
-                guard.pos = (i64::from(x), i64::from(y));
+                let Some((remote_width, remote_height)) = guard.target else {
+                    guard.pos = (i64::from(x), i64::from(y));
+                    return;
+                };
+                match display_logical_dims() {
+                    Some((local_width, local_height)) => {
+                        guard.pos = (
+                            i64::from(map_span(x, local_width, remote_width)),
+                            i64::from(map_span(y, local_height, remote_height)),
+                        );
+                    }
+                    None => {
+                        guard.pos = (i64::from(x), i64::from(y));
+                    }
+                }
             }
         }
 
@@ -691,18 +771,29 @@ mod win32_inject {
         /// the helper receipts): names WHY motion rides absolute or
         /// relative on this machine — the one line that settles
         /// dims/DPI/multi-monitor questions without remote debugging.
+        /// Appends the local physical dims and DPI so a scaled fleet
+        /// reads honestly (fractions still arm: only multi-monitor or
+        /// a missing target pins relative now).
         pub fn absolute_detail(&self) -> String {
-            let (target, single, primary) = match self.absolute.lock() {
-                Ok(guard) => (guard.target, single_monitor(), primary_dims()),
-                Err(_) => (None, false, None),
+            let (target, single) = match self.absolute.lock() {
+                Ok(guard) => (guard.target, single_monitor()),
+                Err(_) => (None, false),
             };
-            describe_absolute(target, single, primary)
+            let mut detail = describe_absolute(target, single);
+            if let Some((width, height)) = primary_dims() {
+                detail.push_str(&format!(
+                    " (local {width}x{height} @{}dpi)",
+                    display_dpi()
+                ));
+            }
+            detail
         }
 
-        /// Build the motion INPUT: absolute when armed and exact (see
-        /// absolute_eligible), relative otherwise. Returns None only when
-        /// the motion state is unavailable (lock poisoned): the caller
-        /// then skips the event rather than injecting a stale position.
+        /// Build the motion INPUT: absolute when a sane remote target is
+        /// announced on a single-monitor primary (see absolute_eligible),
+        /// relative otherwise. Returns None only when the motion state is
+        /// unavailable (lock poisoned): the caller then skips the event
+        /// rather than injecting a stale position.
         fn motion_input(&self, dx: i32, dy: i32) -> Option<INPUT> {
             let mut guard = self.absolute.lock().ok()?;
             if let Some(target) = guard.target {
@@ -1140,7 +1231,7 @@ mod win32_inject {
         fn motion_without_target_stays_relative() {
             // No SetTargetSize seen (or a degenerate one): byte-identical
             // relative motion to every previous release — the fail-open
-            // path for multi-monitor and mismatched machines.
+            // path for multi-monitor machines and missing announces.
             let injector = super::Win32Injector::create().unwrap();
             injector.set_absolute_target(0, 0);
             let input = injector.motion_input(3, -2).unwrap();
@@ -1157,27 +1248,52 @@ mod win32_inject {
         #[test]
         fn describe_absolute_names_every_verdict() {
             // The journal line operators read: each shape names its cause.
+            // Fractions arm on any sane remote target — only a missing
+            // target or multi-monitor pins relative now (DPI scaling and
+            // mismatched peer sizes ride absolute, by design).
             use super::describe_absolute;
             assert_eq!(
-                describe_absolute(None, true, Some((1536, 960))),
+                describe_absolute(None, true),
                 "relative: no target announced"
             );
             assert_eq!(
-                describe_absolute(Some((1536, 960)), false, Some((1536, 960))),
+                describe_absolute(Some((1536, 864)), false),
                 "relative: multi-monitor"
             );
             assert_eq!(
-                describe_absolute(Some((1536, 960)), true, None),
-                "relative: primary metrics unknown"
+                describe_absolute(Some((1536, 864)), true),
+                "absolute armed remote 1536x864"
             );
             assert_eq!(
-                describe_absolute(Some((1536, 960)), true, Some((1229, 768))),
-                "relative: primary 1229x768 != target 1536x960"
+                describe_absolute(Some((1, 864)), true),
+                "relative: no target announced"
             );
-            assert_eq!(
-                describe_absolute(Some((1536, 960)), true, Some((1536, 960))),
-                "absolute armed 1536x960"
-            );
+        }
+
+        #[test]
+        fn span_mapping_preserves_edges() {
+            // Remote-logical to local-logical for warp anchoring: edges
+            // stay edges, midpoints stay proportional, degenerate spans
+            // map to the origin instead of dividing by zero.
+            use super::map_span;
+            assert_eq!(map_span(0, 1536, 864), 0);
+            assert_eq!(map_span(1535, 1536, 864), 863);
+            assert_eq!(map_span(767, 1536, 864), 431);
+            assert_eq!(map_span(99999, 1536, 864), 863);
+            assert_eq!(map_span(100, 0, 864), 0);
+            assert_eq!(map_span(100, 1536, 1), 0);
+        }
+
+        #[test]
+        fn warp_scaling_converts_logical_to_physical() {
+            // The daemon speaks logical pixels; the DPI-aware helper's
+            // SetCursorPos speaks physical. 125% (120dpi): 1536x960
+            // logical lands on 1920x1200 physical, edges preserved.
+            use super::scale_warp_to_physical;
+            assert_eq!(scale_warp_to_physical(0, 0, 120), (0, 0));
+            assert_eq!(scale_warp_to_physical(1535, 959, 120), (1918, 1198));
+            assert_eq!(scale_warp_to_physical(100, 200, 96), (100, 200));
+            assert_eq!(scale_warp_to_physical(100, 200, 0), (100, 200));
         }
 
         #[test]
@@ -1196,6 +1312,8 @@ mod win32_inject {
 
 #[cfg(target_os = "windows")]
 pub use win32_inject::Win32Injector as Injector;
+#[cfg(target_os = "windows")]
+pub use win32_inject::{display_dpi, display_logical_dims, display_physical_dims, scale_warp_to_physical};
 
 /// Compile-time fallback for desktop targets without an evdev/uinput or
 /// Windows backend. Keeping the type available lets the shared daemon,

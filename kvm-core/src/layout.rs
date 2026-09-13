@@ -387,8 +387,18 @@ pub enum RoutedEvent {
     /// driven: the caller ends the episode and restores the saved local
     /// position (edge return, no network round trip). Fires only for an
     /// ARMED home-facing overflow (see the router's Schmitt trigger), so
-    /// post-entry jitter can never produce one.
-    ReturnHome { from: ScreenId, edge: Edge },
+    /// post-entry jitter can never produce one. Carries the PRE-restore
+    /// Schmitt state (entry edge + armed flag as they were when the
+    /// return fired): the router clears both during restore, so reading
+    /// them after the fact can only ever print None/false — which is
+    /// exactly the vacuous telemetry that hid every return-path
+    /// misdiagnosis before this.
+    ReturnHome {
+        from: ScreenId,
+        edge: Edge,
+        entry_edge: Option<Edge>,
+        armed: bool,
+    },
 }
 
 /// Stateful edge router for a local controller. It tracks the cursor in the
@@ -703,6 +713,54 @@ impl EdgeRouter {
         Some((screen.width, screen.height))
     }
 
+    /// Adopt the PEER's advertised screen size into the layout (Hello
+    /// geometry, never the configured fallback). The driver tracks the
+    /// remote cursor, maps entry points, and maps return heights against
+    /// the PEER screen's dims: with the stale 1920x1080 fallback in force
+    /// while both machines measure smaller truth (1536x864 / 1536x960),
+    /// entries land clamped to wrong heights, the virtual cursor roams a
+    /// screen that does not exist (phantom mid-screen exits), and returns
+    /// map through an identity that preserves nothing. Matches the peer
+    /// screen by pairing fingerprint (local numbers never agree across
+    /// machines). Clamps the tracked cursors into the new dims and
+    /// restarts any push/return run (accumulated overflow in old pixels
+    /// is meaningless in new ones). Returns the dims now in force, or
+    /// None when no screen carries that fingerprint / a dim is zero.
+    pub fn adopt_peer_screen_size(
+        &mut self,
+        fingerprint: &str,
+        width: u32,
+        height: u32,
+    ) -> Option<(u32, u32)> {
+        let id = self
+            .layout
+            .screens
+            .iter()
+            .find(|screen| screen.peer_fingerprint.as_deref() == Some(fingerprint))
+            .map(|screen| screen.id)?;
+        if !self.layout.set_screen_size(id, width, height) {
+            return None;
+        }
+        let screen = self
+            .layout
+            .screen(id)
+            .expect("EdgeRouter invariant: peer screen exists");
+        // The virtual cursor only lives in peer pixels while driving
+        // that peer: clamp it then, never the saved LOCAL home position
+        // (clamping home into smaller peer dims would drag every return
+        // inward).
+        if self.current_screen == id {
+            self.cursor_x = self.cursor_x.min(screen.width.saturating_sub(1));
+            self.cursor_y = self.cursor_y.min(screen.height.saturating_sub(1));
+        }
+        self.push_edge = None;
+        self.push_accum = 0;
+        self.return_accum = 0;
+        self.return_edge = None;
+        self.return_edge_accum = 0;
+        Some((screen.width, screen.height))
+    }
+
     pub fn route(&mut self, event: InputEvent) -> RoutedEvent {
         if let Some(target) = self.active_remote {
             // Virtual remote cursor with a Schmitt-trigger edge return.
@@ -795,9 +853,18 @@ impl EdgeRouter {
                                 // Park at the edge with the roamed height
                                 // (mapped vertical, saved edge x): a return
                                 // never lands mid-screen, nor teleports
-                                // back to the stale exit height.
+                                // back to the stale exit height. Snapshot
+                                // the Schmitt state BEFORE restore clears
+                                // it (see the ReturnHome docs).
+                                let entry_edge = self.entry_edge;
+                                let armed = self.return_armed;
                                 let _ = self.restore_local(target);
-                                return RoutedEvent::ReturnHome { from, edge };
+                                return RoutedEvent::ReturnHome {
+                                    from,
+                                    edge,
+                                    entry_edge,
+                                    armed,
+                                };
                             }
                             self.cursor_x =
                                 next_x.clamp(0, i64::from(remote.width) - 1) as u32;
@@ -820,8 +887,15 @@ impl EdgeRouter {
                             };
                             self.return_accum += overflow.max(0);
                             if self.return_accum >= RETURN_PUSH_PX {
+                                let entry_edge = self.entry_edge;
+                                let armed = self.return_armed;
                                 let _ = self.restore_local(target);
-                                return RoutedEvent::ReturnHome { from, edge };
+                                return RoutedEvent::ReturnHome {
+                                    from,
+                                    edge,
+                                    entry_edge,
+                                    armed,
+                                };
                             }
                         } else {
                             self.return_accum = 0;
@@ -1391,13 +1465,16 @@ mod tests {
             assert!(!matches!(result, RoutedEvent::ReturnHome { .. }));
         }
         // ...but a sustained home-ward shove escapes without ever
-        // settling inside first.
+        // settling inside first — carrying the pre-restore Schmitt
+        // state (entry edge known, never armed).
         let result = router.route(InputEvent::MouseMove { dx: -10, dy: 0 });
         assert!(matches!(
             result,
             RoutedEvent::ReturnHome {
                 from: ScreenId(2),
-                edge: Edge::Left
+                edge: Edge::Left,
+                entry_edge: Some(Edge::Left),
+                armed: false,
             }
         ));
         assert_eq!(router.active_remote(), None);
@@ -1696,9 +1773,58 @@ mod tests {
             Some((1280, 720))
         );
     }
+    #[test]
+    fn adopt_peer_screen_size_applies_hello_geometry() {
+        // The Hello advertisement replaces the configured fallback for
+        // the peer screen only: entries map, virtual bounds, and returns
+        // all work in truth instead of 1920x1080 fantasy.
+        let fingerprint = "ab".repeat(32);
+        let layout = Layout::pair_default("me", "peer", &fingerprint);
+        let mut router = EdgeRouter::new(layout).unwrap();
+        let peer = router
+            .layout()
+            .screens
+            .iter()
+            .find(|s| s.peer_fingerprint.as_deref() == Some(fingerprint.as_str()))
+            .map(|s| s.id)
+            .expect("paired layout carries the peer fingerprint");
+        assert_eq!(
+            router.adopt_peer_screen_size(&fingerprint, 1536, 864),
+            Some((1536, 864))
+        );
+        assert_eq!(
+            router.layout().screen(peer).map(|s| (s.width, s.height)),
+            Some((1536, 864))
+        );
+        // The local screen is untouched by peer adoption.
+        assert_eq!(
+            router
+                .layout()
+                .screen(router.local_screen())
+                .map(|s| (s.width, s.height)),
+            Some((1920, 1080))
+        );
+        // Unknown fingerprints and zero dims never corrupt the layout.
+        assert_eq!(router.adopt_peer_screen_size("unknown", 1536, 864), None);
+        assert_eq!(router.adopt_peer_screen_size(&fingerprint, 0, 864), None);
+        assert_eq!(
+            router.layout().screen(peer).map(|s| (s.width, s.height)),
+            Some((1536, 864))
+        );
+    }
 
     #[test]
-    fn next_screen_id_never_collides() {        let paired = Layout::pair_default("me", "peer", &"ab".repeat(32));
+    fn return_state_reports_the_local_idle() {
+        // The accessor backs external telemetry: idle means no entry,
+        // never armed.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let router = EdgeRouter::new(layout).unwrap();
+        assert_eq!(router.return_state(), (None, false));
+    }
+
+    #[test]
+    fn next_screen_id_never_collides() {
+        let paired = Layout::pair_default("me", "peer", &"ab".repeat(32));
         assert_eq!(paired.next_screen_id(), ScreenId(3));
         assert_eq!(Layout::default().next_screen_id(), ScreenId(1));
     }
@@ -1767,7 +1893,8 @@ mod tests {
         // Pushing back past the facing edge returns: x stays the saved
         // edge pixel (never mid-screen), y maps the roamed remote height
         // back (100,590 roamed -> same spans -> (1160,590) home) — with
-        // no network round trip.
+        // no network round trip. The return carries the pre-restore
+        // Schmitt state (settled inside, then pushed out armed).
         let back = router.route(InputEvent::MouseMove {
             dx: -5000,
             dy: 0,
@@ -1777,6 +1904,8 @@ mod tests {
             RoutedEvent::ReturnHome {
                 from,
                 edge: Edge::Left,
+                entry_edge: Some(Edge::Left),
+                armed: true,
             } if from == FIRST_PEER_SCREEN_ID
         ));
         assert_eq!(router.active_remote(), None);
@@ -1884,6 +2013,8 @@ mod tests {
             RoutedEvent::ReturnHome {
                 from,
                 edge: Edge::Right,
+                entry_edge: Some(Edge::Right),
+                armed: true,
             } if from == ScreenId(1)
         ));
         assert_eq!(router.active_remote(), None);
