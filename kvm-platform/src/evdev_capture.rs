@@ -194,13 +194,13 @@ impl Device {
 }
 
 fn key_pressed(value: i32) -> Option<bool> {
-    // EV_KEY value 2 is an autorepeat notification. The receiver's keyboard
-    // stack performs its own repeat; forwarding this as another press creates
-    // duplicate make events and can leave state divergent.
+    // EV_KEY value 2 is an autorepeat notification: forward it as a press
+    // (the capture thread dedupes by transition, and the receiver renders
+    // repeats per platform — re-tap on Windows, native repeat on Linux).
+    // Dropping it here starved Windows receivers of repeats entirely.
     match value {
         0 => Some(false),
-        1 => Some(true),
-        2 => None,
+        1 | 2 => Some(true),
         other => Some(other != 0),
     }
 }
@@ -751,10 +751,13 @@ mod tests {
         );
     }
     #[test]
-    fn filters_kernel_key_autorepeat() {
+    fn kernel_key_autorepeat_forwards_as_press() {
         assert_eq!(key_pressed(0), Some(false));
         assert_eq!(key_pressed(1), Some(true));
-        assert_eq!(key_pressed(2), None);
+        // Value 2 must reach the receiver as a press: Windows renders
+        // repeats from these (it has no native injected-hold repeat),
+        // Linux drops re-presses on held keys and repeats natively.
+        assert_eq!(key_pressed(2), Some(true));
     }
 
     #[test]

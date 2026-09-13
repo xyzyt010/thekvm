@@ -1096,6 +1096,11 @@ mod win32_hooks {
         fingers: Vec<u16>,
         units_per_detent_x: i64,
         units_per_detent_y: i64,
+        /// Negate both scroll axes to match the user's local touchpad
+        /// feel (see ptp_scroll_direction): the HID reports carry raw
+        /// contact motion, while the felt direction depends on the
+        /// Windows ScrollDirection setting.
+        scroll_invert: bool,
     }
 
     fn ptp_device_slot() -> std::sync::MutexGuard<'static, Option<PtpDevice>> {
@@ -1213,6 +1218,43 @@ mod win32_hooks {
                 det_y.clamp(-1000, 1000) as i32 * 120,
             )
         }
+    }
+
+    /// Whether two-finger scroll must be negated to match the user's
+    /// local touchpad feel. The HID digitizer reports raw contact
+    /// motion, but Windows renders the felt direction through the
+    /// PrecisionTouchPad ScrollDirection setting: at the default (0),
+    /// upwards contact motion scrolls content downward (and leftwards
+    /// motion scrolls content rightwards), which is the opposite of the
+    /// raw sensor mapping — forwarding it raw made cross-device scroll
+    /// run backwards against the local feel. Missing/unreadable (e.g.
+    /// the service profile hive) falls back to the default feel.
+    /// Pure apart from the one registry read, read once per subscribe.
+    fn ptp_scroll_invert() -> bool {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::ERROR_SUCCESS;
+        use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+        let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PrecisionTouchPad\0"
+            .encode_utf16()
+            .collect();
+        let value: Vec<u16> = "ScrollDirection\0".encode_utf16().collect();
+        let mut data: u32 = 0;
+        let mut len = std::mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(subkey.as_ptr()),
+                PCWSTR(value.as_ptr()),
+                RRF_RT_REG_DWORD,
+                None,
+                Some((&mut data as *mut u32).cast()),
+                Some(&mut len),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return true;
+        }
+        data == 0
     }
 
     /// Subscribe the raw window to the precision-touchpad digitizer
@@ -1517,11 +1559,13 @@ mod win32_hooks {
                 fingers,
                 units_per_detent_x: units_x,
                 units_per_detent_y: units_y,
+                scroll_invert: ptp_scroll_invert(),
             })
         })();
         match device {
             Some(found) => {
                 let contacts = found.fingers.len();
+                let scroll_invert = found.scroll_invert;
                 {
                     let mut pan = ptp_pan_slot();
                     pan.units_per_detent_x = found.units_per_detent_x;
@@ -1531,6 +1575,7 @@ mod win32_hooks {
                 tracing::info!(
                     contacts,
                     preparsed_source,
+                    scroll_invert,
                     "precision-touchpad scroll channel armed (HID digitizer tap)"
                 );
             }
@@ -1609,13 +1654,19 @@ mod win32_hooks {
             return;
         }
         let Some(device) = ptp_device_slot().as_ref().map(|slot| {
-            (slot.preparsed, slot.report_len, slot.fingers.clone(), slot.handle)
+            (
+                slot.preparsed,
+                slot.report_len,
+                slot.fingers.clone(),
+                slot.handle,
+                slot.scroll_invert,
+            )
         }) else {
             return;
         };
         // NOTE: the slot lock drops before parsing (HidP calls below take
         // no locks; the gesture accumulator has its own slot).
-        let (preparsed, report_len, fingers, _handle) = device;
+        let (preparsed, report_len, fingers, _handle, scroll_invert) = device;
         let data_at = header_size + 8;
         for index in 0..count {
             let at = data_at + index * size_hid;
@@ -1696,6 +1747,14 @@ mod win32_hooks {
             });
             let now = std::time::Instant::now();
             let (x, y) = ptp_pan_slot().feed(&contacts);
+            // Match the local touchpad feel (see ptp_scroll_invert):
+            // saturating negation is overflow-safe by construction
+            // (feed clamps to +-1000 detents before scaling).
+            let (x, y) = if scroll_invert {
+                (x.saturating_neg(), y.saturating_neg())
+            } else {
+                (x, y)
+            };
             if x != 0 || y != 0 {
                 // First live report proves the digitizer tap delivers on
                 // THIS hardware (once per process; the census counts on).

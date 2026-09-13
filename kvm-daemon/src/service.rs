@@ -2858,12 +2858,44 @@ async fn take_parked_for(
     parked: &mut Option<TopologySession>,
     target: ScreenId,
 ) -> Option<TopologySession> {
-    let session = parked.take()?;
-    if session.target == target && session.connection.close_reason().is_none() {
-        return Some(session);
+    let mut session = parked.take()?;
+    if session.target != target || session.connection.close_reason().is_some() {
+        session.finish().await;
+        return None;
     }
-    session.finish().await;
-    None
+    // Liveness proof before reuse: a parked stream whose peer app end
+    // died (wedged drain, reaped episode) can still ride a live QUIC
+    // association, and resuming it opens a silent drive — control
+    // leaves locally, nothing moves remotely, and the only way home is
+    // the walk-back. One bounded Ping/Pong round trip proves the peer
+    // still reads this stream; on timeout the park is finished and the
+    // caller dials fresh instead. Stale backlog drains first so an
+    // ancient Pong cannot pose as fresh proof.
+    while session.signals.try_recv().is_ok() {}
+    let verified = tokio::time::timeout(Duration::from_secs(1), async {
+        write_frame(&mut session.send, &WireMessage::Ping { nonce: 0 }).await?;
+        loop {
+            match session.signals.recv().await {
+                Some(RemoteSignal::Progress) => return Ok::<(), anyhow::Error>(()),
+                Some(_) => continue,
+                None => anyhow::bail!("parked drive stream closed"),
+            }
+        }
+    })
+    .await;
+    match verified {
+        Ok(Ok(())) => Some(session),
+        Ok(Err(error)) => {
+            tracing::debug!(%error, ?target, "parked drive stream failed liveness; dialling fresh");
+            session.finish().await;
+            None
+        }
+        Err(_) => {
+            tracing::debug!(?target, "parked drive stream liveness timed out; dialling fresh");
+            session.finish().await;
+            None
+        }
+    }
 }
 
 /// Drive on an idle/pre-warmed or parked stream: Handoff + state + first
@@ -3494,7 +3526,15 @@ impl CapturedState {
         let changed = match event {
             InputEvent::Key(key) => {
                 if key.pressed {
-                    self.keys.insert(key.usage)
+                    // Typematic repeats arrive as duplicate presses: they
+                    // MUST reach the receiver (Windows does not auto-repeat
+                    // injected holds, so the receiver re-taps them; Linux
+                    // skips re-presses on held keys and repeats natively).
+                    // Dropping them here is what made held keys emit one
+                    // char remotely. Buttons have no repeat and stay
+                    // deduped below.
+                    self.keys.insert(key.usage);
+                    true
                 } else {
                     self.keys.remove(&key.usage)
                 }
@@ -6669,14 +6709,17 @@ mod tests {
     }
 
     #[test]
-    fn capture_state_deduplicates_key_and_button_repeats() {
+    fn capture_state_forwards_key_repeats_but_dedupes_buttons() {
         let mut captured = CapturedState::default();
         let key = InputEvent::Key(kvm_core::KeyEvent {
             usage: 0x04,
             pressed: true,
         });
+        // First press plus two typematic repeats: all three must reach
+        // the receiver (Windows re-taps repeats; Linux skips held keys).
         assert!(captured.record(key).is_some());
-        assert!(captured.record(key).is_none());
+        assert!(captured.record(key).is_some());
+        assert!(captured.record(key).is_some());
         assert!(captured
             .record(InputEvent::Key(kvm_core::KeyEvent {
                 usage: 0x04,

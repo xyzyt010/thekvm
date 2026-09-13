@@ -77,6 +77,11 @@ pub struct X11Capture {
     /// valuator deltas arrive fractional, and truncating each event
     /// would eat slow scrolls whole.
     scroll_bank: HashMap<(xinput::DeviceId, usize), f64>,
+    /// Inbound-diverted arrivals already warned about (see
+    /// INBOUND_DIVERTED): the journal line fires at most once per
+    /// window while the shape persists, never per event.
+    diverted_seen: u64,
+    last_divert_warn: Option<std::time::Instant>,
     /// Whether the server answered XFixes version negotiation (probed
     /// once at creation): gates cursor hiding, which has no fallback.
     xfixes_cursor: bool,
@@ -109,6 +114,12 @@ static XI_KEY: AtomicU64 = AtomicU64::new(0);
 static XI_BUTTON: AtomicU64 = AtomicU64::new(0);
 static XI_MOTION: AtomicU64 = AtomicU64::new(0);
 static XI_WHEEL: AtomicU64 = AtomicU64::new(0);
+/// Raw arrivals from our own virtual injector devices while a local
+/// drive grab is held (see translate): the peer is driving us, but an
+/// active XI grab diverts every pointer event into our invisible grab
+/// window, so the remote cursor cannot move locally until this drive
+/// returns home. The counter names that shape in the journal.
+static INBOUND_DIVERTED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn census() -> (u64, u64, u64, u64) {
     (
@@ -385,6 +396,8 @@ impl X11Capture {
             last_source_refresh: std::time::Instant::now(),
             scroll_axes,
             scroll_bank: HashMap::new(),
+            diverted_seen: 0,
+            last_divert_warn: None,
             screen_dims,
             cage_quiet: 0,
             xfixes_cursor,
@@ -489,6 +502,19 @@ impl X11Capture {
     }
 
     fn translate(&mut self, event: x11rb::protocol::Event) -> Option<InputEvent> {
+        // Inbound-drive visibility while grabbed (see INBOUND_DIVERTED):
+        // our own virtual injector devices keep emitting raw events into
+        // a grabbed server; they land in the grab window instead of
+        // moving the local cursor, which reads as "the peer drives but
+        // nothing moves here". Count them so the journal names the
+        // shape; the existing arms below still drop them as own-echo.
+        if self.grab_kind != GrabKind::None {
+            if let Some(source) = raw_source_id(&event) {
+                if self.ignored_sources.contains(&source) {
+                    INBOUND_DIVERTED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         match event {
             x11rb::protocol::Event::XinputRawKeyPress(event) => {
                 // Core-grabbed: this server stops XI raw delivery under
@@ -672,6 +698,24 @@ impl CaptureBackend for X11Capture {
             // one warp per edge visit — never per event.
             if self.grab_kind == GrabKind::Core {
                 self.maybe_recenter_cage();
+            }
+            // Inbound-drive diversion report (see INBOUND_DIVERTED): new
+            // arrivals only, at most one journal line per window, so a
+            // simultaneous remote drive is diagnosable, not silent.
+            let diverted = INBOUND_DIVERTED.load(Ordering::Relaxed);
+            if diverted > self.diverted_seen {
+                self.diverted_seen = diverted;
+                let due = self
+                    .last_divert_warn
+                    .map(|when| when.elapsed() > std::time::Duration::from_secs(30))
+                    .unwrap_or(true);
+                if due {
+                    self.last_divert_warn = Some(std::time::Instant::now());
+                    tracing::warn!(
+                        diverted,
+                        "inbound remote input is being diverted by our local drive grab; the peer cursor cannot move here until this drive returns home"
+                    );
+                }
             }
             if let Some(event) = self
                 .connection
@@ -1064,6 +1108,20 @@ fn axis_value(mask: &[u32], values: &[xinput::Fp3232], axis: usize) -> Option<f6
         + (mask_word & ((1 << bit) - 1)).count_ones() as usize;
     let value = values.get(index)?;
     Some(value.integral as f64 + f64::from(value.frac) / FIXED_POINT_SCALE)
+}
+
+/// Source slave id of XI2 raw events (the only stream carrying one);
+/// core/grabbed events have none. Used to spot our own injector's
+/// traffic while grabbed (see translate).
+fn raw_source_id(event: &x11rb::protocol::Event) -> Option<xinput::DeviceId> {
+    match event {
+        x11rb::protocol::Event::XinputRawKeyPress(event) => Some(event.sourceid),
+        x11rb::protocol::Event::XinputRawKeyRelease(event) => Some(event.sourceid),
+        x11rb::protocol::Event::XinputRawButtonPress(event) => Some(event.sourceid),
+        x11rb::protocol::Event::XinputRawButtonRelease(event) => Some(event.sourceid),
+        x11rb::protocol::Event::XinputRawMotion(event) => Some(event.sourceid),
+        _ => None,
+    }
 }
 
 /// Relative step between two grabbed-core pointer positions (root

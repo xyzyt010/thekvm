@@ -107,13 +107,28 @@ if ($LASTEXITCODE -ne 0) {
     throw "Could not secure TheKVM data directory $DataDirectory"
 }
 
+# Service diagnostics must stay readable by everyone: the service log
+# lives in a dedicated Logs directory with Users read access (the
+# locked-down data directory above holds identity keys and stays
+# restricted). Created here so reinstalls and upgrades repair it even
+# if deleted; the service itself only appends inside it.
+$logDirectory = Join-Path $DataDirectory "Logs"
+New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+icacls.exe $logDirectory /inheritance:r /grant:r `
+    '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-1-0:(OI)(CI)R' | Out-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not secure TheKVM log directory $logDirectory"
+}
+
 sc.exe create $serviceName binPath= "`"$binary`" serve --service" start= auto obj= LocalSystem | Out-Host
 sc.exe description $serviceName "TheKVM privileged receiver service" | Out-Host
 sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/5000/restart/10000 | Out-Host
 sc.exe start $serviceName | Out-Host
 
-# Idempotent firewall rule: replace any previous TheKVM rule.
+# Idempotent firewall rule: replace any previous TheKVM rule. Public is
+# included (installer parity): a PS-installed machine on a Public-classed
+# network blackholed ALL Mint->Windows inbound while Windows->Mint worked.
 Get-NetFirewallRule -DisplayName "TheKVM QUIC and discovery" -ErrorAction SilentlyContinue |
     Remove-NetFirewallRule -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName "TheKVM QUIC and discovery" -Direction Inbound -Action Allow -Protocol UDP -LocalPort 42110,42111 -Program $binary -Profile Domain,Private | Out-Null
+New-NetFirewallRule -DisplayName "TheKVM QUIC and discovery" -Direction Inbound -Action Allow -Protocol UDP -LocalPort 42110,42111 -Program $binary -Profile Domain,Private,Public | Out-Null
 Write-Host "TheKVM installed to $InstallDirectory and the $serviceName service is running."

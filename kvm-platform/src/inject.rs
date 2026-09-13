@@ -268,6 +268,14 @@ mod linux_uinput {
                     let code = hid_to_evdev(usage).ok_or_else(|| {
                         PlatformError::Uinput(format!("unsupported HID keyboard usage: {usage:#x}"))
                     })?;
+                    if pressed && self.pressed_keys.contains(&code) {
+                        // Typematic repeat on an already-held key: the X
+                        // server auto-repeats held keys natively (proven
+                        // live), so re-injecting would double every held
+                        // char. Skip; the hold (and its native repeat)
+                        // continues uninterrupted.
+                        return Ok(());
+                    }
                     Self::emit(&mut self.keyboard, EV_KEY, code, i32::from(pressed))
                         .map_err(io_error)?;
                     if pressed {
@@ -893,29 +901,12 @@ mod win32_inject {
                             (0, scan_code, extended)
                         }
                     };
-                    let mut flags = if scan_code == 0 {
-                        Default::default()
-                    } else {
-                        KEYEVENTF_SCANCODE
-                    };
-                    if !key.pressed {
-                        flags |= KEYEVENTF_KEYUP;
-                    }
-                    if extended {
-                        flags |= KEYEVENTF_EXTENDEDKEY;
-                    }
-                    vec![INPUT {
-                        r#type: INPUT_KEYBOARD,
-                        Anonymous: INPUT_0 {
-                            ki: KEYBDINPUT {
-                                wVk: VIRTUAL_KEY(virtual_key),
-                                wScan: scan_code,
-                                dwFlags: flags,
-                                time: 0,
-                                dwExtraInfo: crate::ECHO_TAG,
-                            },
-                        },
-                    }]
+                    let held = self
+                        .pressed_keys
+                        .lock()
+                        .map(|pressed| pressed.contains(&key.usage))
+                        .unwrap_or(false);
+                    key_inputs_for(virtual_key, scan_code, extended, key.pressed, held)
                 }
             };
             if inputs.is_empty() {
@@ -1028,6 +1019,60 @@ mod win32_inject {
             });
         }
         inputs
+    }
+
+    /// One keyboard INPUT for a press/release transition. Pure
+    /// constructor so the hold/repeat/tap composition below stays
+    /// testable without touching SendInput.
+    fn keybd_input(virtual_key: u16, scan_code: u16, extended: bool, pressed: bool) -> INPUT {
+        let mut flags = if scan_code == 0 {
+            Default::default()
+        } else {
+            KEYEVENTF_SCANCODE
+        };
+        if !pressed {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        if extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(virtual_key),
+                    wScan: scan_code,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: crate::ECHO_TAG,
+                },
+            },
+        }
+    }
+
+    /// How one incoming key transition renders, given whether the usage
+    /// is already held. Pure so the repeat contract is unit-tested:
+    /// fresh presses hold (modifiers/shortcuts intact), releases lift,
+    /// and repeats on held keys re-tap atomically (UP then DOWN in one
+    /// SendInput): one more char per repeat, while the hold still reads
+    /// unbroken to async-state readers (games) and modifiers. Needed
+    /// because Windows never auto-repeats an injected hold (proven: a
+    /// 3s injected hold deletes one char).
+    fn key_inputs_for(
+        virtual_key: u16,
+        scan_code: u16,
+        extended: bool,
+        pressed: bool,
+        held: bool,
+    ) -> Vec<INPUT> {
+        if pressed && held {
+            vec![
+                keybd_input(virtual_key, scan_code, extended, false),
+                keybd_input(virtual_key, scan_code, extended, true),
+            ]
+        } else {
+            vec![keybd_input(virtual_key, scan_code, extended, pressed)]
+        }
     }
 
     fn mouse_button_flags(
@@ -1306,6 +1351,27 @@ mod win32_inject {
             // Ordinary keys stay on the scancode table.
             assert_eq!(key_virtual_key(0x04), None);
             assert_eq!(key_virtual_key(0xe0), None);
+        }
+
+        #[test]
+        fn held_key_repeats_render_up_then_down() {
+            // Fresh presses hold (one DOWN, modifiers/shortcuts intact),
+            // releases lift (one UP), and repeats on held keys re-tap
+            // (UP then DOWN): Windows never auto-repeats an injected
+            // hold, so each repeat must carry its own transition.
+            use super::key_inputs_for;
+            use super::{KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE};
+            let flags = |input: &super::INPUT| unsafe { input.Anonymous.ki.dwFlags };
+            let fresh = key_inputs_for(0, 0x1e, false, true, false);
+            assert_eq!(fresh.len(), 1);
+            assert_eq!(flags(&fresh[0]), KEYEVENTF_SCANCODE);
+            let retap = key_inputs_for(0, 0x1e, false, true, true);
+            assert_eq!(retap.len(), 2);
+            assert_eq!(flags(&retap[0]), KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP);
+            assert_eq!(flags(&retap[1]), KEYEVENTF_SCANCODE);
+            let release = key_inputs_for(0, 0x1e, false, false, true);
+            assert_eq!(release.len(), 1);
+            assert_eq!(flags(&release[0]), KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP);
         }
     }
 }
