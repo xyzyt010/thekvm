@@ -287,7 +287,7 @@ impl MtPinchTap {
         {
             return None;
         }
-        let span = abs_maximum(&file, ABS_MT_POSITION_X).unwrap_or(3072);
+        let span = i64::from(abs_maximum(&file, ABS_MT_POSITION_X).unwrap_or(3072));
         tracing::debug!(device = %path.display(), span, "multitouch tap node opened read-only");
         Some(TapDevice {
             file,

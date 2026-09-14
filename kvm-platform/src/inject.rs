@@ -284,6 +284,10 @@ mod linux_uinput {
                         self.pressed_keys.remove(&code);
                     }
                 }
+                // Pinch gestures never reach injection: the sending
+                // thread expands them into Ctrl+wheel first (see
+                // pinch_expansion in the daemon). Drop defensively.
+                InputEvent::Pinch { .. } | InputEvent::PinchEnd => {}
             }
             Ok(())
         }
