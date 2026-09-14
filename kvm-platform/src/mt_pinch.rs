@@ -35,11 +35,12 @@ const DETENTS_PER_SPAN: i64 = 48;
 
 type IoctlRequest = libc::c_ulong;
 
+const IOC_NRBITS: u32 = 8;
+const IOC_TYPEBITS: u32 = 8;
+const IOC_SIZEBITS: u32 = 14;
+const IOC_READ: u32 = 2;
+
 const fn ioc(dir: u32, type_: u32, number: u32, size: usize) -> IoctlRequest {
-    const IOC_NRBITS: u32 = 8;
-    const IOC_TYPEBITS: u32 = 8;
-    const IOC_SIZEBITS: u32 = 14;
-    const IOC_READ: u32 = 2;
     ((dir << (IOC_NRBITS + IOC_TYPEBITS + IOC_SIZEBITS))
         | ((type_ & 0xff) << (IOC_NRBITS + IOC_SIZEBITS))
         | ((number & 0xff) << IOC_NRBITS)
@@ -47,15 +48,15 @@ const fn ioc(dir: u32, type_: u32, number: u32, size: usize) -> IoctlRequest {
 }
 
 const fn eviocgbit(event_type: u32, length: usize) -> IoctlRequest {
-    ioc(2, b'E' as u32, 0x20 + event_type, length)
+    ioc(IOC_READ, b'E' as u32, 0x20 + event_type, length)
 }
 
 const fn eviocgname(length: usize) -> IoctlRequest {
-    ioc(2, b'E' as u32, 0x06, length)
+    ioc(IOC_READ, b'E' as u32, 0x06, length)
 }
 
 const fn eviocgabs(abs: u32) -> IoctlRequest {
-    ioc(2, b'E' as u32, 0x40 + abs, 24)
+    ioc(IOC_READ, b'E' as u32, 0x40 + abs, 24)
 }
 
 #[repr(C)]
