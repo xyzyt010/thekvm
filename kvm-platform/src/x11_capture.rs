@@ -91,6 +91,11 @@ pub struct X11Capture {
     /// so a failed show retries on the next release instead of leaking
     /// an invisible cursor.
     cursor_hidden: bool,
+    /// Read-only multitouch gesture tap (see mt_pinch): X11 hides
+    /// trackpad touches behind relative motion, so pinch spread arrives
+    /// from the evdev tap, never from the X stream. Empty when no MT
+    /// node is usable — pinch unavailable, everything else intact.
+    mt_pinch: crate::mt_pinch::MtPinchTap,
 }
 
 /// True when an XI device name is one of our own virtual injector devices.
@@ -117,8 +122,8 @@ static XI_WHEEL: AtomicU64 = AtomicU64::new(0);
 /// Raw arrivals from our own virtual injector devices while a local
 /// drive grab is held (see translate): the peer is driving us, but an
 /// active XI grab diverts every pointer event into our invisible grab
-/// window, so the remote cursor cannot move locally until this drive
-/// returns home. The counter names that shape in the journal.
+/// window. The topology child watches this counter and auto-yields the
+/// outbound drive when it grows (see inbound_diverted_count).
 static INBOUND_DIVERTED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn census() -> (u64, u64, u64, u64) {
@@ -128,6 +133,16 @@ pub(crate) fn census() -> (u64, u64, u64, u64) {
         XI_MOTION.load(Ordering::Relaxed),
         XI_WHEEL.load(Ordering::Relaxed),
     )
+}
+
+/// Inbound-drive signal for the topology child: arrivals from our own
+/// virtual injector while grabbed mean the peer is driving us right now.
+/// The child snapshots this when a drive starts and yields (parks the
+/// outbound drive, releases the grab) when it grows — otherwise the peer
+/// cursor stays invisible and its clicks land in our grab window until
+/// the local mouse physically returns home.
+pub fn inbound_diverted_count() -> u64 {
+    INBOUND_DIVERTED.load(Ordering::Relaxed)
 }
 
 /// Resolve our own slave-device ids via XIQueryDevice (0 = all devices).
@@ -195,7 +210,11 @@ fn query_scroll_axes(connection: &RustConnection) -> HashMap<xinput::DeviceId, V
                 + f64::from(scroll.increment.frac) / FIXED_POINT_SCALE;
             // A zero increment would divide by zero below: fall back to
             // one-detent-per-unit (the common detent convention).
-            let units_120ths = if increment > 0.0 { 120.0 / increment } else { 120.0 };
+            let units_120ths = if increment > 0.0 {
+                120.0 / increment
+            } else {
+                120.0
+            };
             device_axes.push(ScrollAxis {
                 axis: scroll.number as usize,
                 horizontal: scroll.scroll_type == xinput::ScrollType::HORIZONTAL,
@@ -269,7 +288,11 @@ enum GrabKind {
 /// (the "cannot move beyond a certain line" stuck shape). Raw XI
 /// motion never pins (true device deltas), which is why only the Core
 /// hold needs this FPS-style cage.
-fn recenter_point_if_near_edge(last: (i16, i16), dims: (u16, u16), margin: i16) -> Option<(i16, i16)> {
+fn recenter_point_if_near_edge(
+    last: (i16, i16),
+    dims: (u16, u16),
+    margin: i16,
+) -> Option<(i16, i16)> {
     let (width, height) = (dims.0 as i32, dims.1 as i32);
     let (x, y) = (i32::from(last.0), i32::from(last.1));
     let near = x < i32::from(margin)
@@ -346,15 +369,13 @@ impl X11Capture {
             "X11 smooth-scroll valuators resolved (trackpads without button emulation scroll through these)"
         );
         let setup = connection.setup();
-        let screen_info = setup.roots.get(screen).ok_or_else(|| {
-            PlatformError::Capture("X11 screen does not exist".into())
-        })?;
+        let screen_info = setup
+            .roots
+            .get(screen)
+            .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?;
         // Copy out: the setup borrow must end before `connection`
         // moves into Self below.
-        let screen_dims = (
-            screen_info.width_in_pixels,
-            screen_info.height_in_pixels,
-        );
+        let screen_dims = (screen_info.width_in_pixels, screen_info.height_in_pixels);
         // Invisible grab window (see the field): input-only,
         // override-redirect, mapped but zero pixels on screen.
         let grab_window = connection
@@ -402,6 +423,9 @@ impl X11Capture {
             cage_quiet: 0,
             xfixes_cursor,
             cursor_hidden: false,
+            // Best-effort by construction (see MtPinchTap::open): an
+            // empty tap only disables pinch, never capture startup.
+            mt_pinch: crate::mt_pinch::MtPinchTap::open(),
         })
     }
 
@@ -669,6 +693,12 @@ impl CaptureBackend for X11Capture {
             if stop.load(Ordering::Acquire) {
                 return Err(PlatformError::Capture("capture stopped".into()));
             }
+            // Trackpad pinch tap (see mt_pinch): gestures arrive here,
+            // never from the X event stream. Non-blocking drain first so
+            // a pinch stays as snappy as the 4ms X poll below it.
+            if let Some(gesture) = self.mt_pinch.poll() {
+                return Ok(gesture);
+            }
             // The injector (re)creates its uinput devices per receiver
             // session, which can postdate this backend: re-resolve our own
             // sources every few seconds so freshly injected input is never
@@ -713,7 +743,7 @@ impl CaptureBackend for X11Capture {
                     self.last_divert_warn = Some(std::time::Instant::now());
                     tracing::warn!(
                         diverted,
-                        "inbound remote input is being diverted by our local drive grab; the peer cursor cannot move here until this drive returns home"
+                        "inbound remote input is being diverted by our local drive grab; auto-yielding our drive so the peer cursor can move here"
                     );
                 }
             }
@@ -985,7 +1015,10 @@ fn xi_ungrab_selectors(connection: &RustConnection, held: &[u16]) -> Result<(), 
 /// freeze-with-visible-cursor). The XI raw selection underneath is left
 /// in place; translate() reads exactly one source per grab kind, so no
 /// server can double-deliver.
-fn core_grab(connection: &RustConnection, grab_window: xproto::Window) -> Result<(), PlatformError> {
+fn core_grab(
+    connection: &RustConnection,
+    grab_window: xproto::Window,
+) -> Result<(), PlatformError> {
     let pointer = connection
         .grab_pointer(
             false,
@@ -1009,10 +1042,18 @@ fn core_grab(connection: &RustConnection, grab_window: xproto::Window) -> Result
         )));
     }
     let keyboard = connection
-        .grab_keyboard(false, grab_window, 0u32, xproto::GrabMode::ASYNC, xproto::GrabMode::ASYNC)
+        .grab_keyboard(
+            false,
+            grab_window,
+            0u32,
+            xproto::GrabMode::ASYNC,
+            xproto::GrabMode::ASYNC,
+        )
         .map_err(|error| PlatformError::Capture(format!("grab core keyboard: {error}")))?
         .reply()
-        .map_err(|error| PlatformError::Capture(format!("read core keyboard grab status: {error}")))?
+        .map_err(|error| {
+            PlatformError::Capture(format!("read core keyboard grab status: {error}"))
+        })?
         .status;
     if keyboard != xproto::GrabStatus::SUCCESS {
         let _ = connection.ungrab_pointer(0u32).map(|cookie| cookie.check());
@@ -1024,7 +1065,8 @@ fn core_grab(connection: &RustConnection, grab_window: xproto::Window) -> Result
 }
 
 /// Release a core hold (pointer first, then keyboard).
-fn core_ungrab(connection: &RustConnection) -> Result<(), PlatformError> {    connection
+fn core_ungrab(connection: &RustConnection) -> Result<(), PlatformError> {
+    connection
         .ungrab_pointer(0u32)
         .map_err(|error| PlatformError::Capture(format!("ungrab core pointer: {error}")))?
         .check()
@@ -1282,7 +1324,8 @@ mod tests {
     }
 
     #[test]
-    fn own_injector_devices_match_case_insensitively() {        assert!(is_own_device_name(b"TheKVM Virtual Mouse"));
+    fn own_injector_devices_match_case_insensitively() {
+        assert!(is_own_device_name(b"TheKVM Virtual Mouse"));
         assert!(is_own_device_name(b"TheKVM Virtual Keyboard"));
         assert!(is_own_device_name(b"thekvm virtual mouse"));
         assert!(!is_own_device_name(b"Logitech USB Receiver"));

@@ -13,6 +13,8 @@ pub mod diagnostics;
 pub mod evdev_capture;
 pub mod inject;
 #[cfg(target_os = "linux")]
+pub mod mt_pinch;
+#[cfg(target_os = "linux")]
 pub mod wayland_capture;
 #[cfg(target_os = "linux")]
 pub mod x11_capture;

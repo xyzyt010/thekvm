@@ -67,9 +67,7 @@ pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {
 /// platform exposes no truth (the router keeps its configured dims).
 #[cfg(target_os = "windows")]
 pub fn screen_size() -> Result<Option<(u32, u32)>, PlatformError> {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
     let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
@@ -134,7 +132,8 @@ pub fn warp_cursor_on(display: Option<&str>, x: u32, y: u32) -> Result<(), Platf
 }
 
 #[cfg(target_os = "linux")]
-pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {    use x11rb::connection::Connection;
+pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {
+    use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt;
 
     // This is only a best-effort initialization aid for X11. A negative root
@@ -216,6 +215,32 @@ pub fn backend_census() -> (u64, u64, u64, u64, u64, u64, u64) {
 pub fn backend_census() -> (u64, u64, u64, u64, u64, u64, u64) {
     let (key, button, motion, wheel) = crate::x11_capture::census();
     (key, button, motion, wheel, 0, 0, 0)
+}
+
+/// Inbound-while-driving signal for the topology child's auto-yield:
+/// peer-injected arrivals observed while our own drive holds the local
+/// suppression. Linux counts own-uinput arrivals diverted by the XI grab;
+/// Windows counts ECHO_TAG-tagged hook arrivals (this child injects
+/// nothing itself while driving out, and its own warps use the untagged
+/// SetCursorPos path, so tagged arrivals are the peer driving us).
+/// The child snapshots this when a drive starts and yields the outbound
+/// drive when it grows — otherwise the peer cursor stays invisible and
+/// its clicks die in our grab until the local mouse returns home.
+#[cfg(target_os = "windows")]
+pub fn inbound_while_driving_count() -> u64 {
+    win32_hooks::inbound_echo_count()
+}
+
+/// Linux half of the inbound-while-driving signal (see above).
+#[cfg(target_os = "linux")]
+pub fn inbound_while_driving_count() -> u64 {
+    crate::x11_capture::inbound_diverted_count()
+}
+
+/// Platforms without a suppression grab never divert inbound input.
+#[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
+pub fn inbound_while_driving_count() -> u64 {
+    0
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
@@ -326,6 +351,14 @@ mod win32_hooks {
     /// hook and raw-mouse: gestures the OS synthesizes straight into
     /// app windows reach neither of those taps.
     static PTP_SCROLL: AtomicU64 = AtomicU64::new(0);
+    /// Own-echo arrivals skipped by tag (see keyboard_hook/mouse_hook):
+    /// every ECHO_TAG-tagged event the hooks observe. While this child
+    /// drives out it injects nothing itself, so tagged arrivals mean
+    /// the service/helper is injecting the PEER's drive locally — the
+    /// Windows half of the inbound-while-driving signal (see
+    /// inbound_while_driving_count): the peer cursor cannot move here
+    /// until this drive yields, exactly like the X11 divert shape.
+    static INBOUND_ECHO: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn census() -> (u64, u64, u64, u64, u64, u64, u64) {
         (
@@ -337,6 +370,10 @@ mod win32_hooks {
             RAW_WHEEL.load(Ordering::Relaxed),
             PTP_SCROLL.load(Ordering::Relaxed),
         )
+    }
+
+    pub(super) fn inbound_echo_count() -> u64 {
+        INBOUND_ECHO.load(Ordering::Relaxed)
     }
 
     pub(super) fn set_exclusive(exclusive: bool) {
@@ -559,7 +596,9 @@ mod win32_hooks {
             // SendInput events carry ECHO_TAG and are skipped, while input
             // synthesized by vendor drivers (trackpad utilities, hotkey
             // tools) is real user input and must be captured. The old flag
-            // check swallowed those.
+            // check swallowed those. Skipped echoes still count (see
+            // INBOUND_ECHO): while driving out, a tagged arrival is the
+            // peer driving us.
             if info.dwExtraInfo != crate::ECHO_TAG {
                 let message = wparam.0 as u32;
                 let pressed = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
@@ -574,6 +613,8 @@ mod win32_hooks {
                         }
                     }
                 }
+            } else {
+                INBOUND_ECHO.fetch_add(1, Ordering::Relaxed);
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
@@ -586,21 +627,16 @@ mod win32_hooks {
             // WheelDedup): our SendInput wheel always traverses this hook
             // tagged, while the raw channel carries no tag at all.
             if info.dwExtraInfo == crate::ECHO_TAG {
+                INBOUND_ECHO.fetch_add(1, Ordering::Relaxed);
                 let own_message = wparam.0 as u32;
                 let now = std::time::Instant::now();
                 match own_message {
-                    WM_MOUSEWHEEL => wheel_dedup().note_hook(
-                        0,
-                        (info.mouseData >> 16) as i16 as i32,
-                        true,
-                        now,
-                    ),
-                    WM_MOUSEHWHEEL => wheel_dedup().note_hook(
-                        (info.mouseData >> 16) as i16 as i32,
-                        0,
-                        true,
-                        now,
-                    ),
+                    WM_MOUSEWHEEL => {
+                        wheel_dedup().note_hook(0, (info.mouseData >> 16) as i16 as i32, true, now)
+                    }
+                    WM_MOUSEHWHEEL => {
+                        wheel_dedup().note_hook((info.mouseData >> 16) as i16 as i32, 0, true, now)
+                    }
                     _ => {}
                 }
             }
@@ -687,11 +723,8 @@ mod win32_hooks {
                         // to detents for older peers. Filtered against the
                         // raw HID channel (same tick, raw arrived first).
                         let now = std::time::Instant::now();
-                        let (_, y) = wheel_dedup().filter_hook(
-                            0,
-                            (info.mouseData >> 16) as i16 as i32,
-                            now,
-                        );
+                        let (_, y) =
+                            wheel_dedup().filter_hook(0, (info.mouseData >> 16) as i16 as i32, now);
                         if y != 0 {
                             HOOK_WHEEL.fetch_add(1, Ordering::Relaxed);
                             send(InputEvent::SmoothWheel { x: 0, y });
@@ -702,11 +735,8 @@ mod win32_hooks {
                     }
                     WM_MOUSEHWHEEL => {
                         let now = std::time::Instant::now();
-                        let (x, _) = wheel_dedup().filter_hook(
-                            (info.mouseData >> 16) as i16 as i32,
-                            0,
-                            now,
-                        );
+                        let (x, _) =
+                            wheel_dedup().filter_hook((info.mouseData >> 16) as i16 as i32, 0, now);
                         if x != 0 {
                             HOOK_WHEEL.fetch_add(1, Ordering::Relaxed);
                             send(InputEvent::SmoothWheel { x, y: 0 });
@@ -945,8 +975,12 @@ mod win32_hooks {
         let mouse =
             unsafe { std::ptr::read_unaligned(data.as_ptr().add(header_size) as *const RAWMOUSE) };
         // Same unaligned discipline as the motion decoder above.
-        let (button_flags, button_data) =
-            unsafe { (mouse.Anonymous.Anonymous.usButtonFlags, mouse.Anonymous.Anonymous.usButtonData) };
+        let (button_flags, button_data) = unsafe {
+            (
+                mouse.Anonymous.Anonymous.usButtonFlags,
+                mouse.Anonymous.Anonymous.usButtonData,
+            )
+        };
         let delta = button_data as i16 as i32;
         let flags = u32::from(button_flags);
         let mut x = 0;
@@ -966,7 +1000,9 @@ mod win32_hooks {
         use std::sync::Mutex;
 
         static DEDUP: Mutex<WheelDedup> = Mutex::new(WheelDedup::new());
-        DEDUP.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        DEDUP
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Our own SendInput echo stays suppressible for this long after the
@@ -1006,8 +1042,16 @@ mod win32_hooks {
         /// Filter a hook tick against a just-seen raw tick (same gesture,
         /// raw arrived first). Returns the surviving axes.
         fn filter_hook(&mut self, x: i32, y: i32, now: std::time::Instant) -> (i32, i32) {
-            let x = if self.raw_reported(x, true, now) { 0 } else { x };
-            let y = if self.raw_reported(y, false, now) { 0 } else { y };
+            let x = if self.raw_reported(x, true, now) {
+                0
+            } else {
+                x
+            };
+            let y = if self.raw_reported(y, false, now) {
+                0
+            } else {
+                y
+            };
             if x != 0 || y != 0 {
                 self.last_hook = Some((now, x.signum() as i8, y.signum() as i8));
             }
@@ -1022,8 +1066,16 @@ mod win32_hooks {
                     return (0, 0);
                 }
             }
-            let x = if self.hook_reported(x, true, now) { 0 } else { x };
-            let y = if self.hook_reported(y, false, now) { 0 } else { y };
+            let x = if self.hook_reported(x, true, now) {
+                0
+            } else {
+                x
+            };
+            let y = if self.hook_reported(y, false, now) {
+                0
+            } else {
+                y
+            };
             if x != 0 || y != 0 {
                 self.last_raw = Some((now, x.signum() as i8, y.signum() as i8));
             }
@@ -1105,12 +1157,21 @@ mod win32_hooks {
 
     fn ptp_device_slot() -> std::sync::MutexGuard<'static, Option<PtpDevice>> {
         static PTP_DEVICE: Mutex<Option<PtpDevice>> = Mutex::new(None);
-        PTP_DEVICE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        PTP_DEVICE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn ptp_pan_slot() -> std::sync::MutexGuard<'static, PtpPan> {
         static PAN: Mutex<PtpPan> = Mutex::new(PtpPan::new());
         PAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn ptp_pinch_slot() -> std::sync::MutexGuard<'static, PtpPinch> {
+        static PINCH: Mutex<PtpPinch> = Mutex::new(PtpPinch::new());
+        PINCH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Tip-switch state for one finger collection. The MS PTP spec
@@ -1220,6 +1281,85 @@ mod win32_hooks {
         }
     }
 
+    /// Spread changes past this many sensor units own the gesture: below
+    /// it two fingers are scrolling (pan keeps them), above it they are
+    /// pinching (zoom takes over, pan stays silent for the gesture).
+    /// Sensor jitter on a steady scroll stays far below this.
+    const PINCH_ENGAGE_UNITS: i64 = 48;
+
+    /// Two-finger pinch → zoom accumulator. Pure apart from construction,
+    /// so the gesture math is unit-tested without HID hardware. Fed the
+    /// same per-report contacts as PtpPan: spread (manhattan finger
+    /// distance — translation/rotation invariant, only spreading moves
+    /// it) past the engage gate emits zoom in WHEEL_DELTA 120ths with
+    /// the pan accumulator's remainder discipline. Positive = fingers
+    /// spreading = zoom in (matches SmoothWheel's away-positive, so the
+    /// daemon renders it as Ctrl+wheel-up).
+    #[derive(Debug)]
+    struct PtpPinch {
+        anchor: Option<i64>,
+        prev: Option<i64>,
+        acc: i64,
+        units_per_detent: i64,
+        engaged: bool,
+    }
+
+    impl PtpPinch {
+        const fn new() -> Self {
+            Self {
+                anchor: None,
+                prev: None,
+                acc: 0,
+                units_per_detent: 64,
+                engaged: false,
+            }
+        }
+
+        /// Feed one report's down-contact positions. Returns zoom in
+        /// 120ths plus whether a gesture just ended (fingers lifted or
+        /// count changed after engaging — the daemon's Ctrl-release
+        /// signal). Only an engaged pinch scrolls; contact-count changes
+        /// reset anchor and remainder so lifts never jump.
+        fn feed(&mut self, contacts: &[(i32, i32)]) -> (i32, bool) {
+            if contacts.len() != 2 {
+                let ended = self.engaged;
+                self.anchor = None;
+                self.prev = None;
+                self.acc = 0;
+                self.engaged = false;
+                return (0, ended);
+            }
+            let spread = (i64::from(contacts[0].0) - i64::from(contacts[1].0)).abs()
+                + (i64::from(contacts[0].1) - i64::from(contacts[1].1)).abs();
+            let Some(anchor) = self.anchor else {
+                self.anchor = Some(spread);
+                self.prev = Some(spread);
+                return (0, false);
+            };
+            if !self.engaged && (spread - anchor).abs() >= PINCH_ENGAGE_UNITS {
+                self.engaged = true;
+            }
+            let mut zoom = 0;
+            if self.engaged {
+                if let Some(prev) = self.prev {
+                    self.acc += spread - prev;
+                    let det = self.acc / self.units_per_detent.max(1);
+                    self.acc -= det * self.units_per_detent.max(1);
+                    zoom = det.clamp(-1000, 1000) as i32 * 120;
+                }
+            }
+            self.prev = Some(spread);
+            (zoom, false)
+        }
+
+        /// Whether the fingers currently own a pinch (pan stays silent).
+        /// Hysteresis by construction: once engaged, only a contact-count
+        /// change disengages, so borderline spread never flaps pan/zoom.
+        fn engaged(&self) -> bool {
+            self.engaged
+        }
+    }
+
     /// Whether two-finger scroll must be negated to match the user's
     /// local touchpad feel. The HID digitizer reports raw contact
     /// motion, but Windows renders the felt direction through the
@@ -1277,7 +1417,8 @@ mod win32_hooks {
         use windows::Win32::UI::Input as raw;
         let handle = HANDLE(handle_value as *mut std::ffi::c_void);
         let mut len = 0u32;
-        let _ = unsafe { raw::GetRawInputDeviceInfoW(handle, raw::RIDI_PREPARSEDDATA, None, &mut len) };
+        let _ =
+            unsafe { raw::GetRawInputDeviceInfoW(handle, raw::RIDI_PREPARSEDDATA, None, &mut len) };
         if len == 0 || len > 1024 * 1024 {
             return None;
         }
@@ -1320,9 +1461,8 @@ mod win32_hooks {
                 return None;
             }
             let mut list = vec![raw::RAWINPUTDEVICELIST::default(); count as usize];
-            if unsafe {
-                raw::GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut count, size)
-            } == u32::MAX
+            if unsafe { raw::GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut count, size) }
+                == u32::MAX
             {
                 fail_stage = "device-list-read";
                 return None;
@@ -1349,8 +1489,7 @@ mod win32_hooks {
                     continue;
                 }
                 let hid_info = unsafe { info.Anonymous.hid };
-                if hid_info.usUsagePage == PTP_USAGE_PAGE
-                    && hid_info.usUsage == PTP_USAGE_TOUCHPAD
+                if hid_info.usUsagePage == PTP_USAGE_PAGE && hid_info.usUsage == PTP_USAGE_TOUCHPAD
                 {
                     touchpad = Some(entry.hDevice.0 as isize);
                     break;
@@ -1467,8 +1606,7 @@ mod win32_hooks {
                 {
                     let mut spec_fingers = Vec::new();
                     let mut heuristic_fingers = Vec::new();
-                    for (index, node) in nodes.iter().take(nodes_len as usize).enumerate().skip(1)
-                    {
+                    for (index, node) in nodes.iter().take(nodes_len as usize).enumerate().skip(1) {
                         if node.LinkUsagePage != PTP_USAGE_PAGE {
                             continue;
                         }
@@ -1508,14 +1646,18 @@ mod win32_hooks {
             let mut value_caps = vec![hid::HIDP_VALUE_CAPS::default(); value_len.min(512) as usize];
             value_len = value_caps.len() as u16;
             if unsafe {
-                hid::HidP_GetValueCaps(hid::HidP_Input, value_caps.as_mut_ptr(), &mut value_len, preparsed)
+                hid::HidP_GetValueCaps(
+                    hid::HidP_Input,
+                    value_caps.as_mut_ptr(),
+                    &mut value_len,
+                    preparsed,
+                )
             }
             .is_err()
             {
                 value_len = 0;
             }
-            let (units_x, units_y) =
-                ptp_axis_scale(&fingers, &value_caps[..value_len as usize]);
+            let (units_x, units_y) = ptp_axis_scale(&fingers, &value_caps[..value_len as usize]);
             // 4. Register the digitizer usage on our sink window. Observe
             // only (no NOLEGACY): touchpad delivery to local apps is
             // untouched; we only listen.
@@ -1570,6 +1712,10 @@ mod win32_hooks {
                     let mut pan = ptp_pan_slot();
                     pan.units_per_detent_x = found.units_per_detent_x;
                     pan.units_per_detent_y = found.units_per_detent_y;
+                    // Pinch spread moves in the same sensor units: share
+                    // the axis scale (mean of both axes).
+                    ptp_pinch_slot().units_per_detent =
+                        (found.units_per_detent_x + found.units_per_detent_y + 1) / 2;
                 }
                 *ptp_device_slot() = Some(found);
                 tracing::info!(
@@ -1648,8 +1794,18 @@ mod win32_hooks {
         if buffer.len() < header_size + 8 {
             return;
         }
-        let size_hid = u32::from_le_bytes([buffer[header_size], buffer[header_size + 1], buffer[header_size + 2], buffer[header_size + 3]]) as usize;
-        let count = u32::from_le_bytes([buffer[header_size + 4], buffer[header_size + 5], buffer[header_size + 6], buffer[header_size + 7]]) as usize;
+        let size_hid = u32::from_le_bytes([
+            buffer[header_size],
+            buffer[header_size + 1],
+            buffer[header_size + 2],
+            buffer[header_size + 3],
+        ]) as usize;
+        let count = u32::from_le_bytes([
+            buffer[header_size + 4],
+            buffer[header_size + 5],
+            buffer[header_size + 6],
+            buffer[header_size + 7],
+        ]) as usize;
         if !(8..=1024).contains(&size_hid) || !(1..=64).contains(&count) {
             return;
         }
@@ -1721,8 +1877,14 @@ mod win32_hooks {
                 }
             }
             if contacts.is_empty() {
-                // All fingers lifted: reset the anchor, no scroll.
+                // All fingers lifted: reset the anchors, no scroll. The
+                // pinch tap reports here too — its End releases the
+                // daemon's synthetic zoom Ctrl.
                 ptp_pan_slot().feed(&[]);
+                let (_, pinch_ended) = ptp_pinch_slot().feed(&[]);
+                if pinch_ended {
+                    send(InputEvent::PinchEnd);
+                }
                 // Delivery-without-contacts watchdog: buffers arrive but
                 // no contact ever parses (wrong collections or tip
                 // probe). Fires once, only while parsing never
@@ -1743,10 +1905,34 @@ mod win32_hooks {
             static FIRST_CONTACTS_SEEN: std::sync::Once = std::sync::Once::new();
             FIRST_CONTACTS_SEEN.call_once(|| {
                 PTP_EVER_PARSED.store(true, Ordering::Relaxed);
-                tracing::info!(contacts = contacts.len(), "precision-touchpad first parsed contacts");
+                tracing::info!(
+                    contacts = contacts.len(),
+                    "precision-touchpad first parsed contacts"
+                );
             });
             let now = std::time::Instant::now();
+            // Pinch owns engaged fingers: zoom instead of scroll (the
+            // pan anchor still feeds so a post-pinch scroll never jumps).
+            let (zoom, pinch_ended) = ptp_pinch_slot().feed(&contacts);
+            let pinching = ptp_pinch_slot().engaged();
+            if zoom != 0 {
+                static FIRST_PINCH: std::sync::Once = std::sync::Once::new();
+                FIRST_PINCH.call_once(|| {
+                    tracing::info!(
+                        contacts = contacts.len(),
+                        zoom,
+                        "precision-touchpad first pinch report"
+                    );
+                });
+                send(InputEvent::Pinch { delta: zoom });
+            }
+            if pinch_ended {
+                send(InputEvent::PinchEnd);
+            }
             let (x, y) = ptp_pan_slot().feed(&contacts);
+            if pinching {
+                continue;
+            }
             // Match the local touchpad feel (see ptp_scroll_invert):
             // saturating negation is overflow-safe by construction
             // (feed clamps to +-1000 detents before scaling).
@@ -1760,7 +1946,12 @@ mod win32_hooks {
                 // THIS hardware (once per process; the census counts on).
                 static FIRST_REPORT: std::sync::Once = std::sync::Once::new();
                 FIRST_REPORT.call_once(|| {
-                    tracing::info!(contacts = contacts.len(), x, y, "precision-touchpad first scroll report");
+                    tracing::info!(
+                        contacts = contacts.len(),
+                        x,
+                        y,
+                        "precision-touchpad first scroll report"
+                    );
                 });
                 let (fx, fy) = wheel_dedup().filter_raw(x, y, now);
                 if fx != 0 || fy != 0 {
@@ -1774,7 +1965,7 @@ mod win32_hooks {
     #[cfg(test)]
     mod raw_input_tests {
         use super::decode_raw_mouse_motion;
-        use super::{decode_raw_mouse_wheel, PtpPan, WheelDedup};
+        use super::{decode_raw_mouse_wheel, PtpPan, PtpPinch, WheelDedup};
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::UI::Input::{
             MOUSE_MOVE_ABSOLUTE, MOUSE_STATE, RAWINPUT, RAWINPUTHEADER, RAWINPUT_0, RAWMOUSE,
@@ -1842,6 +2033,50 @@ mod win32_hooks {
             assert_eq!(pan.feed(&[(0, 92), (0, 92)]), (0, 0));
             // 4 + 4 + 4 = 12 >= 10: one detent, remainder kept.
             assert_eq!(pan.feed(&[(0, 88), (0, 88)]), (0, 120));
+        }
+
+        #[test]
+        fn ptp_spread_emits_zoom_in_and_close_emits_zoom_out() {
+            let mut pinch = PtpPinch::new();
+            pinch.units_per_detent = 10;
+            // Anchor: spread 100.
+            assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
+            assert!(!pinch.engaged());
+            // Below the engage gate: still scrolling fingers, no zoom.
+            assert_eq!(pinch.feed(&[(0, 0), (120, 0)]), (0, false));
+            assert!(!pinch.engaged());
+            // Past the gate: engaged, spread change emits zoom-in (+).
+            assert_eq!(pinch.feed(&[(0, 0), (160, 0)]), (480, false));
+            assert!(pinch.engaged());
+            // Fingers close: zoom-out (−).
+            assert_eq!(pinch.feed(&[(0, 0), (140, 0)]), (-240, false));
+        }
+
+        #[test]
+        fn ptp_steady_two_finger_scroll_never_pinches() {
+            let mut pinch = PtpPinch::new();
+            pinch.units_per_detent = 10;
+            assert_eq!(pinch.feed(&[(0, 100), (0, 100)]), (0, false));
+            // Pure translation, stable spread: pan's fingers, not a pinch.
+            assert_eq!(pinch.feed(&[(0, 90), (0, 90)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, 80), (0, 80)]), (0, false));
+            assert!(!pinch.engaged());
+            // Lift without engaging: no End (nothing held downstream).
+            assert_eq!(pinch.feed(&[]), (0, false));
+        }
+
+        #[test]
+        fn ptp_lift_after_pinch_ends_the_gesture_once() {
+            let mut pinch = PtpPinch::new();
+            pinch.units_per_detent = 10;
+            assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, 0), (200, 0)]), (1200, false));
+            // Lift: End exactly once, then silence.
+            assert_eq!(pinch.feed(&[]), (0, true));
+            assert_eq!(pinch.feed(&[]), (0, false));
+            // Re-touch anchors anew: no zoom from the gap.
+            assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
+            assert!(!pinch.engaged());
         }
 
         #[test]
@@ -2146,18 +2381,38 @@ mod win32_hooks {
             // (Set 1 scan code, USB HID usage, key) — extended flag matters
             // for the Win keys.
             let pairs: &[(u16, u16, &str)] = &[
-                (0x1e, 0x04, "A"), (0x30, 0x05, "B"), (0x2e, 0x06, "C"),
-                (0x20, 0x07, "D"), (0x12, 0x08, "E"), (0x21, 0x09, "F"),
-                (0x22, 0x0a, "G"), (0x23, 0x0b, "H"), (0x17, 0x0c, "I"),
-                (0x24, 0x0d, "J"), (0x25, 0x0e, "K"), (0x26, 0x0f, "L"),
-                (0x32, 0x10, "M"), (0x31, 0x11, "N"), (0x18, 0x12, "O"),
-                (0x19, 0x13, "P"), (0x10, 0x14, "Q"), (0x13, 0x15, "R"),
-                (0x1f, 0x16, "S"), (0x14, 0x17, "T"), (0x16, 0x18, "U"),
-                (0x2f, 0x19, "V"), (0x11, 0x1a, "W"), (0x2d, 0x1b, "X"),
-                (0x15, 0x1c, "Y"), (0x2c, 0x1d, "Z"),
-                (0x02, 0x1e, "1"), (0x0b, 0x27, "0"),
-                (0x39, 0x2c, "Space"), (0x46, 0x47, "ScrollLock"),
-                (0x1d, 0xe0, "LCtrl"), (0x2a, 0xe1, "LShift"),
+                (0x1e, 0x04, "A"),
+                (0x30, 0x05, "B"),
+                (0x2e, 0x06, "C"),
+                (0x20, 0x07, "D"),
+                (0x12, 0x08, "E"),
+                (0x21, 0x09, "F"),
+                (0x22, 0x0a, "G"),
+                (0x23, 0x0b, "H"),
+                (0x17, 0x0c, "I"),
+                (0x24, 0x0d, "J"),
+                (0x25, 0x0e, "K"),
+                (0x26, 0x0f, "L"),
+                (0x32, 0x10, "M"),
+                (0x31, 0x11, "N"),
+                (0x18, 0x12, "O"),
+                (0x19, 0x13, "P"),
+                (0x10, 0x14, "Q"),
+                (0x13, 0x15, "R"),
+                (0x1f, 0x16, "S"),
+                (0x14, 0x17, "T"),
+                (0x16, 0x18, "U"),
+                (0x2f, 0x19, "V"),
+                (0x11, 0x1a, "W"),
+                (0x2d, 0x1b, "X"),
+                (0x15, 0x1c, "Y"),
+                (0x2c, 0x1d, "Z"),
+                (0x02, 0x1e, "1"),
+                (0x0b, 0x27, "0"),
+                (0x39, 0x2c, "Space"),
+                (0x46, 0x47, "ScrollLock"),
+                (0x1d, 0xe0, "LCtrl"),
+                (0x2a, 0xe1, "LShift"),
                 (0x38, 0xe2, "LAlt"),
             ];
             for (scan, usage, name) in pairs {
@@ -2169,7 +2424,7 @@ mod win32_hooks {
             assert_eq!(hid_from_scan_code(0x38, true), Some(0xe6)); // RAlt
             assert_eq!(hid_from_vk(0x5b), Some(0xe3)); // LWin fallback
             assert_eq!(hid_from_vk(0x5c), Some(0xe7)); // RWin fallback
-            // F-row media keys (round trip with key_virtual_key).
+                                                       // F-row media keys (round trip with key_virtual_key).
             assert_eq!(hid_from_vk(0xAD), Some(0x7f)); // mute
             assert_eq!(hid_from_vk(0xAF), Some(0x80)); // volume up
             assert_eq!(hid_from_vk(0xAE), Some(0x81)); // volume down

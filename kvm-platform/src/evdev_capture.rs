@@ -185,6 +185,25 @@ impl Device {
         };
         let usage = hid_from_evdev(code)?;
         if pressed {
+            // Kernel typematic repeat (value 2) for a key this device
+            // already reports held: queue it straight to this device's
+            // post-filter queue. The shared press-dedupe in accept_event
+            // cannot see the repeat flag and eats every repeat as a
+            // cross-device duplicate press — which starved receivers of
+            // hold-repeat (exactly one char per hold on Windows, whose
+            // injected holds never auto-repeat). device-holds implies the
+            // shared set holds it too (both are seeded by the same
+            // accepted press; cross-device duplicate presses stay dropped
+            // in accept_event), so release accounting is unaffected:
+            // releases still flow through accept_event's multi-device
+            // guard below.
+            if value == 2 && self.pressed_keys.contains(&usage) {
+                self.queue.push_back(InputEvent::Key(KeyEvent {
+                    usage,
+                    pressed: true,
+                }));
+                return None;
+            }
             self.pressed_keys.insert(usage);
         } else {
             self.pressed_keys.remove(&usage);
@@ -751,6 +770,40 @@ mod tests {
         );
     }
     #[test]
+    fn kernel_key_repeats_bypass_cross_device_press_dedupe() {
+        // Backspace hold: down, repeat, repeat, release. The repeats
+        // must reach the wire (Windows renders hold-repeat from them)
+        // while a genuine cross-device duplicate press stays deduped in
+        // accept_event (see aggregates_overlapping_controls_across_devices).
+        let mut device = test_device();
+        let key = |value| RawInputEvent {
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_: EV_KEY,
+            code: 14,
+            value,
+        };
+        let expected = InputEvent::Key(KeyEvent {
+            usage: 0x2a,
+            pressed: true,
+        });
+        assert_eq!(device.process(key(1)), vec![expected]);
+        // Repeats take the direct queue path, leaving process output empty.
+        assert!(device.process(key(2)).is_empty());
+        assert!(device.process(key(2)).is_empty());
+        assert_eq!(device.queue.pop_front(), Some(expected));
+        assert_eq!(device.queue.pop_front(), Some(expected));
+        assert_eq!(
+            device.process(key(0)),
+            vec![InputEvent::Key(KeyEvent {
+                usage: 0x2a,
+                pressed: false
+            })]
+        );
+    }
+    #[test]
     fn kernel_key_autorepeat_forwards_as_press() {
         assert_eq!(key_pressed(0), Some(false));
         assert_eq!(key_pressed(1), Some(true));
@@ -790,15 +843,32 @@ mod tests {
         // (evdev code, USB HID usage, key). Mirror image of the inject
         // table: every letter, exact in both directions.
         let pairs: &[(u16, u16, &str)] = &[
-            (30, 0x04, "A"), (48, 0x05, "B"), (46, 0x06, "C"),
-            (32, 0x07, "D"), (18, 0x08, "E"), (33, 0x09, "F"),
-            (34, 0x0a, "G"), (35, 0x0b, "H"), (23, 0x0c, "I"),
-            (36, 0x0d, "J"), (37, 0x0e, "K"), (38, 0x0f, "L"),
-            (50, 0x10, "M"), (49, 0x11, "N"), (24, 0x12, "O"),
-            (25, 0x13, "P"), (16, 0x14, "Q"), (19, 0x15, "R"),
-            (31, 0x16, "S"), (20, 0x17, "T"), (22, 0x18, "U"),
-            (47, 0x19, "V"), (17, 0x1a, "W"), (45, 0x1b, "X"),
-            (21, 0x1c, "Y"), (44, 0x1d, "Z"),
+            (30, 0x04, "A"),
+            (48, 0x05, "B"),
+            (46, 0x06, "C"),
+            (32, 0x07, "D"),
+            (18, 0x08, "E"),
+            (33, 0x09, "F"),
+            (34, 0x0a, "G"),
+            (35, 0x0b, "H"),
+            (23, 0x0c, "I"),
+            (36, 0x0d, "J"),
+            (37, 0x0e, "K"),
+            (38, 0x0f, "L"),
+            (50, 0x10, "M"),
+            (49, 0x11, "N"),
+            (24, 0x12, "O"),
+            (25, 0x13, "P"),
+            (16, 0x14, "Q"),
+            (19, 0x15, "R"),
+            (31, 0x16, "S"),
+            (20, 0x17, "T"),
+            (22, 0x18, "U"),
+            (47, 0x19, "V"),
+            (17, 0x1a, "W"),
+            (45, 0x1b, "X"),
+            (21, 0x1c, "Y"),
+            (44, 0x1d, "Z"),
         ];
         for (code, usage, name) in pairs {
             assert_eq!(hid_from_evdev(*code), Some(*usage), "letter {name}");

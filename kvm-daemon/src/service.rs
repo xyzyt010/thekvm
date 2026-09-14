@@ -9,8 +9,8 @@ use kvm_platform::inject::Injector;
 use kvm_protocol::pairing::{Identity, PeerBook};
 use kvm_protocol::transport;
 use kvm_protocol::wire::{
-    decode_input_datagram, read_frame, write_frame, DatagramInput, Hello,
-    ScreenGeometry, WireMessage,
+    decode_input_datagram, read_frame, write_frame, DatagramInput, Hello, ScreenGeometry,
+    WireMessage,
 };
 use kvm_protocol::DEFAULT_PORT;
 use std::collections::BTreeSet;
@@ -45,7 +45,8 @@ pub(crate) struct InboundLink {
     pub link_id: Option<u64>,
 }
 
-type LinkRegistry = Arc<std::sync::Mutex<HashMap<String, (InboundLink, tokio::sync::watch::Sender<bool>)>>>;
+type LinkRegistry =
+    Arc<std::sync::Mutex<HashMap<String, (InboundLink, tokio::sync::watch::Sender<bool>)>>>;
 
 static INBOUND_LINKS: std::sync::OnceLock<LinkRegistry> = std::sync::OnceLock::new();
 static LINK_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -459,11 +460,7 @@ fn valid_fingerprint(value: &str) -> bool {
 /// Pin a peer into the running daemon's peer book, mirroring trust the
 /// local user established elsewhere (the desktop UI code ceremony). Falls
 /// back to the state file when the daemon is offline.
-pub async fn pin_peer(
-    fingerprint: &str,
-    name: Option<&str>,
-    address: Option<&str>,
-) -> Result<()> {
+pub async fn pin_peer(fingerprint: &str, name: Option<&str>, address: Option<&str>) -> Result<()> {
     if !valid_fingerprint(fingerprint) {
         bail!("peer fingerprint must contain 64 hexadecimal characters");
     }
@@ -686,13 +683,19 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     if config.mode != previous_mode {
         audit_event(
             &dir,
-            &format!("mode {previous_mode:?} -> {:?} via CLI file write", config.mode),
+            &format!(
+                "mode {previous_mode:?} -> {:?} via CLI file write",
+                config.mode
+            ),
         );
     }
     if config.device_name != previous_name {
         audit_event(
             &dir,
-            &format!("device renamed {previous_name:?} -> {:?} via CLI file write", config.device_name),
+            &format!(
+                "device renamed {previous_name:?} -> {:?} via CLI file write",
+                config.device_name
+            ),
         );
     }
     println!("saved {}", path.display());
@@ -1358,19 +1361,21 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let (config, mut router) = loop {
         let config = Config::load(&dir.join("config.json"))
             .with_context(|| format!("loading topology config from {}", dir.display()))?;
-        let linked = link.as_ref().is_none_or(|link| {
-            config.layout.screens.iter().any(|screen| {
-                screen.peer_fingerprint.as_deref() == Some(link.fingerprint.as_str())
-            })
-        });
+        let linked =
+            link.as_ref().is_none_or(|link| {
+                config.layout.screens.iter().any(|screen| {
+                    screen.peer_fingerprint.as_deref() == Some(link.fingerprint.as_str())
+                })
+            });
         match EdgeRouter::new(config.layout.clone()) {
             Ok(router) if linked => break (config, router),
             Ok(_) => {
-                let waiting_for = link.as_ref().map(|link| link.address.as_str()).unwrap_or("?");
+                let waiting_for = link
+                    .as_ref()
+                    .map(|link| link.address.as_str())
+                    .unwrap_or("?");
                 tracing::info!(%waiting_for, "topology waiting for the linked screen to be arranged");
-                eprintln!(
-                    "THEKVM_STATUS waiting linked computer not arranged yet — adopting it…"
-                );
+                eprintln!("THEKVM_STATUS waiting linked computer not arranged yet — adopting it…");
             }
             Err(error) => {
                 tracing::warn!(%error, "topology has no screen arrangement yet; waiting for one");
@@ -1394,15 +1399,15 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // process: the per-event truth feed below only re-pins the cursor,
     // never the dims.
     match kvm_platform::capture::screen_size() {
-        Ok(Some((width, height))) => {
-            match router.adopt_local_screen_size(width, height) {
-                Some((w, h)) => {
-                    tracing::info!(width = w, height = h, "topology local geometry measured")
-                }
-                None => tracing::warn!("measured screen size rejected; keeping configured geometry"),
+        Ok(Some((width, height))) => match router.adopt_local_screen_size(width, height) {
+            Some((w, h)) => {
+                tracing::info!(width = w, height = h, "topology local geometry measured")
             }
+            None => tracing::warn!("measured screen size rejected; keeping configured geometry"),
+        },
+        Ok(None) => {
+            tracing::debug!("platform did not expose a screen size; keeping configured geometry")
         }
-        Ok(None) => tracing::debug!("platform did not expose a screen size; keeping configured geometry"),
         Err(error) => tracing::debug!(%error, "could not query screen size"),
     }
     match kvm_platform::capture::current_cursor_position() {
@@ -1467,10 +1472,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // The peer deliberately ended this epoch: exit now instead
                 // of parking at edge-ready as a zombie that rejects every
                 // later push. The UI redials on the peer's fresh epoch.
-                eprintln!(
-                    "THEKVM_STATUS {}",
-                    ban_ended_status(link.link_id)
-                );
+                eprintln!("THEKVM_STATUS {}", ban_ended_status(link.link_id));
                 return Err(error);
             }
             Err(_) => {
@@ -1508,8 +1510,20 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // Every release clears it; the keep-alive reaper heals any hold that
     // outlives its drive (the total-freeze class).
     let mut suppression_requested = false;
+    // Inbound-while-driving baseline (see TopologyEventContext): the
+    // divert/echo count when the current drive started. Growth while a
+    // drive is active is the peer driving us back — auto-yield fires.
+    let mut divert_baseline = 0u64;
+    // Last auto-yield to an inbound drive (see yield_cooling_down):
+    // fresh yields refuse new handoffs briefly so opposite-edge
+    // holding cannot ping-pong the drive.
+    let mut last_yield: Option<std::time::Instant> = None;
     let mut local_wheel_dropped = 0u64;
     let mut sequence = 0u64;
+    // Stashed motion-channel event: the burst fold below stops at the
+    // first non-move (wheel) and parks it here for the next iteration,
+    // so folding never reorders wheels past motion.
+    let mut motion_pending: Option<CapturedEvent> = None;
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1763,11 +1777,59 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     suppression_requested: &mut suppression_requested,
                     last_peer_progress: &mut last_peer_progress,
                     unacked_pings: &mut unacked_pings,
+                    divert_baseline: &mut divert_baseline,
+                    last_yield: &mut last_yield,
                 })
                 .await?;
             }
-            event = motion_rx.recv() => {
-                let Some(captured) = event else { bail!("input capture stopped") };
+            event = async {
+                // Stashed non-move from a previous burst fold (see below):
+                // FIFO before fresh channel arrivals, so wheels never
+                // reorder past motion.
+                if let Some(pending) = motion_pending.take() {
+                    Some(pending)
+                } else {
+                    motion_rx.recv().await
+                }
+            } => {
+                let Some(first) = event else { bail!("input capture stopped") };
+                // Burst coalescing: a high-report-rate mouse floods tiny
+                // MouseMoves that each cost a QUIC frame + flush (and each
+                // risks head-of-line delay on lossy Wi-Fi). Fold
+                // consecutively queued moves into one packet — identical
+                // final displacement, far fewer frames. Wheels stop the
+                // fold (scroll position relative to motion is preserved)
+                // and wait in the pending slot above.
+                let mut captured = first;
+                if let InputEvent::MouseMove { mut dx, mut dy } = captured.event {
+                    let mut folded = 0u32;
+                    while folded < 32 {
+                        match motion_rx.try_recv() {
+                            Ok(next) => match next.event {
+                                InputEvent::MouseMove { dx: mx, dy: my } => {
+                                    dx = dx.saturating_add(mx);
+                                    dy = dy.saturating_add(my);
+                                    folded += 1;
+                                }
+                                _ => {
+                                    motion_pending = Some(next);
+                                    break;
+                                }
+                            },
+                            Err(_) => break,
+                        }
+                    }
+                    if folded > 0 {
+                        captured.event = InputEvent::MouseMove { dx, dy };
+                        // Census counts every captured move (the Forward
+                        // arm counts the merged packet itself), so the
+                        // captured-vs-forwarded diagnosis stays exact.
+                        if let Some(session) = active.as_mut() {
+                            session.motion_captured += u64::from(folded);
+                            session.motion_coalesced += u64::from(folded);
+                        }
+                    }
+                }
                 if captured.event_id <= discarded_event_barrier
                     || active
                         .as_ref()
@@ -1800,6 +1862,8 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     suppression_requested: &mut suppression_requested,
                     last_peer_progress: &mut last_peer_progress,
                     unacked_pings: &mut unacked_pings,
+                    divert_baseline: &mut divert_baseline,
+                    last_yield: &mut last_yield,
                 })
                 .await?;
             }
@@ -1848,6 +1912,29 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 None => clipboard_enabled = false,
             },
             _ = keep_alive.tick() => {
+                // Idle auto-yield (same shape as the per-event check in
+                // handle_topology_event): a parked remote cursor produces
+                // no local input, so nothing wakes the event path — yet
+                // the peer may be pushing in. Without this the drive only
+                // yields when the local mouse moves (the "must move the
+                // Mint mouse out first" shape).
+                if active.is_some() {
+                    let diverted = kvm_platform::capture::inbound_while_driving_count();
+                    if diverted > divert_baseline {
+                        yield_drive_to_inbound(
+                            &mut router,
+                            &mut active,
+                            &mut parked,
+                            &capture_control,
+                            &mut discarded_event_barrier,
+                            &mut last_transfer,
+                            &mut last_yield,
+                            &mut suppression_requested,
+                            diverted,
+                        )
+                        .await;
+                    }
+                }
                 if let Some(session) = active.as_mut() {
                     // Bounded keep-alive: an unbounded write pends forever
                     // on a half-dead association and stalls this whole task
@@ -2021,6 +2108,10 @@ struct TopologySession {
     /// the journal instead of a mystery.
     motion_captured: u64,
     motion_forwarded: u64,
+    /// Burst-coalescing census: MouseMove events folded into a neighbor
+    /// packet by the motion arm instead of sent as their own QUIC frame.
+    /// Logged at teardown: proves the coalescer engaged under flood.
+    motion_coalesced: u64,
     /// Motion VALUE probe: the first forwarded delta, how many forwarded
     /// deltas were exactly zero, and the signed sums. Counts prove flow;
     /// only values prove the cursor CAN track: a drive whose warp lands
@@ -2057,7 +2148,10 @@ struct RemoteHandoff {
 
 enum RemoteSignal {
     Handoff(RemoteHandoff),
-    Clipboard { revision: u64, text: String },
+    Clipboard {
+        revision: u64,
+        text: String,
+    },
     Closed,
     /// The peer app answered a keep-alive Ping: the episode stream is
     /// alive end-to-end, not just the QUIC association (which the kernel
@@ -2076,6 +2170,7 @@ impl TopologySession {
                 wheel_forwarded = self.wheel_forwarded,
                 motion_captured = self.motion_captured,
                 motion_forwarded = self.motion_forwarded,
+                motion_coalesced = self.motion_coalesced,
                 motion_first = ?self.motion_first,
                 motion_zero_deltas = self.motion_zero_deltas,
                 motion_sum_dx = self.motion_sum_dx,
@@ -2166,10 +2261,7 @@ fn transfer_debounced(last_transfer: Option<std::time::Instant>) -> bool {
 /// retrying a resisting hold every 5s instead of forgetting it. The old
 /// unconditional clear wedged the hold forever: daemon belief false while
 /// the platform grab stayed held (keys/clicks dead, cursor moving).
-fn release_suppression(
-    capture_control: &CaptureGuard,
-    requested: Option<&mut bool>,
-) {
+fn release_suppression(capture_control: &CaptureGuard, requested: Option<&mut bool>) {
     if let Err(error) = capture_control.set_exclusive(false) {
         tracing::warn!(%error, "suppression release failed; belief kept, reaper will retry");
         return;
@@ -2201,6 +2293,14 @@ fn episode_cooling_down(last_failed_episode: Option<std::time::Instant>) -> bool
     last_failed_episode.is_some_and(|when| when.elapsed() < Duration::from_secs(1))
 }
 
+/// Cooldown after yielding to an inbound drive: the local user may still
+/// be holding against the edge, and without a pause their next push
+/// would instantly re-take the peer — which yields back — ping-ponging
+/// the drive while both users hold opposite edges. Pure for tests.
+fn yield_cooling_down(last_yield: Option<std::time::Instant>) -> bool {
+    last_yield.is_some_and(|when| when.elapsed() < Duration::from_secs(2))
+}
+
 /// Step the router cursor a few pixels inside the screen after a refused
 /// handoff (Deskflow `avoidJumpZone` parity): without it the cursor rests
 /// one pixel from the edge and the very next motion event re-crosses, so a
@@ -2222,6 +2322,44 @@ fn park_inside(router: &mut EdgeRouter, edge: kvm_core::Edge) {
     // "stuck at the edge until wiggled inside" shape. The short transfer
     // debounce already paces re-crossings; no state gate is needed.
     let _ = router.place_local_cursor(x, y);
+}
+
+/// Yield the outbound drive to a concurrent inbound one: park our episode
+/// (warm resume later), release the local suppression grab, and come home.
+/// Without this the peer drives into a held grab — their cursor stays
+/// invisible and their clicks land in our invisible grab window until our
+/// mouse physically returns home. Mirrors the ReturnHome arm's teardown
+/// exactly (park, release, barrier, transfer stamp, restore, warp), plus
+/// the yield stamp that paces re-pushes (see yield_cooling_down).
+#[allow(clippy::too_many_arguments)]
+async fn yield_drive_to_inbound(
+    router: &mut EdgeRouter,
+    active: &mut Option<TopologySession>,
+    parked: &mut Option<TopologySession>,
+    capture_control: &CaptureGuard,
+    discarded_event_barrier: &mut u64,
+    last_transfer: &mut Option<std::time::Instant>,
+    last_yield: &mut Option<std::time::Instant>,
+    suppression_requested: &mut bool,
+    diverted: u64,
+) {
+    let Some(session) = active.take() else {
+        return;
+    };
+    let target = session.target;
+    if let Some(stale) = parked.replace(session) {
+        stale.finish().await;
+    }
+    release_suppression(capture_control, Some(&mut *suppression_requested));
+    *discarded_event_barrier =
+        (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
+    *last_transfer = Some(std::time::Instant::now());
+    *last_yield = Some(std::time::Instant::now());
+    let _ = router.restore_local(target);
+    let (x, y) = router.cursor_position();
+    let _ = capture_control.warp_cursor(x, y);
+    tracing::info!(?target, diverted, x, y, "peer is driving us while we drive them; yielding to the inbound drive (ours parked for resume)");
+    eprintln!("THEKVM_STATUS local");
 }
 
 struct TopologyEventContext<'a> {
@@ -2260,6 +2398,15 @@ struct TopologyEventContext<'a> {
     /// Consecutive unanswered active-episode Pings (see the loop-local):
     /// reset on drive start and on every Pong.
     unacked_pings: &'a mut u32,
+    /// Inbound-while-driving baseline: snapshot of
+    /// capture::inbound_while_driving_count() taken when the current
+    /// drive started. Growth while `active` means the peer is driving
+    /// us back right now — yield instead of diverting them forever.
+    divert_baseline: &'a mut u64,
+    /// Last auto-yield stamp (see yield_cooling_down): fresh yields
+    /// refuse new handoffs briefly so opposite-edge holding cannot
+    /// ping-pong the drive.
+    last_yield: &'a mut Option<std::time::Instant>,
 }
 
 async fn handle_topology_event(
@@ -2291,6 +2438,8 @@ async fn handle_topology_event(
         suppression_requested,
         last_peer_progress,
         unacked_pings,
+        divert_baseline,
+        last_yield,
     } = context;
     // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
     // Raw deltas keep flowing after the OS pointer has stopped at the edge,
@@ -2334,8 +2483,8 @@ async fn handle_topology_event(
                 let target = session.target;
                 session.finish().await;
                 release_suppression(&capture_control, Some(&mut *suppression_requested));
-                *discarded_event_barrier = (*discarded_event_barrier)
-                    .max(capture_control.snapshot().last_event_id);
+                *discarded_event_barrier =
+                    (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
                 let _ = router.restore_local(target);
                 let (x, y) = router.cursor_position();
                 let _ = capture_control.warp_cursor(x, y);
@@ -2351,16 +2500,38 @@ async fn handle_topology_event(
         }
         return Ok(());
     }
+    // Auto-yield to a concurrent inbound drive (see divert_baseline):
+    // while WE drive the peer, peer-injected arrivals counted against
+    // our held suppression mean the peer is driving US back into our
+    // own grab — every one of their motions/clicks diverts into the
+    // invisible grab window. Park ours and release the grab so their
+    // input lands; our parked stream resumes on the next push.
+    // Baseline-gated, so stale counts from an older drive never fire.
+    if active.is_some() {
+        let diverted = kvm_platform::capture::inbound_while_driving_count();
+        if diverted > *divert_baseline {
+            yield_drive_to_inbound(
+                router,
+                active,
+                parked,
+                capture_control,
+                discarded_event_barrier,
+                last_transfer,
+                last_yield,
+                suppression_requested,
+                diverted,
+            )
+            .await;
+            return Ok(());
+        }
+    }
     let routed = router.route(captured.event);
     match routed {
         RoutedEvent::Local(event) => {
             // Scroll that arrives with nobody driven stays local (scroll
             // alone never opens a crossing): count it so the journal
             // distinguishes "hook is dead" from "scrolled while local".
-            if matches!(
-                event,
-                InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
-            ) {
+            if matches!(event, InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }) {
                 *local_wheel_dropped += 1;
             }
             // A compositor portal may have activated a barrier even when the
@@ -2415,7 +2586,9 @@ async fn handle_topology_event(
             let outgoing_is_motion = matches!(outgoing, InputEvent::MouseMove { .. });
             let outgoing_is_datagram = matches!(
                 outgoing,
-                InputEvent::MouseMove { .. } | InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
+                InputEvent::MouseMove { .. }
+                    | InputEvent::Wheel(_)
+                    | InputEvent::SmoothWheel { .. }
             );
             *sequence = sequence.wrapping_add(1);
             if let Err(error) =
@@ -2436,8 +2609,8 @@ async fn handle_topology_event(
                     stale.finish().await;
                 }
                 release_suppression(&capture_control, Some(&mut *suppression_requested));
-                *discarded_event_barrier = (*discarded_event_barrier)
-                    .max(capture_control.snapshot().last_event_id);
+                *discarded_event_barrier =
+                    (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
                 let _ = router.restore_local(target);
                 let (x, y) = router.cursor_position();
                 let _ = capture_control.warp_cursor(x, y);
@@ -2473,8 +2646,8 @@ async fn handle_topology_event(
                 }
             }
             release_suppression(&capture_control, Some(&mut *suppression_requested));
-            *discarded_event_barrier = (*discarded_event_barrier)
-                .max(capture_control.snapshot().last_event_id);
+            *discarded_event_barrier =
+                (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
             *last_transfer = Some(std::time::Instant::now());
             let (x, y) = router.cursor_position();
             let _ = capture_control.warp_cursor(x, y);
@@ -2483,7 +2656,15 @@ async fn handle_topology_event(
             // (escape-hatch or peer-placed return); `armed=true` means
             // the cursor settled inside and then pushed back out past
             // the brush guard — the specified return gesture.
-            tracing::info!(?from, ?edge, ?entry_edge, armed, x, y, "topology edge return; control is local");
+            tracing::info!(
+                ?from,
+                ?edge,
+                ?entry_edge,
+                armed,
+                x,
+                y,
+                "topology edge return; control is local"
+            );
             eprintln!("THEKVM_STATUS local");
         }
         RoutedEvent::Handoff {
@@ -2503,7 +2684,13 @@ async fn handle_topology_event(
             // motion flowing means the push never reached the router
             // (wrong edge/capture), while guard lines below mean the
             // router refused it (unlinked/debounce/cooldown).
-            tracing::info!(?target, ?edge, target_x, target_y, "edge push reaches router; opening crossing");
+            tracing::info!(
+                ?target,
+                ?edge,
+                target_x,
+                target_y,
+                "edge push reaches router; opening crossing"
+            );
             // MWB connected-guard: a linked child drives ONLY its verified
             // linked peer. Anything else is a stranger — clamp back local.
             if let Some(link) = link {
@@ -2521,6 +2708,20 @@ async fn handle_topology_event(
             // MWB lastJump debounce: let the last transfer settle first.
             if transfer_debounced(*last_transfer) {
                 tracing::debug!(?target, ?edge, "edge push debounced after a transfer");
+                let _ = router.restore_local(target);
+                park_inside(router, edge);
+                return Ok(());
+            }
+            // Yield cooldown (see last_yield): this child just yielded
+            // to an inbound drive, and the local user may still be
+            // holding against the edge — refuse an instant re-push so
+            // the drive cannot ping-pong while both hold their edges.
+            if yield_cooling_down(*last_yield) {
+                tracing::debug!(
+                    ?target,
+                    ?edge,
+                    "edge push in yield cooldown after yielding to inbound"
+                );
                 let _ = router.restore_local(target);
                 park_inside(router, edge);
                 return Ok(());
@@ -2630,6 +2831,10 @@ async fn handle_topology_event(
                     session.peer_geometry,
                 );
                 *active = Some(session);
+                // Baseline the inbound-while-driving signal for this
+                // drive: only growth past this point means the peer is
+                // driving us back (see the auto-yield above).
+                *divert_baseline = kvm_platform::capture::inbound_while_driving_count();
                 let name = router
                     .screen(target)
                     .map(|screen| screen.name.clone())
@@ -2638,7 +2843,13 @@ async fn handle_topology_event(
                 // ~0ms; a cold dial reads handshake + provisioning);
                 // local_wheel names scroll that arrived while nobody was
                 // driven.
-                tracing::info!(?target, open_ms = opened_at.elapsed().as_millis(), resumed, local_wheel = *local_wheel_dropped, "topology handoff activated");
+                tracing::info!(
+                    ?target,
+                    open_ms = opened_at.elapsed().as_millis(),
+                    resumed,
+                    local_wheel = *local_wheel_dropped,
+                    "topology handoff activated"
+                );
                 // Handoff-open diagnostic: how far the OS pointer truth
                 // stood from the exit edge at the crossing moment.
                 // Near-zero = a genuine sustained push; far = virtual and
@@ -2657,7 +2868,11 @@ async fn handle_topology_event(
                                 i64::from(local.height.saturating_sub(1)) - truth_y as i64
                             }
                         };
-                        tracing::info!(?edge, truth_gap_px = gap, "topology handoff opened this far from the edge");
+                        tracing::info!(
+                            ?edge,
+                            truth_gap_px = gap,
+                            "topology handoff opened this far from the edge"
+                        );
                     }
                 }
                 eprintln!("THEKVM_STATUS driving {name}");
@@ -2800,19 +3015,13 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
             }
         }
     }
-    let mut session = spawn_episode_driver(
-        conn,
-        send,
-        recv,
-        capabilities,
-        target,
-        event_barrier,
-    );
+    let mut session = spawn_episode_driver(conn, send, recv, capabilities, target, event_barrier);
     // Normalize the first event for this peer's scroll capability exactly
     // like every later event: an older peer gets detents, never raw 120ths
     // it would misread as hundreds of detents.
-    let first_event = first_event
-        .and_then(|event| outgoing_wheel_event(event, session.peer_smooth, &mut session.wheel_debt));
+    let first_event = first_event.and_then(|event| {
+        outgoing_wheel_event(event, session.peer_smooth, &mut session.wheel_debt)
+    });
     if let Some(event) = first_event {
         *sequence = sequence.wrapping_add(1);
         // Keep the first post-handoff motion on the same ordered stream as
@@ -2891,7 +3100,10 @@ async fn take_parked_for(
             None
         }
         Err(_) => {
-            tracing::debug!(?target, "parked drive stream liveness timed out; dialling fresh");
+            tracing::debug!(
+                ?target,
+                "parked drive stream liveness timed out; dialling fresh"
+            );
             session.finish().await;
             None
         }
@@ -2922,13 +3134,8 @@ async fn resume_parked_session(
     // Same session-scoping as the fresh open above: the parked
     // session's capabilities are this peer's advertisement (see
     // above) — never screen-number filtered.
-    let (target_name, target_x, target_y, wire_geometry) = handoff_wire_target(
-        router,
-        target,
-        target_x,
-        target_y,
-        session.peer_geometry,
-    )?;
+    let (target_name, target_x, target_y, wire_geometry) =
+        handoff_wire_target(router, target, target_x, target_y, session.peer_geometry)?;
     write_frame(
         &mut session.send,
         &WireMessage::PointerHandoff {
@@ -2956,8 +3163,9 @@ async fn resume_parked_session(
             }
         }
     }
-    let first_event = first_event
-        .and_then(|event| outgoing_wheel_event(event, session.peer_smooth, &mut session.wheel_debt));
+    let first_event = first_event.and_then(|event| {
+        outgoing_wheel_event(event, session.peer_smooth, &mut session.wheel_debt)
+    });
     if let Some(event) = first_event {
         *sequence = sequence.wrapping_add(1);
         // Same ordering rule as a fresh open: the first post-handoff
@@ -2990,9 +3198,11 @@ async fn prewarm_link_stream(
     dir: &std::path::Path,
     local_geometry: Option<ScreenGeometry>,
 ) -> Result<Option<TopologySession>> {
-    let screen = router.layout().screens.iter().find(|screen| {
-        screen.peer_fingerprint.as_deref() == Some(link.fingerprint.as_str())
-    });
+    let screen = router
+        .layout()
+        .screens
+        .iter()
+        .find(|screen| screen.peer_fingerprint.as_deref() == Some(link.fingerprint.as_str()));
     let Some(screen) = screen else {
         return Ok(None);
     };
@@ -3009,7 +3219,16 @@ async fn prewarm_link_stream(
                     return Err(error);
                 }
                 tracing::debug!(%error, "pre-warm on the warm link failed; dialling cold");
-                match cold_topology_dial(identity, peers, &link.fingerprint, &screen.name, policy, dir).await {
+                match cold_topology_dial(
+                    identity,
+                    peers,
+                    &link.fingerprint,
+                    &screen.name,
+                    policy,
+                    dir,
+                )
+                .await
+                {
                     Ok((conn, send, recv, capabilities, _)) => {
                         store_warm_link(&conn, &link.fingerprint);
                         (conn, send, recv, capabilities)
@@ -3025,7 +3244,16 @@ async fn prewarm_link_stream(
             }
         },
         None => {
-            match cold_topology_dial(identity, peers, &link.fingerprint, &screen.name, policy, dir).await {
+            match cold_topology_dial(
+                identity,
+                peers,
+                &link.fingerprint,
+                &screen.name,
+                policy,
+                dir,
+            )
+            .await
+            {
                 Ok((conn, send, recv, capabilities, _)) => {
                     store_warm_link(&conn, &link.fingerprint);
                     (conn, send, recv, capabilities)
@@ -3040,8 +3268,18 @@ async fn prewarm_link_stream(
             }
         }
     };
-    tracing::info!(?target, "link drive stream pre-warmed; first crossing needs no dial");
-    Ok(Some(spawn_episode_driver(conn, send, recv, capabilities, target, 0)))
+    tracing::info!(
+        ?target,
+        "link drive stream pre-warmed; first crossing needs no dial"
+    );
+    Ok(Some(spawn_episode_driver(
+        conn,
+        send,
+        recv,
+        capabilities,
+        target,
+        0,
+    )))
 }
 
 /// Adopt the linked peer's advertised dims into the driver router (see
@@ -3062,7 +3300,10 @@ fn adopt_peer_geometry(
         return;
     };
     if geometry.width < 2 || geometry.height < 2 {
-        tracing::debug!(?geometry, "peer geometry degenerate; keeping configured peer dims");
+        tracing::debug!(
+            ?geometry,
+            "peer geometry degenerate; keeping configured peer dims"
+        );
         return;
     }
     match router.adopt_peer_screen_size(fingerprint, geometry.width, geometry.height) {
@@ -3082,7 +3323,8 @@ fn adopt_peer_geometry(
 /// Map an edge-entry point into the peer's current geometry and name the
 /// target screen. Shared by fresh opens and parked resumes so both land
 /// identically — entry at the proportional edge point, never mid-screen.
-fn handoff_wire_target(    router: &EdgeRouter,
+fn handoff_wire_target(
+    router: &EdgeRouter,
     target: ScreenId,
     target_x: u32,
     target_y: u32,
@@ -3143,6 +3385,7 @@ fn spawn_episode_driver(
         wheel_forwarded: 0,
         motion_captured: 0,
         motion_forwarded: 0,
+        motion_coalesced: 0,
         motion_first: None,
         motion_zero_deltas: 0,
         motion_sum_dx: 0,
@@ -3170,15 +3413,8 @@ async fn cold_topology_dial(
     String,
 )> {
     let address = resolve_peer_address(peers, fingerprint, peer_name)?;
-    let (conn, send, recv, capabilities) = dial_session(
-        identity,
-        peers,
-        &address,
-        policy,
-        Some(fingerprint),
-        dir,
-    )
-    .await?;
+    let (conn, send, recv, capabilities) =
+        dial_session(identity, peers, &address, policy, Some(fingerprint), dir).await?;
     Ok((conn, send, recv, capabilities, address))
 }
 
@@ -3218,6 +3454,28 @@ async fn drain_peer_responses(
         }
     }
     let _ = signal.send(RemoteSignal::Closed);
+}
+
+/// Record one event and deliver it on the reliable priority channel.
+/// False means the receiver is gone (child exiting). Used for
+/// pinch-expanded events, which must stay ordered with their Ctrl
+/// press/release on one reliable channel instead of racing across the
+/// lossy motion channel.
+fn record_and_send_priority(
+    state: &Arc<std::sync::Mutex<CapturedState>>,
+    priority_tx: &tokio::sync::mpsc::Sender<CapturedEvent>,
+    event: InputEvent,
+) -> bool {
+    let captured = match state.lock() {
+        Ok(mut guard) => {
+            let Some(captured) = guard.record(event) else {
+                return true;
+            };
+            captured
+        }
+        Err(_) => CapturedEvent { event, event_id: 0 },
+    };
+    priority_tx.blocking_send(captured).is_ok()
 }
 
 fn start_capture(
@@ -3260,6 +3518,9 @@ fn start_capture(
             let mut backend = Some(capture);
             let mut failures = 0u32;
             let mut last_warn: Option<std::time::Instant> = None;
+            // Our synthetic pinch-zoom Ctrl hold (see the expansion
+            // below): released on gesture end, or on backend death.
+            let mut pinch_ctrl_held = false;
             'capture: loop {
                 if thread_stop.load(std::sync::atomic::Ordering::Acquire) {
                     break 'capture;
@@ -3304,6 +3565,23 @@ fn start_capture(
                                 tracing::warn!(%error, failures, "input capture backend failed; rebuilding");
                             }
                             backend = None;
+                            // A dying backend mid-pinch never emits
+                            // PinchEnd: release our synthetic Ctrl now, or
+                            // the receiver holds it past the rebuild.
+                            if pinch_ctrl_held {
+                                pinch_ctrl_held = false;
+                                let release = InputEvent::Key(kvm_core::KeyEvent {
+                                    usage: HID_LEFT_CTRL,
+                                    pressed: false,
+                                });
+                                if !record_and_send_priority(
+                                    &thread_state,
+                                    &priority_tx,
+                                    release,
+                                ) {
+                                    break 'capture;
+                                }
+                            }
                             if failures > 20 {
                                 tracing::warn!(
                                     failures,
@@ -3315,13 +3593,33 @@ fn start_capture(
                             continue;
                         }
                     };
+                // Pinch-to-zoom expansion (see pinch_expansion): gestures
+                // become Ctrl+wheel HERE — before record, channels, and
+                // routing — so the wire, snapshots, and fixed-peer links
+                // only ever see universal Ctrl+wheel and old peers keep
+                // working unchanged. Expanded events ride the reliable
+                // priority channel, ordered with their Ctrl press/release:
+                // a wheel must never pass its own release, or a later
+                // real scroll zooms under a stale modifier.
+                if matches!(event, InputEvent::Pinch { .. } | InputEvent::PinchEnd) {
+                    let physical_ctrl = thread_state
+                        .lock()
+                        .map(|state| state.keys.contains(&HID_LEFT_CTRL))
+                        .unwrap_or(false);
+                    for out in pinch_expansion(event, physical_ctrl, &mut pinch_ctrl_held) {
+                        if !record_and_send_priority(&thread_state, &priority_tx, out) {
+                            break 'capture;
+                        }
+                    }
+                    continue;
+                }
                 let captured = match thread_state.lock() {
                     Ok(mut state) => {
                         let Some(captured) = state.record(event) else {
-                            // Hook backends can repeat a key-down while the
-                            // key is held. The receiver's OS performs repeat
-                            // itself, so forwarding duplicate transitions
-                            // only adds queue pressure and state ambiguity.
+                            // Deduped transitions only (held-button
+                            // re-press, spurious release): key typematic
+                            // repeats always pass record (see its docs —
+                            // Windows renders hold-repeat from them).
                             continue;
                         };
                         captured
@@ -3546,7 +3844,14 @@ impl CapturedState {
                     self.buttons.remove(&button)
                 }
             }
-            InputEvent::MouseMove { .. } | InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. } => true,
+            InputEvent::MouseMove { .. }
+            | InputEvent::Wheel(_)
+            | InputEvent::SmoothWheel { .. } => true,
+            // Pinch gestures never reach record: the capture thread
+            // expands them into Ctrl+wheel first (see pinch_expansion).
+            // Drop defensively so one can never leak onto the wire (old
+            // peers cannot parse new variants) or into snapshots.
+            InputEvent::Pinch { .. } | InputEvent::PinchEnd => false,
         };
         if !changed {
             return None;
@@ -3567,6 +3872,52 @@ impl CapturedState {
             },
             last_event_id: self.last_event_id,
         }
+    }
+}
+
+/// USB HID usage for Left Ctrl — the zoom modifier (see pinch_expansion).
+const HID_LEFT_CTRL: HidUsage = 0xe0;
+
+/// Expand a capture-side pinch gesture into wire-ready events. Pure for
+/// tests. A gesture start presses Ctrl (unless physically held — the
+/// caller checks the capture state, so a real held Ctrl is never stolen
+/// or released by us), each spread delta becomes one SmoothWheel (every
+/// receiver zooms at its cursor on Ctrl+wheel, which is exactly
+/// zoom-to-cursor: no focus coordinates cross the wire), and the gesture
+/// end releases our synthetic Ctrl. `pinch_held` tracks OUR hold across
+/// calls. Non-gesture events pass through untouched.
+fn pinch_expansion(
+    event: InputEvent,
+    physical_ctrl_held: bool,
+    pinch_held: &mut bool,
+) -> Vec<InputEvent> {
+    match event {
+        InputEvent::Pinch { delta } => {
+            let mut out = Vec::with_capacity(2);
+            if !*pinch_held && !physical_ctrl_held {
+                *pinch_held = true;
+                out.push(InputEvent::Key(kvm_core::KeyEvent {
+                    usage: HID_LEFT_CTRL,
+                    pressed: true,
+                }));
+            }
+            if delta != 0 {
+                out.push(InputEvent::SmoothWheel { x: 0, y: delta });
+            }
+            out
+        }
+        InputEvent::PinchEnd => {
+            if *pinch_held {
+                *pinch_held = false;
+                vec![InputEvent::Key(kvm_core::KeyEvent {
+                    usage: HID_LEFT_CTRL,
+                    pressed: false,
+                })]
+            } else {
+                Vec::new()
+            }
+        }
+        other => vec![other],
     }
 }
 
@@ -3760,9 +4111,7 @@ pub async fn run() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(metadata) = std::fs::metadata(&dir) {
             let mode = metadata.permissions().mode() | 0o050;
-            if let Err(error) =
-                std::fs::set_permissions(&dir, PermissionsExt::from_mode(mode))
-            {
+            if let Err(error) = std::fs::set_permissions(&dir, PermissionsExt::from_mode(mode)) {
                 tracing::warn!(path = %dir.display(), %error, "cannot add daemon directory group access");
             }
         }
@@ -3770,8 +4119,7 @@ pub async fn run() -> Result<()> {
             let path = dir.join(file);
             if let Ok(metadata) = std::fs::metadata(&path) {
                 let mode = metadata.permissions().mode() | 0o040;
-                if let Err(error) =
-                    std::fs::set_permissions(&path, PermissionsExt::from_mode(mode))
+                if let Err(error) = std::fs::set_permissions(&path, PermissionsExt::from_mode(mode))
                 {
                     tracing::warn!(path = %path.display(), %error, "cannot add daemon file group access");
                 }
@@ -4037,33 +4385,33 @@ async fn handle_connection(
         let local_config = config.read().await.clone();
 
         match first {
-        WireMessage::PairRequest {
-            node_name,
-            fingerprint_hex,
-            pairing_code,
-        } => {
-            handle_pairing(
-                &conn,
-                &mut send,
-                &mut recv,
-                peers.clone(),
-                &peer_fingerprint,
-                pairing_approvals.clone(),
-                PairingRequest {
-                    local_node_name: local_config.device_name.clone(),
-                    node_name,
-                    claimed_fingerprint: fingerprint_hex,
-                    pairing_code,
-                },
-            )
-            .await?;
-        }
-        WireMessage::Hello(hello) => {
-            // Per-stream containment: this async block is a return
-            // boundary, so `bail!`, `return` and `?` end THIS episode
-            // with a logged reason while the association loop above keeps
-            // serving later streams.
-            let stream_result: Result<()> = async {
+            WireMessage::PairRequest {
+                node_name,
+                fingerprint_hex,
+                pairing_code,
+            } => {
+                handle_pairing(
+                    &conn,
+                    &mut send,
+                    &mut recv,
+                    peers.clone(),
+                    &peer_fingerprint,
+                    pairing_approvals.clone(),
+                    PairingRequest {
+                        local_node_name: local_config.device_name.clone(),
+                        node_name,
+                        claimed_fingerprint: fingerprint_hex,
+                        pairing_code,
+                    },
+                )
+                .await?;
+            }
+            WireMessage::Hello(hello) => {
+                // Per-stream containment: this async block is a return
+                // boundary, so `bail!`, `return` and `?` end THIS episode
+                // with a logged reason while the association loop above keeps
+                // serving later streams.
+                let stream_result: Result<()> = async {
             let config = local_config;
             if !peers.read().await.is_pinned(&peer_fingerprint) {
                 reject(&mut send, "peer is not paired").await?;
@@ -4354,6 +4702,12 @@ async fn handle_connection(
                                     InputEvent::SmoothWheel { .. } => smooth_count += 1,
                                     InputEvent::MouseButton { .. } => button_count += 1,
                                     InputEvent::Key(_) => key_count += 1,
+                                    // Pinch never reaches the wire (the
+                                    // sender expands it into Ctrl+wheel);
+                                    // count defensively as smooth wheel.
+                                    InputEvent::Pinch { .. } | InputEvent::PinchEnd => {
+                                        smooth_count += 1;
+                                    }
                                 }
                                 if process_remote_input(
                                     DatagramInput {
@@ -4373,6 +4727,7 @@ async fn handle_connection(
                                     &mut dropped_duplicate,
                                     &mut dropped_stale,
                                     &mut applied_motion,
+                                    lock_screen_enabled,
                                 )
                                 .await?
                                 {
@@ -4487,8 +4842,14 @@ async fn handle_connection(
                                 // episode — driving unplaced beats not
                                 // driving at all.
                                 match injector.warp_cursor(x, y) {
-                                    Ok(()) => tracing::info!(x, y, wire = ?screen_geometry, "receiver placed cursor at entry"),
-                                    Err(error) => tracing::warn!(%error, x, y, "receiver entry warp failed; cursor starts unplaced"),
+                                    // Truthful dims ride both lines: a later
+                                    // "exited mid-screen" (notably on lock
+                                    // screens, where geometry evidence
+                                    // shifts) is checkable here — entry
+                                    // mapped wire→truthful, warp placed or
+                                    // unplaced — instead of guessed about.
+                                    Ok(()) => tracing::info!(x, y, wire = ?screen_geometry, truthful_width = truthful.width, truthful_height = truthful.height, "receiver placed cursor at entry"),
+                                    Err(error) => tracing::warn!(%error, x, y, wire = ?screen_geometry, truthful_width = truthful.width, truthful_height = truthful.height, "receiver entry warp failed; cursor starts unplaced"),
                                 }
                             }
                             WireMessage::ReleaseAll => injector.release_all()?,
@@ -4535,6 +4896,12 @@ async fn handle_connection(
                             InputEvent::SmoothWheel { .. } => smooth_count += 1,
                             InputEvent::MouseButton { .. } => button_count += 1,
                             InputEvent::Key(_) => key_count += 1,
+                            // Pinch never reaches the wire (the sender
+                            // expands it into Ctrl+wheel); count
+                            // defensively as smooth wheel.
+                            InputEvent::Pinch { .. } | InputEvent::PinchEnd => {
+                                smooth_count += 1;
+                            }
                         }
                         if process_remote_input(
                             packet,
@@ -4551,6 +4918,7 @@ async fn handle_connection(
                             &mut dropped_duplicate,
                             &mut dropped_stale,
                             &mut applied_motion,
+                            lock_screen_enabled,
                         )
                         .await?
                         {
@@ -4669,14 +5037,14 @@ async fn handle_connection(
             Ok(())
             }
             .await;
-            if let Err(error) = stream_result {
-                tracing::debug!(%error, "episode stream ended");
+                if let Err(error) = stream_result {
+                    tracing::debug!(%error, "episode stream ended");
+                }
             }
-        }
-        other => {
-            reject(&mut send, &format!("expected hello, received {other:?}")).await?;
-            bail!("invalid first message")
-        }
+            other => {
+                reject(&mut send, &format!("expected hello, received {other:?}")).await?;
+                bail!("invalid first message")
+            }
         } // match first: one pairing or one episode per stream
     } // association loop: streams share one handshake
 }
@@ -4697,6 +5065,7 @@ async fn process_remote_input(
     dropped_duplicate: &mut u64,
     dropped_stale: &mut u64,
     applied: &mut AppliedMotion,
+    lock_screen_requested: bool,
 ) -> Result<bool> {
     if !seen_sequences.insert(packet.sequence) {
         *dropped_duplicate += 1;
@@ -4750,77 +5119,80 @@ async fn process_remote_input(
         if hop_ready {
             *hop_edge = None;
             *hop_accum = 0;
-            if let Some(handoff) = config
-                .layout
-                .handoff_for_motion(screen_id, x, y, dx, dy, config.edge_mode)
+            if let Some(handoff) =
+                config
+                    .layout
+                    .handoff_for_motion(screen_id, x, y, dx, dy, config.edge_mode)
             {
-            let screen = config
-                .layout
-                .screen(screen_id)
-                .context("remote pointer screen disappeared during handoff")?;
-            let next_x = i64::from(x) + i64::from(dx);
-            let next_y = i64::from(y) + i64::from(dy);
-            let (remainder_dx, remainder_dy) = match handoff.edge {
-                kvm_core::Edge::Left => (
-                    next_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-                    0,
-                ),
-                kvm_core::Edge::Right => (
-                    (next_x - i64::from(screen.width - 1))
-                        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-                    0,
-                ),
-                kvm_core::Edge::Top => (
-                    0,
-                    next_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-                ),
-                kvm_core::Edge::Bottom => (
-                    0,
-                    (next_y - i64::from(screen.height - 1))
-                        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-                ),
-            };
-            let configured_target_geometry = screen_geometry_for(&config.layout, handoff.target)
-                .context("handoff target screen disappeared")?;
-            let target_name = config
-                .layout
-                .screen(handoff.target)
-                .map(|screen| screen.name.clone())
-                .unwrap_or_default();
-            // The tracked point lives in the sender's space (see the
-            // terminal branch: remote_cursor integrates sender deltas),
-            // and this hop request carries it onward in that same space:
-            // attach the sender's advertisement as-is. The old
-            // screen-number filter compared the sender's self number
-            // against our local target number (never equal across
-            // machines) and dropped every advertisement (wire=None).
-            let (target_x, target_y, screen_geometry) = match peer_screen_geometry
-            {
-                Some(peer_geometry) => {
-                    let (x, y) = remap_position(
-                        handoff.target_x,
-                        handoff.target_y,
-                        Some(configured_target_geometry),
-                        peer_geometry,
-                    );
-                    (x, y, Some(peer_geometry))
-                }
-                None => (handoff.target_x, handoff.target_y, None),
-            };
-            write_frame(
-                send,
-                &WireMessage::HandoffRequest {
-                    screen_id: handoff.target.0,
-                    target_name,
-                    x: target_x,
-                    y: target_y,
-                    dx: remainder_dx,
-                    dy: remainder_dy,
-                    screen_geometry,
-                },
-            )
-            .await?;
-            return Ok(true);
+                let screen = config
+                    .layout
+                    .screen(screen_id)
+                    .context("remote pointer screen disappeared during handoff")?;
+                let next_x = i64::from(x) + i64::from(dx);
+                let next_y = i64::from(y) + i64::from(dy);
+                let (remainder_dx, remainder_dy) = match handoff.edge {
+                    kvm_core::Edge::Left => (
+                        next_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                        0,
+                    ),
+                    kvm_core::Edge::Right => (
+                        (next_x - i64::from(screen.width - 1))
+                            .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                            as i32,
+                        0,
+                    ),
+                    kvm_core::Edge::Top => (
+                        0,
+                        next_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                    ),
+                    kvm_core::Edge::Bottom => (
+                        0,
+                        (next_y - i64::from(screen.height - 1))
+                            .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                            as i32,
+                    ),
+                };
+                let configured_target_geometry =
+                    screen_geometry_for(&config.layout, handoff.target)
+                        .context("handoff target screen disappeared")?;
+                let target_name = config
+                    .layout
+                    .screen(handoff.target)
+                    .map(|screen| screen.name.clone())
+                    .unwrap_or_default();
+                // The tracked point lives in the sender's space (see the
+                // terminal branch: remote_cursor integrates sender deltas),
+                // and this hop request carries it onward in that same space:
+                // attach the sender's advertisement as-is. The old
+                // screen-number filter compared the sender's self number
+                // against our local target number (never equal across
+                // machines) and dropped every advertisement (wire=None).
+                let (target_x, target_y, screen_geometry) = match peer_screen_geometry {
+                    Some(peer_geometry) => {
+                        let (x, y) = remap_position(
+                            handoff.target_x,
+                            handoff.target_y,
+                            Some(configured_target_geometry),
+                            peer_geometry,
+                        );
+                        (x, y, Some(peer_geometry))
+                    }
+                    None => (handoff.target_x, handoff.target_y, None),
+                };
+                write_frame(
+                    send,
+                    &WireMessage::HandoffRequest {
+                        screen_id: handoff.target.0,
+                        target_name,
+                        x: target_x,
+                        y: target_y,
+                        dx: remainder_dx,
+                        dy: remainder_dy,
+                        screen_geometry,
+                    },
+                )
+                .await?;
+                return Ok(true);
             }
         }
         // Sub-threshold overflow lands here too: the tracked cursor pins
@@ -4840,9 +5212,30 @@ async fn process_remote_input(
     if let InputEvent::MouseMove { dx, dy } = packet.event {
         applied.record(dx, dy);
     }
-    injector
+    if let Err(error) = injector
         .send(packet.event)
-        .with_context(|| format!("inject {:?} failed", packet.event))?;
+        .with_context(|| format!("inject {:?} failed", packet.event))
+    {
+        // A dead platform injector (torn-down uinput, revoked seat)
+        // must not wedge every later episode on this association into
+        // silent no-op drives: rebuild once and retry this event
+        // before failing the stream. Held-key state replays safely —
+        // the sender's release (or its repeats) still arrive and clear
+        // the fresh device. The Windows service bridge keeps today's
+        // fail-stream (its rebuild reconnects helpers and can stall),
+        // so only native injectors rebuild here.
+        tracing::warn!(%error, "receiver injector failed; rebuilding once");
+        match injector {
+            ReceiverInjector::Native(_) => {
+                *injector = ReceiverInjector::create(lock_screen_requested)?;
+                injector
+                    .send(packet.event)
+                    .with_context(|| format!("inject {:?} failed after rebuild", packet.event))?;
+            }
+            #[cfg(target_os = "windows")]
+            ReceiverInjector::Service(_) => return Err(error),
+        }
+    }
     Ok(false)
 }
 
@@ -4885,10 +5278,8 @@ fn outgoing_wheel_event(
     // waits, instead of firing early on one side (as Euclidean division
     // would for negative motion).
     let detents = WheelDelta {
-        x: (debt.x / 120)
-            .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
-        y: (debt.y / 120)
-            .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+        x: (debt.x / 120).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+        y: (debt.y / 120).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
     };
     debt.x -= i32::from(detents.x) * 120;
     debt.y -= i32::from(detents.y) * 120;
@@ -5083,7 +5474,11 @@ impl ReceiverInjector {
                     // total so a future None stays drive-unplaced, not a
                     // panic in the input path.
                     let Some(display) = display else {
-                        tracing::debug!(x, y, "no session display for entry warp; driving unplaced");
+                        tracing::debug!(
+                            x,
+                            y,
+                            "no session display for entry warp; driving unplaced"
+                        );
                         return Ok(());
                     };
                     return kvm_platform::capture::warp_cursor_on(Some(&display), x, y)
@@ -5103,8 +5498,7 @@ impl ReceiverInjector {
                 // warped; only the interactive-session Native path no-oped.
                 #[cfg(target_os = "windows")]
                 {
-                    return kvm_platform::capture::warp_cursor(x, y)
-                        .map_err(anyhow::Error::from);
+                    return kvm_platform::capture::warp_cursor(x, y).map_err(anyhow::Error::from);
                 }
             }
             #[cfg(target_os = "windows")]
@@ -5252,9 +5646,7 @@ async fn handle_pairing(
             WireMessage::Reject { reason } => {
                 Err(anyhow::anyhow!("initiator aborted pairing: {reason}"))
             }
-            other => Err(anyhow::anyhow!(
-                "invalid pairing confirmation: {other:?}"
-            )),
+            other => Err(anyhow::anyhow!("invalid pairing confirmation: {other:?}")),
         }
     };
     tokio::pin!(confirmed);
@@ -5374,7 +5766,10 @@ fn unknown_peer_rejection(error: &anyhow::Error) -> bool {
 /// this machine shows as a pairing station (and vice versa). Returns None
 /// when there is no usable alternate (same directory, unreadable key, or
 /// identical fingerprint).
-fn load_fallback_dial(dir: &std::path::Path, primary_fingerprint: &str) -> Option<(Identity, PeerBook)> {
+fn load_fallback_dial(
+    dir: &std::path::Path,
+    primary_fingerprint: &str,
+) -> Option<(Identity, PeerBook)> {
     let system = system_data_dir();
     if system == dir {
         return None;
@@ -5413,7 +5808,14 @@ async fn dial_session(
     quinn::RecvStream,
     SessionCapabilities,
 )> {
-    match connect_input(primary_identity, peers, address, policy, intended_fingerprint).await
+    match connect_input(
+        primary_identity,
+        peers,
+        address,
+        policy,
+        intended_fingerprint,
+    )
+    .await
     {
         Ok(session) => Ok(session),
         Err(first) if unknown_peer_rejection(&first) => {
@@ -5454,11 +5856,7 @@ fn dialable_peer_address(
 /// machine, re-paired identity — the address moved with it). Fingerprint
 /// verification at handshake stays strict; an address only decides where
 /// to knock.
-fn resolve_peer_address(
-    peers: &PeerBook,
-    fingerprint: &str,
-    peer_name: &str,
-) -> Result<String> {
+fn resolve_peer_address(peers: &PeerBook, fingerprint: &str, peer_name: &str) -> Result<String> {
     if let Some(address) = peers
         .peers
         .iter()
@@ -5506,9 +5904,7 @@ async fn retire_ghost_identities(
         let book = peers.read().await;
         book.peers
             .iter()
-            .filter(|peer| {
-                peer.name == node_name && peer.fingerprint_hex != live_fingerprint
-            })
+            .filter(|peer| peer.name == node_name && peer.fingerprint_hex != live_fingerprint)
             .map(|peer| peer.fingerprint_hex.clone())
             .collect()
     };
@@ -5521,7 +5917,9 @@ async fn retire_ghost_identities(
             match file_book.unpin(ghost) {
                 Ok(true) => retired += 1,
                 Ok(false) => {}
-                Err(error) => tracing::debug!(%error, %ghost, "cannot retire ghost identity from peer book"),
+                Err(error) => {
+                    tracing::debug!(%error, %ghost, "cannot retire ghost identity from peer book")
+                }
             }
         }
     }
@@ -5565,7 +5963,8 @@ fn note_peer_address(dir: &std::path::Path, fingerprint: &str, address: &str) {
                     .find(|peer| peer.fingerprint_hex == fingerprint)
                     .map(|peer| peer.name.clone())
                     .unwrap_or_else(|| fingerprint.to_owned());
-                match book.pin_with_address(name, fingerprint.to_owned(), Some(address.to_owned())) {
+                match book.pin_with_address(name, fingerprint.to_owned(), Some(address.to_owned()))
+                {
                     Ok(()) => tracing::info!("recorded working address for known peer"),
                     Err(error) => tracing::debug!(%error, "cannot record peer address"),
                 }
@@ -5638,11 +6037,7 @@ async fn connect_input(
 async fn open_episode_stream(
     conn: &quinn::Connection,
     policy: ConnectPolicy<'_>,
-) -> Result<(
-    quinn::SendStream,
-    quinn::RecvStream,
-    SessionCapabilities,
-)> {
+) -> Result<(quinn::SendStream, quinn::RecvStream, SessionCapabilities)> {
     let ConnectPolicy {
         node_name,
         request_lock_screen,
@@ -5745,7 +6140,12 @@ fn note_helper_display_dims(width: u32, height: u32, dpi: u32) {
     {
         if guard.is_none() {
             *guard = Some((width, height, dpi));
-            tracing::info!(width, height, dpi, "helper reported interactive display dims");
+            tracing::info!(
+                width,
+                height,
+                dpi,
+                "helper reported interactive display dims"
+            );
         }
     }
 }
@@ -5785,11 +6185,7 @@ fn parse_sidecar_display(text: &str) -> Option<String> {
 fn parse_sidecar_xauthority(text: &str) -> Option<std::path::PathBuf> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let path = value.get("xauthority")?.as_str()?;
-    if path.len() > 256
-        || !path.starts_with('/')
-        || path.contains('\0')
-        || path.contains("..")
-    {
+    if path.len() > 256 || !path.starts_with('/') || path.contains('\0') || path.contains("..") {
         return None;
     }
     Some(std::path::PathBuf::from(path))
@@ -5812,12 +6208,24 @@ fn seed_session_xauthority() {
     }
     let cookie = std::fs::read_to_string(data_dir().join(GEOMETRY_SIDECAR))
         .ok()
-        .and_then(|text| parse_sidecar_xauthority(&text))
-        .filter(|path| path.is_file());
-    if let Some(cookie) = cookie {
-        std::env::set_var("XAUTHORITY", &cookie);
-        tracing::debug!(path = %cookie.display(), "seeded session X cookie for entry warp");
+        .and_then(|text| parse_sidecar_xauthority(&text));
+    let Some(cookie) = cookie else {
+        return;
+    };
+    if !cookie.is_file() {
+        // Loud once per process: sandboxed daemons (ProtectHome, a
+        // foreign data dir) cannot reach the session cookie, so entry
+        // warps lean on the xhost grant and go unplaced the moment it
+        // lapses — lock greeters, X resets — which reads as mid-screen
+        // exits and offset clicks from a stale tracking origin.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(path = %cookie.display(), "session X cookie is not readable by this daemon; entry warps use the xhost grant and drive unplaced when it lapses (notably on lock screens)");
+        }
+        return;
     }
+    std::env::set_var("XAUTHORITY", &cookie);
+    tracing::debug!(path = %cookie.display(), "seeded session X cookie for entry warp");
 }
 
 /// Display the receiver should warp on: our own environment first, else
@@ -5874,7 +6282,8 @@ fn remote_truth_for_announce(
     peer_fingerprint: &str,
     peer_geometry: Option<ScreenGeometry>,
 ) -> ((u32, u32), &'static str) {
-    if let Some(geometry) = peer_geometry.filter(|geometry| geometry.width >= 2 && geometry.height >= 2)
+    if let Some(geometry) =
+        peer_geometry.filter(|geometry| geometry.width >= 2 && geometry.height >= 2)
     {
         return ((geometry.width, geometry.height), "hello");
     }
@@ -5917,7 +6326,12 @@ fn truthful_local_geometry(layout: &kvm_core::Layout) -> Option<ScreenGeometry> 
         .ok()
         .flatten()
         .filter(|(width, height)| *width != 0 && *height != 0);
-    pick_geometry(screen_id.0, sidecar, measured, local_screen_geometry(layout))
+    pick_geometry(
+        screen_id.0,
+        sidecar,
+        measured,
+        local_screen_geometry(layout),
+    )
 }
 
 /// Publish session-measured geometry for the headless daemon to
@@ -5967,8 +6381,7 @@ fn remap_position(
     source: Option<ScreenGeometry>,
     target: ScreenGeometry,
 ) -> (u32, u32) {
-    let Some(source) = source.filter(|geometry| geometry.width > 0 && geometry.height > 0)
-    else {
+    let Some(source) = source.filter(|geometry| geometry.width > 0 && geometry.height > 0) else {
         return (
             x.min(target.width.saturating_sub(1)),
             y.min(target.height.saturating_sub(1)),
@@ -6064,10 +6477,7 @@ fn os_host_name() -> Option<String> {
     {
         if let Ok(raw) = std::fs::read_to_string("/etc/hostname") {
             let name = raw.trim().trim_matches('.').to_owned();
-            if !name.is_empty()
-                && name.len() <= 64
-                && !name.chars().any(char::is_control)
-            {
+            if !name.is_empty() && name.len() <= 64 && !name.chars().any(char::is_control) {
                 return Some(name);
             }
         }
@@ -6351,7 +6761,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_hold_reaper_fires_only_without_a_drive() {        // The total-freeze invariant: suppression requested + no active
+    fn stale_hold_reaper_fires_only_without_a_drive() {
+        // The total-freeze invariant: suppression requested + no active
         // drive = release now. Any other combination leaves the hold
         // alone (an active drive legitimately suppresses).
         assert!(stale_hold_needs_release(false, true));
@@ -6364,9 +6775,15 @@ mod tests {
     fn geometry_sidecar_parses_and_preference_holds() {
         // Sidecar truth beats live measure beats configured fallback;
         // garbage never corrupts an advertisement.
-        assert_eq!(parse_geometry_sidecar(r#"{"width":1536,"height":864}"#), Some((1536, 864)));
+        assert_eq!(
+            parse_geometry_sidecar(r#"{"width":1536,"height":864}"#),
+            Some((1536, 864))
+        );
         assert_eq!(parse_geometry_sidecar(r#"{"width":0,"height":864}"#), None);
-        assert_eq!(parse_geometry_sidecar(r#"{"width":99999,"height":864}"#), None);
+        assert_eq!(
+            parse_geometry_sidecar(r#"{"width":99999,"height":864}"#),
+            None
+        );
         assert_eq!(parse_geometry_sidecar("not json"), None);
         assert_eq!(parse_geometry_sidecar(r#"{"width":1536}"#), None);
         let configured = Some(kvm_protocol::wire::ScreenGeometry {
@@ -6479,18 +6896,9 @@ mod tests {
             parse_sidecar_display(r#"{"width":1536,"height":864}"#),
             None
         );
-        assert_eq!(
-            parse_sidecar_display(r#"{"display":"/tmp/evil"}"#),
-            None
-        );
-        assert_eq!(
-            parse_sidecar_display(r#"{"display":"host:0"}"#),
-            None
-        );
-        assert_eq!(
-            parse_sidecar_display(r#"{"display":"; rm -rf ~"}"#),
-            None
-        );
+        assert_eq!(parse_sidecar_display(r#"{"display":"/tmp/evil"}"#), None);
+        assert_eq!(parse_sidecar_display(r#"{"display":"host:0"}"#), None);
+        assert_eq!(parse_sidecar_display(r#"{"display":"; rm -rf ~"}"#), None);
     }
 
     #[test]
@@ -6520,7 +6928,8 @@ mod tests {
     }
 
     #[test]
-    fn ban_exit_status_names_the_dead_epoch() {        // The supervising UI parses this exact shape to auto-redial, so
+    fn ban_exit_status_names_the_dead_epoch() {
+        // The supervising UI parses this exact shape to auto-redial, so
         // the wording is a contract, not prose.
         assert_eq!(
             ban_ended_status(Some(16824951138575866452)),
@@ -6550,7 +6959,8 @@ mod tests {
     }
 
     #[test]
-    fn failed_handoff_parks_the_cursor_inside_and_cools_down() {        use kvm_core::{InputEvent, RoutedEvent};
+    fn failed_handoff_parks_the_cursor_inside_and_cools_down() {
+        use kvm_core::{InputEvent, RoutedEvent};
         let mut router = EdgeRouter::new(kvm_core::Layout::pair_default(
             "me",
             "peer",
@@ -6583,6 +6993,67 @@ mod tests {
         // An old transfer: drive again.
         let old = just - Duration::from_secs(1);
         assert!(!transfer_debounced(Some(old)));
+    }
+
+    #[test]
+    fn yield_cooldown_paces_repush_after_yielding_to_inbound() {
+        // Never yielded: drive.
+        assert!(!yield_cooling_down(None));
+        let just = std::time::Instant::now();
+        // Just yielded to an inbound drive: hold, so opposite-edge
+        // holding cannot ping-pong the drive back instantly.
+        assert!(yield_cooling_down(Some(just)));
+        // An old yield: drive again.
+        let old = just - Duration::from_secs(3);
+        assert!(!yield_cooling_down(Some(old)));
+    }
+
+    #[test]
+    fn pinch_expands_to_ctrl_wheel_with_gesture_scoped_hold() {
+        use kvm_core::KeyEvent;
+        let ctrl_down = InputEvent::Key(KeyEvent {
+            usage: HID_LEFT_CTRL,
+            pressed: true,
+        });
+        let ctrl_up = InputEvent::Key(KeyEvent {
+            usage: HID_LEFT_CTRL,
+            pressed: false,
+        });
+        // Gesture start: synthetic Ctrl down, then the wheel.
+        let mut held = false;
+        assert_eq!(
+            pinch_expansion(InputEvent::Pinch { delta: 240 }, false, &mut held),
+            vec![ctrl_down, InputEvent::SmoothWheel { x: 0, y: 240 }]
+        );
+        assert!(held);
+        // Mid-gesture: wheel only, no repeated Ctrl.
+        assert_eq!(
+            pinch_expansion(InputEvent::Pinch { delta: -120 }, false, &mut held),
+            vec![InputEvent::SmoothWheel { x: 0, y: -120 }]
+        );
+        // Zero-delta tick: nothing (no empty wheel on the wire).
+        assert!(pinch_expansion(InputEvent::Pinch { delta: 0 }, false, &mut held).is_empty());
+        // Gesture end: synthetic Ctrl up, hold cleared.
+        assert_eq!(
+            pinch_expansion(InputEvent::PinchEnd, false, &mut held),
+            vec![ctrl_up]
+        );
+        assert!(!held);
+        // Stray end without a hold: silent.
+        assert!(pinch_expansion(InputEvent::PinchEnd, false, &mut held).is_empty());
+    }
+
+    #[test]
+    fn pinch_never_steals_a_physically_held_ctrl() {
+        // The user really holds Ctrl while pinching: no synthetic down,
+        // and the gesture end must NOT release their key.
+        let mut held = false;
+        assert_eq!(
+            pinch_expansion(InputEvent::Pinch { delta: 120 }, true, &mut held),
+            vec![InputEvent::SmoothWheel { x: 0, y: 120 }]
+        );
+        assert!(!held);
+        assert!(pinch_expansion(InputEvent::PinchEnd, true, &mut held).is_empty());
     }
 
     #[test]
@@ -6626,11 +7097,15 @@ mod tests {
             usage: 0x04,
             pressed: true,
         })));
-        assert!(!is_scroll_lock_press(&InputEvent::MouseMove { dx: 1, dy: 0 }));
+        assert!(!is_scroll_lock_press(&InputEvent::MouseMove {
+            dx: 1,
+            dy: 0
+        }));
     }
 
     #[test]
-    fn unknown_peer_rejection_matches_only_trust_failures() {        assert!(unknown_peer_rejection(&anyhow::anyhow!(
+    fn unknown_peer_rejection_matches_only_trust_failures() {
+        assert!(unknown_peer_rejection(&anyhow::anyhow!(
             "peer 192.168.1.7:42110 is not paired (fingerprint {})",
             "ab".repeat(32)
         )));
@@ -6808,11 +7283,7 @@ mod tests {
         let mut debt = WheelDowngrade::default();
         // Smooth peers take events untouched.
         assert_eq!(
-            outgoing_wheel_event(
-                InputEvent::SmoothWheel { x: 18, y: -45 },
-                true,
-                &mut debt
-            ),
+            outgoing_wheel_event(InputEvent::SmoothWheel { x: 18, y: -45 }, true, &mut debt),
             Some(InputEvent::SmoothWheel { x: 18, y: -45 })
         );
         // Older peers: sub-detent motion banks debt and sends nothing…
@@ -6827,11 +7298,7 @@ mod tests {
             None
         );
         assert_eq!(
-            outgoing_wheel_event(
-                InputEvent::SmoothWheel { x: 130, y: -45 },
-                false,
-                &mut debt
-            ),
+            outgoing_wheel_event(InputEvent::SmoothWheel { x: 130, y: -45 }, false, &mut debt),
             Some(InputEvent::Wheel(WheelDelta { x: 1, y: -1 }))
         );
         // Non-wheel events always pass through.
@@ -6871,7 +7338,8 @@ mod tests {
     }
 
     #[test]
-    fn input_roles_are_enforced_in_both_directions() {        assert!(mode_allows_incoming(Mode::Bidirectional));
+    fn input_roles_are_enforced_in_both_directions() {
+        assert!(mode_allows_incoming(Mode::Bidirectional));
         assert!(!mode_allows_incoming(Mode::ServerClient));
         assert!(mode_allows_incoming(Mode::ClientOnly));
         assert!(mode_allows_outgoing(Mode::Bidirectional));

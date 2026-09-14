@@ -11,8 +11,14 @@ pub type HidUsage = u16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputEvent {
     Key(KeyEvent),
-    MouseMove { dx: i32, dy: i32 },
-    MouseButton { button: MouseButton, pressed: bool },
+    MouseMove {
+        dx: i32,
+        dy: i32,
+    },
+    MouseButton {
+        button: MouseButton,
+        pressed: bool,
+    },
     Wheel(WheelDelta),
     /// High-resolution scroll in 1/120-detent units (one Windows WHEEL_DELTA,
     /// one Linux REL_WHEEL_HI_RES step). Precision touchpads report smooth
@@ -22,7 +28,22 @@ pub enum InputEvent {
     /// emit it canonically and the sender downgrades to `Wheel` for older
     /// peers. Sign convention matches `WheelDelta`: positive is away from
     /// the user.
-    SmoothWheel { x: i32, y: i32 },
+    SmoothWheel {
+        x: i32,
+        y: i32,
+    },
+    /// Trackpad pinch gesture in 120ths of spread change (same unit as
+    /// SmoothWheel). Positive = fingers spreading = zoom in. This is a
+    /// CAPTURE-side transport only: the sending thread expands it into
+    /// Ctrl+wheel (which every receiver already applies at its cursor,
+    /// i.e. zoom-to-cursor) before recording or queueing, so it never
+    /// reaches the wire, snapshots, or old peers.
+    Pinch {
+        delta: i32,
+    },
+    /// Fingers lifted (or contact count changed) after a pinch. Releases
+    /// the synthetic Ctrl from `Pinch` expansion; idempotent.
+    PinchEnd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

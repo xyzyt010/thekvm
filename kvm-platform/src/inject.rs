@@ -497,15 +497,32 @@ mod linux_uinput {
             // (USB HID usage, evdev code, key). Every letter, exact —
             // regressions here type the wrong letter on the peer.
             let pairs: &[(u16, u16, &str)] = &[
-                (0x04, 30, "A"), (0x05, 48, "B"), (0x06, 46, "C"),
-                (0x07, 32, "D"), (0x08, 18, "E"), (0x09, 33, "F"),
-                (0x0a, 34, "G"), (0x0b, 35, "H"), (0x0c, 23, "I"),
-                (0x0d, 36, "J"), (0x0e, 37, "K"), (0x0f, 38, "L"),
-                (0x10, 50, "M"), (0x11, 49, "N"), (0x12, 24, "O"),
-                (0x13, 25, "P"), (0x14, 16, "Q"), (0x15, 19, "R"),
-                (0x16, 31, "S"), (0x17, 20, "T"), (0x18, 22, "U"),
-                (0x19, 47, "V"), (0x1a, 17, "W"), (0x1b, 45, "X"),
-                (0x1c, 21, "Y"), (0x1d, 44, "Z"),
+                (0x04, 30, "A"),
+                (0x05, 48, "B"),
+                (0x06, 46, "C"),
+                (0x07, 32, "D"),
+                (0x08, 18, "E"),
+                (0x09, 33, "F"),
+                (0x0a, 34, "G"),
+                (0x0b, 35, "H"),
+                (0x0c, 23, "I"),
+                (0x0d, 36, "J"),
+                (0x0e, 37, "K"),
+                (0x0f, 38, "L"),
+                (0x10, 50, "M"),
+                (0x11, 49, "N"),
+                (0x12, 24, "O"),
+                (0x13, 25, "P"),
+                (0x14, 16, "Q"),
+                (0x15, 19, "R"),
+                (0x16, 31, "S"),
+                (0x17, 20, "T"),
+                (0x18, 22, "U"),
+                (0x19, 47, "V"),
+                (0x1a, 17, "W"),
+                (0x1b, 45, "X"),
+                (0x1c, 21, "Y"),
+                (0x1d, 44, "Z"),
             ];
             for (usage, evdev, name) in pairs {
                 assert_eq!(hid_to_evdev(*usage), Some(*evdev), "letter {name}");
@@ -515,26 +532,46 @@ mod linux_uinput {
         #[test]
         fn digits_modifiers_and_win_keys_map_exactly() {
             let pairs: &[(u16, u16, &str)] = &[
-                (0x1e, 2, "1"), (0x1f, 3, "2"), (0x20, 4, "3"),
-                (0x21, 5, "4"), (0x22, 6, "5"), (0x23, 7, "6"),
-                (0x24, 8, "7"), (0x25, 9, "8"), (0x26, 10, "9"),
+                (0x1e, 2, "1"),
+                (0x1f, 3, "2"),
+                (0x20, 4, "3"),
+                (0x21, 5, "4"),
+                (0x22, 6, "5"),
+                (0x23, 7, "6"),
+                (0x24, 8, "7"),
+                (0x25, 9, "8"),
+                (0x26, 10, "9"),
                 (0x27, 11, "0"),
-                (0x2c, 57, "Space"), (0x28, 28, "Enter"),
-                (0x29, 1, "Esc"), (0x2b, 15, "Tab"),
+                (0x2c, 57, "Space"),
+                (0x28, 28, "Enter"),
+                (0x29, 1, "Esc"),
+                (0x2b, 15, "Tab"),
                 (0x2a, 14, "Backspace"),
-                (0xe0, 29, "LCtrl"), (0xe1, 42, "LShift"),
-                (0xe2, 56, "LAlt"), (0xe3, 125, "LWin"),
-                (0xe4, 97, "RCtrl"), (0xe5, 54, "RShift"),
-                (0xe6, 100, "RAlt"), (0xe7, 126, "RWin"),
-                (0x47, 70, "ScrollLock"), (0x39, 58, "CapsLock"),
+                (0xe0, 29, "LCtrl"),
+                (0xe1, 42, "LShift"),
+                (0xe2, 56, "LAlt"),
+                (0xe3, 125, "LWin"),
+                (0xe4, 97, "RCtrl"),
+                (0xe5, 54, "RShift"),
+                (0xe6, 100, "RAlt"),
+                (0xe7, 126, "RWin"),
+                (0x47, 70, "ScrollLock"),
+                (0x39, 58, "CapsLock"),
                 (0x53, 69, "NumLock"),
-                (0x4a, 102, "Home"), (0x52, 103, "Up"),
-                (0x4b, 104, "PgUp"), (0x50, 105, "Left"),
-                (0x4f, 106, "Right"), (0x4d, 107, "End"),
-                (0x51, 108, "Down"), (0x4e, 109, "PgDn"),
-                (0x49, 110, "Insert"), (0x4c, 111, "Delete"),
-                (0x3a, 59, "F1"), (0x43, 68, "F10"),
-                (0x44, 87, "F11"), (0x45, 88, "F12"),
+                (0x4a, 102, "Home"),
+                (0x52, 103, "Up"),
+                (0x4b, 104, "PgUp"),
+                (0x50, 105, "Left"),
+                (0x4f, 106, "Right"),
+                (0x4d, 107, "End"),
+                (0x51, 108, "Down"),
+                (0x4e, 109, "PgDn"),
+                (0x49, 110, "Insert"),
+                (0x4c, 111, "Delete"),
+                (0x3a, 59, "F1"),
+                (0x43, 68, "F10"),
+                (0x44, 87, "F11"),
+                (0x45, 88, "F12"),
             ];
             for (usage, evdev, name) in pairs {
                 assert_eq!(hid_to_evdev(*usage), Some(*evdev), "key {name}");
@@ -612,8 +649,7 @@ mod win32_inject {
         if span <= 0 {
             return 0;
         }
-        ((pos.clamp(0, span) * 65535) / span)
-            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        ((pos.clamp(0, span) * 65535) / span).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
     }
 
     /// Map a coordinate across pixel spaces, edges preserved (0 maps to
@@ -622,8 +658,8 @@ mod win32_inject {
         if from_span <= 1 || to_span <= 1 {
             return 0;
         }
-        (u64::from(value.min(from_span - 1)) * u64::from(to_span - 1)
-            / u64::from(from_span - 1)) as u32
+        (u64::from(value.min(from_span - 1)) * u64::from(to_span - 1) / u64::from(from_span - 1))
+            as u32
     }
 
     /// System DPI for scaling (helpers run per-monitor-aware, so cursor
@@ -645,9 +681,7 @@ mod win32_inject {
     /// Physical primary dims in px (DPI-aware metrics). None when the
     /// platform exposes no truth.
     pub fn display_physical_dims() -> Option<(u32, u32)> {
-        primary_dims().and_then(|(w, h)| {
-            (w > 0 && h > 0).then_some((w as u32, h as u32))
-        })
+        primary_dims().and_then(|(w, h)| (w > 0 && h > 0).then_some((w as u32, h as u32)))
     }
 
     /// Logical (DPI-unscaled) primary dims: the coordinate space the
@@ -789,10 +823,7 @@ mod win32_inject {
             };
             let mut detail = describe_absolute(target, single);
             if let Some((width, height)) = primary_dims() {
-                detail.push_str(&format!(
-                    " (local {width}x{height} @{}dpi)",
-                    display_dpi()
-                ));
+                detail.push_str(&format!(" (local {width}x{height} @{}dpi)", display_dpi()));
             }
             detail
         }
@@ -873,13 +904,16 @@ mod win32_inject {
                     }]
                 }
                 // Detent wheel: one WHEEL_DELTA (120) per detent, both axes.
-                InputEvent::Wheel(delta) => wheel_inputs(
-                    delta.y as i32 * 120,
-                    delta.x as i32 * 120,
-                ),
+                InputEvent::Wheel(delta) => {
+                    wheel_inputs(delta.y as i32 * 120, delta.x as i32 * 120)
+                }
                 // Touchpad smooth scroll: already in 120ths, injected raw so
                 // apps receive the same fine motion as local scrolling.
                 InputEvent::SmoothWheel { x, y } => wheel_inputs(y, x),
+                // Pinch gestures never reach injection: the sending
+                // thread expands them into Ctrl+wheel first (see
+                // pinch_expansion in the daemon). Drop defensively.
+                InputEvent::Pinch { .. } | InputEvent::PinchEnd => Vec::new(),
                 InputEvent::Key(key) => {
                     // Pause has an E1-prefixed make code that SendInput does
                     // not represent through KEYEVENTF_SCANCODE, and the
@@ -1081,7 +1115,8 @@ mod win32_inject {
     ) -> (
         windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
         u32,
-    ) {        match (button, pressed) {
+    ) {
+        match (button, pressed) {
             (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
             (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
             (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
@@ -1113,7 +1148,8 @@ mod win32_inject {
         })
     }
 
-    fn hid_to_scan_code(usage: u16) -> Option<(u16, bool)> {        Some(match usage {
+    fn hid_to_scan_code(usage: u16) -> Option<(u16, bool)> {
+        Some(match usage {
             0x04 => (0x1e, false),
             0x05 => (0x30, false),
             0x06 => (0x2e, false),
@@ -1236,21 +1272,36 @@ mod win32_inject {
             // (USB HID usage, scan code, extended, key). The reverse trip:
             // Mint driving Windows must land the same physical keys.
             let pairs: &[(u16, (u16, bool), &str)] = &[
-                (0x04, (0x1e, false), "A"), (0x05, (0x30, false), "B"),
-                (0x06, (0x2e, false), "C"), (0x07, (0x20, false), "D"),
-                (0x08, (0x12, false), "E"), (0x09, (0x21, false), "F"),
-                (0x0a, (0x22, false), "G"), (0x0b, (0x23, false), "H"),
-                (0x0c, (0x17, false), "I"), (0x0d, (0x24, false), "J"),
-                (0x0e, (0x25, false), "K"), (0x0f, (0x26, false), "L"),
-                (0x10, (0x32, false), "M"), (0x11, (0x31, false), "N"),
-                (0x12, (0x18, false), "O"), (0x13, (0x19, false), "P"),
-                (0x14, (0x10, false), "Q"), (0x15, (0x13, false), "R"),
-                (0x16, (0x1f, false), "S"), (0x17, (0x14, false), "T"),
-                (0x18, (0x16, false), "U"), (0x19, (0x2f, false), "V"),
-                (0x1a, (0x11, false), "W"), (0x1b, (0x2d, false), "X"),
-                (0x1c, (0x15, false), "Y"), (0x1d, (0x2c, false), "Z"),
-                (0xe3, (0x5b, true), "LWin"), (0xe7, (0x5c, true), "RWin"),
-                (0xe0, (0x1d, false), "LCtrl"), (0xe2, (0x38, false), "LAlt"),
+                (0x04, (0x1e, false), "A"),
+                (0x05, (0x30, false), "B"),
+                (0x06, (0x2e, false), "C"),
+                (0x07, (0x20, false), "D"),
+                (0x08, (0x12, false), "E"),
+                (0x09, (0x21, false), "F"),
+                (0x0a, (0x22, false), "G"),
+                (0x0b, (0x23, false), "H"),
+                (0x0c, (0x17, false), "I"),
+                (0x0d, (0x24, false), "J"),
+                (0x0e, (0x25, false), "K"),
+                (0x0f, (0x26, false), "L"),
+                (0x10, (0x32, false), "M"),
+                (0x11, (0x31, false), "N"),
+                (0x12, (0x18, false), "O"),
+                (0x13, (0x19, false), "P"),
+                (0x14, (0x10, false), "Q"),
+                (0x15, (0x13, false), "R"),
+                (0x16, (0x1f, false), "S"),
+                (0x17, (0x14, false), "T"),
+                (0x18, (0x16, false), "U"),
+                (0x19, (0x2f, false), "V"),
+                (0x1a, (0x11, false), "W"),
+                (0x1b, (0x2d, false), "X"),
+                (0x1c, (0x15, false), "Y"),
+                (0x1d, (0x2c, false), "Z"),
+                (0xe3, (0x5b, true), "LWin"),
+                (0xe7, (0x5c, true), "RWin"),
+                (0xe0, (0x1d, false), "LCtrl"),
+                (0xe2, (0x38, false), "LAlt"),
                 (0x47, (0x46, false), "ScrollLock"),
             ];
             for (usage, scan, name) in pairs {
@@ -1342,13 +1393,14 @@ mod win32_inject {
         }
 
         #[test]
-        fn media_keys_and_pause_travel_as_virtual_keys() {            // No AT scancode exists for these; the VK path must carry them
+        fn media_keys_and_pause_travel_as_virtual_keys() {
+            // No AT scancode exists for these; the VK path must carry them
             // or Mint driving Windows can never mute/adjust volume.
             assert_eq!(key_virtual_key(0x48), Some((0x13, 0, false))); // Pause
             assert_eq!(key_virtual_key(0x7f), Some((0xAD, 0, false))); // mute
             assert_eq!(key_virtual_key(0x80), Some((0xAF, 0, false))); // vol up
             assert_eq!(key_virtual_key(0x81), Some((0xAE, 0, false))); // vol down
-            // Ordinary keys stay on the scancode table.
+                                                                       // Ordinary keys stay on the scancode table.
             assert_eq!(key_virtual_key(0x04), None);
             assert_eq!(key_virtual_key(0xe0), None);
         }
@@ -1379,7 +1431,9 @@ mod win32_inject {
 #[cfg(target_os = "windows")]
 pub use win32_inject::Win32Injector as Injector;
 #[cfg(target_os = "windows")]
-pub use win32_inject::{display_dpi, display_logical_dims, display_physical_dims, scale_warp_to_physical};
+pub use win32_inject::{
+    display_dpi, display_logical_dims, display_physical_dims, scale_warp_to_physical,
+};
 
 /// Compile-time fallback for desktop targets without an evdev/uinput or
 /// Windows backend. Keeping the type available lets the shared daemon,
