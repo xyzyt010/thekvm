@@ -40,7 +40,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            libdbus-1-dev libinput-dev libwayland-dev libx11-xcb-dev \
+            libdbus-1-dev libfontconfig1-dev libinput-dev libwayland-dev libx11-xcb-dev \
             libxi-dev libxkbcommon-dev libxtst-dev pkg-config
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

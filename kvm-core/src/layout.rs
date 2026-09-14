@@ -1,5 +1,5 @@
-use crate::InputEvent;
 use crate::EdgeMode;
+use crate::InputEvent;
 use serde::{Deserialize, Serialize};
 
 /// Screen arrangement, like MWB's topology grid / Deskflow's layout editor.
@@ -170,11 +170,7 @@ impl Layout {
     /// the UI's inbound auto-arrangement). Every machine numbers itself 1
     /// and its first peer 2 — handoffs travel by device name and numbers
     /// are local-only.
-    pub fn pair_default(
-        self_name: &str,
-        peer_name: &str,
-        peer_fingerprint: &str,
-    ) -> Self {
+    pub fn pair_default(self_name: &str, peer_name: &str, peer_fingerprint: &str) -> Self {
         Self {
             screens: vec![
                 Screen {
@@ -239,7 +235,12 @@ impl Layout {
     /// Arrangement edits use this so added screens never collide, on any
     /// machine, under the global-id convention.
     pub fn next_screen_id(&self) -> ScreenId {
-        let max = self.screens.iter().map(|screen| screen.id.0).max().unwrap_or(0);
+        let max = self
+            .screens
+            .iter()
+            .map(|screen| screen.id.0)
+            .max()
+            .unwrap_or(0);
         ScreenId(max.saturating_add(1).max(1))
     }
 
@@ -539,10 +540,7 @@ impl EdgeRouter {
     /// Only while local and unlocked; driving and locked states never
     /// cross.
     pub fn near_crossing_edge(&self, margin_px: u32) -> bool {
-        if self.active_remote.is_some()
-            || self.current_screen != self.local_screen
-            || self.locked
-        {
+        if self.active_remote.is_some() || self.current_screen != self.local_screen || self.locked {
             return false;
         }
         let Some(screen) = self.layout.screen(self.current_screen) else {
@@ -640,13 +638,8 @@ impl EdgeRouter {
                 .iter()
                 .any(|edge| {
                     self.crossing_target(self.local_screen, *edge).is_some()
-                        && distance_from_edge(
-                            *edge,
-                            self.cursor_x,
-                            self.cursor_y,
-                            width,
-                            height,
-                        ) < EDGE_PUSH_PX as u32
+                        && distance_from_edge(*edge, self.cursor_x, self.cursor_y, width, height)
+                            < EDGE_PUSH_PX as u32
                 });
         Ok(())
     }
@@ -697,7 +690,10 @@ impl EdgeRouter {
     /// the tracked cursors into the new dims and restarts any push run.
     /// Returns the dims now in force for the local screen.
     pub fn adopt_local_screen_size(&mut self, width: u32, height: u32) -> Option<(u32, u32)> {
-        if !self.layout.set_screen_size(self.local_screen, width, height) {
+        if !self
+            .layout
+            .set_screen_size(self.local_screen, width, height)
+        {
             return None;
         }
         let screen = self
@@ -825,10 +821,9 @@ impl EdgeRouter {
                         // Unarmed entry edge: clamp, stay disarmed. This is
                         // the snap-back fix: post-entry jitter and fling
                         // tails pin at the boundary instead of firing.
-                        let unarmed_entry =
-                            self.entry_edge == Some(edge) && !self.return_armed;
-                        let faces_home = self.layout.neighbor_for_edge(from, edge)
-                            == Some(self.local_screen);
+                        let unarmed_entry = self.entry_edge == Some(edge) && !self.return_armed;
+                        let faces_home =
+                            self.layout.neighbor_for_edge(from, edge) == Some(self.local_screen);
                         if faces_home && !unarmed_entry {
                             // Brush-proof armed return (see RETURN_EDGE_PX):
                             // accumulate same-edge overflow instead of
@@ -866,10 +861,8 @@ impl EdgeRouter {
                                     armed,
                                 };
                             }
-                            self.cursor_x =
-                                next_x.clamp(0, i64::from(remote.width) - 1) as u32;
-                            self.cursor_y =
-                                next_y.clamp(0, i64::from(remote.height) - 1) as u32;
+                            self.cursor_x = next_x.clamp(0, i64::from(remote.width) - 1) as u32;
+                            self.cursor_y = next_y.clamp(0, i64::from(remote.height) - 1) as u32;
                             return RoutedEvent::Forward { target, event };
                         }
                         if faces_home {
@@ -906,10 +899,8 @@ impl EdgeRouter {
                         // stop at the border and keep driving. Local
                         // overflow never auto-chains a third hop; the peer
                         // routes onwards by request.
-                        self.cursor_x =
-                            next_x.clamp(0, i64::from(remote.width) - 1) as u32;
-                        self.cursor_y =
-                            next_y.clamp(0, i64::from(remote.height) - 1) as u32;
+                        self.cursor_x = next_x.clamp(0, i64::from(remote.width) - 1) as u32;
+                        self.cursor_y = next_y.clamp(0, i64::from(remote.height) - 1) as u32;
                     }
                 }
             }
@@ -1075,10 +1066,10 @@ impl EdgeRouter {
         self.local_cursor_x = self.cursor_x;
         self.local_cursor_y = self.cursor_y;
         RoutedEvent::Local(InputEvent::MouseMove {
-            dx: (clamped_x - i64::from(previous_x))
-                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-            dy: (clamped_y - i64::from(previous_y))
-                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            dx: (clamped_x - i64::from(previous_x)).clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                as i32,
+            dy: (clamped_y - i64::from(previous_y)).clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                as i32,
         })
     }
 
@@ -1284,7 +1275,8 @@ fn distance_from_edge(edge: Edge, x: u32, y: u32, width: u32, height: u32) -> u3
     }
 }
 
-fn map_coordinate(value: u32, source_span: u32, target_span: u32) -> u32 {    if source_span <= 1 || target_span <= 1 {
+fn map_coordinate(value: u32, source_span: u32, target_span: u32) -> u32 {
+    if source_span <= 1 || target_span <= 1 {
         return 0;
     }
     (u64::from(value.min(source_span - 1)) * u64::from(target_span - 1)
@@ -1662,7 +1654,10 @@ mod tests {
             router.resync_if_local(1919, 540);
             if matches!(
                 router.route(InputEvent::MouseMove { dx: 1, dy: 0 }),
-                RoutedEvent::Handoff { edge: Edge::Right, .. }
+                RoutedEvent::Handoff {
+                    edge: Edge::Right,
+                    ..
+                }
             ) {
                 fired = true;
                 break;
@@ -1701,7 +1696,8 @@ mod tests {
     }
 
     #[test]
-    fn near_crossing_edge_flags_only_crossable_borders() {        // Mid-screen is never near; the facing edge within margin is;
+    fn near_crossing_edge_flags_only_crossable_borders() {
+        // Mid-screen is never near; the facing edge within margin is;
         // an unlinked edge (top) never is; lock and remote never are.
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
@@ -1759,7 +1755,10 @@ mod tests {
         let mut router = EdgeRouter::new(layout).unwrap();
         assert_eq!(router.adopt_local_screen_size(1280, 720), Some((1280, 720)));
         assert_eq!(
-            router.layout().screen(router.local_screen()).map(|s| (s.width, s.height)),
+            router
+                .layout()
+                .screen(router.local_screen())
+                .map(|s| (s.width, s.height)),
             Some((1280, 720))
         );
         // Cursor was centered in 1920x1080: now clamped into 1280x720.
@@ -1769,7 +1768,10 @@ mod tests {
         // Zero dims or unknown screens never corrupt the layout.
         assert_eq!(router.adopt_local_screen_size(0, 720), None);
         assert_eq!(
-            router.layout().screen(router.local_screen()).map(|s| (s.width, s.height)),
+            router
+                .layout()
+                .screen(router.local_screen())
+                .map(|s| (s.width, s.height)),
             Some((1280, 720))
         );
     }
@@ -1895,10 +1897,7 @@ mod tests {
         // back (100,590 roamed -> same spans -> (1160,590) home) — with
         // no network round trip. The return carries the pre-restore
         // Schmitt state (settled inside, then pushed out armed).
-        let back = router.route(InputEvent::MouseMove {
-            dx: -5000,
-            dy: 0,
-        });
+        let back = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
         assert!(matches!(
             back,
             RoutedEvent::ReturnHome {
@@ -2043,7 +2042,10 @@ mod tests {
         let back = router.route(InputEvent::MouseMove { dx: -100, dy: 0 });
         assert!(matches!(
             back,
-            RoutedEvent::ReturnHome { edge: Edge::Left, .. }
+            RoutedEvent::ReturnHome {
+                edge: Edge::Left,
+                ..
+            }
         ));
         assert_eq!(router.active_remote(), None);
     }
@@ -2101,7 +2103,10 @@ mod tests {
         let home = router.route(InputEvent::MouseMove { dx: -5, dy: 0 });
         assert!(matches!(
             home,
-            RoutedEvent::ReturnHome { edge: Edge::Left, .. }
+            RoutedEvent::ReturnHome {
+                edge: Edge::Left,
+                ..
+            }
         ));
         assert_eq!(router.active_remote(), None);
     }
@@ -2149,7 +2154,10 @@ mod tests {
         let home = router.route(InputEvent::MouseMove { dx: -600, dy: 0 });
         assert!(matches!(
             home,
-            RoutedEvent::ReturnHome { edge: Edge::Left, .. }
+            RoutedEvent::ReturnHome {
+                edge: Edge::Left,
+                ..
+            }
         ));
         assert_eq!(router.active_remote(), None);
         assert_eq!(router.cursor_position(), (960, 900));
@@ -2165,7 +2173,10 @@ mod tests {
         let back = router.route(InputEvent::MouseMove { dx: -50, dy: 0 });
         assert!(matches!(
             back,
-            RoutedEvent::ReturnHome { edge: Edge::Left, .. }
+            RoutedEvent::ReturnHome {
+                edge: Edge::Left,
+                ..
+            }
         ));
         assert_eq!(router.active_remote(), None);
     }
@@ -2260,7 +2271,8 @@ mod tests {
     }
 
     #[test]
-    fn restores_saved_local_position_when_remote_handoff_fails() {        let layout = Layout {
+    fn restores_saved_local_position_when_remote_handoff_fails() {
+        let layout = Layout {
             screens: vec![screen(1, "main", 0, 0), screen(2, "right", 1, 0)],
             self_screen: Some(ScreenId(1)),
         };
@@ -2311,8 +2323,14 @@ mod tests {
         let mint = Layout::pair_default("mint", "laptop", &"ef".repeat(32));
         assert_eq!(laptop.self_screen, Some(SELF_SCREEN_ID));
         assert_eq!(mint.self_screen, Some(SELF_SCREEN_ID));
-        assert_eq!(laptop.screen_by_name("mint").map(|s| s.id), Some(FIRST_PEER_SCREEN_ID));
-        assert_eq!(mint.screen_by_name("laptop").map(|s| s.id), Some(FIRST_PEER_SCREEN_ID));
+        assert_eq!(
+            laptop.screen_by_name("mint").map(|s| s.id),
+            Some(FIRST_PEER_SCREEN_ID)
+        );
+        assert_eq!(
+            mint.screen_by_name("laptop").map(|s| s.id),
+            Some(FIRST_PEER_SCREEN_ID)
+        );
         // Fresh defaults face right on both sides (the dialer keeps this;
         // the station mirrors to the left on first inbound).
         assert_eq!(laptop.peer_exit_edge(), Some(Edge::Right));
@@ -2323,9 +2341,14 @@ mod tests {
     fn screens_resolve_by_device_name_for_handoff_routing() {
         let fp = "ee".repeat(32);
         let layout = Layout::pair_default("me", "peer", &fp);
-        assert_eq!(layout.screen_by_name("me").map(|s| s.id), Some(SELF_SCREEN_ID));
         assert_eq!(
-            layout.screen_by_name("peer").and_then(|s| s.peer_fingerprint.clone()),
+            layout.screen_by_name("me").map(|s| s.id),
+            Some(SELF_SCREEN_ID)
+        );
+        assert_eq!(
+            layout
+                .screen_by_name("peer")
+                .and_then(|s| s.peer_fingerprint.clone()),
             Some(fp)
         );
         assert!(layout.screen_by_name("stranger").is_none());
@@ -2338,7 +2361,9 @@ mod tests {
         layout.place_peer(fp, Edge::Top).expect("top must be free");
         assert_eq!(layout.validate(), Ok(()));
         assert_eq!(layout.peer_exit_edge(), Some(Edge::Top));
-        layout.place_peer(fp, Edge::Right).expect("right must be free");
+        layout
+            .place_peer(fp, Edge::Right)
+            .expect("right must be free");
         assert_eq!(layout.peer_exit_edge(), Some(Edge::Right));
 
         // A third screen on the left blocks moving the peer there.

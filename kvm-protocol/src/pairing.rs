@@ -24,7 +24,12 @@ pub fn station_pairing_code(identity_fingerprint_hex: &str, unix_secs: u64) -> S
     let window = unix_secs / PAIRING_CODE_ROTATION_SECS;
     let mut hasher = Sha256::new();
     hasher.update(b"thekvm-pairing-code-v1");
-    hasher.update(identity_fingerprint_hex.trim().to_ascii_lowercase().as_bytes());
+    hasher.update(
+        identity_fingerprint_hex
+            .trim()
+            .to_ascii_lowercase()
+            .as_bytes(),
+    );
     hasher.update(window.to_be_bytes());
     let digest = hasher.finalize();
     let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
@@ -33,11 +38,7 @@ pub fn station_pairing_code(identity_fingerprint_hex: &str, unix_secs: u64) -> S
 
 /// Accept the current window plus one on each side: honest clocks skew,
 /// and a code typed at 29:59 must still work at 30:01.
-pub fn station_code_valid(
-    identity_fingerprint_hex: &str,
-    code: &str,
-    unix_secs: u64,
-) -> bool {
+pub fn station_code_valid(identity_fingerprint_hex: &str, code: &str, unix_secs: u64) -> bool {
     let code = code.trim();
     if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
         return false;
@@ -45,7 +46,12 @@ pub fn station_code_valid(
     let current = unix_secs / PAIRING_CODE_ROTATION_SECS;
     [current.saturating_sub(1), current, current + 1]
         .into_iter()
-        .any(|window| station_pairing_code(identity_fingerprint_hex, window * PAIRING_CODE_ROTATION_SECS) == code)
+        .any(|window| {
+            station_pairing_code(
+                identity_fingerprint_hex,
+                window * PAIRING_CODE_ROTATION_SECS,
+            ) == code
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -651,11 +657,8 @@ mod identity_adopt_tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("thekvm-adopt-identity-{nonce}"));
         let original = Identity::load_or_create(&root).unwrap();
-        let adopted = Identity::from_der(
-            original.cert_der.clone(),
-            original.key_der.clone(),
-        )
-        .unwrap();
+        let adopted =
+            Identity::from_der(original.cert_der.clone(), original.key_der.clone()).unwrap();
         assert_eq!(adopted.fingerprint, original.fingerprint);
         assert_eq!(adopted.fingerprint_hex(), original.fingerprint_hex());
         let _ = std::fs::remove_dir_all(root);

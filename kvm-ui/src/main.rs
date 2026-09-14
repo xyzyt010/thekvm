@@ -88,7 +88,8 @@ fn mint_link_id() -> u64 {
         .unwrap_or_default()
         .as_nanos() as u64;
     let salt = SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    nanos ^ ((std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    nanos
+        ^ ((std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
         ^ salt.wrapping_mul(0xBF58_476D_1CE4_E5B9)
 }
 
@@ -127,7 +128,10 @@ fn main() -> Result<()> {
     let ui = AppWindow::new()?;
     let pending_pair = Arc::new(Mutex::new(None::<PendingPair>));
     let startup_dir = data_dir();
-    ui.set_app_version(SharedString::from(format!("v{}", env!("CARGO_PKG_VERSION"))));
+    ui.set_app_version(SharedString::from(format!(
+        "v{}",
+        env!("CARGO_PKG_VERSION")
+    )));
 
     // A GUI-subsystem app has no console: without this hook any panicking
     // background thread dies silently and the UI just looks "dead" (this is
@@ -220,218 +224,223 @@ fn main() -> Result<()> {
         let mut was_failing = false;
         ui_log("poll thread started");
         loop {
-        // NOTE: never gate this loop on weak.upgrade(). Slint component
-        // handles live on the event-loop thread: upgrading a Weak from any
-        // background thread ALWAYS returns None, so such a check exits the
-        // poll on its very first iteration — silently killing every
-        // poll-driven display (status, station code, invite, peers,
-        // incoming approvals, update counter) on all machines while buttons
-        // keep working. The per-update closures below upgrade safely
-        // because invoke_from_event_loop runs them ON the UI thread. This
-        // thread holds no strong handle, so process exit still ends it.
-        // One panicking iteration must never kill the whole poll thread:
-        // catch it, log it, count it as a failure, keep polling.
-        let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        tick += 1;
-        set_poll_count(&weak, tick);
-        match control_request(ControlRequest::Status) {
-            Ok(ControlResponse::Status(status)) => {
-                // Make every success transition provable in ui.log: a poll
-                // that works but stays silent is indistinguishable from a
-                // dead one, and that ambiguity has cost real debugging days.
-                let code_state = if status.pairing_code.is_empty() {
-                    "station code unset"
-                } else {
-                    "station code set"
-                };
-                if was_failing {
-                    was_failing = false;
-                    ui_log(&format!(
+            // NOTE: never gate this loop on weak.upgrade(). Slint component
+            // handles live on the event-loop thread: upgrading a Weak from any
+            // background thread ALWAYS returns None, so such a check exits the
+            // poll on its very first iteration — silently killing every
+            // poll-driven display (status, station code, invite, peers,
+            // incoming approvals, update counter) on all machines while buttons
+            // keep working. The per-update closures below upgrade safely
+            // because invoke_from_event_loop runs them ON the UI thread. This
+            // thread holds no strong handle, so process exit still ends it.
+            // One panicking iteration must never kill the whole poll thread:
+            // catch it, log it, count it as a failure, keep polling.
+            let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tick += 1;
+                set_poll_count(&weak, tick);
+                match control_request(ControlRequest::Status) {
+                    Ok(ControlResponse::Status(status)) => {
+                        // Make every success transition provable in ui.log: a poll
+                        // that works but stays silent is indistinguishable from a
+                        // dead one, and that ambiguity has cost real debugging days.
+                        let code_state = if status.pairing_code.is_empty() {
+                            "station code unset"
+                        } else {
+                            "station code set"
+                        };
+                        if was_failing {
+                            was_failing = false;
+                            ui_log(&format!(
                         "poll: daemon reachable again after failures ({} peers, {code_state})",
                         status.peer_count
                     ));
-                }
-                if !POLL_FIRST_OK.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    ui_log(&format!(
-                        "poll: first status ok ({} peers, {code_state})",
-                        status.peer_count
-                    ));
-                }
-                consecutive_failures = 0;
-                // Station-side default arrangement (both sides number
-                // themselves 1 — see ensure_link_arrangement) and the
-                // Devices arrangement display both refresh here, from live
-                // daemon state.
-                ensure_link_arrangement();
-                let link_running = session_for_poll
-                    .lock()
-                    .ok()
-                    .is_some_and(|slot| slot.is_some());
-                refresh_arrangement(&weak, link_running);
-                // Link-following (MWB arming): children run only inside a
-                // live link — never at boot, never unprompted. Outbound
-                // links belong to the session flow; this arms (and tears
-                // down) the station half of an inbound link automatically.
-                follow_link(
-                    &weak,
-                    &status,
-                    &session_for_poll,
-                    &pending_for_poll,
-                    &link_dir,
-                    &last_inbound_state,
-                    &last_dialback_state,
-                    &last_link_seen_state,
-                );
-                let port = status.listen_port;
-                let fingerprint = status.fingerprint_hex.clone();
-                set_daemon_status(&weak, status);
-                refresh_invite(&weak, &invite_state, port, &fingerprint);
-                match control_request(ControlRequest::ListPeers) {
-                    Ok(ControlResponse::Peers(peers)) => set_peer_list(&weak, peers),
-                    Ok(other) => set_status(&weak, format!("Unexpected peer list: {other:?}")),
-                    Err(error) => set_status(&weak, format!("Peer list unavailable: {error}")),
-                }
-                if let Ok(ControlResponse::PendingPairings(pairings)) =
-                    control_request(ControlRequest::ListPendingPairings)
-                {
-                    // Log arrivals and clears: "UI knew but didn't show" vs
-                    // "UI never knew" must always be answerable from ui.log.
-                    let count = pairings.len();
-                    if LAST_INCOMING_COUNT
-                        .swap(count, std::sync::atomic::Ordering::Relaxed)
-                        != count
-                    {
-                        ui_log(&format!("poll: {count} incoming pairing(s) listed"));
-                    }
-                    set_incoming_pairing(&weak, pairings);
-                }
-            }
-            Ok(other) => {
-                consecutive_failures += 1;
-                was_failing = true;
-                ui_log(&format!("poll: unexpected daemon status: {other:?}"));
-                set_daemon_offline(&weak, format!("Unexpected daemon status: {other:?}"));
-                clear_invite(&weak, &invite_state);
-                set_local_address_direct(&weak);
-            }
-            Err(error) => {
-                consecutive_failures += 1;
-                was_failing = true;
-                let failure = classify_control_error(&error);
-                match failure {
-                    ControlFailure::Missing => {
-                        // No daemon endpoint at all: start a user-session
-                        // daemon next to this app so launching TheKVM always
-                        // yields a working app, then keep polling until its
-                        // control endpoint appears.
-                        let mut attempt = false;
-                        if let Ok(mut slot) = autostart_state.lock() {
-                            let due = slot
-                                .map(|last| last.elapsed() >= std::time::Duration::from_secs(15))
-                                .unwrap_or(true);
-                            if due {
-                                *slot = Some(std::time::Instant::now());
-                                attempt = true;
+                        }
+                        if !POLL_FIRST_OK.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            ui_log(&format!(
+                                "poll: first status ok ({} peers, {code_state})",
+                                status.peer_count
+                            ));
+                        }
+                        consecutive_failures = 0;
+                        // Station-side default arrangement (both sides number
+                        // themselves 1 — see ensure_link_arrangement) and the
+                        // Devices arrangement display both refresh here, from live
+                        // daemon state.
+                        ensure_link_arrangement();
+                        let link_running = session_for_poll
+                            .lock()
+                            .ok()
+                            .is_some_and(|slot| slot.is_some());
+                        refresh_arrangement(&weak, link_running);
+                        // Link-following (MWB arming): children run only inside a
+                        // live link — never at boot, never unprompted. Outbound
+                        // links belong to the session flow; this arms (and tears
+                        // down) the station half of an inbound link automatically.
+                        follow_link(
+                            &weak,
+                            &status,
+                            &session_for_poll,
+                            &pending_for_poll,
+                            &link_dir,
+                            &last_inbound_state,
+                            &last_dialback_state,
+                            &last_link_seen_state,
+                        );
+                        let port = status.listen_port;
+                        let fingerprint = status.fingerprint_hex.clone();
+                        set_daemon_status(&weak, status);
+                        refresh_invite(&weak, &invite_state, port, &fingerprint);
+                        match control_request(ControlRequest::ListPeers) {
+                            Ok(ControlResponse::Peers(peers)) => set_peer_list(&weak, peers),
+                            Ok(other) => {
+                                set_status(&weak, format!("Unexpected peer list: {other:?}"))
+                            }
+                            Err(error) => {
+                                set_status(&weak, format!("Peer list unavailable: {error}"))
                             }
                         }
-                        if attempt {
-                            match ensure_user_daemon() {
-                                Ok(()) => {
-                                    ui_log("poll: no daemon endpoint; started user-session daemon");
-                                    set_status(
+                        if let Ok(ControlResponse::PendingPairings(pairings)) =
+                            control_request(ControlRequest::ListPendingPairings)
+                        {
+                            // Log arrivals and clears: "UI knew but didn't show" vs
+                            // "UI never knew" must always be answerable from ui.log.
+                            let count = pairings.len();
+                            if LAST_INCOMING_COUNT.swap(count, std::sync::atomic::Ordering::Relaxed)
+                                != count
+                            {
+                                ui_log(&format!("poll: {count} incoming pairing(s) listed"));
+                            }
+                            set_incoming_pairing(&weak, pairings);
+                        }
+                    }
+                    Ok(other) => {
+                        consecutive_failures += 1;
+                        was_failing = true;
+                        ui_log(&format!("poll: unexpected daemon status: {other:?}"));
+                        set_daemon_offline(&weak, format!("Unexpected daemon status: {other:?}"));
+                        clear_invite(&weak, &invite_state);
+                        set_local_address_direct(&weak);
+                    }
+                    Err(error) => {
+                        consecutive_failures += 1;
+                        was_failing = true;
+                        let failure = classify_control_error(&error);
+                        match failure {
+                            ControlFailure::Missing => {
+                                // No daemon endpoint at all: start a user-session
+                                // daemon next to this app so launching TheKVM always
+                                // yields a working app, then keep polling until its
+                                // control endpoint appears.
+                                let mut attempt = false;
+                                if let Ok(mut slot) = autostart_state.lock() {
+                                    let due = slot
+                                        .map(|last| {
+                                            last.elapsed() >= std::time::Duration::from_secs(15)
+                                        })
+                                        .unwrap_or(true);
+                                    if due {
+                                        *slot = Some(std::time::Instant::now());
+                                        attempt = true;
+                                    }
+                                }
+                                if attempt {
+                                    match ensure_user_daemon() {
+                                        Ok(()) => {
+                                            ui_log("poll: no daemon endpoint; started user-session daemon");
+                                            set_status(
                                         &weak,
                                         "Background service was not running; started it, connecting…"
                                             .into(),
                                     )
+                                        }
+                                        Err(start_error) => {
+                                            ui_log(&format!(
+                                                "poll: daemon autostart failed: {start_error}"
+                                            ));
+                                            set_daemon_offline(
+                                                &weak,
+                                                format!("Daemon not started: {start_error}"),
+                                            )
+                                        }
+                                    }
                                 }
-                                Err(start_error) => {
-                                    ui_log(&format!("poll: daemon autostart failed: {start_error}"));
-                                    set_daemon_offline(
-                                        &weak,
-                                        format!("Daemon not started: {start_error}"),
-                                    )
-                                }
+                            }
+                            ControlFailure::AccessDenied => {
+                                // A daemon owns this machine but this session may not
+                                // reach it (Linux: desktop session predates the
+                                // `thekvm` group). Never spawn a second daemon here:
+                                // it would steal port 42110 from the real service.
+                                ui_log("poll: access denied to daemon control endpoint");
+                                set_daemon_offline(
+                                    &weak,
+                                    control_denied_status(
+                                        &error,
+                                        "Access denied to the background service",
+                                    ),
+                                );
+                            }
+                            ControlFailure::Other(message) => {
+                                ui_log(&format!("poll: daemon control failed: {message}"));
+                                set_daemon_offline(&weak, format!("Daemon not started: {message}"));
+                            }
+                        }
+                        clear_invite(&weak, &invite_state);
+                        set_local_address_direct(&weak);
+                    }
+                }
+                // The supervised `connect` process retries internally, so an exit
+                // always means the session ended abnormally (or was disconnected,
+                // which clears the slot first). Surface it instead of silently
+                // showing a stale "connected" state. The verified flag keeps the
+                // message honest: a child that never reported `established` never
+                // connected, so say so instead of implying a live session dropped.
+                if let Ok(mut slot) = session_for_poll.lock() {
+                    if let Some(session) = slot.as_mut() {
+                        match session.child.try_wait() {
+                            Ok(Some(status)) => {
+                                let address = session.address.clone();
+                                let verified =
+                                    session.verified.load(std::sync::atomic::Ordering::Relaxed);
+                                *slot = None;
+                                set_session(&weak, None);
+                                set_status(
+                                    &weak,
+                                    if verified {
+                                        format!("Connection to {address} ended ({status})")
+                                    } else {
+                                        format!(
+                                    "Could not establish a connection to {address} ({status}). Check the address and that the other side is waiting, then Connect again."
+                                )
+                                    },
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let address = session.address.clone();
+                                *slot = None;
+                                set_session(&weak, None);
+                                set_status(&weak, format!("Connection to {address} lost: {error}"));
                             }
                         }
                     }
-                    ControlFailure::AccessDenied => {
-                        // A daemon owns this machine but this session may not
-                        // reach it (Linux: desktop session predates the
-                        // `thekvm` group). Never spawn a second daemon here:
-                        // it would steal port 42110 from the real service.
-                        ui_log("poll: access denied to daemon control endpoint");
-                        set_daemon_offline(
-                            &weak,
-                            control_denied_status(&error, "Access denied to the background service"),
-                        );
-                    }
-                    ControlFailure::Other(message) => {
-                        ui_log(&format!("poll: daemon control failed: {message}"));
-                        set_daemon_offline(&weak, format!("Daemon not started: {message}"));
-                    }
                 }
-                clear_invite(&weak, &invite_state);
-                set_local_address_direct(&weak);
+            })); // end catch_unwind for one poll iteration
+            if iteration.is_err() {
+                consecutive_failures += 1;
+                was_failing = true;
+                ui_log("poll: iteration panicked and was caught; continuing");
             }
-        }
-        // The supervised `connect` process retries internally, so an exit
-        // always means the session ended abnormally (or was disconnected,
-        // which clears the slot first). Surface it instead of silently
-        // showing a stale "connected" state. The verified flag keeps the
-        // message honest: a child that never reported `established` never
-        // connected, so say so instead of implying a live session dropped.
-        if let Ok(mut slot) = session_for_poll.lock() {
-            if let Some(session) = slot.as_mut() {
-                match session.child.try_wait() {
-                    Ok(Some(status)) => {
-                        let address = session.address.clone();
-                        let verified =
-                            session.verified.load(std::sync::atomic::Ordering::Relaxed);
-                        *slot = None;
-                        set_session(&weak, None);
-                        set_status(
-                            &weak,
-                            if verified {
-                                format!("Connection to {address} ended ({status})")
-                            } else {
-                                format!(
-                                    "Could not establish a connection to {address} ({status}). Check the address and that the other side is waiting, then Connect again."
-                                )
-                            },
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        let address = session.address.clone();
-                        *slot = None;
-                        set_session(&weak, None);
-                        set_status(
-                            &weak,
-                            format!("Connection to {address} lost: {error}"),
-                        );
-                    }
-                }
+            // Status is intentionally polled instead of pushed over the local
+            // endpoint so the UI also recovers cleanly when the privileged daemon
+            // restarts, upgrades, or changes active sessions. After sustained
+            // failure, back off so a dead endpoint cannot churn threads: the
+            // Start button and any later poll still retry.
+            if consecutive_failures == 10 {
+                ui_log("poll: 10 consecutive failures; backing off to 15s intervals");
             }
-        }
-        })); // end catch_unwind for one poll iteration
-        if iteration.is_err() {
-            consecutive_failures += 1;
-            was_failing = true;
-            ui_log("poll: iteration panicked and was caught; continuing");
-        }
-        // Status is intentionally polled instead of pushed over the local
-        // endpoint so the UI also recovers cleanly when the privileged daemon
-        // restarts, upgrades, or changes active sessions. After sustained
-        // failure, back off so a dead endpoint cannot churn threads: the
-        // Start button and any later poll still retry.
-        if consecutive_failures == 10 {
-            ui_log("poll: 10 consecutive failures; backing off to 15s intervals");
-        }
-        std::thread::sleep(std::time::Duration::from_secs(if consecutive_failures >= 10 {
-            15
-        } else {
-            3
-        }));
+            std::thread::sleep(std::time::Duration::from_secs(
+                if consecutive_failures >= 10 { 15 } else { 3 },
+            ));
         }
     });
 
@@ -556,7 +565,10 @@ fn main() -> Result<()> {
             1 => EdgeMode::Double,
             _ => EdgeMode::Single,
         };
-        ui_log(&format!("edge button pressed: {}", edge_mode_name(requested)));
+        ui_log(&format!(
+            "edge button pressed: {}",
+            edge_mode_name(requested)
+        ));
         set_status(&weak, "Applying edge crossing…".into());
         std::thread::spawn(move || {
             // Read-modify-write so the toggle only ever changes the edge
@@ -570,7 +582,10 @@ fn main() -> Result<()> {
                 }
                 Err(error) => {
                     ui_log(&format!("edge change: settings unreadable: {error:#}"));
-                    set_status(&weak, control_denied_status(&error, "Background service unreachable"));
+                    set_status(
+                        &weak,
+                        control_denied_status(&error, "Background service unreachable"),
+                    );
                     return;
                 }
             };
@@ -594,7 +609,10 @@ fn main() -> Result<()> {
                         None,
                         Some(requested),
                     );
-                    ui_log(&format!("edge crossing applied: {}", edge_mode_name(requested)));
+                    ui_log(&format!(
+                        "edge crossing applied: {}",
+                        edge_mode_name(requested)
+                    ));
                     set_edge_mode_display(&weak, requested);
                     refresh_arrangement(&weak, child_running(&edge_session));
                     if edge_session
@@ -698,9 +716,10 @@ fn main() -> Result<()> {
                 match control_request(ControlRequest::DropSession {
                     fingerprint_hex: link.fingerprint_hex.clone(),
                 }) {
-                    Ok(ControlResponse::SessionDropped { .. }) => {
-                        ui_log(&format!("link: dropped inbound session from {}", link.node_name))
-                    }
+                    Ok(ControlResponse::SessionDropped { .. }) => ui_log(&format!(
+                        "link: dropped inbound session from {}",
+                        link.node_name
+                    )),
                     Ok(other) => ui_log(&format!("link: drop session unexpected: {other:?}")),
                     Err(error) => ui_log(&format!("link: drop session failed: {error:#}")),
                 }
@@ -810,11 +829,11 @@ fn main() -> Result<()> {
                 }
             }
             match ensure_user_daemon() {
-                Ok(()) => set_status(
+                Ok(()) => set_status(&weak, "Background service started, connecting…".into()),
+                Err(error) => set_status(
                     &weak,
-                    "Background service started, connecting…".into(),
+                    format!("Could not start background service: {error}"),
                 ),
-                Err(error) => set_status(&weak, format!("Could not start background service: {error}")),
             }
         });
     });
@@ -1221,9 +1240,9 @@ fn unix_session_lacks_thekvm_group() -> bool {
         if fields.next() != Some("thekvm") {
             return false;
         }
-        fields.nth(2).is_some_and(|members| {
-            members.split(',').any(|member| member.trim() == user)
-        })
+        fields
+            .nth(2)
+            .is_some_and(|members| members.split(',').any(|member| member.trim() == user))
     });
     if !listed {
         return false;
@@ -1403,9 +1422,9 @@ fn start_session_flow(
     // Reap a dead previous session first so a stale slot can never wedge
     // reconnect behind a permanent "Already connected".
     if let Ok(mut slot) = session.lock() {
-        let dead = slot.as_mut().is_some_and(|session| {
-            matches!(session.child.try_wait(), Ok(Some(_)) | Err(_))
-        });
+        let dead = slot
+            .as_mut()
+            .is_some_and(|session| matches!(session.child.try_wait(), Ok(Some(_)) | Err(_)));
         if dead {
             *slot = None;
             set_session(weak, None);
@@ -1518,12 +1537,7 @@ fn start_session_flow(
                                 *slot = None;
                             }
                             ui_log("pairing: station ended the request; code screen cleared");
-                            set_pending(
-                                &watch_weak,
-                                String::new(),
-                                String::new(),
-                                String::new(),
-                            );
+                            set_pending(&watch_weak, String::new(), String::new(), String::new());
                             set_status(
                                 &watch_weak,
                                 format!(
@@ -1569,12 +1583,17 @@ fn run_pair_confirm(
         let mut pending = pending;
         let Some(mut channel) = pending.pairing.take() else {
             ui_log("pairing: confirm without an open channel");
-            set_status(&weak, "Pairing channel is gone — press Connect again.".into());
+            set_status(
+                &weak,
+                "Pairing channel is gone — press Connect again.".into(),
+            );
             return;
         };
         let peer_name = pending.peer_node_name.clone();
         set_status(&weak, format!("Waiting for approval on {peer_name}…"));
-        ui_log(&format!("pairing: codes approved locally, awaiting {peer_name}"));
+        ui_log(&format!(
+            "pairing: codes approved locally, awaiting {peer_name}"
+        ));
         let answer = runtime().block_on(async {
             write_frame(
                 &mut channel.send,
@@ -1588,9 +1607,7 @@ fn run_pair_confirm(
                 read_frame(&mut channel.recv),
             )
             .await
-            .map_err(|_| {
-                anyhow::anyhow!("timed out waiting for {peer_name} to approve (150s)")
-            })?
+            .map_err(|_| anyhow::anyhow!("timed out waiting for {peer_name} to approve (150s)"))?
             .context("peer closed pairing without answering")?
             .context("peer closed pairing without answering")
         });
@@ -1610,7 +1627,13 @@ fn run_pair_confirm(
                             Some(&pending.address),
                         );
                         ensure_default_arrangement(&peer_name, &pending.peer_fingerprint);
-                        spawn_session(&weak, &confirm_session, &confirm_pending, &confirm_data_dir, pending.address);
+                        spawn_session(
+                            &weak,
+                            &confirm_session,
+                            &confirm_pending,
+                            &confirm_data_dir,
+                            pending.address,
+                        );
                     }
                     Err(error) => {
                         ui_log(&format!("pairing: accepted but pin failed: {error:#}"));
@@ -1702,9 +1725,12 @@ fn pin_controller_peer(data_dir: &std::path::Path, pending: &PendingPair) -> Res
     } else {
         pending.peer_node_name.clone()
     };
-    book
-        .pin_with_address(name, pending.peer_fingerprint.clone(), Some(pending.address.clone()))
-        .with_context(|| format!("pin peer {}", pending.peer_fingerprint))?;
+    book.pin_with_address(
+        name,
+        pending.peer_fingerprint.clone(),
+        Some(pending.address.clone()),
+    )
+    .with_context(|| format!("pin peer {}", pending.peer_fingerprint))?;
     Ok(())
 }
 
@@ -1718,11 +1744,9 @@ fn ensure_user_pin(fingerprint: &str, name: &str, address: Option<&str>) {
             } else {
                 name
             };
-            if let Err(error) = book.pin_with_address(
-                label,
-                fingerprint.to_owned(),
-                address.map(str::to_owned),
-            ) {
+            if let Err(error) =
+                book.pin_with_address(label, fingerprint.to_owned(), address.map(str::to_owned))
+            {
                 ui_log(&format!("arrange: user pin failed: {error:#}"));
             }
         }
@@ -1744,9 +1768,7 @@ fn adopt_layout_fingerprint(peer_name: &str, fingerprint_hex: &str) {
     let mut layout = config.layout.clone();
     let mut changed = false;
     for screen in &mut layout.screens {
-        if screen.name == peer_name
-            && screen.peer_fingerprint.as_deref() != Some(fingerprint_hex)
-        {
+        if screen.name == peer_name && screen.peer_fingerprint.as_deref() != Some(fingerprint_hex) {
             screen.peer_fingerprint = Some(fingerprint_hex.to_owned());
             changed = true;
         }
@@ -1849,8 +1871,7 @@ fn ensure_default_arrangement(peer_name: &str, peer_fingerprint: &str) {
     if !current.layout.screens.is_empty() {
         return;
     }
-    let layout =
-        kvm_core::Layout::pair_default(&current.device_name, peer_name, peer_fingerprint);
+    let layout = kvm_core::Layout::pair_default(&current.device_name, peer_name, peer_fingerprint);
     match write_arrangement(layout) {
         Ok(_) => ui_log("arrange: default Machine-1 arrangement saved (peer on the right)"),
         Err(error) => ui_log(&format!("arrange: default arrangement failed: {error:#}")),
@@ -1871,8 +1892,7 @@ fn ensure_station_arrangement(peer_name: &str, fingerprint: &str) {
         return;
     }
     let fingerprint = fingerprint.to_ascii_lowercase();
-    let mut layout =
-        kvm_core::Layout::pair_default(&current.device_name, peer_name, &fingerprint);
+    let mut layout = kvm_core::Layout::pair_default(&current.device_name, peer_name, &fingerprint);
     if layout
         .place_peer(&fingerprint, kvm_core::Edge::Left)
         .is_err()
@@ -1890,8 +1910,7 @@ fn ensure_station_arrangement(peer_name: &str, fingerprint: &str) {
 }
 
 /// Throttle for the automatic arrangement/trust setup check (seconds).
-static LAST_ARRANGE_CHECK_SECS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static LAST_ARRANGE_CHECK_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Automatic first-time setup (at most once a minute, never overwriting an
 /// existing arrangement): when a peer is known (either book) but no screens
@@ -1933,23 +1952,12 @@ fn ensure_link_arrangement() {
     let Some(peer) = peer else {
         return;
     };
-    let layout = kvm_core::Layout::pair_default(
-        &config.device_name,
-        &peer.name,
-        &peer.fingerprint_hex,
-    );
+    let layout =
+        kvm_core::Layout::pair_default(&config.device_name, &peer.name, &peer.fingerprint_hex);
     match write_arrangement(layout) {
         Ok(_) => {
-            ensure_user_pin(
-                &peer.fingerprint_hex,
-                &peer.name,
-                peer.address.as_deref(),
-            );
-            pin_daemon_peer(
-                &peer.fingerprint_hex,
-                &peer.name,
-                peer.address.as_deref(),
-            );
+            ensure_user_pin(&peer.fingerprint_hex, &peer.name, peer.address.as_deref());
+            pin_daemon_peer(&peer.fingerprint_hex, &peer.name, peer.address.as_deref());
             ui_log("arrange: default arrangement saved (peer on the right), both books linked");
         }
         Err(error) => ui_log(&format!("arrange: default arrangement failed: {error:#}")),
@@ -1977,9 +1985,7 @@ fn linked_peers() -> Vec<LinkedPeer> {
             }
         }
     }
-    if let Ok(book) =
-        kvm_protocol::pairing::PeerBook::load_or_create(&data_dir())
-    {
+    if let Ok(book) = kvm_protocol::pairing::PeerBook::load_or_create(&data_dir()) {
         for peer in &book.peers {
             if seen.insert(peer.fingerprint_hex.clone()) {
                 ordered.push((
@@ -2163,7 +2169,10 @@ fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kv
         Ok(_) => {
             ensure_user_pin(fingerprint, &name, address.as_deref());
             pin_daemon_peer(fingerprint, &name, address.as_deref());
-            ui_log(&format!("arrange: {name} placed on the {}", edge_name(side)));
+            ui_log(&format!(
+                "arrange: {name} placed on the {}",
+                edge_name(side)
+            ));
             refresh_arrangement(&weak, false);
             set_status(
                 &weak,
@@ -2187,7 +2196,10 @@ fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kv
 fn arrange_place_first_peer(weak: &slint::Weak<AppWindow>, side: kvm_core::Edge) {
     let peers = linked_peers();
     let Some(peer) = peers.first() else {
-        set_status(&weak, "No linked computer to place — pair one first.".into());
+        set_status(
+            &weak,
+            "No linked computer to place — pair one first.".into(),
+        );
         return;
     };
     arrange_place_peer(&weak, &peer.fingerprint.clone(), side);
@@ -2218,7 +2230,10 @@ fn spawn_session(
     // Every user Connect mints a FRESH epoch: a previous Disconnect banned
     // the old one, so reusing it would be rejected as a stale redial.
     let link_id = Some(mint_link_id());
-    ui_log(&format!("link: minted fresh link epoch {}", link_id.unwrap_or(0)));
+    ui_log(&format!(
+        "link: minted fresh link epoch {}",
+        link_id.unwrap_or(0)
+    ));
     launch_child(
         weak,
         session,
@@ -2267,18 +2282,10 @@ fn follow_link(
     last_attempt: &Arc<Mutex<Option<std::time::Instant>>>,
     last_link_seen: &Arc<Mutex<Option<std::time::Instant>>>,
 ) {
-    let outbound_running = session
-        .lock()
-        .ok()
-        .is_some_and(|slot| slot.is_some());
-    let ceremony_open = pending
-        .lock()
-        .ok()
-        .is_some_and(|slot| slot.is_some());
+    let outbound_running = session.lock().ok().is_some_and(|slot| slot.is_some());
+    let ceremony_open = pending.lock().ok().is_some_and(|slot| slot.is_some());
     let inbound = status.sessions.first().cloned();
-    let inbound_fp = inbound
-        .as_ref()
-        .map(|link| link.fingerprint_hex.clone());
+    let inbound_fp = inbound.as_ref().map(|link| link.fingerprint_hex.clone());
     let previous = last_inbound.lock().ok().and_then(|mut slot| {
         let prev = slot.clone();
         *slot = inbound_fp.clone();
@@ -2419,10 +2426,7 @@ fn follow_link(
 
 /// True while any supervised child (outbound or dial-back) is alive.
 fn child_running(session: &Arc<Mutex<Option<Session>>>) -> bool {
-    session
-        .lock()
-        .ok()
-        .is_some_and(|slot| slot.is_some())
+    session.lock().ok().is_some_and(|slot| slot.is_some())
 }
 
 /// Start the supervised station dial-back: the daemon accepted an inbound
@@ -2560,7 +2564,9 @@ fn launch_child(
                     .write_all(payload.as_bytes())
                     .and_then(|()| stdin.flush())
                 {
-                    ui_log(&format!("session: daemon identity handoff failed: {error:#}"));
+                    ui_log(&format!(
+                        "session: daemon identity handoff failed: {error:#}"
+                    ));
                 }
             }
             let verified = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2586,7 +2592,9 @@ fn launch_child(
                 let pending = pending.clone();
                 let data_dir = data_dir.to_owned();
                 std::thread::spawn(move || {
-                    relay_session_progress(&weak, stderr, &label, &verified, &session, &pending, data_dir, dialback)
+                    relay_session_progress(
+                        &weak, stderr, &label, &verified, &session, &pending, data_dir, dialback,
+                    )
                 });
             } else {
                 ui_log("session: child stderr unavailable; connection cannot be verified");
@@ -2634,13 +2642,7 @@ fn parse_ban_epoch(detail: &str) -> Option<Option<u64>> {
 fn link_log_path(data_dir: &std::path::Path, address: &str) -> std::path::PathBuf {
     let mut safe: String = address
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c
-            } else {
-                '_'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
     safe.truncate(64);
     data_dir.join(format!("link-{safe}.log"))
@@ -2702,7 +2704,9 @@ fn relay_session_progress(
                 // unprompted outbound dial; the poll re-arms the dial-back
                 // once trust is repaired.
                 if dialback {
-                    ui_log("link: dial-back peer reports us unknown 3x; stopping for a fresh pairing");
+                    ui_log(
+                        "link: dial-back peer reports us unknown 3x; stopping for a fresh pairing",
+                    );
                     stop_session(weak, session, "Link stopped");
                     set_status(
                         weak,
@@ -2711,9 +2715,7 @@ fn relay_session_progress(
                     return;
                 }
                 if unpin_peer_by_address(&data_dir, address) {
-                    ui_log(
-                        "session: peer reports us unknown 3x; restarting pairing automatically",
-                    );
+                    ui_log("session: peer reports us unknown 3x; restarting pairing automatically");
                     set_status(
                         weak,
                         format!(
@@ -3196,14 +3198,12 @@ static PAIRING_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Last incoming-pairing count already logged; the poll logs arrivals and
 /// clears, so "UI knew but didn't show" vs "UI never knew" is always
 /// answerable from ui.log alone.
-static LAST_INCOMING_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static LAST_INCOMING_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether the poll has ever completed a Status round-trip. First success is
 /// logged once with the station-code state, so a healthy-but-silent poll is
 /// distinguishable from a dead one in ui.log alone.
-static POLL_FIRST_OK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static POLL_FIRST_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the user-socket fallback warning fired already. Talking to a
 /// user-session daemon instead of the system service splits identity and
@@ -3219,9 +3219,7 @@ static CONTROL_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
 /// failure; a single long-lived runtime removes that entire class.
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Runtime::new().expect("start UI background runtime")
-    })
+    RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("start UI background runtime"))
 }
 
 /// Ban one link epoch in the local daemon (Disconnect path): afterwards a
@@ -3230,9 +3228,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 /// ended our side; a missed ban only risks one rejected redial round-trip.
 fn end_link(link_id: u64) {
     match control_request(ControlRequest::EndLink { link_id }) {
-        Ok(ControlResponse::LinkEnded { .. }) => {
-            ui_log(&format!("link: banned epoch {link_id}"))
-        }
+        Ok(ControlResponse::LinkEnded { .. }) => ui_log(&format!("link: banned epoch {link_id}")),
         Ok(other) => ui_log(&format!("link: end link unexpected: {other:?}")),
         Err(error) => ui_log(&format!("link: end link failed: {error:#}")),
     }
@@ -3487,9 +3483,7 @@ fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
                 match address {
                     Some(address) => {
                         ui.set_session_active(true);
-                        ui.set_session_text(SharedString::from(format!(
-                            "Connected to {address}"
-                        )));
+                        ui.set_session_text(SharedString::from(format!("Connected to {address}")));
                     }
                     None => {
                         ui.set_session_active(false);
@@ -3701,7 +3695,8 @@ mod tests {
     }
 
     #[test]
-    fn dial_back_arms_only_live_links_we_may_drive() {        use kvm_core::Mode::{Bidirectional, ClientOnly, ServerClient};
+    fn dial_back_arms_only_live_links_we_may_drive() {
+        use kvm_core::Mode::{Bidirectional, ClientOnly, ServerClient};
         // May drive + no ceremony: arm.
         assert!(should_dial_back(Bidirectional, false));
         assert!(should_dial_back(ServerClient, false));
@@ -3730,7 +3725,9 @@ mod tests {
         let layout = kvm_core::Layout::pair_default("me", "peer", &fp);
         assert_eq!(layout.self_screen, Some(kvm_core::SELF_SCREEN_ID));
         assert_eq!(
-            layout.screen_by_name("peer").and_then(|s| s.peer_fingerprint.clone()),
+            layout
+                .screen_by_name("peer")
+                .and_then(|s| s.peer_fingerprint.clone()),
             Some(fp)
         );
         assert_eq!(layout.validate(), Ok(()));
@@ -3753,4 +3750,3 @@ mod tests {
         assert_eq!(parse_ban_epoch("interrupted"), None);
     }
 }
-

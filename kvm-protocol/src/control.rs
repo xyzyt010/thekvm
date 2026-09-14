@@ -72,7 +72,9 @@ pub enum ControlRequest {
     /// untouched — a fresh Connect mints a fresh epoch and works. One side's
     /// Disconnect bans + drops; the peer learns from the rejection and its
     /// child exits instead of retrying forever.
-    EndLink { link_id: u64 },
+    EndLink {
+        link_id: u64,
+    },
     /// Return the daemon-owned identity (certificate + key, hex-encoded) so
     /// a UI-supervised `connect` child can wear the SAME face as the
     /// service. Without this the child loads the interactive user's files
@@ -175,23 +177,41 @@ pub struct PendingPairing {
 pub enum ControlResponse {
     Status(DaemonStatus),
     Config(Config),
-    Paired { fingerprint_hex: String },
+    Paired {
+        fingerprint_hex: String,
+    },
     Peers(Vec<Peer>),
-    Unpaired { fingerprint_hex: String },
+    Unpaired {
+        fingerprint_hex: String,
+    },
     PendingPairings(Vec<PendingPairing>),
-    PairingApproved { fingerprint_hex: String },
-    PairingRejected { fingerprint_hex: String },
-    Pinned { fingerprint_hex: String },
-    Applied { restart_required: bool },
-    SessionDropped { fingerprint_hex: String },
-    LinkEnded { link_id: u64 },
+    PairingApproved {
+        fingerprint_hex: String,
+    },
+    PairingRejected {
+        fingerprint_hex: String,
+    },
+    Pinned {
+        fingerprint_hex: String,
+    },
+    Applied {
+        restart_required: bool,
+    },
+    SessionDropped {
+        fingerprint_hex: String,
+    },
+    LinkEnded {
+        link_id: u64,
+    },
     /// The daemon-owned identity for [`ControlRequest::ExportIdentity`].
     /// Hex-encoded DER (see `pairing::hex_encode`); empty on older daemons.
     Identity {
         cert_der_hex: String,
         key_der_hex: String,
     },
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 pub async fn write_request<W>(writer: &mut W, request: &ControlRequest) -> std::io::Result<()>

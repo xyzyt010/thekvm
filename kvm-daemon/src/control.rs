@@ -252,10 +252,7 @@ where
                 .as_secs();
             ControlResponse::Status(DaemonStatus {
                 node_name: current.device_name,
-                pairing_code: kvm_protocol::pairing::station_pairing_code(
-                    &fingerprint,
-                    now_secs,
-                ),
+                pairing_code: kvm_protocol::pairing::station_pairing_code(&fingerprint, now_secs),
                 fingerprint_hex: fingerprint,
                 listen_port: current.listen_port,
                 mode: current.mode,
@@ -394,7 +391,8 @@ where
             fingerprint_hex,
             node_name,
             address,
-        } => {            if !is_fingerprint(&fingerprint_hex) {
+        } => {
+            if !is_fingerprint(&fingerprint_hex) {
                 ControlResponse::Error {
                     message: "peer fingerprint must contain 64 hexadecimal characters".into(),
                 }

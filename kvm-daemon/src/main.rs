@@ -150,14 +150,16 @@ fn main() -> Result<()> {
     if let Some(writer) = writer {
         tracing_subscriber::fmt()
             .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info".into()),
             )
             .with_writer(writer)
             .init();
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info".into()),
             )
             // Supervised children run with stdout nulled (the UI pipes stderr
             // for progress): diagnostics must go to stderr or they vanish.
@@ -269,14 +271,18 @@ impl std::io::Write for ServiceFileWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.file
             .lock()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "service log lock poisoned"))?
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "service log lock poisoned")
+            })?
             .write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.file
             .lock()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "service log lock poisoned"))?
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "service log lock poisoned")
+            })?
             .flush()
     }
 }
@@ -344,18 +350,14 @@ async fn async_main() -> Result<()> {
             fingerprint,
             name,
             address,
-        } => {
-            service::pin_peer(&fingerprint, name.as_deref(), address.as_deref()).await
-        }
+        } => service::pin_peer(&fingerprint, name.as_deref(), address.as_deref()).await,
         Command::Send { address, keycode } => service::send_test(&address, keycode).await,
         Command::Capture { address } => service::capture(&address).await,
         Command::Connect {
             address,
             link_id,
             identity_stdin,
-        } => {
-            service::connect(address.as_deref(), link_id, identity_stdin).await
-        }
+        } => service::connect(address.as_deref(), link_id, identity_stdin).await,
         Command::Configure {
             device_name,
             mode,

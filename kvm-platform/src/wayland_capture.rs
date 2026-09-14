@@ -402,7 +402,10 @@ mod tests {
         );
         assert_eq!(
             translate_event(
-                Event::Pointer(PointerEvent::AxisDiscrete120 { axis: 1, value: -30 }),
+                Event::Pointer(PointerEvent::AxisDiscrete120 {
+                    axis: 1,
+                    value: -30
+                }),
                 &mut accumulator,
             ),
             Some(InputEvent::SmoothWheel { x: -30, y: 0 })

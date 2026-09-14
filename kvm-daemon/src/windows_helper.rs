@@ -24,14 +24,20 @@ const HELPER_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 enum HelperMessage {
     Input(InputEvent),
     ReleaseAll,
-    WarpCursor { x: u32, y: u32 },
+    WarpCursor {
+        x: u32,
+        y: u32,
+    },
     /// Service-to-helper drive-target announce: the REMOTE (driver-side)
     /// logical screen dims in px. The helper tracks the remote cursor in
     /// this space and injects the same fraction locally (proportional
     /// absolute motion, ballistics-proof on any DPI or peer size — see
     /// Win32Injector). Unknown to pre-absolute helpers, which drop the
     /// frame and stay relative — mixed-version safe.
-    SetTargetSize { width: u32, height: u32 },
+    SetTargetSize {
+        width: u32,
+        height: u32,
+    },
     SetExclusive(bool),
     /// Service-to-helper request: report this helper's own display dims
     /// (physical metrics + DPI-derived logical space). The service runs
@@ -54,7 +60,10 @@ enum HelperMessage {
     /// Helper-to-service reply for WarpCursor: whether this helper
     /// actually moved the visible cursor. Without it a skipped warp
     /// (idle desktop) reads as success and entries land stale.
-    WarpDone { placed: bool, detail: String },
+    WarpDone {
+        placed: bool,
+        detail: String,
+    },
     /// Service-to-helper request at input-session teardown: report what
     /// happened to the Input messages since the last request. The
     /// helper's own logs never reach the service journal (stderr is a
@@ -167,8 +176,13 @@ impl ServiceInputProxy {
     pub fn send(&mut self, event: InputEvent) -> Result<()> {
         self.ensure_session()?;
         let message = serde_json::to_vec(&HelperMessage::Input(event))?;
-        fan_out(&mut self.streams, &mut self.desktops, "send event to Windows helper", &message)
-            .map(|_| ())
+        fan_out(
+            &mut self.streams,
+            &mut self.desktops,
+            "send event to Windows helper",
+            &message,
+        )
+        .map(|_| ())
     }
 
     pub fn ensure_session(&self) -> Result<()> {
@@ -185,14 +199,24 @@ impl ServiceInputProxy {
 
     pub fn release_all(&mut self) -> Result<()> {
         let message = serde_json::to_vec(&HelperMessage::ReleaseAll)?;
-        fan_out(&mut self.streams, &mut self.desktops, "release input in Windows helper", &message)
-            .map(|_| ())
+        fan_out(
+            &mut self.streams,
+            &mut self.desktops,
+            "release input in Windows helper",
+            &message,
+        )
+        .map(|_| ())
     }
 
     pub fn warp_cursor(&mut self, x: u32, y: u32) -> Result<()> {
         self.ensure_session()?;
         let message = serde_json::to_vec(&HelperMessage::WarpCursor { x, y })?;
-        fan_out(&mut self.streams, &mut self.desktops, "warp cursor in Windows helper", &message)?;
+        fan_out(
+            &mut self.streams,
+            &mut self.desktops,
+            "warp cursor in Windows helper",
+            &message,
+        )?;
         collect_warp_acks(&mut self.streams, x, y)
     }
 
@@ -385,7 +409,11 @@ fn fan_out(
     }
     for index in dead.iter().rev() {
         let name = desktops.get(*index).map(String::as_str).unwrap_or("?");
-        tracing::warn!(desktop = name, context, "Windows helper stream failed; dropping it");
+        tracing::warn!(
+            desktop = name,
+            context,
+            "Windows helper stream failed; dropping it"
+        );
         streams.remove(*index);
         if *index < desktops.len() {
             desktops.remove(*index);
@@ -619,7 +647,9 @@ impl HelperReceipts {
 }
 
 fn receipt_ok() {
-    RECEIPTS.ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RECEIPTS
+        .ok
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn receipt_failed(error: String) {
@@ -812,9 +842,7 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                                 }
                                 Ok(actual) => (
                                     false,
-                                    format!(
-                                        "warp unverified on {desktop}: cursor at {actual:?}"
-                                    ),
+                                    format!("warp unverified on {desktop}: cursor at {actual:?}"),
                                 ),
                                 Err(error) => (
                                     false,
@@ -833,8 +861,7 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                         format!("cannot identify active Windows input desktop: {error:#}"),
                     ),
                 };
-                if let Ok(reply) = serde_json::to_vec(&HelperMessage::WarpDone { placed, detail })
-                {
+                if let Ok(reply) = serde_json::to_vec(&HelperMessage::WarpDone { placed, detail }) {
                     // Fire-and-forget: if the service is gone the next
                     // read ends this helper anyway.
                     let _ = write_ipc_frame(&mut stream, &reply);
@@ -1017,14 +1044,20 @@ fn current_desktop_is_input() -> Result<bool> {
     }
     .is_ok()
     {
-        let len = name.iter().position(|unit| *unit == 0).unwrap_or(name.len());
+        let len = name
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(name.len());
         String::from_utf16_lossy(&name[..len])
     } else {
         "<unnamed>".to_owned()
     };
     static LAST: std::sync::Mutex<Option<(String, bool)>> = std::sync::Mutex::new(None);
     if let Ok(mut guard) = LAST.lock() {
-        if guard.as_ref().is_none_or(|last| last.0 != desktop_name || last.1 != owns) {
+        if guard
+            .as_ref()
+            .is_none_or(|last| last.0 != desktop_name || last.1 != owns)
+        {
             tracing::info!(desktop = %desktop_name, owns_input = owns, "Windows helper desktop ownership");
             *guard = Some((desktop_name, owns));
         }
@@ -1035,7 +1068,9 @@ fn current_desktop_is_input() -> Result<bool> {
 #[cfg(target_os = "windows")]
 fn attach_to_desktop(desktop: &str) -> Result<()> {
     use windows::core::PCWSTR;
-    use windows::Win32::System::StationsAndDesktops::{CloseDesktop, OpenDesktopW, SetThreadDesktop};
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, OpenDesktopW, SetThreadDesktop,
+    };
 
     let name = desktop
         .rsplit('\\')
@@ -1053,7 +1088,7 @@ fn attach_to_desktop(desktop: &str) -> Result<()> {
             helper_desktop_access(),
         )
     }
-        .context("open target Windows desktop")?;
+    .context("open target Windows desktop")?;
     let result = unsafe { SetThreadDesktop(handle) }.context("set helper thread desktop");
     let _ = unsafe { CloseDesktop(handle) };
     result
@@ -1133,7 +1168,7 @@ fn spawn_helper(
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, OpenProcess, OpenProcessToken, CREATE_NO_WINDOW,
         CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
-        STARTUPINFOW, STARTF_USESHOWWINDOW,
+        STARTF_USESHOWWINDOW, STARTUPINFOW,
     };
 
     let session_id = active_console_session_id()?;
@@ -1279,7 +1314,10 @@ mod tests {
         let (right_tx, mut right_rx) = loopback_pair();
         let mut streams = vec![left_tx, right_tx];
         let mut desktops = vec!["winlogon".to_owned(), "default".to_owned()];
-        assert_eq!(fan_out(&mut streams, &mut desktops, "test", b"ping").unwrap(), 2);
+        assert_eq!(
+            fan_out(&mut streams, &mut desktops, "test", b"ping").unwrap(),
+            2
+        );
         assert_eq!(streams.len(), 2);
         assert_eq!(desktops, vec!["winlogon".to_owned(), "default".to_owned()]);
         assert_eq!(read_ipc_frame(&mut left_rx).unwrap(), b"ping");
@@ -1294,7 +1332,10 @@ mod tests {
         let (live_tx, mut live_rx) = loopback_pair();
         let mut streams = vec![dead_tx, live_tx];
         let mut desktops = vec!["winlogon".to_owned(), "default".to_owned()];
-        assert_eq!(fan_out(&mut streams, &mut desktops, "test", b"ping").unwrap(), 1);
+        assert_eq!(
+            fan_out(&mut streams, &mut desktops, "test", b"ping").unwrap(),
+            1
+        );
         assert_eq!(streams.len(), 1);
         // Names stay index-aligned with the surviving streams.
         assert_eq!(desktops, vec!["default".to_owned()]);
@@ -1504,10 +1545,7 @@ mod tests {
             desktops: vec!["default".to_owned()],
             session_id: 1,
         };
-        assert_eq!(
-            proxy.primary_dims(),
-            Some((1920, 1200, 1536, 960, 120))
-        );
+        assert_eq!(proxy.primary_dims(), Some((1920, 1200, 1536, 960, 120)));
     }
 
     #[test]
