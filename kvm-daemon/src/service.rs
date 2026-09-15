@@ -1526,6 +1526,16 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut motion_pending: Option<CapturedEvent> = None;
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Fast inbound-drive probe (dual-drive deadlock fix): the 5s keep-alive
+    // idle check alone leaves a reverse crossing stuck for seconds ("must
+    // move the Mint mouse home first"). Every 300ms while a drive is active,
+    // check the cheap divert/echo counter AND the authoritative local control
+    // endpoint (which works under an X11 Core grab and for motion-only
+    // Windows drives where the counters never grow). Best effort: a missing
+    // socket simply yields no signal.
+    let mut yield_probe = tokio::time::interval(Duration::from_millis(300));
+    yield_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let control_dirs = daemon_control_candidates(&dir);
 
     tracing::info!(screen = ?router.current_screen(), version = env!("CARGO_PKG_VERSION"), "topology capture ready; move to a configured screen edge");
     eprintln!("THEKVM_STATUS edge-ready");
@@ -1829,6 +1839,34 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             session.motion_coalesced += u64::from(folded);
                         }
                     }
+                } else if let InputEvent::SmoothWheel { mut x, mut y } = captured.event {
+                    // Touchpad scroll bursts: a two-finger glide queues many
+                    // small SmoothWheel events that each cost a QUIC frame.
+                    // Fold consecutively queued smooth wheels into one packet
+                    // — identical total displacement, far fewer frames, so a
+                    // fast glide stays smooth instead of stuttering behind
+                    // head-of-line delay. Motion stops the fold (scroll
+                    // position relative to motion is preserved).
+                    let mut folded = 0u32;
+                    while folded < 32 {
+                        match motion_rx.try_recv() {
+                            Ok(next) => match next.event {
+                                InputEvent::SmoothWheel { x: nx, y: ny } => {
+                                    x = x.saturating_add(nx);
+                                    y = y.saturating_add(ny);
+                                    folded += 1;
+                                }
+                                _ => {
+                                    motion_pending = Some(next);
+                                    break;
+                                }
+                            },
+                            Err(_) => break,
+                        }
+                    }
+                    if folded > 0 {
+                        captured.event = InputEvent::SmoothWheel { x, y };
+                    }
                 }
                 if captured.event_id <= discarded_event_barrier
                     || active
@@ -1911,13 +1949,15 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 }
                 None => clipboard_enabled = false,
             },
-            _ = keep_alive.tick() => {
-                // Idle auto-yield (same shape as the per-event check in
-                // handle_topology_event): a parked remote cursor produces
-                // no local input, so nothing wakes the event path — yet
-                // the peer may be pushing in. Without this the drive only
-                // yields when the local mouse moves (the "must move the
-                // Mint mouse out first" shape).
+            _ = yield_probe.tick() => {
+                // Fast dual-drive yield (300ms): a parked remote cursor
+                // produces no local input, so nothing wakes the event path
+                // — yet the peer may be pushing in. The divert/echo counter
+                // is the cheap fast path (XI grabs, hook keys/buttons); the
+                // control-endpoint check is authoritative under an X11 Core
+                // grab (Mint Xorg refuses XIGrabDevice, so core events carry
+                // no source id and the counter never grows) and for
+                // motion-only Windows drives (raw motion carries no tag).
                 if active.is_some() {
                     let diverted = kvm_platform::capture::inbound_while_driving_count();
                     if diverted > divert_baseline {
@@ -1931,6 +1971,63 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             &mut last_yield,
                             &mut suppression_requested,
                             diverted,
+                        )
+                        .await;
+                    } else if has_live_inbound(&control_dirs).await {
+                        let observed =
+                            kvm_platform::capture::inbound_while_driving_count();
+                        yield_drive_to_inbound(
+                            &mut router,
+                            &mut active,
+                            &mut parked,
+                            &capture_control,
+                            &mut discarded_event_barrier,
+                            &mut last_transfer,
+                            &mut last_yield,
+                            &mut suppression_requested,
+                            observed,
+                        )
+                        .await;
+                    }
+                }
+            }
+            _ = keep_alive.tick() => {
+                // Idle auto-yield (same shape as the per-event check in
+                // handle_topology_event): a parked remote cursor produces
+                // no local input, so nothing wakes the event path — yet
+                // the peer may be pushing in. Without this the drive only
+                // yields when the local mouse moves (the "must move the
+                // Mint mouse out first" shape). The fast yield_probe above
+                // already covers the common case; this remains as a backup
+                // for a missed probe tick.
+                if active.is_some() {
+                    let diverted = kvm_platform::capture::inbound_while_driving_count();
+                    if diverted > divert_baseline {
+                        yield_drive_to_inbound(
+                            &mut router,
+                            &mut active,
+                            &mut parked,
+                            &capture_control,
+                            &mut discarded_event_barrier,
+                            &mut last_transfer,
+                            &mut last_yield,
+                            &mut suppression_requested,
+                            diverted,
+                        )
+                        .await;
+                    } else if has_live_inbound(&control_dirs).await {
+                        let observed =
+                            kvm_platform::capture::inbound_while_driving_count();
+                        yield_drive_to_inbound(
+                            &mut router,
+                            &mut active,
+                            &mut parked,
+                            &capture_control,
+                            &mut discarded_event_barrier,
+                            &mut last_transfer,
+                            &mut last_yield,
+                            &mut suppression_requested,
+                            observed,
                         )
                         .await;
                     }
@@ -2299,6 +2396,55 @@ fn episode_cooling_down(last_failed_episode: Option<std::time::Instant>) -> bool
 /// the drive while both users hold opposite edges. Pure for tests.
 fn yield_cooling_down(last_yield: Option<std::time::Instant>) -> bool {
     last_yield.is_some_and(|when| when.elapsed() < Duration::from_secs(2))
+}
+
+/// Candidate control endpoints that may know about a live inbound drive.
+///
+/// The topology child reads its layout from `data_dir()` (the user dir the
+/// UI pins via THEKVM_DATA_DIR), but the privileged daemon owns the inbound
+/// input slot and serves its control socket from the system dir (and the UI
+/// publishes that dir to children via THEKVM_DAEMON_DIR). Querying only the
+/// child dir misses the inbound session that must pre-empt our outbound
+/// drive — the whole "must move the Mint mouse home first" deadlock. Pure
+/// for tests (env read only for the daemon-dir override).
+fn daemon_control_candidates(primary: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![primary.to_path_buf()];
+    if let Ok(daemon_dir) = std::env::var("THEKVM_DAEMON_DIR") {
+        let trimmed = daemon_dir.trim();
+        if !trimmed.is_empty() {
+            let path = std::path::PathBuf::from(trimmed);
+            if !dirs.contains(&path) {
+                dirs.push(path);
+            }
+        }
+    }
+    let system = system_data_dir();
+    if !dirs.contains(&system) {
+        dirs.push(system);
+    }
+    dirs
+}
+
+/// True when any local control endpoint reports a live inbound input session.
+///
+/// Authoritative inbound-drive signal for auto-yield: unlike the divert/echo
+/// counters it works under an X11 Core grab (Mint Xorg refuses XIGrabDevice,
+/// so core events carry no source id and the divert counter never grows) and
+/// for motion-only Windows drives (raw motion carries no ECHO_TAG). Best
+/// effort with a short per-candidate timeout — a missing socket simply means
+/// "no daemon observed", never a failed yield.
+async fn has_live_inbound(candidates: &[std::path::PathBuf]) -> bool {
+    for dir in candidates {
+        let request =
+            crate::control::request(dir.clone(), kvm_protocol::control::ControlRequest::Status);
+        let response = tokio::time::timeout(Duration::from_millis(200), request).await;
+        if let Ok(Ok(kvm_protocol::control::ControlResponse::Status(status))) = response {
+            if !status.sessions.is_empty() || status.active_session_count > 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Step the router cursor a few pixels inside the screen after a refused
@@ -7006,6 +7152,19 @@ mod tests {
         // An old yield: drive again.
         let old = just - Duration::from_secs(3);
         assert!(!yield_cooling_down(Some(old)));
+    }
+
+    #[test]
+    fn control_candidates_cover_user_daemon_and_system_dirs() {
+        // The deadlock fix queries every local control endpoint that may
+        // know about an inbound drive: the child dir, the daemon dir
+        // override, and the privileged system dir. Duplicates collapse.
+        let primary = std::path::PathBuf::from("/tmp/thekvm-user");
+        let candidates = daemon_control_candidates(&primary);
+        assert!(candidates.contains(&primary));
+        assert!(candidates.contains(&system_data_dir()));
+        // No daemon-dir override in test env: exactly user + system.
+        assert_eq!(candidates.len(), 2);
     }
 
     #[test]

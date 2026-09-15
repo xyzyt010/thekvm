@@ -96,6 +96,53 @@ pub struct X11Capture {
     /// from the evdev tap, never from the X stream. Empty when no MT
     /// node is usable — pinch unavailable, everything else intact.
     mt_pinch: crate::mt_pinch::MtPinchTap,
+    /// Typematic hold-repeat state (HID usage -> press/last-repeat stamps).
+    /// X11 servers differ on whether a held key re-presses via XI raw: some
+    /// emit repeats, some emit a single press and rely on the local toolkit
+    /// to repeat. A Windows receiver never auto-repeats an injected hold, so
+    /// a single-press server would delete exactly one char per Backspace hold
+    /// remotely. This map synthesizes repeats for the silent case while
+    /// staying quiet when the server already repeats (each observed re-press
+    /// refreshes the stamp, so synthesis never doubles it). Modifiers never
+    /// repeat by OS convention and are excluded at emission time.
+    held_keys: HashMap<u16, (std::time::Instant, std::time::Instant)>,
+}
+
+/// Initial hold before the first synthesized repeat, then the steady rate.
+/// Matches desktop typematic feel (~500ms delay, ~30Hz repeat).
+const REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(500);
+const REPEAT_INTERVAL: Duration = Duration::from_millis(33);
+
+/// True for USB HID modifier usages, which never auto-repeat by OS convention.
+fn is_modifier_usage(usage: u16) -> bool {
+    (0xe0..=0xe7).contains(&usage)
+}
+
+/// Next synthesized hold-repeat due now, if any: the most recently pressed
+/// non-modifier still held past the initial delay whose last repeat (observed
+/// or synthesized) is older than the interval. Pure over the stamp map so the
+/// selection rule is unit-tested without X hardware.
+fn due_repeat(
+    held: &HashMap<u16, (std::time::Instant, std::time::Instant)>,
+    now: std::time::Instant,
+) -> Option<u16> {
+    let mut best: Option<(u16, std::time::Instant)> = None;
+    for (usage, (pressed_at, last_repeat)) in held {
+        if is_modifier_usage(*usage) {
+            continue;
+        }
+        if now.duration_since(*pressed_at) < REPEAT_INITIAL_DELAY {
+            continue;
+        }
+        if now.duration_since(*last_repeat) < REPEAT_INTERVAL {
+            continue;
+        }
+        let newer = best.is_none_or(|(_, at)| *pressed_at > at);
+        if newer {
+            best = Some((*usage, *pressed_at));
+        }
+    }
+    best.map(|(usage, _)| usage)
 }
 
 /// True when an XI device name is one of our own virtual injector devices.
@@ -426,6 +473,7 @@ impl X11Capture {
             // Best-effort by construction (see MtPinchTap::open): an
             // empty tap only disables pinch, never capture startup.
             mt_pinch: crate::mt_pinch::MtPinchTap::open(),
+            held_keys: HashMap::new(),
         })
     }
 
@@ -525,6 +573,47 @@ impl X11Capture {
         self.cursor_hidden = false;
     }
 
+    fn track_press(&mut self, usage: u16) {
+        let now = std::time::Instant::now();
+        // An observed re-press refreshes the repeat stamp (see held_keys):
+        // servers that already repeat keep synthesis quiet, silent servers
+        // let synthesis fire. First press seeds both stamps.
+        self.held_keys
+            .entry(usage)
+            .and_modify(|(_, last)| *last = now)
+            .or_insert((now, now));
+    }
+
+    fn track_release(&mut self, usage: u16) {
+        self.held_keys.remove(&usage);
+    }
+
+    fn track_key_event(&mut self, event: Option<InputEvent>) -> Option<InputEvent> {
+        if let Some(InputEvent::Key(key)) = event {
+            if key.pressed {
+                self.track_press(key.usage);
+            } else {
+                self.track_release(key.usage);
+            }
+            return Some(InputEvent::Key(key));
+        }
+        event
+    }
+
+    /// Synthesized typematic repeat due now, if any (see held_keys). Advances
+    /// the stamp so the next repeat paces at REPEAT_INTERVAL. Returns the
+    /// InputEvent to emit, or None when nothing is due.
+    fn take_due_repeat(&mut self, now: std::time::Instant) -> Option<InputEvent> {
+        let usage = due_repeat(&self.held_keys, now)?;
+        if let Some((_, last)) = self.held_keys.get_mut(&usage) {
+            *last = now;
+        }
+        Some(InputEvent::Key(KeyEvent {
+            usage,
+            pressed: true,
+        }))
+    }
+
     fn translate(&mut self, event: x11rb::protocol::Event) -> Option<InputEvent> {
         // Inbound-drive visibility while grabbed (see INBOUND_DIVERTED):
         // our own virtual injector devices keep emitting raw events into
@@ -552,7 +641,8 @@ impl X11Capture {
                     return None;
                 }
                 XI_KEY.fetch_add(1, Ordering::Relaxed);
-                key_event(event.detail, true)
+                let decoded = key_event(event.detail, true);
+                self.track_key_event(decoded)
             }
             x11rb::protocol::Event::XinputRawKeyRelease(event) => {
                 if self.grab_kind == GrabKind::Core {
@@ -562,7 +652,8 @@ impl X11Capture {
                     return None;
                 }
                 XI_KEY.fetch_add(1, Ordering::Relaxed);
-                key_event(event.detail, false)
+                let decoded = key_event(event.detail, false);
+                self.track_key_event(decoded)
             }
             x11rb::protocol::Event::XinputRawButtonPress(event) => {
                 if self.grab_kind == GrabKind::Core {
@@ -668,14 +759,16 @@ impl X11Capture {
                     return None;
                 }
                 XI_KEY.fetch_add(1, Ordering::Relaxed);
-                key_event(u32::from(event.detail), true)
+                let decoded = key_event(u32::from(event.detail), true);
+                self.track_key_event(decoded)
             }
             x11rb::protocol::Event::KeyRelease(event) => {
                 if self.grab_kind != GrabKind::Core {
                     return None;
                 }
                 XI_KEY.fetch_add(1, Ordering::Relaxed);
-                key_event(u32::from(event.detail), false)
+                let decoded = key_event(u32::from(event.detail), false);
+                self.track_key_event(decoded)
             }
             _ => None,
         }
@@ -698,6 +791,15 @@ impl CaptureBackend for X11Capture {
             // a pinch stays as snappy as the 4ms X poll below it.
             if let Some(gesture) = self.mt_pinch.poll() {
                 return Ok(gesture);
+            }
+            // Typematic hold-repeat (see held_keys): X servers that emit a
+            // single press per hold would otherwise starve Windows receivers
+            // (one char per Backspace hold). Servers that already repeat
+            // refresh the stamp on each observed re-press, so this stays
+            // quiet for them and never doubles.
+            if let Some(repeat) = self.take_due_repeat(std::time::Instant::now()) {
+                XI_KEY.fetch_add(1, Ordering::Relaxed);
+                return Ok(repeat);
             }
             // The injector (re)creates its uinput devices per receiver
             // session, which can postdate this backend: re-resolve our own
@@ -1321,6 +1423,31 @@ mod tests {
         assert_eq!(core_motion_step((100, 100), (112, 96)), (12, -4));
         assert_eq!(core_motion_step((100, 100), (100, 100)), (0, 0));
         assert_eq!(core_motion_step((0, 0), (-5, 300)), (-5, 300));
+    }
+
+    #[test]
+    fn hold_repeat_fires_only_for_settled_non_modifiers() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let old_press = now - Duration::from_millis(600);
+        let recent_press = now - Duration::from_millis(100);
+        // Settled Backspace (0x2a) repeats; fresh press does not (initial delay).
+        let mut held = HashMap::new();
+        held.insert(0x2au16, (old_press, old_press));
+        assert_eq!(due_repeat(&held, now), Some(0x2a));
+        held.insert(0x04u16, (recent_press, recent_press));
+        // Most recent press wins when several are due — but the fresh one
+        // is still inside its initial delay, so Backspace still wins.
+        assert_eq!(due_repeat(&held, now), Some(0x2a));
+        // Recently repeated: interval not elapsed, silent.
+        held.insert(0x2au16, (old_press, now));
+        assert_eq!(due_repeat(&held, now), None);
+        // Modifiers never repeat, even when settled.
+        let mut mods = HashMap::new();
+        mods.insert(0xe0u16, (old_press, old_press));
+        assert_eq!(due_repeat(&mods, now), None);
+        assert!(is_modifier_usage(0xe0));
+        assert!(!is_modifier_usage(0x2a));
     }
 
     #[test]

@@ -331,6 +331,7 @@ mod win32_hooks {
     static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
     static RAW_WINDOW: AtomicIsize = AtomicIsize::new(0);
     static RAW_NOLEGACY: AtomicBool = AtomicBool::new(false);
+    static PTP_NOLEGACY: AtomicBool = AtomicBool::new(false);
     /// Private thread message (WM_APP range): wparam != 0 enables RawInput
     /// legacy suppression while driving, 0 restores normal delivery.
     const WM_THEKVM_NOLEGACY: u32 = 0x8000 + 11;
@@ -567,6 +568,7 @@ mod win32_hooks {
             let _ = UnhookWindowsHookEx(mouse);
             RAW_INPUT_ACTIVE.store(false, Ordering::Release);
             RAW_NOLEGACY.store(false, Ordering::Release);
+            PTP_NOLEGACY.store(false, Ordering::Release);
             RAW_WINDOW.store(0, Ordering::Release);
             HOOK_THREAD_ID.store(0, Ordering::Release);
             if let Some(window) = raw_input_window {
@@ -760,9 +762,15 @@ mod win32_hooks {
     /// usage with RIDEV_NOLEGACY stops legacy delivery (the low-level
     /// hook still fires, so buttons/keys keep their hook swallow path,
     /// and WM_INPUT keeps flowing, so remote forwarding is untouched).
+    /// The precision-touchpad digitizer collection (0x0D/0x05) is a
+    /// separate HID top-level collection whose synthesized scroll bypasses
+    /// the mouse-usage flag entirely, so it gets the same NOLEGACY toggle
+    /// on the same sink window (WM_INPUT still flows for forwarding).
     /// Runs on the hook thread; idempotent across repeated transitions.
     fn apply_raw_legacy_suppression(suppress: bool) {
-        if RAW_NOLEGACY.swap(suppress, Ordering::AcqRel) == suppress {
+        let mouse_changed = RAW_NOLEGACY.swap(suppress, Ordering::AcqRel) != suppress;
+        let ptp_changed = PTP_NOLEGACY.swap(suppress, Ordering::AcqRel) != suppress;
+        if !mouse_changed && !ptp_changed {
             return;
         }
         if !RAW_INPUT_ACTIVE.load(Ordering::Acquire) {
@@ -777,27 +785,57 @@ mod win32_hooks {
         } else {
             RIDEV_INPUTSINK
         };
-        let device = RAWINPUTDEVICE {
-            usUsagePage: 0x01,
-            usUsage: 0x02,
-            dwFlags: flags,
-            hwndTarget: hwnd,
-        };
-        match unsafe {
-            RegisterRawInputDevices(
-                std::slice::from_ref(&device),
-                std::mem::size_of::<RAWINPUTDEVICE>() as u32,
-            )
-        } {
-            Ok(_) => tracing::info!(
-                suppress,
-                "RawInput legacy delivery toggled for the drive session"
-            ),
-            Err(error) => tracing::warn!(
-                %error,
-                suppress,
-                "RawInput legacy toggle failed; trackpad scroll may apply locally while driving"
-            ),
+        if mouse_changed {
+            let device = RAWINPUTDEVICE {
+                usUsagePage: 0x01,
+                usUsage: 0x02,
+                dwFlags: flags,
+                hwndTarget: hwnd,
+            };
+            match unsafe {
+                RegisterRawInputDevices(
+                    std::slice::from_ref(&device),
+                    std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+                )
+            } {
+                Ok(_) => tracing::info!(
+                    suppress,
+                    "RawInput legacy delivery toggled for the drive session"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    suppress,
+                    "RawInput legacy toggle failed; trackpad scroll may apply locally while driving"
+                ),
+            }
+        }
+        if ptp_changed {
+            // Digitizer-only toggle: observe-only WM_INPUT keeps flowing,
+            // so the PTP scroll channel still forwards while local legacy
+            // synthesis stops. Best effort — desktops without a touchpad
+            // simply have nothing to suppress.
+            let digitizer = RAWINPUTDEVICE {
+                usUsagePage: PTP_USAGE_PAGE,
+                usUsage: PTP_USAGE_TOUCHPAD,
+                dwFlags: flags,
+                hwndTarget: hwnd,
+            };
+            match unsafe {
+                RegisterRawInputDevices(
+                    std::slice::from_ref(&digitizer),
+                    std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+                )
+            } {
+                Ok(_) => tracing::info!(
+                    suppress,
+                    "precision-touchpad legacy delivery toggled for the drive session"
+                ),
+                Err(error) => tracing::debug!(
+                    %error,
+                    suppress,
+                    "precision-touchpad legacy toggle unavailable; local scroll may apply while driving"
+                ),
+            }
         }
     }
 
@@ -1270,14 +1308,18 @@ mod win32_hooks {
             // fingers right scrolls right (+120ths).
             self.acc_x += avg.0 - prev.0;
             self.acc_y += prev.1 - avg.1;
-            let det_x = self.acc_x / self.units_per_detent_x.max(1);
-            let det_y = self.acc_y / self.units_per_detent_y.max(1);
-            self.acc_x -= det_x * self.units_per_detent_x.max(1);
-            self.acc_y -= det_y * self.units_per_detent_y.max(1);
-            (
-                det_x.clamp(-1000, 1000) as i32 * 120,
-                det_y.clamp(-1000, 1000) as i32 * 120,
-            )
+            // Smooth 120ths, not detent-quantized: one sensor unit earns
+            // 120/units 120ths, so slow sub-detent motion still emits small
+            // smooth steps instead of waiting for a whole detent (the steppy
+            // shape). Truncation toward zero keeps both directions symmetric;
+            // the sensor remainder is preserved for the next report.
+            let units_x = self.units_per_detent_x.max(1);
+            let units_y = self.units_per_detent_y.max(1);
+            let out_x = (self.acc_x.saturating_mul(120) / units_x).clamp(-120_000, 120_000);
+            let out_y = (self.acc_y.saturating_mul(120) / units_y).clamp(-120_000, 120_000);
+            self.acc_x -= out_x.saturating_mul(units_x) / 120;
+            self.acc_y -= out_y.saturating_mul(units_y) / 120;
+            (out_x as i32, out_y as i32)
         }
     }
 
@@ -1343,9 +1385,10 @@ mod win32_hooks {
             if self.engaged {
                 if let Some(prev) = self.prev {
                     self.acc += spread - prev;
-                    let det = self.acc / self.units_per_detent.max(1);
-                    self.acc -= det * self.units_per_detent.max(1);
-                    zoom = det.clamp(-1000, 1000) as i32 * 120;
+                    let units = self.units_per_detent.max(1);
+                    let out = (self.acc.saturating_mul(120) / units).clamp(-120_000, 120_000);
+                    self.acc -= out.saturating_mul(units) / 120;
+                    zoom = out as i32;
                 }
             }
             self.prev = Some(spread);
@@ -2029,10 +2072,11 @@ mod win32_hooks {
             pan.units_per_detent_x = 10;
             pan.units_per_detent_y = 10;
             assert_eq!(pan.feed(&[(0, 100), (0, 100)]), (0, 0));
-            assert_eq!(pan.feed(&[(0, 96), (0, 96)]), (0, 0));
-            assert_eq!(pan.feed(&[(0, 92), (0, 92)]), (0, 0));
-            // 4 + 4 + 4 = 12 >= 10: one detent, remainder kept.
-            assert_eq!(pan.feed(&[(0, 88), (0, 88)]), (0, 120));
+            // Smooth 120ths: 4 sensor units earn 48 120ths immediately
+            // instead of waiting for a whole detent (the steppy shape).
+            assert_eq!(pan.feed(&[(0, 96), (0, 96)]), (0, 48));
+            assert_eq!(pan.feed(&[(0, 92), (0, 92)]), (0, 48));
+            assert_eq!(pan.feed(&[(0, 88), (0, 88)]), (0, 48));
         }
 
         #[test]
@@ -2126,10 +2170,8 @@ mod win32_hooks {
 
         fn raw_wheel(flags: u32, data: i16) -> RAWINPUT {
             let mut raw = raw_mouse(MOUSE_STATE(0), 0, 0);
-            unsafe {
-                raw.data.mouse.Anonymous.Anonymous.usButtonFlags = flags as u16;
-                raw.data.mouse.Anonymous.Anonymous.usButtonData = data as u16;
-            }
+            raw.data.mouse.Anonymous.Anonymous.usButtonFlags = flags as u16;
+            raw.data.mouse.Anonymous.Anonymous.usButtonData = data as u16;
             raw
         }
 
