@@ -3,7 +3,7 @@
 # Layout: ./in holds the release binaries; metadata is generated here.
 set -eu
 cd ~/thekvm-build
-VER=0.9.32
+VER=0.9.33
 PKG=thekvm
 ROOT=debroot
 rm -rf "$ROOT" "${PKG}_${VER}_amd64.deb"

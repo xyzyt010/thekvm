@@ -43,6 +43,16 @@ pub(crate) struct InboundLink {
     pub address: String,
     /// Administrative epoch from the dialer's Hello (None for older peers).
     pub link_id: Option<u64>,
+    /// Input events (motion/keys/buttons/wheel, stream plus datagram)
+    /// received from this peer on this session, bumped by the serve
+    /// loop. Shared (not a plain u64) so the drive loop's yield probe
+    /// can read live activity through list_inbound_links: with a
+    /// two-way edge the dial-back session stays open persistently, so
+    /// mere session EXISTENCE is true 100% of connected time and must
+    /// never count as "the peer is driving us" — only ADVANCING input
+    /// proves an active inbound drive (0.9.32 yielded every crossing
+    /// instantly on existence alone).
+    pub input_events: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 type LinkRegistry =
@@ -57,18 +67,24 @@ pub(crate) fn inbound_link_registry() -> LinkRegistry {
         .clone()
 }
 
-/// Record a verified inbound session; returns its registration id and a
-/// drop-watch the serve loop selects on. Replaces any stale entry for the
-/// same peer (the old task is already gone — only one input session holds
-/// the slot at a time).
+/// Record a verified inbound session; returns its registration id, a
+/// drop-watch the serve loop selects on, and the shared input-activity
+/// counter the serve loop bumps for every received input event. Replaces
+/// any stale entry for the same peer (the old task is already gone —
+/// only one input session holds the slot at a time).
 pub(crate) fn register_inbound_link(
     fingerprint_hex: &str,
     node_name: &str,
     address: &str,
     link_id: Option<u64>,
-) -> (u64, tokio::sync::watch::Receiver<bool>) {
+) -> (
+    u64,
+    tokio::sync::watch::Receiver<bool>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
     let id = LINK_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (drop_tx, drop_rx) = tokio::sync::watch::channel(false);
+    let input_events = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     if let Ok(mut links) = inbound_link_registry().lock() {
         links.insert(
             fingerprint_hex.to_owned(),
@@ -79,12 +95,13 @@ pub(crate) fn register_inbound_link(
                     node_name: node_name.to_owned(),
                     address: address.to_owned(),
                     link_id,
+                    input_events: input_events.clone(),
                 },
                 drop_tx,
             ),
         );
     }
-    (id, drop_rx)
+    (id, drop_rx, input_events)
 }
 
 /// Remove a registration, but only when the id still matches — a redialed
@@ -121,6 +138,7 @@ pub(crate) fn list_inbound_links() -> Vec<kvm_protocol::control::ActiveSession> 
                 node_name: link.node_name.clone(),
                 address: link.address.clone(),
                 link_id: link.link_id,
+                input_events: link.input_events.load(std::sync::atomic::Ordering::Relaxed),
             })
             .collect()
     } else {
@@ -1514,6 +1532,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // divert/echo count when the current drive started. Growth while a
     // drive is active is the peer driving us back — auto-yield fires.
     let mut divert_baseline = 0u64;
+    // Inbound INPUT-ACTIVITY baselines for the yield probe (see
+    // inbound_inputs_growth): per-peer input-event totals from the
+    // last probe. `inbound_baselines_fresh` is cleared on every
+    // handoff so the first probe of a drive only records — input the
+    // peer sent on an OLDER drive can never fire a new crossing.
+    let mut inbound_baseline: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    let mut inbound_baselines_fresh = true;
     // Last auto-yield to an inbound drive (see yield_cooling_down):
     // fresh yields refuse new handoffs briefly so opposite-edge
     // holding cannot ping-pong the drive.
@@ -1529,9 +1555,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // Fast inbound-drive probe (dual-drive deadlock fix): the 5s keep-alive
     // idle check alone leaves a reverse crossing stuck for seconds ("must
     // move the Mint mouse home first"). Every 300ms while a drive is active,
-    // check the cheap divert/echo counter AND the authoritative local control
-    // endpoint (which works under an X11 Core grab and for motion-only
-    // Windows drives where the counters never grow). Best effort: a missing
+    // check the cheap divert/echo counter AND fresh inbound INPUT ACTIVITY
+    // from the local control endpoint (which works under an X11 Core grab
+    // and for motion-only Windows drives where the counters never grow).
+    // Activity means ADVANCING input events, never mere session existence:
+    // the two-way-edge dial-back stays open persistently, so existence
+    // would yield every crossing instantly. Best effort: a missing
     // socket simply yields no signal.
     let mut yield_probe = tokio::time::interval(Duration::from_millis(300));
     yield_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1788,6 +1817,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     last_peer_progress: &mut last_peer_progress,
                     unacked_pings: &mut unacked_pings,
                     divert_baseline: &mut divert_baseline,
+                    inbound_baselines_fresh: &mut inbound_baselines_fresh,
                     last_yield: &mut last_yield,
                 })
                 .await?;
@@ -1901,6 +1931,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     last_peer_progress: &mut last_peer_progress,
                     unacked_pings: &mut unacked_pings,
                     divert_baseline: &mut divert_baseline,
+                    inbound_baselines_fresh: &mut inbound_baselines_fresh,
                     last_yield: &mut last_yield,
                 })
                 .await?;
@@ -1953,11 +1984,13 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // Fast dual-drive yield (300ms): a parked remote cursor
                 // produces no local input, so nothing wakes the event path
                 // — yet the peer may be pushing in. The divert/echo counter
-                // is the cheap fast path (XI grabs, hook keys/buttons); the
-                // control-endpoint check is authoritative under an X11 Core
-                // grab (Mint Xorg refuses XIGrabDevice, so core events carry
-                // no source id and the counter never grows) and for
-                // motion-only Windows drives (raw motion carries no tag).
+                // is the cheap fast path (XI grabs, hook keys/buttons);
+                // fresh inbound INPUT ACTIVITY is authoritative under an
+                // X11 Core grab (Mint Xorg refuses XIGrabDevice, so core
+                // events carry no source id and the counter never grows)
+                // and for motion-only Windows drives (raw motion carries
+                // no tag). Activity, never session existence: the
+                // two-way-edge dial-back stays open persistently.
                 if active.is_some() {
                     let diverted = kvm_platform::capture::inbound_while_driving_count();
                     if diverted > divert_baseline {
@@ -1973,21 +2006,37 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             diverted,
                         )
                         .await;
-                    } else if has_live_inbound(&control_dirs).await {
-                        let observed =
-                            kvm_platform::capture::inbound_while_driving_count();
-                        yield_drive_to_inbound(
-                            &mut router,
-                            &mut active,
-                            &mut parked,
-                            &capture_control,
-                            &mut discarded_event_barrier,
-                            &mut last_transfer,
-                            &mut last_yield,
-                            &mut suppression_requested,
-                            observed,
-                        )
-                        .await;
+                    } else {
+                        // Fresh-inbound-input path (see
+                        // inbound_inputs_growth): the first probe of a
+                        // drive only records its baseline, so input the
+                        // peer sent on an older drive can never fire a
+                        // new crossing.
+                        let current = snapshot_inbound_inputs(&control_dirs).await;
+                        let growth = if inbound_baselines_fresh {
+                            inbound_inputs_growth(&mut inbound_baseline, &current)
+                        } else {
+                            inbound_baseline = current;
+                            inbound_baselines_fresh = true;
+                            0
+                        };
+                        if growth > 0 {
+                            let observed =
+                                kvm_platform::capture::inbound_while_driving_count();
+                            tracing::info!(growth, "fresh peer input arrived while driving; yielding to the inbound drive");
+                            yield_drive_to_inbound(
+                                &mut router,
+                                &mut active,
+                                &mut parked,
+                                &capture_control,
+                                &mut discarded_event_barrier,
+                                &mut last_transfer,
+                                &mut last_yield,
+                                &mut suppression_requested,
+                                observed,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -2015,21 +2064,37 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             diverted,
                         )
                         .await;
-                    } else if has_live_inbound(&control_dirs).await {
-                        let observed =
-                            kvm_platform::capture::inbound_while_driving_count();
-                        yield_drive_to_inbound(
-                            &mut router,
-                            &mut active,
-                            &mut parked,
-                            &capture_control,
-                            &mut discarded_event_barrier,
-                            &mut last_transfer,
-                            &mut last_yield,
-                            &mut suppression_requested,
-                            observed,
-                        )
-                        .await;
+                    } else {
+                        // Fresh-inbound-input path (see
+                        // inbound_inputs_growth): the first probe of a
+                        // drive only records its baseline, so input the
+                        // peer sent on an older drive can never fire a
+                        // new crossing.
+                        let current = snapshot_inbound_inputs(&control_dirs).await;
+                        let growth = if inbound_baselines_fresh {
+                            inbound_inputs_growth(&mut inbound_baseline, &current)
+                        } else {
+                            inbound_baseline = current;
+                            inbound_baselines_fresh = true;
+                            0
+                        };
+                        if growth > 0 {
+                            let observed =
+                                kvm_platform::capture::inbound_while_driving_count();
+                            tracing::info!(growth, "fresh peer input arrived while driving; yielding to the inbound drive");
+                            yield_drive_to_inbound(
+                                &mut router,
+                                &mut active,
+                                &mut parked,
+                                &capture_control,
+                                &mut discarded_event_barrier,
+                                &mut last_transfer,
+                                &mut last_yield,
+                                &mut suppression_requested,
+                                observed,
+                            )
+                            .await;
+                        }
                     }
                 }
                 if let Some(session) = active.as_mut() {
@@ -2425,26 +2490,79 @@ fn daemon_control_candidates(primary: &std::path::Path) -> Vec<std::path::PathBu
     dirs
 }
 
-/// True when any local control endpoint reports a live inbound input session.
-///
-/// Authoritative inbound-drive signal for auto-yield: unlike the divert/echo
-/// counters it works under an X11 Core grab (Mint Xorg refuses XIGrabDevice,
-/// so core events carry no source id and the divert counter never grows) and
-/// for motion-only Windows drives (raw motion carries no ECHO_TAG). Best
-/// effort with a short per-candidate timeout — a missing socket simply means
-/// "no daemon observed", never a failed yield.
-async fn has_live_inbound(candidates: &[std::path::PathBuf]) -> bool {
+/// Snapshot of per-peer inbound input activity: fingerprint hex ->
+/// input events received on the live session. Best effort with a short
+/// per-candidate timeout — a missing socket simply contributes nothing.
+/// Takes the MAX per fingerprint across candidates so overlapping dirs
+/// that reach the same daemon can never double-count.
+async fn snapshot_inbound_inputs(
+    candidates: &[std::path::PathBuf],
+) -> std::collections::HashMap<String, u64> {
+    let mut totals: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     for dir in candidates {
         let request =
             crate::control::request(dir.clone(), kvm_protocol::control::ControlRequest::Status);
         let response = tokio::time::timeout(Duration::from_millis(200), request).await;
         if let Ok(Ok(kvm_protocol::control::ControlResponse::Status(status))) = response {
-            if !status.sessions.is_empty() || status.active_session_count > 0 {
-                return true;
+            for session in &status.sessions {
+                totals
+                    .entry(session.fingerprint_hex.clone())
+                    .and_modify(|total| {
+                        *total = (*total).max(session.input_events);
+                    })
+                    .or_insert(session.input_events);
             }
         }
     }
-    false
+    totals
+}
+
+/// Fresh inbound input since the baseline snapshot, and refresh the
+/// baseline to the current snapshot. Returns the total event growth.
+///
+/// This is the authoritative inbound-drive signal for auto-yield: unlike
+/// the divert/echo counters it works under an X11 Core grab (Mint Xorg
+/// refuses XIGrabDevice, so core events carry no source id and the
+/// divert counter never grows) and for motion-only Windows drives (raw
+/// motion carries no ECHO_TAG). Unlike 0.9.32's session-EXISTENCE check
+/// it cannot fire on an idle link: with a two-way edge the peer's
+/// dial-back session stays open persistently (5s keep-alive Pings), so
+/// existence is true 100% of connected time and yielded every crossing
+/// ~85ms after handoff, both directions.
+///
+/// Rules (all deliberate against false yields):
+/// - only STRICT growth over a previously-seen baseline fires;
+/// - a fingerprint seen for the first time is recorded WITHOUT firing
+///   (a redialed session resets its counter; firing on it would yank a
+///   healthy drive the moment the peer redials);
+/// - a counter that reset (current < baseline) refreshes the baseline
+///   without firing.
+/// Callers absorb one snapshot per drive start (see
+/// inbound_baselines_fresh) so an older drive's input can never fire a
+/// later crossing. Pure for tests.
+fn inbound_inputs_growth(
+    baseline: &mut std::collections::HashMap<String, u64>,
+    current: &std::collections::HashMap<String, u64>,
+) -> u64 {
+    let mut growth = 0u64;
+    for (fingerprint, count) in current {
+        match baseline.get(fingerprint) {
+            Some(previous) => {
+                if *count > *previous {
+                    growth = growth.saturating_add(count - previous);
+                }
+            }
+            None => {
+                // First sighting mid-drive: record, never fire (a fresh
+                // session that already carries input still proves
+                // nothing about THIS drive — the next probe catches a
+                // peer that keeps driving).
+            }
+        }
+        baseline.insert(fingerprint.clone(), *count);
+    }
+    growth
 }
 
 /// Step the router cursor a few pixels inside the screen after a refused
@@ -2549,6 +2667,11 @@ struct TopologyEventContext<'a> {
     /// drive started. Growth while `active` means the peer is driving
     /// us back right now — yield instead of diverting them forever.
     divert_baseline: &'a mut u64,
+    /// Freshness flag for the loop-local inbound input-activity
+    /// baselines (see inbound_inputs_growth): cleared on every handoff
+    /// so the first probe of the new drive records instead of firing.
+    /// (The map itself lives in loop scope; only the reset travels.)
+    inbound_baselines_fresh: &'a mut bool,
     /// Last auto-yield stamp (see yield_cooling_down): fresh yields
     /// refuse new handoffs briefly so opposite-edge holding cannot
     /// ping-pong the drive.
@@ -2585,6 +2708,7 @@ async fn handle_topology_event(
         last_peer_progress,
         unacked_pings,
         divert_baseline,
+        inbound_baselines_fresh,
         last_yield,
     } = context;
     // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
@@ -2981,6 +3105,10 @@ async fn handle_topology_event(
                 // drive: only growth past this point means the peer is
                 // driving us back (see the auto-yield above).
                 *divert_baseline = kvm_platform::capture::inbound_while_driving_count();
+                // Fresh drive, fresh activity baseline: the first yield
+                // probe records instead of firing, so input the peer
+                // sent on an older drive can never end this crossing.
+                *inbound_baselines_fresh = false;
                 let name = router
                     .screen(target)
                     .map(|screen| screen.name.clone())
@@ -4741,7 +4869,7 @@ async fn handle_connection(
             // daemon address and otherwise the inbound IP on the standard
             // daemon port.
             let peer_book = peers.read().await;
-            let (link_id, mut link_drop) = register_inbound_link(
+            let (link_id, mut link_drop, link_input_events) = register_inbound_link(
                 &peer_fingerprint,
                 &hello.node_name,
                 &dialable_peer_address(
@@ -4855,6 +4983,14 @@ async fn handle_connection(
                                         smooth_count += 1;
                                     }
                                 }
+                                // Live inbound-drive signal for the drive
+                                // loop's yield probe (see
+                                // snapshot_inbound_inputs): every stream
+                                // input message is peer-injected input by
+                                // construction (handshakes, pings, clipboard
+                                // and state sync never take this branch).
+                                link_input_events
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if process_remote_input(
                                     DatagramInput {
                                         sequence: packet.sequence,
@@ -5036,6 +5172,10 @@ async fn handle_connection(
                             }
                         };
                         datagrams_received += 1;
+                        // Same live-drive signal for the datagram path
+                        // (motion usually arrives here, not on the stream).
+                        link_input_events
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         match packet.event {
                             InputEvent::MouseMove { .. } => motion_count += 1,
                             InputEvent::Wheel(_) => wheel_count += 1,
@@ -7223,7 +7363,7 @@ mod tests {
         assert!(!drop_inbound_link(&fp));
         assert!(list_inbound_links().iter().all(|s| s.fingerprint_hex != fp));
         // Register: listed with name and address, droppable.
-        let (id, _rx) = register_inbound_link(&fp, "mint", "192.168.1.7:42110", Some(7));
+        let (id, _rx, inputs) = register_inbound_link(&fp, "mint", "192.168.1.7:42110", Some(7));
         let listed: Vec<_> = list_inbound_links()
             .into_iter()
             .filter(|s| s.fingerprint_hex == fp)
@@ -7232,6 +7372,16 @@ mod tests {
         assert_eq!(listed[0].node_name, "mint");
         assert_eq!(listed[0].address, "192.168.1.7:42110");
         assert_eq!(listed[0].link_id, Some(7));
+        // Fresh registration reports zero input activity.
+        assert_eq!(listed[0].input_events, 0);
+        // Serve-loop bumps surface through the listing (the yield
+        // probe's activity signal).
+        inputs.fetch_add(25, std::sync::atomic::Ordering::Relaxed);
+        let relisted: Vec<_> = list_inbound_links()
+            .into_iter()
+            .filter(|s| s.fingerprint_hex == fp)
+            .collect();
+        assert_eq!(relisted[0].input_events, 25);
         assert!(drop_inbound_link(&fp));
         // Wrong id must not unregister (a redialed successor survives).
         remove_inbound_link(&fp, id + 999);
@@ -7239,6 +7389,41 @@ mod tests {
         // Right id unregisters.
         remove_inbound_link(&fp, id);
         assert!(list_inbound_links().iter().all(|s| s.fingerprint_hex != fp));
+    }
+
+    #[test]
+    fn inbound_activity_growth_fires_only_on_fresh_input() {
+        use std::collections::HashMap;
+        let mut baseline = HashMap::new();
+        // Idle persistent link (the two-way-edge dial-back): static
+        // totals never fire, no matter how large.
+        let mut current = HashMap::new();
+        current.insert("peer".to_owned(), 10_000u64);
+        assert_eq!(inbound_inputs_growth(&mut baseline, &current), 0);
+        // Still static on the next probe: still nothing.
+        assert_eq!(inbound_inputs_growth(&mut baseline, &current), 0);
+        // Fresh motion while we drive: fires with the exact growth.
+        current.insert("peer".to_owned(), 10_041u64);
+        assert_eq!(inbound_inputs_growth(&mut baseline, &current), 41);
+        // Baseline absorbed it: same snapshot is quiet again.
+        assert_eq!(inbound_inputs_growth(&mut baseline, &current), 0);
+        // A redialed session (counter reset) refreshes without firing.
+        current.insert("peer".to_owned(), 3u64);
+        assert_eq!(inbound_inputs_growth(&mut baseline, &current), 0);
+        // ...and growth on the new session fires normally.
+        current.insert("peer".to_owned(), 5u64);
+        assert_eq!(inbound_inputs_growth(&mut baseline, &current), 2);
+        // A brand-new fingerprint mid-drive records without firing
+        // (never yank a healthy drive for a redial).
+        current.insert("peer2".to_owned(), 7u64);
+        assert_eq!(inbound_inputs_growth(&mut baseline, &current), 0);
+        // Continued driving on either session fires.
+        current.insert("peer2".to_owned(), 9u64);
+        assert_eq!(inbound_inputs_growth(&mut baseline, &current), 2);
+        // Empty snapshot (link down) is quiet and keeps baselines.
+        let empty = HashMap::new();
+        assert_eq!(inbound_inputs_growth(&mut baseline, &empty), 0);
+        assert_eq!(inbound_inputs_growth(&mut baseline, &current), 0);
     }
 
     #[test]

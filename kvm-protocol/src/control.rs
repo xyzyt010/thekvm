@@ -157,6 +157,13 @@ pub struct ActiveSession {
     /// dials its half back with the same value; absent on older daemons.
     #[serde(default)]
     pub link_id: Option<u64>,
+    /// Input events (motion/keys/buttons/wheel, stream plus datagram)
+    /// received from this peer on this session. Monotonic per
+    /// registration; resets when the session is replaced. Zero on older
+    /// daemons that predate the field — treat zero as "no signal", never
+    /// as "idle", so mixed-version links keep the pre-activity behavior.
+    #[serde(default)]
+    pub input_events: u64,
 }
 
 /// A remote identity that completed the network half of pairing and is
@@ -407,5 +414,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status.edge_mode, EdgeMode::Single);
+    }
+
+    #[test]
+    fn older_daemon_session_defaults_input_events_to_zero() {
+        // A 0.9.32-era session object carries no activity counter: it
+        // must parse, and zero must mean "no signal" (never "idle").
+        let status: DaemonStatus = serde_json::from_str(
+            r#"{
+                "node_name": "new",
+                "fingerprint_hex": "bb",
+                "listen_port": 42110,
+                "mode": "Bidirectional",
+                "allow_lock_screen_control": false,
+                "auto_connect_address": null,
+                "clipboard_enabled": false,
+                "peer_count": 1,
+                "active_session_count": 1,
+                "uptime_seconds": 1,
+                "sessions": [
+                    {
+                        "fingerprint_hex": "bb",
+                        "node_name": "peer",
+                        "address": "192.168.1.7:42110",
+                        "link_id": 7
+                    },
+                    {
+                        "fingerprint_hex": "cc",
+                        "node_name": "peer2",
+                        "address": "192.168.1.8:42110",
+                        "link_id": 8,
+                        "input_events": 41
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(status.sessions.len(), 2);
+        assert_eq!(status.sessions[0].input_events, 0);
+        assert_eq!(status.sessions[1].input_events, 41);
     }
 }
