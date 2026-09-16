@@ -169,6 +169,18 @@ pub struct Hello {
     /// ever see downgraded detent `Wheel` events.
     #[serde(default)]
     pub smooth_scroll: bool,
+    /// The sender may emit raw `InputEvent::Pinch`/`PinchEnd` gestures.
+    /// Absent/false on older peers, for which the sender expands every
+    /// gesture into Ctrl+wheel before sending.
+    #[serde(default)]
+    pub pinch_zoom: bool,
+    /// The sender opens a second stream per episode carrying only
+    /// `MouseMove` frames, so pointer floods (and their loss stalls) can
+    /// never queue behind — or stall — keys, buttons, and wheel on the
+    /// main episode stream. Absent/false on older peers: everything rides
+    /// the one episode stream, as before.
+    #[serde(default)]
+    pub motion_lane: bool,
     /// Administrative link epoch both sides share for this link: the UI that
     /// the user pressed Connect on mints it, and the station side learns it
     /// from the inbound session and dials back with the same value. Either
@@ -223,6 +235,18 @@ pub enum WireMessage {
         /// downgrades to detent `Wheel` when this is absent/false.
         #[serde(default)]
         smooth_scroll: bool,
+        /// The receiver handles raw `InputEvent::Pinch`/`PinchEnd` — natively
+        /// (OS-level gesture injection) or via a local Ctrl+wheel fallback —
+        /// so the sender passes gestures through. Absent/false on older
+        /// peers, which only ever see sender-expanded Ctrl+wheel.
+        #[serde(default)]
+        pinch_zoom: bool,
+        /// The receiver accepts the per-episode motion lane (see Hello):
+        /// `MouseMove` arrives on its own stream while everything else
+        /// stays ordered on the episode stream. Absent/false on older
+        /// peers, which read all input off the one stream.
+        #[serde(default)]
+        motion_lane: bool,
     },
     Input(InputPacket),
     /// Reliable sender state snapshot, sent before the first event on every
@@ -619,6 +643,8 @@ mod tests {
             hello,
             WireMessage::Hello(Hello {
                 smooth_scroll: false,
+                pinch_zoom: false,
+                motion_lane: false,
                 ..
             })
         ));
@@ -629,6 +655,8 @@ mod tests {
             accepted,
             WireMessage::Accepted {
                 smooth_scroll: false,
+                pinch_zoom: false,
+                motion_lane: false,
                 ..
             }
         ));
@@ -674,6 +702,8 @@ mod tests {
                 height: 1080,
             }),
             smooth_scroll: false,
+            pinch_zoom: false,
+            motion_lane: false,
             link_id: None,
         }))
         .is_err());
@@ -688,6 +718,8 @@ mod tests {
             clipboard_enabled: false,
             screen_geometry: None,
             smooth_scroll: false,
+            pinch_zoom: false,
+            motion_lane: false,
             link_id: None,
         }))
         .is_err());

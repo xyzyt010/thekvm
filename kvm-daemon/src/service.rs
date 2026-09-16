@@ -920,7 +920,7 @@ pub async fn send_test(address: &str, usage: u16) -> Result<()> {
     let config = load_local_config()?;
     let identity = Identity::load_or_create(&data_dir())?;
     let peers = PeerBook::load_or_create(&data_dir())?;
-    let (_conn, mut send, _recv, _capabilities) = connect_input(
+    let (_conn, mut send, _recv, _motion_send, _capabilities) = connect_input(
         &identity,
         &peers,
         address,
@@ -972,7 +972,10 @@ pub async fn capture(address: &str) -> Result<()> {
     // authenticated session handshake. A failed connection must never leave
     // the local desktop temporarily without its keyboard or mouse.
     let (mut priority_rx, mut motion_rx, capture_control) = start_capture(false, false)?;
-    let (conn, mut send, recv, capabilities) = dial_session(
+    // Suppression watchdog for this process (see TASK_HEARTBEAT_MS).
+    spawn_suppression_watchdog();
+    stamp_task_heartbeat();
+    let (conn, mut send, recv, motion_send, capabilities) = dial_session(
         &identity,
         &peers,
         address,
@@ -998,6 +1001,7 @@ pub async fn capture(address: &str) -> Result<()> {
         conn,
         send,
         recv,
+        motion_send,
         &mut priority_rx,
         &mut motion_rx,
         snapshot.last_event_id,
@@ -1005,6 +1009,7 @@ pub async fn capture(address: &str) -> Result<()> {
         clipboard_enabled,
         &mut clipboard_revision,
         capabilities.smooth_scroll,
+        capabilities.pinch_zoom,
     )
     .await;
     // Keep local input usable after Ctrl+C, peer loss, or any protocol error.
@@ -1101,7 +1106,7 @@ pub async fn connect(
         )
         .await
         {
-            Ok((conn, mut send, _recv, _capabilities)) => {
+            Ok((conn, mut send, _recv, _motion_send, _capabilities)) => {
                 // Verified logical link: this is the LIVE fingerprint — ghost
                 // pins elsewhere can no longer misroute. Episodes dial fresh
                 // per crossing, so the handshake connection itself is done.
@@ -1165,6 +1170,9 @@ async fn run_windows_service_controller(
     mode: Mode,
     screen_geometry: Option<ScreenGeometry>,
 ) -> Result<()> {
+    // Suppression watchdog for this process (see TASK_HEARTBEAT_MS).
+    spawn_suppression_watchdog();
+    stamp_task_heartbeat();
     loop {
         let capture_result =
             tokio::task::spawn_blocking(move || ServiceCaptureProxy::create(request_lock_screen))
@@ -1206,7 +1214,7 @@ async fn run_windows_service_controller(
             )
             .await
             {
-                Ok((connection, mut send, recv, capabilities)) => {
+                Ok((connection, mut send, recv, motion_send, capabilities)) => {
                     let peer_fingerprint = peer_fingerprint(&connection)?;
                     let snapshot = state.snapshot();
                     send_state_sync(&mut send, snapshot.state).await?;
@@ -1215,10 +1223,12 @@ async fn run_windows_service_controller(
                         connection,
                         send,
                         recv,
+                        motion_send,
                         &mut capture,
                         &mut state,
                         peer_fingerprint,
                         capabilities.smooth_scroll,
+                        capabilities.pinch_zoom,
                         revoked_peers.clone(),
                     )
                     .await;
@@ -1257,14 +1267,17 @@ async fn run_windows_service_controller(
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 async fn run_windows_service_capture_stream(
     connection: quinn::Connection,
     mut send: quinn::SendStream,
     recv: quinn::RecvStream,
+    mut motion_send: Option<quinn::SendStream>,
     capture: &mut ServiceCaptureProxy,
     state: &mut CapturedState,
     peer_fingerprint: String,
     peer_smooth: bool,
+    peer_pinch: bool,
     revoked_peers: tokio::sync::broadcast::Sender<String>,
 ) -> Result<()> {
     let (remote_closed_tx, mut remote_closed_rx) = tokio::sync::oneshot::channel();
@@ -1285,33 +1298,58 @@ async fn run_windows_service_capture_stream(
     session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut revoked_rx = revoked_peers.subscribe();
     let mut wheel_debt = WheelDowngrade::default();
+    // Legacy pinch-expansion hold for old peers (this stream has the
+    // live capture state, so a physically held Ctrl is never stolen).
+    let mut pinch_held = false;
     let result: Result<()> = loop {
         tokio::select! {
             biased;
             event = capture.recv() => match event {
                 Some(crate::windows_helper::ServiceCaptureEvent::Input(event)) => {
-                    state.record(event);
-                    let Some(outgoing) =
-                        outgoing_wheel_event(event, peer_smooth, &mut wheel_debt)
-                    else {
-                        // Sub-detent touchpad debt kept, nothing sent.
-                        continue;
-                    };
-                    sequence = sequence.wrapping_add(1);
-                    let send_result = match outgoing {
-                        InputEvent::MouseMove { .. }
-                        | InputEvent::Wheel(_)
-                        | InputEvent::SmoothWheel { .. } => {
-                            send_input(&connection, &mut send, sequence, outgoing).await
+                    // Drive-task heartbeat (see TASK_HEARTBEAT_MS).
+                    stamp_task_heartbeat();
+                    let physical_ctrl = state.keys.contains(&HID_LEFT_CTRL);
+                    let mut send_failed: Option<anyhow::Error> = None;
+                    for out in pinch_for_send(event, peer_pinch, physical_ctrl, &mut pinch_held) {
+                        state.record(out);
+                        let Some(outgoing) =
+                            outgoing_wheel_event(out, peer_smooth, &mut wheel_debt)
+                        else {
+                            // Sub-detent touchpad debt kept, nothing sent.
+                            continue;
+                        };
+                        sequence = sequence.wrapping_add(1);
+                        let send_result = match outgoing {
+                            InputEvent::MouseMove { .. } => {
+                                // Motion lane when negotiated (see
+                                // open_episode_stream); everything else
+                                // stays ordered on the episode stream.
+                                match motion_send.as_mut() {
+                                    Some(motion) => {
+                                        send_input(&connection, motion, sequence, outgoing).await
+                                    }
+                                    None => {
+                                        send_input(&connection, &mut send, sequence, outgoing).await
+                                    }
+                                }
+                            }
+                            InputEvent::Wheel(_)
+                            | InputEvent::SmoothWheel { .. } => {
+                                send_input(&connection, &mut send, sequence, outgoing).await
+                            }
+                            _ => write_frame(
+                                &mut send,
+                                &WireMessage::Input(InputPacket { sequence, event: outgoing }),
+                            )
+                            .await
+                            .map_err(Into::into),
+                        };
+                        if let Err(error) = send_result {
+                            send_failed = Some(error);
+                            break;
                         }
-                        _ => write_frame(
-                            &mut send,
-                            &WireMessage::Input(InputPacket { sequence, event: outgoing }),
-                        )
-                        .await
-                        .map_err(Into::into),
-                    };
-                    if let Err(error) = send_result {
+                    }
+                    if let Some(error) = send_failed {
                         break Err(error);
                     }
                 }
@@ -1320,6 +1358,8 @@ async fn run_windows_service_capture_stream(
                 }
             },
             _ = keep_alive.tick() => {
+                // Drive-task heartbeat (see TASK_HEARTBEAT_MS).
+                stamp_task_heartbeat();
                 if let Err(error) = write_frame(&mut send, &WireMessage::Ping { nonce: sequence }).await {
                     break Err(error.into());
                 }
@@ -1500,6 +1540,11 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
         };
     }
     let (mut priority_rx, mut motion_rx, capture_control) = start_capture(false, true)?;
+    // The suppression watchdog (see TASK_HEARTBEAT_MS) distinguishes a
+    // live task from a wedged one by this stamp: start it here, on every
+    // hot-path tick below, so a stall is provable within seconds.
+    spawn_suppression_watchdog();
+    stamp_task_heartbeat();
     let mut active: Option<TopologySession> = None;
     let mut clipboard = start_clipboard_agent(config.clipboard_enabled);
     let mut clipboard_enabled = config.clipboard_enabled;
@@ -1872,13 +1917,17 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 } else if let InputEvent::SmoothWheel { mut x, mut y } = captured.event {
                     // Touchpad scroll bursts: a two-finger glide queues many
                     // small SmoothWheel events that each cost a QUIC frame.
-                    // Fold consecutively queued smooth wheels into one packet
-                    // — identical total displacement, far fewer frames, so a
-                    // fast glide stays smooth instead of stuttering behind
-                    // head-of-line delay. Motion stops the fold (scroll
-                    // position relative to motion is preserved).
+                    // Fold a FEW consecutively queued smooth wheels into one
+                    // packet — fewer frames, but the fold STAYS SMALL (6, not
+                    // 32 like motion): merging a whole glide into one giant
+                    // delta makes the receiver inject it as a single jump,
+                    // which is exactly the chunky non-native scroll feel. A
+                    // fast glide still flows as several small packets with
+                    // identical total displacement, so smoothness survives.
+                    // Motion stops the fold (scroll position relative to
+                    // motion is preserved).
                     let mut folded = 0u32;
-                    while folded < 32 {
+                    while folded < 6 {
                         match motion_rx.try_recv() {
                             Ok(next) => match next.event {
                                 InputEvent::SmoothWheel { x: nx, y: ny } => {
@@ -1981,6 +2030,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 None => clipboard_enabled = false,
             },
             _ = yield_probe.tick() => {
+                // Drive-task heartbeat (see TASK_HEARTBEAT_MS): this probe
+                // ticks every 300ms unconditionally, so the watchdog stays
+                // quiet on any live task — even an idle one.
+                stamp_task_heartbeat();
                 // Fast dual-drive yield (300ms): a parked remote cursor
                 // produces no local input, so nothing wakes the event path
                 // — yet the peer may be pushing in. The divert/echo counter
@@ -2041,6 +2094,9 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 }
             }
             _ = keep_alive.tick() => {
+                // Drive-task heartbeat (see TASK_HEARTBEAT_MS): 5s backstop
+                // so an idle-but-live task never looks wedged.
+                stamp_task_heartbeat();
                 // Idle auto-yield (same shape as the per-event check in
                 // handle_topology_event): a parked remote cursor produces
                 // no local input, so nothing wakes the event path — yet
@@ -2248,6 +2304,10 @@ struct TopologySession {
     target: ScreenId,
     connection: quinn::Connection,
     send: quinn::SendStream,
+    /// Per-episode motion lane (own stream, own loss domain) when the peer
+    /// negotiated one: `MouseMove` rides here, everything else on `send`.
+    /// `None` for older peers (all input on `send`, as before).
+    motion_send: Option<quinn::SendStream>,
     signals: tokio::sync::mpsc::UnboundedReceiver<RemoteSignal>,
     response_drain: tokio::task::JoinHandle<()>,
     event_barrier: u64,
@@ -2257,6 +2317,15 @@ struct TopologySession {
     /// does not, captured `SmoothWheel` events are downgraded to detent
     /// `Wheel` here (never dropped wholesale, never sent raw).
     peer_smooth: bool,
+    /// Whether this peer handles raw `Pinch`/`PinchEnd` on receipt. When it
+    /// does not (older peers), gestures are expanded into Ctrl+wheel at
+    /// send time (see `pinch_for_send`).
+    peer_pinch: bool,
+    /// OUR synthetic pinch-zoom Ctrl hold for THIS session's legacy
+    /// expansion (old peers only): pressed on gesture start, released on
+    /// gesture end. Never touches a physically held Ctrl, and never
+    /// survives the session (the teardown ReleaseAll frees it anyway).
+    pinch_held: bool,
     wheel_debt: WheelDowngrade,
     /// Sender-side scroll census: captured vs forwarded wheel events. Logged
     /// at teardown next to the receiver's census, so each side's journal
@@ -2339,12 +2408,19 @@ impl TopologySession {
                 motion_sum_dy = self.motion_sum_dy,
                 datagrams_sent = self.datagrams_sent,
                 peer_smooth = self.peer_smooth,
+                peer_pinch = self.peer_pinch,
                 "topology episode ended",
             );
         }
         let mut send = self.send;
         let _ = write_frame(&mut send, &WireMessage::ReleaseAll).await;
         let _ = send.finish();
+        // The motion lane carries no teardown frame (motion-only by
+        // construction): finish it so the receiver's lane reader lands
+        // instead of hanging into the lease.
+        if let Some(mut motion) = self.motion_send {
+            let _ = motion.finish();
+        }
         self.response_drain.abort();
     }
 }
@@ -2439,6 +2515,152 @@ fn stale_hold_needs_release(drive_active: bool, suppression_requested: bool) -> 
     suppression_requested && !drive_active
 }
 
+/// Last drive-task heartbeat, millis since the Unix epoch. Every task that
+/// can hold local suppression stamps it on its hot path (throttled to
+/// ~10Hz); the capture thread and the watchdog below read it. A stale
+/// stamp while suppression is desired means the task is wedged — the
+/// permanent-freeze class (local input dead, and every in-task watchdog
+/// stalled on the same task). Never stamped = 0 = not stale (startup,
+/// or paths that never suppress).
+static TASK_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Last watchdog actuation, same clock. Bounds the loud log + any forced
+/// release to one volley per 30s while a wedge persists.
+static WATCHDOG_ACTED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn heartbeat_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Stamp task liveness. Call on every hot-path tick of every
+/// suppression-holding task (topology events, keep-alive, probes).
+fn stamp_task_heartbeat() {
+    use std::sync::atomic::Ordering;
+    let now = heartbeat_now_ms();
+    if now.saturating_sub(TASK_HEARTBEAT_MS.load(Ordering::Relaxed)) >= 100 {
+        TASK_HEARTBEAT_MS.store(now, Ordering::Relaxed);
+    }
+}
+
+/// Millis since the last stamp, or None when nothing ever stamped.
+/// Pure-ish (reads the global clock + stamp); the threshold lives with
+/// the callers so tests pin the arithmetic, not the policy.
+fn task_heartbeat_stale_ms() -> Option<u64> {
+    let last = TASK_HEARTBEAT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return None;
+    }
+    Some(heartbeat_now_ms().saturating_sub(last))
+}
+
+/// Independent suppression watchdog: a plain OS thread OUTSIDE tokio and
+/// outside the capture thread, so it keeps ticking when a wedged drive
+/// task stalls everything else. Past 10s without a stamp it fires (at
+/// most one volley per 30s): on Windows it force-releases the process
+/// hook suppression directly (the helper has its own send-stall release,
+/// see run_capture_helper); elsewhere it logs loudly — the capture
+/// thread owns the real backend release there (see start_capture).
+/// A healthy task stamps every ≤5s (keep-alive), usually every event, so
+/// a firing watchdog is proof of a wedge, never a slow drive.
+fn spawn_suppression_watchdog() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("thekvm-suppression-watchdog".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let Some(stale_ms) = task_heartbeat_stale_ms() else {
+                    continue;
+                };
+                if stale_ms < 10_000 {
+                    continue;
+                }
+                use std::sync::atomic::Ordering;
+                let now = heartbeat_now_ms();
+                if now.saturating_sub(WATCHDOG_ACTED_MS.load(Ordering::Relaxed)) < 30_000 {
+                    continue;
+                }
+                WATCHDOG_ACTED_MS.store(now, Ordering::Relaxed);
+                #[cfg(target_os = "windows")]
+                {
+                    kvm_platform::capture::set_exclusive(false);
+                    tracing::error!(
+                        stale_ms,
+                        "suppression watchdog: drive task wedged; force-released local input"
+                    );
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    tracing::error!(
+                        stale_ms,
+                        "suppression watchdog: drive task wedged; capture thread owns the backend release"
+                    );
+                }
+            });
+    });
+}
+
+/// Capture-thread watchdog actuation, shared by every stall path in the
+/// capture thread (see TASK_HEARTBEAT_MS): when the drive task has not
+/// ticked for 8s while suppression is still desired, release the backend
+/// in hand and clear the desire, so local input never freezes
+/// permanently. A recovered task re-engages on its next transition.
+fn watchdog_release_if_task_wedged(
+    backend: &mut Option<Box<dyn kvm_platform::capture::CaptureBackend>>,
+    thread_exclusive: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+    if !thread_exclusive.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(stale_ms) = task_heartbeat_stale_ms() else {
+        return;
+    };
+    if stale_ms <= 8_000 {
+        return;
+    }
+    tracing::error!(
+        stale_ms,
+        "drive task wedged with suppression held; capture thread releasing local input"
+    );
+    if let Some(active) = backend.as_mut() {
+        let _ = active.set_exclusive(false);
+    }
+    thread_exclusive.store(false, Ordering::Release);
+}
+
+/// Bounded reliable send for the capture thread: retries a full channel
+/// every 20ms instead of parking forever, running the wedged-task
+/// release on every stall — so a wedged drive task costs events (which
+/// nobody can drive with anyway), never the capture thread or local
+/// input. True once sent; false when the channel closed or stop was
+/// requested (the caller exits either way).
+fn capture_send_bounded(
+    tx: &tokio::sync::mpsc::Sender<CapturedEvent>,
+    mut pending: CapturedEvent,
+    stop: &std::sync::atomic::AtomicBool,
+    backend: &mut Option<Box<dyn kvm_platform::capture::CaptureBackend>>,
+    thread_exclusive: &std::sync::atomic::AtomicBool,
+) -> bool {
+    loop {
+        match tx.try_send(pending) {
+            Ok(()) => return true,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(stalled)) => {
+                pending = stalled;
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return false;
+                }
+                watchdog_release_if_task_wedged(backend, thread_exclusive);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 /// Starvation predicate: this many consecutive active-episode Pings with
 /// no Pong answer proves the peer app is not reading the episode stream
 /// (twelve Pings at the 5s cadence is ~60s). Pure for tests.
@@ -2498,8 +2720,7 @@ fn daemon_control_candidates(primary: &std::path::Path) -> Vec<std::path::PathBu
 async fn snapshot_inbound_inputs(
     candidates: &[std::path::PathBuf],
 ) -> std::collections::HashMap<String, u64> {
-    let mut totals: std::collections::HashMap<String, u64> =
-        std::collections::HashMap::new();
+    let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for dir in candidates {
         let request =
             crate::control::request(dir.clone(), kvm_protocol::control::ControlRequest::Status);
@@ -2586,6 +2807,47 @@ fn park_inside(router: &mut EdgeRouter, edge: kvm_core::Edge) {
     // "stuck at the edge until wiggled inside" shape. The short transfer
     // debounce already paces re-crossings; no state gate is needed.
     let _ = router.place_local_cursor(x, y);
+}
+
+/// Phantom-handoff veto: the 24px push budget can complete from a SINGLE
+/// in-flight flick event while the visible cursor is still mid-screen —
+/// the OS clamps the fling at the edge, but the router (integrating raw
+/// deltas that arrived after the OS pointer stopped) has already crossed.
+/// Returns the OS truth to re-pin to when the crossing must NOT commit
+/// (None = proceed): the caller restores local, re-pins, parks inside,
+/// and stays local. Genuine pushes — including fast ones, whose truth is
+/// already clamped at the edge — cross instantly, so fast movement keeps
+/// working. Unqueryable platforms (Wayland) and failed reads fail OPEN:
+/// today's behavior, never a new can't-cross.
+fn phantom_handoff_veto(
+    router: &EdgeRouter,
+    from: ScreenId,
+    edge: kvm_core::Edge,
+) -> Option<(u32, u32)> {
+    const EDGE_TRUTH_SLACK_PX: i64 = 24;
+    let Ok(Some((truth_x, truth_y))) = kvm_platform::capture::current_cursor_position() else {
+        return None;
+    };
+    let screen = router.layout().screen(from)?;
+    let gap = match edge {
+        kvm_core::Edge::Left => i64::from(truth_x),
+        kvm_core::Edge::Right => {
+            i64::from(screen.width.saturating_sub(1)).saturating_sub(i64::from(truth_x))
+        }
+        kvm_core::Edge::Top => i64::from(truth_y),
+        kvm_core::Edge::Bottom => {
+            i64::from(screen.height.saturating_sub(1)).saturating_sub(i64::from(truth_y))
+        }
+    };
+    if gap <= EDGE_TRUTH_SLACK_PX {
+        return None;
+    }
+    tracing::info!(
+        ?edge,
+        truth_gap_px = gap,
+        "phantom handoff vetoed: OS cursor still mid-screen; staying local"
+    );
+    Some((truth_x, truth_y))
 }
 
 /// Yield the outbound drive to a concurrent inbound one: park our episode
@@ -2682,6 +2944,10 @@ async fn handle_topology_event(
     captured: CapturedEvent,
     context: TopologyEventContext<'_>,
 ) -> Result<()> {
+    // Drive-task heartbeat for the suppression watchdog (see
+    // TASK_HEARTBEAT_MS): every routed capture event proves this task is
+    // alive and draining.
+    stamp_task_heartbeat();
     let TopologyEventContext {
         router,
         identity,
@@ -2819,81 +3085,119 @@ async fn handle_topology_event(
             if session.target != target {
                 bail!("topology router/session target mismatch");
             }
-            // Sub-detent touchpad motion with nothing whole to report yet
-            // stays silent (the remainder is kept): an older peer must never
-            // see raw 120ths, and sending zeroes would only waste the wire.
-            // Census: proves per session what the hook captured vs what the
-            // peer accepted, so a silent scroll drop is diagnosable from the
-            // journal instead of a mystery (captured counts arrivals here,
-            // forwarded counts wire sends).
-            match event {
-                InputEvent::Wheel(_) => session.wheel_captured += 1,
-                InputEvent::SmoothWheel { .. } => session.smooth_captured += 1,
-                InputEvent::MouseMove { dx, dy } => {
-                    session.motion_captured += 1;
-                    if session.motion_first.is_none() {
-                        session.motion_first = Some((dx, dy));
+            // Pinch gestures expand-or-pass HERE, per this session's peer
+            // capability (see `pinch_for_send`): capable peers get raw
+            // gestures with no synthetic modifier anywhere; older peers
+            // get Ctrl+wheel ordered with everything else on this one
+            // reliable stream. Each expanded event then flows through the
+            // normal census/downgrade/send below. (The synthetic Ctrl is
+            // deliberately NOT recorded in capture state — like all
+            // transient gesture state it lives and dies with the session;
+            // a mid-gesture StateSync may release it early, degrading the
+            // gesture tail to plain scroll instead of sticking anything.)
+            let physical_ctrl = capture_control
+                .snapshot()
+                .state
+                .pressed_keys
+                .contains(&HID_LEFT_CTRL);
+            let peer_pinch = session.peer_pinch;
+            let send_list =
+                pinch_for_send(event, peer_pinch, physical_ctrl, &mut session.pinch_held);
+            for event in send_list {
+                // Sub-detent touchpad motion with nothing whole to report yet
+                // stays silent (the remainder is kept): an older peer must never
+                // see raw 120ths, and sending zeroes would only waste the wire.
+                // Census: proves per session what the hook captured vs what the
+                // peer accepted, so a silent scroll drop is diagnosable from the
+                // journal instead of a mystery (captured counts arrivals here,
+                // forwarded counts wire sends).
+                match event {
+                    InputEvent::Wheel(_) => session.wheel_captured += 1,
+                    InputEvent::SmoothWheel { .. } => session.smooth_captured += 1,
+                    InputEvent::MouseMove { dx, dy } => {
+                        session.motion_captured += 1;
+                        if session.motion_first.is_none() {
+                            session.motion_first = Some((dx, dy));
+                        }
+                        if dx == 0 && dy == 0 {
+                            session.motion_zero_deltas += 1;
+                        }
+                        session.motion_sum_dx += i64::from(dx);
+                        session.motion_sum_dy += i64::from(dy);
                     }
-                    if dx == 0 && dy == 0 {
-                        session.motion_zero_deltas += 1;
+                    _ => {}
+                }
+                let Some(outgoing) =
+                    outgoing_wheel_event(event, session.peer_smooth, &mut session.wheel_debt)
+                else {
+                    continue;
+                };
+                if matches!(
+                    outgoing,
+                    InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
+                ) {
+                    session.wheel_forwarded += 1;
+                }
+                let outgoing_is_motion = matches!(outgoing, InputEvent::MouseMove { .. });
+                let outgoing_is_datagram = matches!(
+                    outgoing,
+                    InputEvent::MouseMove { .. }
+                        | InputEvent::Wheel(_)
+                        | InputEvent::SmoothWheel { .. }
+                );
+                *sequence = sequence.wrapping_add(1);
+                // Pointer motion rides the motion lane when negotiated (own
+                // QUIC stream, own loss domain — a stalled motion packet
+                // delays the cursor instead of head-of-line-blocking the
+                // keystroke behind it). Everything else stays ordered on the
+                // episode stream; the shared sequence spans both, so the
+                // receiver's dedup/stale sets work unchanged.
+                let lane = match outgoing {
+                    InputEvent::MouseMove { .. } => session.motion_send.as_mut(),
+                    _ => None,
+                };
+                let send_result = match lane {
+                    Some(motion) => {
+                        send_input(&session.connection, motion, *sequence, outgoing).await
                     }
-                    session.motion_sum_dx += i64::from(dx);
-                    session.motion_sum_dy += i64::from(dy);
-                }
-                _ => {}
-            }
-            let Some(outgoing) =
-                outgoing_wheel_event(event, session.peer_smooth, &mut session.wheel_debt)
-            else {
-                return Ok(());
-            };
-            if matches!(
-                outgoing,
-                InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
-            ) {
-                session.wheel_forwarded += 1;
-            }
-            let outgoing_is_motion = matches!(outgoing, InputEvent::MouseMove { .. });
-            let outgoing_is_datagram = matches!(
-                outgoing,
-                InputEvent::MouseMove { .. }
-                    | InputEvent::Wheel(_)
-                    | InputEvent::SmoothWheel { .. }
-            );
-            *sequence = sequence.wrapping_add(1);
-            if let Err(error) =
-                send_input(&session.connection, &mut session.send, *sequence, outgoing).await
-            {
-                // A dead episode ends the EPISODE, never the child: the
-                // link (and the next crossing) survives a wobbly network.
-                // This used to `return Err`, killing the whole child — one
-                // dropped datagram ended every future crossing until the
-                // UI noticed the exit and redialled.
-                tracing::warn!(%error, "topology episode send failed; control is local");
-                let session = active.take().expect("active session exists");
-                let target = session.target;
-                session.finish().await;
-                // The association itself is suspect: drop the park too, so
-                // the next push redials instead of resuming a dead stream.
-                if let Some(stale) = parked.take() {
-                    stale.finish().await;
-                }
-                release_suppression(&capture_control, Some(&mut *suppression_requested));
-                *discarded_event_barrier =
-                    (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
-                let _ = router.restore_local(target);
-                let (x, y) = router.cursor_position();
-                let _ = capture_control.warp_cursor(x, y);
-                *last_failed_episode = Some(std::time::Instant::now());
-                eprintln!("THEKVM_STATUS local");
-            } else {
-                // Success path (the Err branch above tore the episode
-                // down instead): count what actually left on the wire.
-                if outgoing_is_motion {
-                    session.motion_forwarded += 1;
-                }
-                if outgoing_is_datagram {
-                    session.datagrams_sent += 1;
+                    None => {
+                        send_input(&session.connection, &mut session.send, *sequence, outgoing)
+                            .await
+                    }
+                };
+                if let Err(error) = send_result {
+                    // A dead episode ends the EPISODE, never the child: the
+                    // link (and the next crossing) survives a wobbly network.
+                    // This used to `return Err`, killing the whole child — one
+                    // dropped datagram ended every future crossing until the
+                    // UI noticed the exit and redialled.
+                    tracing::warn!(%error, "topology episode send failed; control is local");
+                    let session = active.take().expect("active session exists");
+                    let target = session.target;
+                    session.finish().await;
+                    // The association itself is suspect: drop the park too, so
+                    // the next push redials instead of resuming a dead stream.
+                    if let Some(stale) = parked.take() {
+                        stale.finish().await;
+                    }
+                    release_suppression(&capture_control, Some(&mut *suppression_requested));
+                    *discarded_event_barrier =
+                        (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
+                    let _ = router.restore_local(target);
+                    let (x, y) = router.cursor_position();
+                    let _ = capture_control.warp_cursor(x, y);
+                    *last_failed_episode = Some(std::time::Instant::now());
+                    eprintln!("THEKVM_STATUS local");
+                    return Ok(());
+                } else {
+                    // Success path (the Err branch above tore the episode
+                    // down instead): count what actually left on the wire.
+                    if outgoing_is_motion {
+                        session.motion_forwarded += 1;
+                    }
+                    if outgoing_is_datagram {
+                        session.datagrams_sent += 1;
+                    }
                 }
             }
         }
@@ -2938,6 +3242,7 @@ async fn handle_topology_event(
             eprintln!("THEKVM_STATUS local");
         }
         RoutedEvent::Handoff {
+            from,
             target,
             target_x,
             target_y,
@@ -3003,6 +3308,16 @@ async fn handle_topology_event(
             if episode_cooling_down(*last_failed_episode) {
                 tracing::debug!(?target, ?edge, "edge push in failed-episode cooldown");
                 let _ = router.restore_local(target);
+                park_inside(router, edge);
+                return Ok(());
+            }
+            // Phantom-handoff veto (see phantom_handoff_veto): a fast
+            // in-flight flick can satisfy the push budget while the
+            // visible cursor is still mid-screen. Truth decides — genuine
+            // pushes (truth at the edge) proceed below instantly.
+            if let Some((truth_x, truth_y)) = phantom_handoff_veto(router, from, edge) {
+                let _ = router.restore_local(target);
+                router.resync_if_local(truth_x, truth_y);
                 park_inside(router, edge);
                 return Ok(());
             }
@@ -3222,26 +3537,28 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
     // association falls back to a cold dial, which re-warms the pool. Only
     // a cold dial teaches us anything new about the peer's address (it
     // heals the book across DHCP moves); warm episodes skip re-resolving.
-    let (conn, mut send, recv, capabilities, dialed_address) = match take_warm_link(fingerprint) {
-        Some(warm) => match open_episode_stream(&warm, policy).await {
-            Ok((send, recv, capabilities)) => {
-                tracing::debug!(?target, "topology episode opened on the warm link");
-                (warm, send, recv, capabilities, None)
-            }
-            Err(error) => {
-                tracing::debug!(%error, ?target, "warm link episode failed; re-dialling");
-                let (conn, send, recv, capabilities, address) =
+    let (conn, mut send, recv, motion_send, capabilities, dialed_address) =
+        match take_warm_link(fingerprint) {
+            Some(warm) => match open_episode_stream(&warm, policy).await {
+                Ok((send, recv, motion_send, capabilities)) => {
+                    tracing::debug!(?target, "topology episode opened on the warm link");
+                    (warm, send, recv, motion_send, capabilities, None)
+                }
+                Err(error) => {
+                    tracing::debug!(%error, ?target, "warm link episode failed; re-dialling");
+                    let (conn, send, recv, motion_send, capabilities, address) =
+                        cold_topology_dial(identity, peers, fingerprint, &peer_name, policy, dir)
+                            .await?;
+                    (conn, send, recv, motion_send, capabilities, Some(address))
+                }
+            },
+            None => {
+                let (conn, send, recv, motion_send, capabilities, address) =
                     cold_topology_dial(identity, peers, fingerprint, &peer_name, policy, dir)
                         .await?;
-                (conn, send, recv, capabilities, Some(address))
+                (conn, send, recv, motion_send, capabilities, Some(address))
             }
-        },
-        None => {
-            let (conn, send, recv, capabilities, address) =
-                cold_topology_dial(identity, peers, fingerprint, &peer_name, policy, dir).await?;
-            (conn, send, recv, capabilities, Some(address))
-        }
-    };
+        };
     store_warm_link(&conn, fingerprint);
     if let Some(address) = dialed_address {
         if let Ok(presented) = peer_fingerprint(&conn) {
@@ -3289,7 +3606,15 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
             }
         }
     }
-    let mut session = spawn_episode_driver(conn, send, recv, capabilities, target, event_barrier);
+    let mut session = spawn_episode_driver(
+        conn,
+        send,
+        recv,
+        motion_send,
+        capabilities,
+        target,
+        event_barrier,
+    );
     // Normalize the first event for this peer's scroll capability exactly
     // like every later event: an older peer gets detents, never raw 120ths
     // it would misread as hundreds of detents.
@@ -3482,9 +3807,11 @@ async fn prewarm_link_stream(
     };
     let target = screen.id;
     let policy = episode_policy(config, Some(link), local_geometry);
-    let (conn, send, recv, capabilities) = match take_warm_link(&link.fingerprint) {
+    let (conn, send, recv, motion_send, capabilities) = match take_warm_link(&link.fingerprint) {
         Some(warm) => match open_episode_stream(&warm, policy).await {
-            Ok((send, recv, capabilities)) => (warm, send, recv, capabilities),
+            Ok((send, recv, motion_send, capabilities)) => {
+                (warm, send, recv, motion_send, capabilities)
+            }
             Err(error) => {
                 // A ban on the warm link is final (peer re-epoch'd): fail
                 // the child loudly instead of idling a zombie that can
@@ -3503,9 +3830,9 @@ async fn prewarm_link_stream(
                 )
                 .await
                 {
-                    Ok((conn, send, recv, capabilities, _)) => {
+                    Ok((conn, send, recv, motion_send, capabilities, _)) => {
                         store_warm_link(&conn, &link.fingerprint);
-                        (conn, send, recv, capabilities)
+                        (conn, send, recv, motion_send, capabilities)
                     }
                     Err(error) => {
                         if is_link_ended_rejection(&error) {
@@ -3528,9 +3855,9 @@ async fn prewarm_link_stream(
             )
             .await
             {
-                Ok((conn, send, recv, capabilities, _)) => {
+                Ok((conn, send, recv, motion_send, capabilities, _)) => {
                     store_warm_link(&conn, &link.fingerprint);
-                    (conn, send, recv, capabilities)
+                    (conn, send, recv, motion_send, capabilities)
                 }
                 Err(error) => {
                     if is_link_ended_rejection(&error) {
@@ -3550,6 +3877,7 @@ async fn prewarm_link_stream(
         conn,
         send,
         recv,
+        motion_send,
         capabilities,
         target,
         0,
@@ -3635,6 +3963,7 @@ fn spawn_episode_driver(
     connection: quinn::Connection,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+    motion_send: Option<quinn::SendStream>,
     capabilities: SessionCapabilities,
     target: ScreenId,
     event_barrier: u64,
@@ -3645,12 +3974,15 @@ fn spawn_episode_driver(
         target,
         connection,
         send,
+        motion_send,
         signals: signal_rx,
         response_drain,
         event_barrier,
         clipboard_enabled: capabilities.clipboard_enabled,
         remote_clipboard_revision: 0,
         peer_smooth: capabilities.smooth_scroll,
+        peer_pinch: capabilities.pinch_zoom,
+        pinch_held: false,
         peer_geometry: capabilities.screen_geometry,
         handed_off: false,
         wheel_debt: WheelDowngrade::default(),
@@ -3683,13 +4015,14 @@ async fn cold_topology_dial(
     quinn::Connection,
     quinn::SendStream,
     quinn::RecvStream,
+    Option<quinn::SendStream>,
     SessionCapabilities,
     String,
 )> {
     let address = resolve_peer_address(peers, fingerprint, peer_name)?;
-    let (conn, send, recv, capabilities) =
+    let (conn, send, recv, motion_send, capabilities) =
         dial_session(identity, peers, &address, policy, Some(fingerprint), dir).await?;
-    Ok((conn, send, recv, capabilities, address))
+    Ok((conn, send, recv, motion_send, capabilities, address))
 }
 
 async fn drain_peer_responses(
@@ -3728,28 +4061,6 @@ async fn drain_peer_responses(
         }
     }
     let _ = signal.send(RemoteSignal::Closed);
-}
-
-/// Record one event and deliver it on the reliable priority channel.
-/// False means the receiver is gone (child exiting). Used for
-/// pinch-expanded events, which must stay ordered with their Ctrl
-/// press/release on one reliable channel instead of racing across the
-/// lossy motion channel.
-fn record_and_send_priority(
-    state: &Arc<std::sync::Mutex<CapturedState>>,
-    priority_tx: &tokio::sync::mpsc::Sender<CapturedEvent>,
-    event: InputEvent,
-) -> bool {
-    let captured = match state.lock() {
-        Ok(mut guard) => {
-            let Some(captured) = guard.record(event) else {
-                return true;
-            };
-            captured
-        }
-        Err(_) => CapturedEvent { event, event_id: 0 },
-    };
-    priority_tx.blocking_send(captured).is_ok()
 }
 
 fn start_capture(
@@ -3792,13 +4103,17 @@ fn start_capture(
             let mut backend = Some(capture);
             let mut failures = 0u32;
             let mut last_warn: Option<std::time::Instant> = None;
-            // Our synthetic pinch-zoom Ctrl hold (see the expansion
-            // below): released on gesture end, or on backend death.
-            let mut pinch_ctrl_held = false;
             'capture: loop {
                 if thread_stop.load(std::sync::atomic::Ordering::Acquire) {
                     break 'capture;
                 }
+                // Suppression watchdog, capture-thread half (see
+                // TASK_HEARTBEAT_MS): this plain OS thread survives a
+                // wedged tokio drive task, and it OWNS the backend — so a
+                // wedged task costs local input for 8s max, never forever.
+                // A recovered task re-engages on its next transition; the
+                // independent watchdog thread covers the rest.
+                watchdog_release_if_task_wedged(&mut backend, &thread_exclusive);
                 let Some(active) = backend.as_mut() else {
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     match kvm_platform::capture::create_capture(prefer_wayland, false) {
@@ -3840,21 +4155,28 @@ fn start_capture(
                             }
                             backend = None;
                             // A dying backend mid-pinch never emits
-                            // PinchEnd: release our synthetic Ctrl now, or
-                            // the receiver holds it past the rebuild.
-                            if pinch_ctrl_held {
-                                pinch_ctrl_held = false;
-                                let release = InputEvent::Key(kvm_core::KeyEvent {
-                                    usage: HID_LEFT_CTRL,
-                                    pressed: false,
-                                });
-                                if !record_and_send_priority(
-                                    &thread_state,
-                                    &priority_tx,
-                                    release,
-                                ) {
-                                    break 'capture;
-                                }
+                            // PinchEnd: synthesize one so downstream
+                            // per-session pinch holds (legacy synthetic
+                            // Ctrl, native touch contacts) terminate
+                            // instead of sticking past the rebuild.
+                            // Best-effort and bounded — a wedged task is
+                            // the loop-top watchdog's job, not this
+                            // rebuild path's.
+                            let end_id = thread_state
+                                .lock()
+                                .map(|mut state| state.next_event_id())
+                                .unwrap_or(0);
+                            if !capture_send_bounded(
+                                &priority_tx,
+                                CapturedEvent {
+                                    event: InputEvent::PinchEnd,
+                                    event_id: end_id,
+                                },
+                                &thread_stop,
+                                &mut backend,
+                                &thread_exclusive,
+                            ) {
+                                break 'capture;
                             }
                             if failures > 20 {
                                 tracing::warn!(
@@ -3867,23 +4189,29 @@ fn start_capture(
                             continue;
                         }
                     };
-                // Pinch-to-zoom expansion (see pinch_expansion): gestures
-                // become Ctrl+wheel HERE — before record, channels, and
-                // routing — so the wire, snapshots, and fixed-peer links
-                // only ever see universal Ctrl+wheel and old peers keep
-                // working unchanged. Expanded events ride the reliable
-                // priority channel, ordered with their Ctrl press/release:
-                // a wheel must never pass its own release, or a later
-                // real scroll zooms under a stale modifier.
+                // Pinch-to-zoom gestures ride the reliable priority channel
+                // RAW (see `pinch_for_send`): the peer's capability is only
+                // known downstream at the send sites (sessions, links), so
+                // expansion-or-passthrough happens there — never here, where
+                // one choice would be wrong for mixed-version topologies.
+                // Unrecorded (gestures carry no capture hold-state), but
+                // barrier-clocked like everything else. Bounded send (see
+                // below): a wedged task must never park this thread — the
+                // watchdog check above is what releases suppression then.
                 if matches!(event, InputEvent::Pinch { .. } | InputEvent::PinchEnd) {
-                    let physical_ctrl = thread_state
+                    let event_id = thread_state
                         .lock()
-                        .map(|state| state.keys.contains(&HID_LEFT_CTRL))
-                        .unwrap_or(false);
-                    for out in pinch_expansion(event, physical_ctrl, &mut pinch_ctrl_held) {
-                        if !record_and_send_priority(&thread_state, &priority_tx, out) {
-                            break 'capture;
-                        }
+                        .map(|mut state| state.next_event_id())
+                        .unwrap_or(0);
+                    let captured = CapturedEvent { event, event_id };
+                    if !capture_send_bounded(
+                        &priority_tx,
+                        captured,
+                        &thread_stop,
+                        &mut backend,
+                        &thread_exclusive,
+                    ) {
+                        break 'capture;
                     }
                     continue;
                 }
@@ -3901,12 +4229,19 @@ fn start_capture(
                     Err(_) => CapturedEvent { event, event_id: 0 },
                 };
                 // Never let a stalled network session block the OS hook or
-                // evdev reader indefinitely. Motion/wheel events are safely
-                // lossy under backpressure; key and button transitions are
-                // reliable within the bounded queue so their state cannot be
-                // silently corrupted by a busy network.
+                // evdev reader: key and button transitions stay reliable
+                // within the bounded queue, but the wait is BOUNDED (20ms
+                // retries) so a wedged task parks this thread in slices,
+                // never forever — the watchdog above keeps releasing
+                // suppression while it does. Motion/wheel stay lossy.
                 if matches!(event, InputEvent::Key(_) | InputEvent::MouseButton { .. }) {
-                    if priority_tx.blocking_send(captured).is_err() {
+                    if !capture_send_bounded(
+                        &priority_tx,
+                        captured,
+                        &thread_stop,
+                        &mut backend,
+                        &thread_exclusive,
+                    ) {
                         break 'capture;
                     }
                     continue;
@@ -4094,6 +4429,15 @@ struct CapturedState {
 }
 
 impl CapturedState {
+    /// Fresh event id for unrecorded pass-through events (raw `Pinch` on
+    /// its way to a capable peer): advances the barrier clock without
+    /// touching key/button state, so pre-handoff gestures are skipped like
+    /// any other stale capture while post-handoff ones flow.
+    fn next_event_id(&mut self) -> u64 {
+        self.last_event_id = self.last_event_id.wrapping_add(1);
+        self.last_event_id
+    }
+
     fn record(&mut self, event: InputEvent) -> Option<CapturedEvent> {
         let changed = match event {
             InputEvent::Key(key) => {
@@ -4121,10 +4465,12 @@ impl CapturedState {
             InputEvent::MouseMove { .. }
             | InputEvent::Wheel(_)
             | InputEvent::SmoothWheel { .. } => true,
-            // Pinch gestures never reach record: the capture thread
-            // expands them into Ctrl+wheel first (see pinch_expansion).
-            // Drop defensively so one can never leak onto the wire (old
-            // peers cannot parse new variants) or into snapshots.
+            // Pinch gestures never reach record: the capture thread forwards
+            // them raw (see below) and each send site expands-or-passes via
+            // `pinch_for_send` against the peer's capability. Drop
+            // defensively so one can never leak into snapshots (a gesture
+            // carries no hold state on the native path, and the legacy
+            // synthetic Ctrl is per-session send state, not capture state).
             InputEvent::Pinch { .. } | InputEvent::PinchEnd => false,
         };
         if !changed {
@@ -4151,6 +4497,25 @@ impl CapturedState {
 
 /// USB HID usage for Left Ctrl — the zoom modifier (see pinch_expansion).
 const HID_LEFT_CTRL: HidUsage = 0xe0;
+
+/// Route a capture-side event toward the wire for a peer whose pinch
+/// capability is known. Pure for tests. Peers that handle `Pinch`
+/// (0.9.34+) receive gestures untouched — the receiver renders them as an
+/// OS-level gesture (Windows touch injection) or a local Ctrl+wheel
+/// fallback, with no synthetic modifier on the wire at all. Older peers
+/// get the legacy `pinch_expansion` (Ctrl+wheel); non-gesture events pass
+/// through either way.
+fn pinch_for_send(
+    event: InputEvent,
+    peer_handles_pinch: bool,
+    physical_ctrl_held: bool,
+    pinch_held: &mut bool,
+) -> Vec<InputEvent> {
+    match event {
+        InputEvent::Pinch { .. } | InputEvent::PinchEnd if peer_handles_pinch => vec![event],
+        _ => pinch_expansion(event, physical_ctrl_held, pinch_held),
+    }
+}
 
 /// Expand a capture-side pinch gesture into wire-ready events. Pure for
 /// tests. A gesture start presses Ctrl (unless physically held — the
@@ -4240,6 +4605,7 @@ async fn run_capture_stream(
     connection: quinn::Connection,
     mut send: quinn::SendStream,
     recv: quinn::RecvStream,
+    mut motion_send: Option<quinn::SendStream>,
     priority_rx: &mut tokio::sync::mpsc::Receiver<CapturedEvent>,
     motion_rx: &mut tokio::sync::mpsc::Receiver<CapturedEvent>,
     event_barrier: u64,
@@ -4247,6 +4613,7 @@ async fn run_capture_stream(
     clipboard_enabled: bool,
     clipboard_revision: &mut u64,
     peer_smooth: bool,
+    peer_pinch: bool,
 ) -> Result<()> {
     // The receiver replies to pings on the same bidirectional stream. Drain
     // that direction so the QUIC receive window cannot fill during a long
@@ -4275,6 +4642,14 @@ async fn run_capture_stream(
     let mut clipboard_enabled = clipboard_enabled;
     let mut remote_clipboard_revision = 0u64;
     let mut wheel_debt = WheelDowngrade::default();
+    // Legacy pinch-expansion state for old peers (see pinch_for_send),
+    // plus a shadow of the physical Ctrl hold: this stream sees every
+    // key event reliably, so the shadow stays exact and a real held Ctrl
+    // is never stolen by our synthetic one. (A session that STARTS with
+    // Ctrl already held shadows false until the next press — the corner
+    // heals on release and never sticks.)
+    let mut pinch_held = false;
+    let mut ctrl_shadow = false;
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let result: Result<()> = loop {
@@ -4283,6 +4658,8 @@ async fn run_capture_stream(
             event = priority_rx.recv() => match event {
                 Some(captured) if captured.event_id <= event_barrier => continue,
                 Some(captured) => {
+                    // Drive-task heartbeat (see TASK_HEARTBEAT_MS).
+                    stamp_task_heartbeat();
                     // ScrollLock restores local control immediately
                     // (consumed, never forwarded): the only key that can
                     // break a fullscreen takeover from the inside.
@@ -4291,9 +4668,29 @@ async fn run_capture_stream(
                         eprintln!("THEKVM_STATUS ended ScrollLock pressed — local control restored");
                         break Ok(());
                     }
-                    sequence = sequence.wrapping_add(1);
-                    if let Err(error) = write_frame(&mut send, &WireMessage::Input(InputPacket { sequence, event: captured.event })).await {
-                        break Err(error.into());
+                    if let InputEvent::Key(key) = captured.event {
+                        if key.usage == HID_LEFT_CTRL {
+                            ctrl_shadow = key.pressed;
+                        }
+                    }
+                    let mut send_failed: Option<anyhow::Error> = None;
+                    for outgoing in pinch_for_send(
+                        captured.event,
+                        peer_pinch,
+                        ctrl_shadow,
+                        &mut pinch_held,
+                    ) {
+                        // Expanded synthetic Ctrl presses flow like any key
+                        // (ordered with their wheels on this one reliable
+                        // stream); native Pinch passes through untouched.
+                        sequence = sequence.wrapping_add(1);
+                        if let Err(error) = write_frame(&mut send, &WireMessage::Input(InputPacket { sequence, event: outgoing })).await {
+                            send_failed = Some(error.into());
+                            break;
+                        }
+                    }
+                    if let Some(error) = send_failed {
+                        break Err(error);
                     }
                 }
                 None => break Err(anyhow::anyhow!("priority input capture stopped")),
@@ -4301,13 +4698,31 @@ async fn run_capture_stream(
             event = motion_rx.recv() => match event {
                 Some(captured) if captured.event_id <= event_barrier => continue,
                 Some(captured) => {
+                    // Drive-task heartbeat (see TASK_HEARTBEAT_MS).
+                    stamp_task_heartbeat();
                     let Some(outgoing) =
                         outgoing_wheel_event(captured.event, peer_smooth, &mut wheel_debt)
                     else {
                         continue;
                     };
                     sequence = sequence.wrapping_add(1);
-                    if let Err(error) = send_input(&connection, &mut send, sequence, outgoing).await {
+                    // Pointer motion rides the motion lane when negotiated
+                    // (own flow-control window and loss domain — a stalled
+                    // motion packet never head-of-line-blocks keys); wheel
+                    // stays ordered with keys on the episode stream.
+                    let lane = match outgoing {
+                        InputEvent::MouseMove { .. } => motion_send.as_mut(),
+                        _ => None,
+                    };
+                    let send_result = match lane {
+                        Some(motion) => {
+                            send_input(&connection, motion, sequence, outgoing).await
+                        }
+                        None => {
+                            send_input(&connection, &mut send, sequence, outgoing).await
+                        }
+                    };
+                    if let Err(error) = send_result {
                         break Err(error);
                     }
                 }
@@ -4347,6 +4762,8 @@ async fn run_capture_stream(
                 None => break Err(anyhow::anyhow!("peer clipboard stream closed")),
             },
             _ = keep_alive.tick() => {
+                // Drive-task heartbeat (see TASK_HEARTBEAT_MS).
+                stamp_task_heartbeat();
                 if let Err(error) = write_frame(&mut send, &WireMessage::Ping { nonce: sequence }).await {
                     break Err(error.into());
                 }
@@ -4835,13 +5252,21 @@ async fn handle_connection(
             local_geometry = truthful_local_geometry(&config.layout);
             write_frame(
                 &mut send,
-                &WireMessage::Accepted {
-                    lock_screen_enabled,
-                    clipboard_enabled,
-                    screen_geometry: local_geometry,
-                    // This daemon injects high-resolution touchpad scroll.
-                    smooth_scroll: true,
-                },
+            &WireMessage::Accepted {
+                lock_screen_enabled,
+                clipboard_enabled,
+                screen_geometry: local_geometry,
+                // This daemon injects high-resolution touchpad scroll.
+                smooth_scroll: true,
+                // Raw pinch gestures are handled on receipt: natively via
+                // OS-level gesture injection on Windows, via a local
+                // Ctrl+wheel fallback elsewhere.
+                pinch_zoom: true,
+                // Pointer motion rides its own lane when the sender opens
+                // one (see open_episode_stream); keys, buttons, wheel and
+                // gestures stay ordered on this episode stream.
+                motion_lane: true,
+            },
             )
             .await?;
             audit_event(
@@ -4860,6 +5285,35 @@ async fn handle_connection(
                 remote = %conn.remote_address(),
                 "input session accepted",
             );
+            // Motion-lane accept (see open_episode_stream): the sender
+            // opens its lane right after reading our Accepted, so accept
+            // order on this association is deterministic (episode first,
+            // lane second — episodes are served sequentially, so this
+            // accept pairs with THIS episode's lane exactly). A missing
+            // lane is a hard episode failure, never a silent downgrade:
+            // the sender WILL send motion on it, and an unread lane
+            // would stall the episode into the lease instead.
+            let mut motion_recv: Option<quinn::RecvStream> = if hello.motion_lane {
+                match tokio::time::timeout(Duration::from_secs(10), conn.accept_uni()).await {
+                    Ok(Ok(lane)) => {
+                        tracing::info!(
+                            peer = %peer_fingerprint,
+                            "episode motion lane accepted",
+                        );
+                        Some(lane)
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "motion lane accept failed; ending episode");
+                        bail!("peer negotiated a motion lane but the accept failed");
+                    }
+                    Err(_) => {
+                        tracing::warn!("motion lane accept timed out; ending episode");
+                        bail!("peer negotiated a motion lane but never opened it");
+                    }
+                }
+            } else {
+                None
+            };
             // Publish the live inbound link: the station-side UI arms its
             // own half of the link from here (it never dialed), and hangs
             // the link up from here too. The address MUST be dialable: the
@@ -4948,6 +5402,12 @@ async fn handle_connection(
             // whenever motion comes back inside.
             let mut hop_edge: Option<kvm_core::Edge> = None;
             let mut hop_accum: i64 = 0;
+            // OUR synthetic pinch-zoom Ctrl hold for THIS session's local
+            // Ctrl+wheel fallback (non-Windows receivers only): pressed on
+            // gesture start, released on gesture end. Never touches a
+            // physically held Ctrl, and never survives the session (the
+            // teardown release_all frees it anyway).
+            let mut recv_pinch_held = false;
             let mut clipboard_revision = 0u64;
             let mut remote_clipboard_revision = 0u64;
             let mut lease_check = tokio::time::interval(Duration::from_secs(5));
@@ -4976,9 +5436,9 @@ async fn handle_connection(
                                     InputEvent::SmoothWheel { .. } => smooth_count += 1,
                                     InputEvent::MouseButton { .. } => button_count += 1,
                                     InputEvent::Key(_) => key_count += 1,
-                                    // Pinch never reaches the wire (the
-                                    // sender expands it into Ctrl+wheel);
-                                    // count defensively as smooth wheel.
+                                    // Wire-native pinch (see above): gestures
+                                    // render per-OS, never through the
+                                    // pointer/key path.
                                     InputEvent::Pinch { .. } | InputEvent::PinchEnd => {
                                         smooth_count += 1;
                                     }
@@ -4991,6 +5451,22 @@ async fn handle_connection(
                                 // and state sync never take this branch).
                                 link_input_events
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // Wire-native pinch (0.9.34+ peers): never
+                                // reaches process_remote_input — it is a
+                                // gesture, not pointer/key state, and the
+                                // rendering differs per OS (see
+                                // handle_inbound_pinch).
+                                if matches!(
+                                    packet.event,
+                                    InputEvent::Pinch { .. } | InputEvent::PinchEnd
+                                ) {
+                                    handle_inbound_pinch(
+                                        packet.event,
+                                        &mut injector,
+                                        &mut recv_pinch_held,
+                                    )?;
+                                    continue;
+                                }
                                 if process_remote_input(
                                     DatagramInput {
                                         sequence: packet.sequence,
@@ -5182,9 +5658,8 @@ async fn handle_connection(
                             InputEvent::SmoothWheel { .. } => smooth_count += 1,
                             InputEvent::MouseButton { .. } => button_count += 1,
                             InputEvent::Key(_) => key_count += 1,
-                            // Pinch never reaches the wire (the sender
-                            // expands it into Ctrl+wheel); count
-                            // defensively as smooth wheel.
+                            // Pinch cannot arrive on datagrams (the codec
+                            // rejects it); count defensively as smooth.
                             InputEvent::Pinch { .. } | InputEvent::PinchEnd => {
                                 smooth_count += 1;
                             }
@@ -5229,6 +5704,91 @@ async fn handle_connection(
                         }
                         None => clipboard_enabled = false,
                     },
+                    motion_message = async {
+                        // Disabled arm when no lane was negotiated: pending
+                        // forever so the select below never fires it.
+                        match motion_recv.as_mut() {
+                            Some(lane) => read_frame(lane).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let Some(message) = motion_message.map_err(|error| {
+                            end_reason = "motion lane read failed";
+                            error
+                        })? else {
+                            // The sender finishes the lane at episode
+                            // teardown: park the arm and let the episode
+                            // stream close (ReleaseAll/FIN) end the
+                            // session normally.
+                            end_reason = "peer finished the motion lane";
+                            motion_recv = None;
+                            continue;
+                        };
+                        last_activity = Instant::now();
+                        injector.ensure_session()?;
+                        match message {
+                            WireMessage::Input(packet) => {
+                                // Byte-identical handling to the episode
+                                // stream arm above: the sender guarantees
+                                // MouseMove-only on this lane, sequence and
+                                // dedup state are shared across lanes, and
+                                // responses still go out on `send`.
+                                match packet.event {
+                                    InputEvent::MouseMove { .. } => motion_count += 1,
+                                    InputEvent::Wheel(_) => wheel_count += 1,
+                                    InputEvent::SmoothWheel { .. } => smooth_count += 1,
+                                    InputEvent::MouseButton { .. } => button_count += 1,
+                                    InputEvent::Key(_) => key_count += 1,
+                                    InputEvent::Pinch { .. } | InputEvent::PinchEnd => {
+                                        smooth_count += 1;
+                                    }
+                                }
+                                link_input_events
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if matches!(
+                                    packet.event,
+                                    InputEvent::Pinch { .. } | InputEvent::PinchEnd
+                                ) {
+                                    handle_inbound_pinch(
+                                        packet.event,
+                                        &mut injector,
+                                        &mut recv_pinch_held,
+                                    )?;
+                                    continue;
+                                }
+                                if process_remote_input(
+                                    DatagramInput {
+                                        sequence: packet.sequence,
+                                        event: packet.event,
+                                    },
+                                    &config,
+                                    &mut injector,
+                                    &mut send,
+                                    &mut remote_screen,
+                                    &mut remote_cursor,
+                                    &mut seen_sequences,
+                                    &mut motion_sequence,
+                                    peer_screen_geometry,
+                                    &mut hop_edge,
+                                    &mut hop_accum,
+                                    &mut dropped_duplicate,
+                                    &mut dropped_stale,
+                                    &mut applied_motion,
+                                    lock_screen_enabled,
+                                )
+                                .await?
+                                {
+                                    end_reason = "peer requested the session end";
+                                    break Ok(());
+                                }
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    "non-input frame on the motion lane; ignoring"
+                                );
+                            }
+                        }
+                    }
                     _ = lease_check.tick() => {
                         injector.ensure_session()?;
                         if last_activity.elapsed() > Duration::from_secs(15) {
@@ -5333,6 +5893,35 @@ async fn handle_connection(
             }
         } // match first: one pairing or one episode per stream
     } // association loop: streams share one handshake
+}
+
+/// Render a wire-native pinch gesture on the receiver. The gesture is
+/// zoom-to-cursor by construction (no focus coordinates cross the wire):
+/// Windows injects it as a genuine two-finger OS touch gesture at the
+/// current cursor (see the injector's touch driver — browsers, photo
+/// viewers, maps and every other gesture-aware app respond exactly as to
+/// local trackpad pinch, not as browser-only Ctrl+wheel). Platforms without
+/// OS-level gesture injection expand it into Ctrl+wheel at the cursor
+/// here, reusing the sender's legacy expansion against the INJECTOR's
+/// held keys so a physically held Ctrl is never stolen or released by us.
+fn handle_inbound_pinch(
+    event: InputEvent,
+    injector: &mut ReceiverInjector,
+    pinch_held: &mut bool,
+) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = pinch_held;
+        injector.send(event)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let physical_ctrl = injector.key_pressed(HID_LEFT_CTRL);
+        for out in pinch_expansion(event, physical_ctrl, pinch_held) {
+            injector.send(out)?;
+        }
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5678,6 +6267,20 @@ impl ReceiverInjector {
         }
     }
 
+    /// Whether a key is currently held in the native injector. Feeds the
+    /// receiver-side pinch fallback (see `handle_inbound_pinch`) so the
+    /// synthetic zoom Ctrl never fights a physically held one. The service
+    /// bridge tracks holds helper-side and cannot answer here — it reports
+    /// false, and that path never needs the answer (Windows renders pinch
+    /// natively, with no synthetic Ctrl at all).
+    fn key_pressed(&self, usage: HidUsage) -> bool {
+        match self {
+            Self::Native(injector) => injector.key_pressed(usage),
+            #[cfg(target_os = "windows")]
+            Self::Service(_) => false,
+        }
+    }
+
     fn ensure_session(&self) -> Result<()> {
         match self {
             Self::Native(_) => Ok(()),
@@ -5982,6 +6585,9 @@ async fn handle_pairing(
             clipboard_enabled: false,
             screen_geometry: None,
             smooth_scroll: true,
+            pinch_zoom: true,
+            // Pairing completion carries no input session; no lane.
+            motion_lane: false,
         },
     )
     .await?;
@@ -6092,6 +6698,7 @@ async fn dial_session(
     quinn::Connection,
     quinn::SendStream,
     quinn::RecvStream,
+    Option<quinn::SendStream>,
     SessionCapabilities,
 )> {
     match connect_input(
@@ -6270,6 +6877,7 @@ async fn connect_input(
     quinn::Connection,
     quinn::SendStream,
     quinn::RecvStream,
+    Option<quinn::SendStream>,
     SessionCapabilities,
 )> {
     if !mode_allows_outgoing(policy.mode) {
@@ -6311,8 +6919,8 @@ async fn connect_input(
     if !peers.is_pinned(&fingerprint) {
         bail!("peer {addr} is not paired (fingerprint {fingerprint})");
     }
-    let (send, recv, capabilities) = open_episode_stream(&conn, policy).await?;
-    Ok((conn, send, recv, capabilities))
+    let (send, recv, motion_send, capabilities) = open_episode_stream(&conn, policy).await?;
+    Ok((conn, send, recv, motion_send, capabilities))
 }
 
 /// Open one drive episode on a live association: a fresh bidirectional
@@ -6320,10 +6928,24 @@ async fn connect_input(
 /// the second half of a cold dial AND the whole of every later episode on
 /// the warm link association, so screen-edge crossings skip endpoint setup
 /// and the QUIC handshake entirely.
+///
+/// Returns the episode streams plus an optional MOTION LANE: when both
+/// sides negotiate it, the sender opens a second (send-only) stream that
+/// carries nothing but `MouseMove` frames. Pointer floods then have their
+/// own flow-control window and loss domain — a stalled motion packet
+/// delays the cursor by one RTT instead of head-of-line-blocking the
+/// keystroke behind it. The shared sequence counter spans both streams,
+/// so the receiver's dedup/stale sets keep working unchanged. `None` for
+/// older peers (everything rides the episode stream, as before).
 async fn open_episode_stream(
     conn: &quinn::Connection,
     policy: ConnectPolicy<'_>,
-) -> Result<(quinn::SendStream, quinn::RecvStream, SessionCapabilities)> {
+) -> Result<(
+    quinn::SendStream,
+    quinn::RecvStream,
+    Option<quinn::SendStream>,
+    SessionCapabilities,
+)> {
     let ConnectPolicy {
         node_name,
         request_lock_screen,
@@ -6343,6 +6965,12 @@ async fn open_episode_stream(
             screen_geometry,
             // This side captures and understands touchpad smooth scroll.
             smooth_scroll: true,
+            // This side may emit raw pinch gestures; the receiver's
+            // Accepted decides whether they cross the wire as-is or are
+            // expanded into Ctrl+wheel first.
+            pinch_zoom: true,
+            // This side opens a motion lane when the receiver accepts one.
+            motion_lane: true,
             link_id,
         }),
     )
@@ -6355,16 +6983,27 @@ async fn open_episode_stream(
             clipboard_enabled,
             screen_geometry,
             smooth_scroll,
+            pinch_zoom,
+            motion_lane,
             ..
-        } => Ok((
-            send,
-            recv,
-            SessionCapabilities {
+        } => {
+            let capabilities = SessionCapabilities {
                 clipboard_enabled,
                 screen_geometry,
                 smooth_scroll,
-            },
-        )),
+                pinch_zoom,
+            };
+            // The receiver agreed to a motion lane: open it now, before
+            // any input flows, so stream-accept order on their side is
+            // deterministic (episode stream first, motion lane second —
+            // episodes are served sequentially per association).
+            let motion_send = if motion_lane {
+                Some(conn.open_uni().await?)
+            } else {
+                None
+            };
+            Ok((send, recv, motion_send, capabilities))
+        }
         WireMessage::Reject { reason } => bail!("peer rejected session: {reason}"),
         other => bail!("unexpected session response: {other:?}"),
     }
@@ -6375,6 +7014,7 @@ struct SessionCapabilities {
     clipboard_enabled: bool,
     screen_geometry: Option<ScreenGeometry>,
     smooth_scroll: bool,
+    pinch_zoom: bool,
 }
 
 fn local_screen_geometry(layout: &kvm_core::Layout) -> Option<ScreenGeometry> {
@@ -6702,11 +7342,26 @@ async fn send_input(
     // stalled packet delays the cursor by one RTT instead of teleporting
     // it. The receiver still accepts datagrams from older peers (shared
     // dedup sets cover both arms).
-    write_frame(
-        &mut *send,
-        &WireMessage::Input(InputPacket { sequence, event }),
+    //
+    // BOUNDED (3s): a peer that stops reading (wedged app, dead helper)
+    // would otherwise park this write — and the whole drive task —
+    // forever. That is the permanent-freeze class: local suppression
+    // stays engaged while every watchdog lives on the same stalled task
+    // and can never fire. A timed-out write ends the EPISODE instead
+    // (every call site tears down and releases suppression), so a dead
+    // peer costs a crossing, never the local desktop.
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        write_frame(
+            &mut *send,
+            &WireMessage::Input(InputPacket { sequence, event }),
+        ),
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => bail!("episode stream write stalled; ending the episode"),
+    }
     Ok(())
 }
 
@@ -7242,6 +7897,54 @@ mod tests {
         // Twelve consecutive Pings (~60s) with no Pong is proof, not noise.
         assert!(drive_starved(12));
         assert!(drive_starved(120));
+    }
+
+    #[test]
+    fn pinch_for_send_passes_native_and_expands_legacy() {
+        use kvm_core::{InputEvent, KeyEvent};
+        // Capable peer: gestures cross the wire untouched, no synthetic
+        // modifier anywhere.
+        let mut held = false;
+        assert_eq!(
+            pinch_for_send(InputEvent::Pinch { delta: 240 }, true, false, &mut held),
+            vec![InputEvent::Pinch { delta: 240 }]
+        );
+        assert!(!held);
+        assert_eq!(
+            pinch_for_send(InputEvent::PinchEnd, true, false, &mut held),
+            vec![InputEvent::PinchEnd]
+        );
+        // Older peer: identical to the legacy expansion (Ctrl wrap).
+        let mut held = false;
+        let out = pinch_for_send(InputEvent::Pinch { delta: 240 }, false, false, &mut held);
+        assert!(held);
+        assert_eq!(
+            out,
+            vec![
+                InputEvent::Key(KeyEvent {
+                    usage: HID_LEFT_CTRL,
+                    pressed: true
+                }),
+                InputEvent::SmoothWheel { x: 0, y: 240 },
+            ]
+        );
+        let out = pinch_for_send(InputEvent::PinchEnd, false, false, &mut held);
+        assert!(!held);
+        assert_eq!(
+            out,
+            vec![InputEvent::Key(KeyEvent {
+                usage: HID_LEFT_CTRL,
+                pressed: false
+            })]
+        );
+        // Non-gestures pass through on both paths.
+        let mut held = false;
+        let key = InputEvent::Key(KeyEvent {
+            usage: 0x04,
+            pressed: true,
+        });
+        assert_eq!(pinch_for_send(key, true, false, &mut held), vec![key]);
+        assert_eq!(pinch_for_send(key, false, false, &mut held), vec![key]);
     }
 
     #[test]

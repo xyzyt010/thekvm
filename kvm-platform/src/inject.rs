@@ -284,12 +284,19 @@ mod linux_uinput {
                         self.pressed_keys.remove(&code);
                     }
                 }
-                // Pinch gestures never reach injection: the sending
-                // thread expands them into Ctrl+wheel first (see
-                // pinch_expansion in the daemon). Drop defensively.
+                // Pinch gestures never reach this injector: capable senders
+                // keep them native per-OS, and the daemon expands them for
+                // legacy peers before sending. Drop defensively.
                 InputEvent::Pinch { .. } | InputEvent::PinchEnd => {}
             }
             Ok(())
+        }
+
+        /// Whether a key is currently held in this injector. Feeds the
+        /// receiver-side pinch fallback so the synthetic zoom Ctrl never
+        /// fights a physically held one.
+        pub fn key_pressed(&self, usage: HidUsage) -> bool {
+            hid_to_evdev(usage).is_some_and(|code| self.pressed_keys.contains(&code))
         }
 
         pub fn release_all(&mut self) -> Result<(), PlatformError> {
@@ -590,10 +597,10 @@ pub use linux_uinput::UinputDevice as Injector;
 #[cfg(target_os = "windows")]
 mod win32_inject {
     use crate::PlatformError;
-    use kvm_core::{InputEvent, MouseButton};
+    use kvm_core::{HidUsage, InputEvent, MouseButton};
     use std::collections::BTreeSet;
     use std::sync::Mutex;
-    use windows::Win32::Foundation::GetLastError;
+    use windows::Win32::Foundation::{GetLastError, HANDLE, HWND, POINT, RECT};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
         KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
@@ -601,14 +608,21 @@ mod win32_inject {
         MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
         MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
     };
+    use windows::Win32::UI::Input::Pointer::{
+        InitializeTouchInjection, InjectTouchInput, POINTER_CHANGE_NONE, POINTER_FLAGS,
+        POINTER_FLAG_DOWN, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_UP,
+        POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_TOUCH_INFO, TOUCH_FEEDBACK_NONE,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CMONITORS, SM_CXSCREEN, SM_CYSCREEN,
+        GetCursorPos, GetSystemMetrics, PT_TOUCH, SM_CMONITORS, SM_CXSCREEN, SM_CYSCREEN,
+        TOUCH_FLAG_NONE, TOUCH_MASK_CONTACTAREA, TOUCH_MASK_ORIENTATION, TOUCH_MASK_PRESSURE,
     };
 
     pub struct Win32Injector {
         pressed_keys: Mutex<BTreeSet<u16>>,
         pressed_buttons: Mutex<BTreeSet<MouseButton>>,
         absolute: Mutex<AbsoluteState>,
+        pinch: Mutex<PinchTouch>,
     }
 
     /// Ballistics-proof absolute-motion state. Windows applies pointer
@@ -757,12 +771,73 @@ mod win32_inject {
         format!("absolute armed remote {width}x{height}")
     }
 
+    /// OS-level pinch-zoom gesture state. A remote trackpad pinch arrives
+    /// as `Pinch` deltas (see `inject_pinch`) and is rendered as a genuine
+    /// two-finger touch gesture at the cursor via InjectTouchInput — the
+    /// OS gesture recognizer turns it into the same zoom every
+    /// gesture-aware app gives a local trackpad pinch (browser, photos,
+    /// maps, …), not the app-by-app Ctrl+wheel approximation.
+    #[derive(Debug)]
+    struct PinchTouch {
+        /// Touch contacts are currently down on the local desktop.
+        active: bool,
+        /// Current contact separation in px (grows = zoom in).
+        separation_px: f64,
+        /// Gesture midpoint in physical screen px (cursor at gesture start).
+        center: (i32, i32),
+        /// Last gesture update; a stale active gesture (lost PinchEnd)
+        /// lifts its contacts instead of sticking them.
+        last_update: Option<std::time::Instant>,
+        /// Touch-injection frame counter.
+        frame: u32,
+        /// InitializeTouchInjection verdict: None = untried yet.
+        touch_ready: Option<bool>,
+        /// Degraded Ctrl+wheel fallback hold (touch unavailable only).
+        fallback_ctrl: bool,
+        /// The degraded-fallback journal line fires once, never per event.
+        fallback_warned: bool,
+    }
+
+    impl Default for PinchTouch {
+        fn default() -> Self {
+            Self {
+                active: false,
+                separation_px: 120.0,
+                center: (0, 0),
+                last_update: None,
+                frame: 0,
+                touch_ready: None,
+                fallback_ctrl: false,
+                fallback_warned: false,
+            }
+        }
+    }
+
+    /// Contact separation after a pinch delta. Pure for tests. Deltas are
+    /// 120ths of finger spread; 0.3px per unit makes a firm phone-style
+    /// gesture span most of the clamp range without jumping.
+    fn pinch_separation(current_px: f64, delta_120ths: i32) -> f64 {
+        const PX_PER_UNIT: f64 = 0.3;
+        const MIN_SEPARATION_PX: f64 = 40.0;
+        const MAX_SEPARATION_PX: f64 = 700.0;
+        (current_px + f64::from(delta_120ths) * PX_PER_UNIT)
+            .clamp(MIN_SEPARATION_PX, MAX_SEPARATION_PX)
+    }
+
+    /// Contact x positions for a separation around a center. Pure for
+    /// tests: symmetric horizontal pair, exactly like two fingers.
+    fn pinch_contacts(center_x: i32, separation_px: f64) -> (i32, i32) {
+        let half = (separation_px / 2.0).round() as i32;
+        (center_x - half, center_x + half)
+    }
+
     impl Win32Injector {
         pub fn create() -> Result<Self, PlatformError> {
             Ok(Self {
                 pressed_keys: Mutex::new(BTreeSet::new()),
                 pressed_buttons: Mutex::new(BTreeSet::new()),
                 absolute: Mutex::new(AbsoluteState::default()),
+                pinch: Mutex::new(PinchTouch::default()),
             })
         }
 
@@ -801,6 +876,214 @@ mod win32_inject {
                     }
                 }
             }
+        }
+
+        /// Render one pinch-delta as OS-level touch motion. The first call
+        /// of a gesture puts two contacts down around the cursor, later
+        /// calls spread/pinch them, `end_pinch` lifts them. A stale active
+        /// gesture (lost gesture end upstream) lifts before restarting, so
+        /// contacts never stick. Touch failures degrade the gesture to a
+        /// Ctrl+wheel tail instead of erroring — a gesture must never kill
+        /// the session.
+        pub fn inject_pinch(&self, delta: i32) -> Result<(), PlatformError> {
+            let mut pinch = self
+                .pinch
+                .lock()
+                .map_err(|_| PlatformError::Win32("pinch state lock poisoned".into()))?;
+            if pinch.touch_ready.is_none() {
+                let ready = unsafe { InitializeTouchInjection(2, TOUCH_FEEDBACK_NONE) }.is_ok();
+                pinch.touch_ready = Some(ready);
+            }
+            if pinch.touch_ready != Some(true) {
+                return self.fallback_pinch_wheel(&mut pinch, delta);
+            }
+            let now = std::time::Instant::now();
+            if pinch.active
+                && pinch.last_update.is_some_and(|when| {
+                    now.duration_since(when) > std::time::Duration::from_secs(2)
+                })
+            {
+                let _ = Self::inject_touch_pair(&pinch, POINTER_FLAG_UP);
+                pinch.active = false;
+            }
+            if !pinch.active {
+                let Some(center) = Self::cursor_physical() else {
+                    return self.fallback_pinch_wheel(&mut pinch, delta);
+                };
+                pinch.center = center;
+                pinch.separation_px = 120.0;
+                if let Err(error) = Self::inject_touch_pair(&pinch, POINTER_FLAG_DOWN) {
+                    pinch.active = false;
+                    tracing::warn!(%error, "pinch touch DOWN failed; degrading gesture to Ctrl+wheel");
+                    return self.fallback_pinch_wheel(&mut pinch, delta);
+                }
+                pinch.active = true;
+            }
+            pinch.separation_px = pinch_separation(pinch.separation_px, delta);
+            pinch.frame = pinch.frame.wrapping_add(1);
+            if let Err(error) = Self::inject_touch_pair(&pinch, POINTER_FLAG_UPDATE) {
+                let _ = Self::inject_touch_pair(&pinch, POINTER_FLAG_UP);
+                pinch.active = false;
+                tracing::warn!(%error, "pinch touch UPDATE failed; degrading gesture to Ctrl+wheel");
+                return self.fallback_pinch_wheel(&mut pinch, delta);
+            }
+            pinch.last_update = Some(now);
+            Ok(())
+        }
+
+        /// Lift pinch contacts / release the fallback Ctrl. Best-effort
+        /// and silent: called on gesture end and session teardown, where
+        /// there is nothing useful left to fail with.
+        pub fn end_pinch(&self) {
+            let Ok(mut pinch) = self.pinch.lock() else {
+                return;
+            };
+            if pinch.active {
+                let _ = Self::inject_touch_pair(&pinch, POINTER_FLAG_UP);
+                pinch.active = false;
+            }
+            if pinch.fallback_ctrl {
+                const HID_LEFT_CTRL: u16 = 0xe0;
+                let up = keybd_input(0, 0x1d, false, false);
+                let sent = unsafe { SendInput(&[up], std::mem::size_of::<INPUT>() as i32) };
+                if sent == 1 {
+                    if let Ok(mut held) = self.pressed_keys.lock() {
+                        held.remove(&HID_LEFT_CTRL);
+                    }
+                }
+                pinch.fallback_ctrl = false;
+            }
+        }
+
+        /// Whether a key is currently held in this injector. Feeds the
+        /// receiver-side pinch fallback so the synthetic zoom Ctrl never
+        /// fights a physically held one.
+        pub fn key_pressed(&self, usage: HidUsage) -> bool {
+            self.pressed_keys
+                .lock()
+                .map(|held| held.contains(&usage))
+                .unwrap_or(false)
+        }
+
+        /// Current cursor in physical screen px (touch injection speaks
+        /// physical pixels; the entry warp already placed the cursor).
+        /// Multi-monitor negative origins pass through untouched.
+        fn cursor_physical() -> Option<(i32, i32)> {
+            let mut point = POINT::default();
+            unsafe { GetCursorPos(&mut point) }.ok()?;
+            Some((point.x, point.y))
+        }
+
+        /// One touch frame: the symmetric contact pair for the gesture
+        /// state, with the lifecycle phase (DOWN / UPDATE / UP). UP drops
+        /// INCONTACT (the touch is gone); DOWN/UPDATE carry it.
+        fn inject_touch_pair(
+            state: &PinchTouch,
+            phase: POINTER_FLAGS,
+        ) -> Result<(), PlatformError> {
+            fn contact(
+                id: u32,
+                x: i32,
+                y: i32,
+                frame: u32,
+                flags: POINTER_FLAGS,
+            ) -> POINTER_TOUCH_INFO {
+                POINTER_TOUCH_INFO {
+                    pointerInfo: POINTER_INFO {
+                        pointerType: PT_TOUCH,
+                        pointerId: id,
+                        frameId: frame,
+                        pointerFlags: flags,
+                        sourceDevice: HANDLE::default(),
+                        hwndTarget: HWND::default(),
+                        ptPixelLocation: POINT { x, y },
+                        ptHimetricLocation: POINT { x, y },
+                        ptPixelLocationRaw: POINT { x, y },
+                        ptHimetricLocationRaw: POINT { x, y },
+                        dwTime: 0,
+                        historyCount: 0,
+                        InputData: 0,
+                        dwKeyStates: 0,
+                        PerformanceCount: 0,
+                        ButtonChangeType: POINTER_CHANGE_NONE,
+                    },
+                    touchFlags: TOUCH_FLAG_NONE,
+                    touchMask: TOUCH_MASK_CONTACTAREA
+                        | TOUCH_MASK_ORIENTATION
+                        | TOUCH_MASK_PRESSURE,
+                    rcContact: RECT {
+                        left: x - 2,
+                        top: y - 2,
+                        right: x + 2,
+                        bottom: y + 2,
+                    },
+                    rcContactRaw: RECT {
+                        left: x - 2,
+                        top: y - 2,
+                        right: x + 2,
+                        bottom: y + 2,
+                    },
+                    orientation: 90,
+                    pressure: 32000,
+                }
+            }
+            let flags = if phase == POINTER_FLAG_UP {
+                POINTER_FLAG_UP | POINTER_FLAG_INRANGE
+            } else {
+                phase | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
+            };
+            let (left_x, right_x) = pinch_contacts(state.center.0, state.separation_px);
+            let contacts = [
+                contact(0, left_x, state.center.1, state.frame, flags),
+                contact(1, right_x, state.center.1, state.frame, flags),
+            ];
+            unsafe { InjectTouchInput(&contacts) }
+                .map_err(|error| PlatformError::Win32(format!("InjectTouchInput failed: {error}")))
+        }
+
+        /// Ctrl+wheel fallback for machines where touch injection is
+        /// unavailable: the old universal behavior, with our OWN hold bit
+        /// so a physically held Ctrl is never stolen or released by us.
+        fn fallback_pinch_wheel(
+            &self,
+            pinch: &mut PinchTouch,
+            delta: i32,
+        ) -> Result<(), PlatformError> {
+            const HID_LEFT_CTRL: u16 = 0xe0;
+            if !pinch.fallback_warned {
+                pinch.fallback_warned = true;
+                tracing::warn!("touch injection unavailable; pinch-zoom degrades to Ctrl+wheel");
+            }
+            if delta != 0 {
+                let physical = self
+                    .pressed_keys
+                    .lock()
+                    .map(|held| held.contains(&HID_LEFT_CTRL))
+                    .unwrap_or(false);
+                if !pinch.fallback_ctrl && !physical {
+                    let down = keybd_input(0, 0x1d, false, true);
+                    let sent = unsafe { SendInput(&[down], std::mem::size_of::<INPUT>() as i32) };
+                    if sent != 1 {
+                        return Err(PlatformError::Win32(format!(
+                            "pinch fallback Ctrl SendInput failed: {}",
+                            unsafe { GetLastError().0 }
+                        )));
+                    }
+                    if let Ok(mut held) = self.pressed_keys.lock() {
+                        held.insert(HID_LEFT_CTRL);
+                    }
+                    pinch.fallback_ctrl = true;
+                }
+                let inputs = wheel_inputs(delta, 0);
+                let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+                if sent as usize != inputs.len() {
+                    return Err(PlatformError::Win32(format!(
+                        "pinch fallback wheel SendInput failed: {}",
+                        unsafe { GetLastError().0 }
+                    )));
+                }
+            }
+            Ok(())
         }
 
         /// Whether the latest motion_input injected absolute units.
@@ -914,10 +1197,19 @@ mod win32_inject {
                 // Touchpad smooth scroll: already in 120ths, injected raw so
                 // apps receive the same fine motion as local scrolling.
                 InputEvent::SmoothWheel { x, y } => wheel_inputs(y, x),
-                // Pinch gestures never reach injection: the sending
-                // thread expands them into Ctrl+wheel first (see
-                // pinch_expansion in the daemon). Drop defensively.
-                InputEvent::Pinch { .. } | InputEvent::PinchEnd => Vec::new(),
+                // Native OS-level pinch (see inject_pinch): a real two-finger
+                // touch gesture at the cursor — every gesture-aware app
+                // responds exactly as to a local trackpad pinch. Touch
+                // failures degrade INSIDE the driver (Ctrl+wheel tail), so
+                // a gesture can never fail the send or kill the session.
+                InputEvent::Pinch { delta } => {
+                    self.inject_pinch(delta)?;
+                    Vec::new()
+                }
+                InputEvent::PinchEnd => {
+                    self.end_pinch();
+                    Vec::new()
+                }
                 InputEvent::Key(key) => {
                     // Pause has an E1-prefixed make code that SendInput does
                     // not represent through KEYEVENTF_SCANCODE, and the
@@ -985,6 +1277,10 @@ mod win32_inject {
         }
 
         pub fn release_all(&self) -> Result<(), PlatformError> {
+            // A session that ends mid-pinch must not leave touch contacts
+            // down (or the fallback Ctrl held): lift everything first,
+            // then release keys/buttons as usual.
+            self.end_pinch();
             let keys = self
                 .pressed_keys
                 .lock()
@@ -1021,19 +1317,49 @@ mod win32_inject {
         }
     }
 
+    /// Split one scroll axis into per-notch chunks (each within
+    /// [-120, 120]) for `wheel_inputs`. Pure for tests. Apps accumulate
+    /// wheel deltas toward whole notches, so chunking preserves the exact
+    /// total while letting the OS deliver it as N smooth messages instead
+    /// of one jump. Absurd deltas saturate at 100 notches per axis: beyond
+    /// any real gesture, this only bounds one SendInput call against a
+    /// pathological flood sum.
+    fn wheel_chunks(delta_120ths: i32) -> Vec<i32> {
+        const NOTCH: i32 = 120;
+        const MAX_NOTCHES: i32 = 100;
+        let clamped = delta_120ths.clamp(-NOTCH * MAX_NOTCHES, NOTCH * MAX_NOTCHES);
+        if clamped == 0 {
+            return Vec::new();
+        }
+        let sign = clamped.signum();
+        let mut remaining = clamped.abs();
+        let mut chunks = Vec::new();
+        while remaining > 0 {
+            let take = remaining.min(NOTCH);
+            chunks.push(sign * take);
+            remaining -= take;
+        }
+        chunks
+    }
+
     /// One INPUT per non-zero scroll axis, in 120ths (WHEEL_DELTA units).
     /// A zero axis sends nothing: a zero-amount wheel INPUT is wire noise
     /// that some apps still scroll on.
+    ///
+    /// Large deltas are split into per-notch INPUTs (see `wheel_chunks`):
+    /// apps accumulate wheel messages, so one 3840-unit INPUT scrolls as a
+    /// single violent jump while thirty-two 120-unit INPUTs in the same
+    /// SendInput call scroll as the smooth glide the sender captured.
     fn wheel_inputs(vertical_120ths: i32, horizontal_120ths: i32) -> Vec<INPUT> {
-        let mut inputs = Vec::with_capacity(2);
-        if vertical_120ths != 0 {
+        let mut inputs = Vec::new();
+        for chunk in wheel_chunks(vertical_120ths) {
             inputs.push(INPUT {
                 r#type: INPUT_MOUSE,
                 Anonymous: INPUT_0 {
                     mi: MOUSEINPUT {
                         dx: 0,
                         dy: 0,
-                        mouseData: vertical_120ths as u32,
+                        mouseData: chunk as u32,
                         dwFlags: MOUSEEVENTF_WHEEL,
                         time: 0,
                         dwExtraInfo: crate::ECHO_TAG,
@@ -1041,14 +1367,14 @@ mod win32_inject {
                 },
             });
         }
-        if horizontal_120ths != 0 {
+        for chunk in wheel_chunks(horizontal_120ths) {
             inputs.push(INPUT {
                 r#type: INPUT_MOUSE,
                 Anonymous: INPUT_0 {
                     mi: MOUSEINPUT {
                         dx: 0,
                         dy: 0,
-                        mouseData: horizontal_120ths as u32,
+                        mouseData: chunk as u32,
                         dwFlags: MOUSEEVENTF_HWHEEL,
                         time: 0,
                         dwExtraInfo: crate::ECHO_TAG,
@@ -1258,6 +1584,37 @@ mod win32_inject {
     mod tests {
         use super::hid_to_scan_code;
         use super::key_virtual_key;
+
+        #[test]
+        fn wheel_chunks_split_large_deltas_into_notches() {
+            // Small glides pass through untouched; folded bursts split
+            // into per-notch pieces with the exact total preserved, so
+            // the OS delivers smooth motion instead of one jump.
+            assert_eq!(super::wheel_chunks(0), Vec::<i32>::new());
+            assert_eq!(super::wheel_chunks(120), vec![120]);
+            assert_eq!(super::wheel_chunks(60), vec![60]);
+            assert_eq!(super::wheel_chunks(300), vec![120, 120, 60]);
+            assert_eq!(super::wheel_chunks(-250), vec![-120, -120, -10]);
+            // Pathological floods saturate instead of building a
+            // thousand-INPUT SendInput call; direction is preserved.
+            let huge = super::wheel_chunks(1_000_000);
+            assert_eq!(huge.len(), 100);
+            assert!(huge.iter().all(|chunk| *chunk == 120));
+            assert_eq!(super::wheel_chunks(-1_000_000).iter().sum::<i32>(), -12000);
+        }
+
+        #[test]
+        fn pinch_separation_tracks_deltas_within_clamps() {
+            // Symmetric contacts around the center; separation grows with
+            // zoom-in deltas, shrinks with zoom-out, and clamps instead of
+            // running away on a pathological flood.
+            assert_eq!(super::pinch_contacts(960, 120.0), (900, 1020));
+            assert_eq!(super::pinch_separation(120.0, 120), 156.0);
+            assert_eq!(super::pinch_separation(120.0, -120), 84.0);
+            assert_eq!(super::pinch_separation(120.0, 0), 120.0);
+            assert_eq!(super::pinch_separation(690.0, 10_000), 700.0);
+            assert_eq!(super::pinch_separation(50.0, -10_000), 40.0);
+        }
 
         #[test]
         fn uses_physical_scan_codes_for_common_keys() {

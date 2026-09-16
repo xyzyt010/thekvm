@@ -20,7 +20,12 @@ use x11rb::protocol::xproto::{self, ConnectionExt as XprotoConnectionExt};
 use x11rb::rust_connection::RustConnection;
 
 const ALL_MASTER_DEVICES: u16 = 1;
-const POLL_INTERVAL: Duration = Duration::from_millis(4);
+// Event-poll quantum: an X event arriving just after a poll waits at most
+// this long (keystroke/motion capture latency). 1ms keeps every keystroke
+// wire-bound instead of poll-bound — ~1000 cheap empty polls/s is ~0.2%
+// of a core, nothing next to a 60Hz compositor — while the repeat
+// synthesis below keeps its own 33ms cadence regardless.
+const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const FIXED_POINT_SCALE: f64 = 4_294_967_296.0;
 
 /// Blocking adapter around XInput2's raw event stream.
@@ -788,7 +793,7 @@ impl CaptureBackend for X11Capture {
             }
             // Trackpad pinch tap (see mt_pinch): gestures arrive here,
             // never from the X event stream. Non-blocking drain first so
-            // a pinch stays as snappy as the 4ms X poll below it.
+            // a pinch stays as snappy as the 1ms X poll below it.
             if let Some(gesture) = self.mt_pinch.poll() {
                 return Ok(gesture);
             }
@@ -805,7 +810,7 @@ impl CaptureBackend for X11Capture {
             // session, which can postdate this backend: re-resolve our own
             // sources every few seconds so freshly injected input is never
             // re-captured. One round trip per interval is negligible next
-            // to the 4ms event poll.
+            // to the 1ms event poll.
             if self.last_source_refresh.elapsed() > std::time::Duration::from_secs(5) {
                 self.last_source_refresh = std::time::Instant::now();
                 if let Some(refreshed) = query_own_sources(&self.connection) {

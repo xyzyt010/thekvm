@@ -56,10 +56,19 @@ struct Device {
     dx: i32,
     dy: i32,
     /// Accumulated scroll in 120ths (one REL_WHEEL_HI_RES step), flushed as
-    /// one `SmoothWheel` per SYN. Legacy detent ticks count 120 each, so a
-    /// notched wheel and a smooth touchpad share one canonical unit.
+    /// one `SmoothWheel` per SYN.
     scroll_x_120ths: i32,
     scroll_y_120ths: i32,
+    /// Legacy detent ticks banked per SYN (one REL_WHEEL step). Kept apart
+    /// from the hi-res accumulators above because dual-reporting devices
+    /// emit BOTH for one physical tick (REL_WHEEL=1 plus
+    /// REL_WHEEL_HI_RES=120): summing them scrolled at double speed. The
+    /// flush below gives hi-res precedence per axis per SYN (the libinput
+    /// convention) and only falls back to detents*120 when no hi-res
+    /// arrived, so a notched wheel and a smooth touchpad share one
+    /// canonical unit without ever double-counting.
+    wheel_detent_x: i32,
+    wheel_detent_y: i32,
     queue: VecDeque<InputEvent>,
     pressed_keys: BTreeSet<u16>,
     pressed_buttons: BTreeSet<MouseButton>,
@@ -138,16 +147,8 @@ impl Device {
             EV_REL if self.is_mouse => match event.code {
                 REL_X => self.dx = self.dx.saturating_add(event.value),
                 REL_Y => self.dy = self.dy.saturating_add(event.value),
-                REL_WHEEL => {
-                    self.scroll_y_120ths = self
-                        .scroll_y_120ths
-                        .saturating_add(event.value.saturating_mul(120))
-                }
-                REL_HWHEEL => {
-                    self.scroll_x_120ths = self
-                        .scroll_x_120ths
-                        .saturating_add(event.value.saturating_mul(120))
-                }
+                REL_WHEEL => self.wheel_detent_y = self.wheel_detent_y.saturating_add(event.value),
+                REL_HWHEEL => self.wheel_detent_x = self.wheel_detent_x.saturating_add(event.value),
                 REL_WHEEL_HI_RES => {
                     self.scroll_y_120ths = self.scroll_y_120ths.saturating_add(event.value)
                 }
@@ -168,11 +169,19 @@ impl Device {
                         x: self.scroll_x_120ths,
                         y: self.scroll_y_120ths,
                     });
+                } else if self.wheel_detent_x != 0 || self.wheel_detent_y != 0 {
+                    // No hi-res this SYN: one legacy detent is one notch.
+                    output.push(InputEvent::SmoothWheel {
+                        x: self.wheel_detent_x.saturating_mul(120),
+                        y: self.wheel_detent_y.saturating_mul(120),
+                    });
                 }
                 self.dx = 0;
                 self.dy = 0;
                 self.scroll_x_120ths = 0;
                 self.scroll_y_120ths = 0;
+                self.wheel_detent_x = 0;
+                self.wheel_detent_y = 0;
             }
             _ => {}
         }
@@ -729,6 +738,8 @@ mod tests {
             dy: 0,
             scroll_x_120ths: 0,
             scroll_y_120ths: 0,
+            wheel_detent_x: 0,
+            wheel_detent_y: 0,
             queue: VecDeque::new(),
             pressed_keys: BTreeSet::new(),
             pressed_buttons: BTreeSet::new(),
@@ -758,15 +769,55 @@ mod tests {
             code: SYN_REPORT,
             value: 0,
         };
-        // One legacy detent tick plus a sub-detent hi-res touchpad motion.
+        // Hi-res takes precedence per axis per SYN (dual-reporting
+        // devices emit both for one tick): legacy detents only render
+        // when no hi-res arrived, so one physical tick is one notch.
         assert!(device.process(rel(REL_WHEEL, 1)).is_empty());
         assert!(device.process(rel(REL_WHEEL_HI_RES, 30)).is_empty());
         assert!(device.process(rel(REL_HWHEEL_HI_RES, -15)).is_empty());
-        // Legacy horizontal detent counts 120.
         assert!(device.process(rel(REL_HWHEEL, -1)).is_empty());
         assert_eq!(
             device.process(syn),
-            vec![InputEvent::SmoothWheel { x: -135, y: 150 }]
+            vec![InputEvent::SmoothWheel { x: -15, y: 30 }]
+        );
+    }
+
+    #[test]
+    fn scroll_dual_reporting_wheel_tick_counts_one_notch() {
+        use super::{REL_WHEEL, REL_WHEEL_HI_RES};
+        let mut device = test_device();
+        let rel = |code, value| RawInputEvent {
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_: EV_REL,
+            code,
+            value,
+        };
+        let syn = RawInputEvent {
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_: EV_SYN,
+            code: SYN_REPORT,
+            value: 0,
+        };
+        // One physical detent on a dual-reporting wheel: legacy 1 plus
+        // hi-res 120 in the same SYN must scroll exactly one notch (120),
+        // never the old summed 240.
+        assert!(device.process(rel(REL_WHEEL, 1)).is_empty());
+        assert!(device.process(rel(REL_WHEEL_HI_RES, 120)).is_empty());
+        assert_eq!(
+            device.process(syn),
+            vec![InputEvent::SmoothWheel { x: 0, y: 120 }]
+        );
+        // A legacy-only wheel still renders one notch per detent.
+        assert!(device.process(rel(REL_WHEEL, -1)).is_empty());
+        assert_eq!(
+            device.process(syn),
+            vec![InputEvent::SmoothWheel { x: 0, y: -120 }]
         );
     }
     #[test]

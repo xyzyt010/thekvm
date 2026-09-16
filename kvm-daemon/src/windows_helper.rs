@@ -906,6 +906,12 @@ pub fn run_capture_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .context("connect to Windows service capture bridge")?;
     stream.set_nodelay(true)?;
+    // Bounded writes (the freeze fix): a wedged service task stops
+    // draining this pipe, and an unbounded write would park the helper
+    // here forever with the hooks swallowing — local input dead until a
+    // touchscreen Disconnect. 5s, then the loop below releases
+    // suppression locally and keeps retrying.
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     write_ipc_frame(&mut stream, token.as_bytes()).context("authenticate capture helper")?;
 
     let mut command_stream = stream.try_clone()?;
@@ -940,6 +946,11 @@ pub fn run_capture_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
 
     let mut capture = kvm_platform::capture::DefaultCapture::create()
         .context("create Windows capture helper hooks")?;
+    // Consecutive stalled sends (service not draining) + last warn line:
+    // the release below must fire every stall, the journal line must not
+    // spam per event.
+    let mut stalled_sends: u64 = 0;
+    let mut last_stall_warn: Option<std::time::Instant> = None;
     let result = (|| -> Result<()> {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             let event = capture
@@ -952,7 +963,41 @@ pub fn run_capture_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                 continue;
             }
             let frame = serde_json::to_vec(&HelperMessage::Input(event))?;
-            write_ipc_frame(&mut stream, &frame).context("send captured Windows input")?;
+            match write_ipc_frame(&mut stream, &frame) {
+                Ok(()) => {
+                    stalled_sends = 0;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    // The service stopped draining (wedged task): release
+                    // suppression LOCALLY now — the hooks live in this
+                    // process, and nobody upstream will ever tell us to.
+                    // The helper stays alive: a recovered service
+                    // re-engages on its next transition, and a dead one
+                    // ends us via EOF on the command stream.
+                    stalled_sends += 1;
+                    exclusive.store(false, std::sync::atomic::Ordering::Release);
+                    kvm_platform::capture::set_exclusive(false);
+                    let due = last_stall_warn
+                        .map(|when| when.elapsed() > std::time::Duration::from_secs(30))
+                        .unwrap_or(true);
+                    if due {
+                        last_stall_warn = Some(std::time::Instant::now());
+                        tracing::warn!(
+                            stalled_sends,
+                            "service stopped draining capture pipe; released local suppression (service task may be wedged)"
+                        );
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).context("send captured Windows input");
+                }
+            }
         }
         Ok(())
     })();
