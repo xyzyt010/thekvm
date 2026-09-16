@@ -113,6 +113,8 @@ impl Device {
             dy: 0,
             scroll_x_120ths: 0,
             scroll_y_120ths: 0,
+            wheel_detent_x: 0,
+            wheel_detent_y: 0,
             queue: VecDeque::new(),
             pressed_keys: BTreeSet::new(),
             pressed_buttons: BTreeSet::new(),
