@@ -1939,11 +1939,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // consecutively queued moves into one packet — identical
                 // final displacement, far fewer frames. Wheels stop the
                 // fold (scroll position relative to motion is preserved)
-                // and wait in the pending slot above.
+                // and wait in the pending slot above. The fold stays small
+                // (12, about one 1000Hz frame-batch at 60fps): merging a
+                // whole burst into one giant delta makes the remote cursor
+                // jump in visible steps instead of gliding.
                 let mut captured = first;
                 if let InputEvent::MouseMove { mut dx, mut dy } = captured.event {
                     let mut folded = 0u32;
-                    while folded < 32 {
+                    while folded < 12 {
                         match motion_rx.try_recv() {
                             Ok(next) => match next.event {
                                 InputEvent::MouseMove { dx: mx, dy: my } => {
@@ -2517,7 +2520,7 @@ fn store_warm_link(connection: &quinn::Connection, fingerprint: &str) {
 /// completed one, so two facing edges can never ping-pong the cursor
 /// forever. Pure so the determinism is unit-tested.
 fn transfer_debounced(last_transfer: Option<std::time::Instant>) -> bool {
-    last_transfer.is_some_and(|when| when.elapsed() < Duration::from_millis(100))
+    last_transfer.is_some_and(|when| when.elapsed() < Duration::from_millis(25))
 }
 
 /// Best-effort release of local-input suppression. A failed ungrab must
@@ -5958,7 +5961,13 @@ async fn handle_connection(
                     }
                     _ = lease_check.tick() => {
                         injector.ensure_session()?;
-                        if last_activity.elapsed() > Duration::from_secs(15) {
+                        // Generous lease (45s = nine missed 5s keep-alives):
+                        // a short Wi-Fi stall must never drop a live remote
+                        // session out from under the driver. Truly dead peers
+                        // are still reaped by the QUIC idle timeout and the
+                        // keep-alive watchdogs; the lease is only the last
+                        // backstop for a silent-but-connected peer.
+                        if last_activity.elapsed() > Duration::from_secs(45) {
                             end_reason = "input lease expired without activity";
                             break Err(anyhow::anyhow!(
                                 "input session lease expired; released remote input"
@@ -7749,28 +7758,20 @@ fn saved_peer_fingerprint(peers: &PeerBook, address: SocketAddr) -> Option<&str>
 
 fn validate_input_capability(config: &Config, lock_screen_requested: bool) -> Result<bool> {
     // Returns the EFFECTIVE lock-screen grant (requested AND allowed).
-    // MWB-like both-ways rule: a peer that asks for privileged input from
-    // a machine that did not opt in is DOWNGRADED to an ordinary desktop
-    // session on Windows (the Default-desktop helper isolates it, so this
-    // is exactly the "normal paired Windows desktop session" the module
-    // below blesses) instead of rejected — a one-sided checkbox must never
-    // silently kill reverse control while forward works. The non-Windows
-    // evdev/uinput receiver writes below the compositor and can reach a
-    // greeter, so its opt-in stays a hard reject in every direction.
+    // MWB-like both-ways rule: an ordinary desktop session never needs the
+    // lock-screen opt-in on any OS — requiring it on Linux made every
+    // fresh Mint install reject Windows-initiated links while Mint-initiated
+    // ones worked, forcing a manual Connect on both computers for a link
+    // that still crossed only one way. A privileged (lock-screen) request
+    // without the local opt-in downgrades to an ordinary session on
+    // Windows (the Default-desktop helper isolates it) and is rejected
+    // elsewhere, so a one-sided checkbox can never silently kill reverse
+    // control of ordinary desktop sessions.
     if lock_screen_requested && !config.allow_lock_screen_control {
         if cfg!(target_os = "windows") {
             return Ok(false);
         }
         bail!("privileged remote input is disabled locally");
-    }
-    // The non-Windows evdev/uinput receiver writes a virtual HID device below
-    // the compositor, so it cannot safely promise that an ordinary session is
-    // unable to reach a greeter or locker. Windows can isolate an ordinary
-    // session to the Default desktop helper. Keep the evdev/uinput path
-    // explicitly opted in, while allowing normal paired Windows desktop
-    // sessions without Winlogon access.
-    if !lock_screen_requested && !config.allow_lock_screen_control && !cfg!(target_os = "windows") {
-        bail!("evdev/uinput input injection requires the local lock-screen capability opt-in");
     }
     Ok(lock_screen_requested && config.allow_lock_screen_control)
 }
@@ -7901,22 +7902,22 @@ mod tests {
             allow_lock_screen_control: true,
             ..kvm_core::Config::default()
         };
+        // Ordinary desktop sessions never need the lock-screen opt-in on
+        // any OS: gating them stranded fresh Linux installs one-way (their
+        // dials out worked, incoming links were rejected) and forced a
+        // manual Connect on both computers.
+        assert!(!validate_input_capability(&locked_off, false).unwrap());
+        assert!(!validate_input_capability(&locked_on, false).unwrap());
+        assert!(validate_input_capability(&locked_on, true).unwrap());
         if cfg!(target_os = "windows") {
             // Windows isolates ordinary sessions in the Default desktop
-            // helper: no opt-in needed, and a privileged request downgrades
+            // helper: a privileged request without the opt-in downgrades
             // to ordinary (Ok(false)) instead of killing reverse control.
-            assert!(!validate_input_capability(&locked_off, false).unwrap());
             assert!(!validate_input_capability(&locked_off, true).unwrap());
-            assert!(!validate_input_capability(&locked_on, false).unwrap());
-            assert!(validate_input_capability(&locked_on, true).unwrap());
         } else {
-            // evdev/uinput writes below the compositor and can reach a
-            // greeter, so every non-Windows session needs the explicit
-            // opt-in — ordinary and privileged alike.
-            assert!(validate_input_capability(&locked_off, false).is_err());
+            // A privileged request without the opt-in stays a hard reject
+            // off Windows.
             assert!(validate_input_capability(&locked_off, true).is_err());
-            assert!(!validate_input_capability(&locked_on, false).unwrap());
-            assert!(validate_input_capability(&locked_on, true).unwrap());
         }
     }
 
@@ -8790,7 +8791,7 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn ordinary_non_windows_sessions_stay_gated_by_uinput_policy() {
-        assert!(validate_input_capability(&Config::default(), false).is_err());
+    fn ordinary_non_windows_sessions_do_not_need_lock_screen_opt_in() {
+        assert!(validate_input_capability(&Config::default(), false).is_ok());
     }
 }

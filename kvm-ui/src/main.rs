@@ -2910,15 +2910,36 @@ fn relay_session_progress(
                         .and_then(|slot| slot.as_ref().and_then(|current| current.link_id));
                     if ours == banned {
                         stop_session(weak, session, "Peer started a fresh link");
-                        ui_log(&format!(
-                            "link: peer ended epoch {} — redialling on their fresh link automatically",
-                            banned.map(|id| id.to_string()).unwrap_or_else(|| "none".into())
-                        ));
-                        set_status(
-                            weak,
-                            "Peer ended this link (fresh link on their side) — redialling automatically…".into(),
+                        // Honest status: "redialling automatically" is only
+                        // true when the peer's fresh epoch is already
+                        // inbound (the poll loop adopts it). With no fresh
+                        // inbound nothing redials on its own — saying so
+                        // left both computers dark with no next step.
+                        let fresh_inbound = matches!(
+                            control_request(ControlRequest::Status),
+                            Ok(ControlResponse::Status(status)) if status.sessions.iter().any(|link| link.link_id != banned)
                         );
-                        "Peer ended this link (fresh link on their side) — redialling automatically…".into()
+                        if fresh_inbound {
+                            ui_log(&format!(
+                                "link: peer ended epoch {} — redialling on their fresh link automatically",
+                                banned.map(|id| id.to_string()).unwrap_or_else(|| "none".into())
+                            ));
+                            set_status(
+                                weak,
+                                "Peer ended this link (fresh link on their side) — redialling automatically…".into(),
+                            );
+                            "Peer ended this link (fresh link on their side) — redialling automatically…".into()
+                        } else {
+                            ui_log(&format!(
+                                "link: peer ended epoch {} — waiting for a fresh Connect (either side connects, the other dials back on its own)",
+                                banned.map(|id| id.to_string()).unwrap_or_else(|| "none".into())
+                            ));
+                            set_status(
+                                weak,
+                                "Peer ended this link — press Connect for a fresh link, or wait for their Connect (this side dials back on its own).".into(),
+                            );
+                            "Peer ended this link — press Connect for a fresh link, or wait for their Connect (this side dials back on its own).".into()
+                        }
                     } else {
                         format!("Connection to {address} ended ({detail})")
                     }
