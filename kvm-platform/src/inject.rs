@@ -772,15 +772,18 @@ mod win32_inject {
     }
 
     /// OS-level pinch-zoom gesture state. A remote trackpad pinch arrives
-    /// as `Pinch` deltas (see `inject_pinch`). By default it renders as
-    /// Ctrl+wheel at the cursor — the browser-native page zoom (zoom popup
-    /// at the top right, zoom-to-cursor) that a local precision-touchpad
-    /// pinch produces in Chrome/Edge. The InjectTouchInput touchscreen path
-    /// is opt-in only (`THEKVM_NATIVE_TOUCH_PINCH=1`): it renders as a
-    /// touchscreen pinch (cursor point zoom, huge scaled text, no zoom
-    /// popup) which reads as wrong next to the native behavior, and true
-    /// HID-level precision-touchpad emulation (usage page 0x0D reports) is
-    /// impossible from user mode — it needs a kernel virtual-HID driver.
+    /// as `Pinch` deltas (see `inject_pinch`) and renders by default as a
+    /// real two-finger touch gesture at the cursor (InjectTouchInput): the
+    /// viewport pinch-zoom that a local trackpad pinch produces in
+    /// Chrome/Edge — optical zoom anchored at the cursor, no layout
+    /// reflow, no zoom badge in the address bar, nothing persisted
+    /// per-site. Ctrl+wheel is only the degraded fallback (touch
+    /// unavailable) or an explicit opt-out (`THEKVM_WHEEL_PINCH=1`): it
+    /// renders the browser page zoom instead (layout reflows, zoom badge
+    /// appears, level sticks per site), which is a different gesture.
+    /// True HID-level precision-touchpad emulation (usage page 0x0D
+    /// reports) is impossible from user mode — it needs a kernel
+    /// virtual-HID driver.
     #[derive(Debug)]
     struct PinchTouch {
         /// Touch contacts are currently down on the local desktop.
@@ -887,21 +890,21 @@ mod win32_inject {
             }
         }
 
-        /// Render one pinch-delta. DEFAULT is browser-native Ctrl+wheel at
-        /// the cursor (page zoom with the top-right zoom popup, matching a
-        /// local precision-touchpad pinch in Chrome/Edge). The touchscreen
-        /// InjectTouchInput path (cursor point zoom, no popup) is opt-in
-        /// via THEKVM_NATIVE_TOUCH_PINCH=1 only: it answers a different
-        /// gesture (touchscreen, not trackpad) and reads as wrong next to
-        /// native. A gesture must never kill the session.
+        /// Render one pinch-delta. DEFAULT is a real two-finger touch
+        /// gesture at the cursor (viewport pinch-zoom: optical zoom
+        /// anchored at the cursor, no reflow, no address-bar badge —
+        /// what a local trackpad pinch does in Chrome/Edge). Touch
+        /// failures degrade INSIDE this function to Ctrl+wheel (page
+        /// zoom) so a gesture never fails the send; `THEKVM_WHEEL_PINCH=1`
+        /// forces the page-zoom rendering for comparison. A gesture must
+        /// never kill the session.
         pub fn inject_pinch(&self, delta: i32) -> Result<(), PlatformError> {
             let mut pinch = self
                 .pinch
                 .lock()
                 .map_err(|_| PlatformError::Win32("pinch state lock poisoned".into()))?;
-            // Browser-native default: Ctrl+wheel zoom-to-cursor. Touch only
-            // on explicit opt-in (see struct docs for why).
-            if std::env::var("THEKVM_NATIVE_TOUCH_PINCH").as_deref() != Ok("1") {
+            // Explicit opt-out: page zoom instead of viewport zoom.
+            if std::env::var("THEKVM_WHEEL_PINCH").as_deref() == Ok("1") {
                 return self.fallback_pinch_wheel(&mut pinch, delta);
             }
             if pinch.touch_ready.is_none() {

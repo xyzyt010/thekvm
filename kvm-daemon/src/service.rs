@@ -6113,19 +6113,18 @@ async fn handle_connection(
 }
 
 /// Render a wire-native pinch gesture on the receiver. The gesture is
-/// zoom-to-cursor by construction (no focus coordinates cross the wire):
-/// every platform expands it into Ctrl+wheel at the cursor here, reusing
-/// the sender's legacy expansion against the INJECTOR's held keys so a
-/// physically held Ctrl is never stolen or released by us. Ctrl+wheel is
-/// the browser-native page zoom (zoom popup at the top right, layout
-/// reflows) that a local precision-touchpad pinch produces in Chrome/Edge.
-/// The Windows touchscreen InjectTouchInput path is opt-in only
-/// (THEKVM_NATIVE_TOUCH_PINCH=1): it renders a touchscreen point zoom
-/// (huge scaled text under the cursor, no popup) which reads as wrong next
-/// to native, and true HID-level trackpad emulation (usage page 0x0D
-/// contact reports) is impossible from user mode — it needs a kernel
-/// virtual-HID driver, not SendInput/uinput. Set the env var on the
-/// RECEIVER to force the old touch path for comparison.
+/// zoom-to-cursor by construction (no focus coordinates cross the wire).
+/// On Windows the raw gesture is handed to the injector, which renders a
+/// real two-finger touch gesture at the cursor: the viewport pinch-zoom a
+/// local trackpad pinch produces in Chrome/Edge (optical zoom anchored at
+/// the cursor, no layout reflow, no zoom badge in the address bar, nothing
+/// persisted per site). `THEKVM_WHEEL_PINCH=1` on the receiver forces the
+/// old Ctrl+wheel page-zoom rendering for comparison. Off Windows the
+/// gesture expands here into Ctrl+wheel at the cursor (reusing the
+/// sender's legacy expansion against the INJECTOR's held keys so a
+/// physically held Ctrl is never stolen or released by us). True HID-level
+/// trackpad emulation (usage page 0x0D contact reports) is impossible from
+/// user mode — it needs a kernel virtual-HID driver, not SendInput/uinput.
 fn handle_inbound_pinch(
     event: InputEvent,
     injector: &mut ReceiverInjector,
@@ -6133,7 +6132,7 @@ fn handle_inbound_pinch(
 ) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        if std::env::var("THEKVM_NATIVE_TOUCH_PINCH").as_deref() == Ok("1") {
+        if std::env::var("THEKVM_WHEEL_PINCH").as_deref() != Ok("1") {
             let _ = pinch_held;
             return injector.send(event);
         }

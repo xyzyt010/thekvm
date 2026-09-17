@@ -13,7 +13,7 @@
 ; Build: iscc packaging\windows\thekvm.iss   (output: dist\thekvm-<ver>-setup.exe)
 
 #define MyAppName "TheKVM"
-#define MyAppVersion "0.9.38"
+#define MyAppVersion "0.9.39"
 #define MyAppPublisher "TheKVM project"
 #define MyAppURL "https://github.com/xyzyt010/thekvm"
 #define ServiceName "TheKVM"
