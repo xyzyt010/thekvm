@@ -1013,12 +1013,27 @@ const XI_UNGRAB_SWEEP: [u16; 4] = [0, 1, 2, 3];
 /// XI delivery (including smooth-scroll valuators) keeps flowing
 /// under an XI hold, which a core hold kills. Core stays the fallback
 /// for servers that refuse XI grabs outright.
+///
+/// The mask pairs RAW classes (our capture feed — raw events bypass
+/// grabs by XI2 design, so they keep flowing to our root selection)
+/// with the COOKED pointer/key classes: an active grab redirects
+/// matching cooked events to the grab window (which selects nothing, so
+/// they die there) instead of delivering them to local apps. A raw-only
+/// mask would capture fine but leak every local click/scroll while
+/// driving — the scroll-applies-locally class. Servers that refuse the
+/// wider mask fall back to the core grab, which blocks everything
+/// anyway, so widening can only help, never hurt.
 fn xi_grab(
     connection: &RustConnection,
     grab_window: xproto::Window,
     deviceid: u16,
 ) -> Result<(), PlatformError> {
-    let mask = [raw_mask()];
+    let mask = [raw_mask()
+        | u32::from(xinput::XIEventMask::BUTTON_PRESS)
+        | u32::from(xinput::XIEventMask::BUTTON_RELEASE)
+        | u32::from(xinput::XIEventMask::MOTION)
+        | u32::from(xinput::XIEventMask::KEY_PRESS)
+        | u32::from(xinput::XIEventMask::KEY_RELEASE)];
     let status = connection
         .xinput_xi_grab_device(
             grab_window,

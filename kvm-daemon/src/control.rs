@@ -263,6 +263,7 @@ where
                 peer_count,
                 active_session_count: active_sessions.load(std::sync::atomic::Ordering::Relaxed),
                 sessions: crate::service::list_inbound_links(),
+                peer_ended_links: crate::service::peer_ended_links(),
                 uptime_seconds: started.elapsed().as_secs(),
             })
         }
@@ -375,6 +376,43 @@ where
             crate::service::end_link(link_id);
             crate::service::audit_event(&data_dir, &format!("link-ended link_id={link_id}"));
             ControlResponse::LinkEnded { link_id }
+        }
+        ControlRequest::NotifyPeerEnded {
+            fingerprint_hex,
+            link_id,
+        } => {
+            if !is_fingerprint(&fingerprint_hex) {
+                ControlResponse::Error {
+                    message: "peer fingerprint must contain 64 hexadecimal characters".into(),
+                }
+            } else {
+                let fingerprint_hex = fingerprint_hex.to_ascii_lowercase();
+                let book = peers.read().await;
+                match crate::service::notify_peer_ended(&book, &fingerprint_hex, link_id, &data_dir)
+                    .await
+                {
+                    Ok(()) => {
+                        crate::service::audit_event(
+                            &data_dir,
+                            &format!(
+                                "link-end-notified peer={fingerprint_hex} link_id={link_id:?}"
+                            ),
+                        );
+                        ControlResponse::PeerNotified { fingerprint_hex }
+                    }
+                    Err(error) => {
+                        crate::service::audit_event(
+                            &data_dir,
+                            &format!(
+                                "link-end-notify-failed peer={fingerprint_hex} link_id={link_id:?} error={error:#}"
+                            ),
+                        );
+                        ControlResponse::Error {
+                            message: format!("peer notify failed: {error:#}"),
+                        }
+                    }
+                }
+            }
         }
         ControlRequest::ExportIdentity => {
             match kvm_protocol::pairing::Identity::load_or_create(&data_dir) {

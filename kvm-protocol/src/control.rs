@@ -75,6 +75,16 @@ pub enum ControlRequest {
     EndLink {
         link_id: u64,
     },
+    /// Deliver our Disconnect to the peer's daemon: open a bare stream to
+    /// the paired peer and send `LinkEnded`, so THEIR side bans the epoch
+    /// and drops sessions too — one Disconnect ends the link on both
+    /// computers even with no live episode to close. Best-effort (a peer
+    /// that is already gone learns nothing, and needs nothing): failures
+    /// report `PeerNotifyFailed`, never block local teardown.
+    NotifyPeerEnded {
+        fingerprint_hex: String,
+        link_id: Option<u64>,
+    },
     /// Return the daemon-owned identity (certificate + key, hex-encoded) so
     /// a UI-supervised `connect` child can wear the SAME face as the
     /// service. Without this the child loads the interactive user's files
@@ -145,6 +155,12 @@ pub struct DaemonStatus {
     /// dialed — and to hang it up. Empty on older daemons.
     #[serde(default)]
     pub sessions: Vec<ActiveSession>,
+    /// Link epochs the PEER ended via Disconnect (their `LinkEnded`
+    /// reached us). The poll loop ends our side too, so one Disconnect
+    /// lands on both computers. Empty on older daemons; bounded like the
+    /// ban set (recent epochs only).
+    #[serde(default)]
+    pub peer_ended_links: Vec<u64>,
 }
 
 /// One live inbound input session: who dialed in, from where.
@@ -164,6 +180,14 @@ pub struct ActiveSession {
     /// as "idle", so mixed-version links keep the pre-activity behavior.
     #[serde(default)]
     pub input_events: u64,
+    /// True once this peer has taken the cursor (PointerHandoff received)
+    /// on this session: the peer IS driving us, not merely linked. False
+    /// for a linked-but-idle dial-back, and on older daemons that predate
+    /// the field. The outbound drive loop reads it (via Status) to break
+    /// the dual-drive idle standoff: both sides driving with no input
+    /// flowing either way would otherwise sit suppressed forever.
+    #[serde(default)]
+    pub driving: bool,
 }
 
 /// A remote identity that completed the network half of pairing and is
@@ -209,6 +233,11 @@ pub enum ControlResponse {
     },
     LinkEnded {
         link_id: u64,
+    },
+    /// The peer's daemon acknowledged our Disconnect (`NotifyPeerEnded`
+    /// sent `LinkEnded` to it). Local teardown proceeds regardless.
+    PeerNotified {
+        fingerprint_hex: String,
     },
     /// The daemon-owned identity for [`ControlRequest::ExportIdentity`].
     /// Hex-encoded DER (see `pairing::hex_encode`); empty on older daemons.
@@ -453,5 +482,10 @@ mod tests {
         assert_eq!(status.sessions.len(), 2);
         assert_eq!(status.sessions[0].input_events, 0);
         assert_eq!(status.sessions[1].input_events, 41);
+        // Pre-driving-flag sessions are merely linked, never driving —
+        // the idle-dual arbitration must not read them as drives.
+        assert!(!status.sessions[0].driving);
+        assert!(!status.sessions[1].driving);
+        assert!(status.peer_ended_links.is_empty());
     }
 }

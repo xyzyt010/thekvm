@@ -814,14 +814,17 @@ mod win32_inject {
     }
 
     /// Contact separation after a pinch delta. Pure for tests. Deltas are
-    /// 120ths of finger spread; 0.3px per unit makes a firm phone-style
-    /// gesture span most of the clamp range without jumping.
+    /// 120ths of finger spread; a gentle gain plus a per-event clamp keeps
+    /// a slight two-finger slide a slight zoom (not a full-page leap):
+    /// small deltas track proportionally, pathological single-event spikes
+    /// clamp instead of teleporting the contacts.
     fn pinch_separation(current_px: f64, delta_120ths: i32) -> f64 {
-        const PX_PER_UNIT: f64 = 0.3;
+        const PX_PER_UNIT: f64 = 0.08;
+        const MAX_STEP_PX: f64 = 30.0;
         const MIN_SEPARATION_PX: f64 = 40.0;
         const MAX_SEPARATION_PX: f64 = 700.0;
-        (current_px + f64::from(delta_120ths) * PX_PER_UNIT)
-            .clamp(MIN_SEPARATION_PX, MAX_SEPARATION_PX)
+        let step = (f64::from(delta_120ths) * PX_PER_UNIT).clamp(-MAX_STEP_PX, MAX_STEP_PX);
+        (current_px + step).clamp(MIN_SEPARATION_PX, MAX_SEPARATION_PX)
     }
 
     /// Contact x positions for a separation around a center. Pure for
@@ -1609,9 +1612,12 @@ mod win32_inject {
             // zoom-in deltas, shrinks with zoom-out, and clamps instead of
             // running away on a pathological flood.
             assert_eq!(super::pinch_contacts(960, 120.0), (900, 1020));
-            assert_eq!(super::pinch_separation(120.0, 120), 156.0);
-            assert_eq!(super::pinch_separation(120.0, -120), 84.0);
+            assert_eq!(super::pinch_separation(120.0, 120), 129.6);
+            assert_eq!(super::pinch_separation(120.0, -120), 110.4);
             assert_eq!(super::pinch_separation(120.0, 0), 120.0);
+            // Single-event spikes clamp to a 30px step instead of leaping.
+            assert_eq!(super::pinch_separation(120.0, 10_000), 150.0);
+            assert_eq!(super::pinch_separation(120.0, -10_000), 90.0);
             assert_eq!(super::pinch_separation(690.0, 10_000), 700.0);
             assert_eq!(super::pinch_separation(50.0, -10_000), 40.0);
         }

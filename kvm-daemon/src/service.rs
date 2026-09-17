@@ -53,6 +53,12 @@ pub(crate) struct InboundLink {
     /// proves an active inbound drive (0.9.32 yielded every crossing
     /// instantly on existence alone).
     pub input_events: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Set when this peer takes the cursor (PointerHandoff) on this
+    /// session: the peer IS driving us, not merely linked. Shared like
+    /// input_events so the Status snapshot (and the outbound drive
+    /// loop's idle-dual arbitration) can tell an idle DRIVE from an idle
+    /// LINK — the distinction that breaks the both-suppressed freeze.
+    pub driving: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 type LinkRegistry =
@@ -68,8 +74,9 @@ pub(crate) fn inbound_link_registry() -> LinkRegistry {
 }
 
 /// Record a verified inbound session; returns its registration id, a
-/// drop-watch the serve loop selects on, and the shared input-activity
-/// counter the serve loop bumps for every received input event. Replaces
+/// drop-watch the serve loop selects on, the shared input-activity
+/// counter the serve loop bumps for every received input event, and the
+/// shared driving flag the serve loop sets on PointerHandoff. Replaces
 /// any stale entry for the same peer (the old task is already gone —
 /// only one input session holds the slot at a time).
 pub(crate) fn register_inbound_link(
@@ -81,10 +88,12 @@ pub(crate) fn register_inbound_link(
     u64,
     tokio::sync::watch::Receiver<bool>,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let id = LINK_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (drop_tx, drop_rx) = tokio::sync::watch::channel(false);
     let input_events = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let driving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let Ok(mut links) = inbound_link_registry().lock() {
         links.insert(
             fingerprint_hex.to_owned(),
@@ -96,12 +105,13 @@ pub(crate) fn register_inbound_link(
                     address: address.to_owned(),
                     link_id,
                     input_events: input_events.clone(),
+                    driving: driving.clone(),
                 },
                 drop_tx,
             ),
         );
     }
-    (id, drop_rx, input_events)
+    (id, drop_rx, input_events, driving)
 }
 
 /// Remove a registration, but only when the id still matches — a redialed
@@ -139,6 +149,7 @@ pub(crate) fn list_inbound_links() -> Vec<kvm_protocol::control::ActiveSession> 
                 address: link.address.clone(),
                 link_id: link.link_id,
                 input_events: link.input_events.load(std::sync::atomic::Ordering::Relaxed),
+                driving: link.driving.load(std::sync::atomic::Ordering::Relaxed),
             })
             .collect()
     } else {
@@ -180,11 +191,49 @@ pub(crate) fn end_link(link_id: u64) {
     }
 }
 
+/// Link epochs the PEER ended via Disconnect (their `LinkEnded` reached
+/// us). Same rejection effect as a local ban (redials stay dead), kept
+/// apart so the UI can tell "the other side hung up" (end our side too)
+/// from "we hung up" (wait for their fresh dial). Same 32 bound.
+static PEER_ENDED_LINKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+fn peer_ended_link_ids() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
+    PEER_ENDED_LINKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+pub(crate) fn peer_end_link(link_id: u64) {
+    if let Ok(mut ended) = peer_ended_link_ids().lock() {
+        if ended.len() >= 32 {
+            ended.clear();
+        }
+        ended.insert(link_id);
+    }
+}
+
+fn peer_link_ended(link_id: u64) -> bool {
+    peer_ended_link_ids()
+        .lock()
+        .ok()
+        .is_some_and(|ended| ended.contains(&link_id))
+}
+
+/// Recently peer-ended epochs, for the Status snapshot the UI poll loop
+/// watches: our side ends itself when its link_id shows up here.
+pub(crate) fn peer_ended_links() -> Vec<u64> {
+    peer_ended_link_ids()
+        .lock()
+        .ok()
+        .map(|ended| ended.iter().copied().collect())
+        .unwrap_or_default()
+}
+
 fn link_ended(link_id: u64) -> bool {
     ended_link_ids()
         .lock()
         .ok()
         .is_some_and(|ended| ended.contains(&link_id))
+        || peer_link_ended(link_id)
 }
 
 /// True when the dial failed because the peer deliberately ended this link
@@ -1589,6 +1638,11 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // fresh yields refuse new handoffs briefly so opposite-edge
     // holding cannot ping-pong the drive.
     let mut last_yield: Option<std::time::Instant> = None;
+    // Idle-dual arbitration stamps (see probe_inbound_yield): last event
+    // forwarded to the peer, and last inbound activity growth observed.
+    // Both idle 5s with the peer driving us ends our drive (both local).
+    let mut last_outbound_input: Option<std::time::Instant> = None;
+    let mut last_inbound_growth_at: Option<std::time::Instant> = None;
     let mut local_wheel_dropped = 0u64;
     let mut sequence = 0u64;
     // Stashed motion-channel event: the burst fold below stops at the
@@ -1864,6 +1918,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     divert_baseline: &mut divert_baseline,
                     inbound_baselines_fresh: &mut inbound_baselines_fresh,
                     last_yield: &mut last_yield,
+                    last_outbound_input: &mut last_outbound_input,
                 })
                 .await?;
             }
@@ -1982,6 +2037,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     divert_baseline: &mut divert_baseline,
                     inbound_baselines_fresh: &mut inbound_baselines_fresh,
                     last_yield: &mut last_yield,
+                    last_outbound_input: &mut last_outbound_input,
                 })
                 .await?;
             }
@@ -2060,36 +2116,22 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         )
                         .await;
                     } else {
-                        // Fresh-inbound-input path (see
-                        // inbound_inputs_growth): the first probe of a
-                        // drive only records its baseline, so input the
-                        // peer sent on an older drive can never fire a
-                        // new crossing.
-                        let current = snapshot_inbound_inputs(&control_dirs).await;
-                        let growth = if inbound_baselines_fresh {
-                            inbound_inputs_growth(&mut inbound_baseline, &current)
-                        } else {
-                            inbound_baseline = current;
-                            inbound_baselines_fresh = true;
-                            0
-                        };
-                        if growth > 0 {
-                            let observed =
-                                kvm_platform::capture::inbound_while_driving_count();
-                            tracing::info!(growth, "fresh peer input arrived while driving; yielding to the inbound drive");
-                            yield_drive_to_inbound(
-                                &mut router,
-                                &mut active,
-                                &mut parked,
-                                &capture_control,
-                                &mut discarded_event_barrier,
-                                &mut last_transfer,
-                                &mut last_yield,
-                                &mut suppression_requested,
-                                observed,
-                            )
-                            .await;
-                        }
+                        probe_inbound_yield(
+                            &mut router,
+                            &mut active,
+                            &mut parked,
+                            &capture_control,
+                            &mut discarded_event_barrier,
+                            &mut last_transfer,
+                            &mut last_yield,
+                            &mut suppression_requested,
+                            &mut inbound_baseline,
+                            &mut inbound_baselines_fresh,
+                            &last_outbound_input,
+                            &mut last_inbound_growth_at,
+                            &control_dirs,
+                        )
+                        .await;
                     }
                 }
             }
@@ -2121,36 +2163,22 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         )
                         .await;
                     } else {
-                        // Fresh-inbound-input path (see
-                        // inbound_inputs_growth): the first probe of a
-                        // drive only records its baseline, so input the
-                        // peer sent on an older drive can never fire a
-                        // new crossing.
-                        let current = snapshot_inbound_inputs(&control_dirs).await;
-                        let growth = if inbound_baselines_fresh {
-                            inbound_inputs_growth(&mut inbound_baseline, &current)
-                        } else {
-                            inbound_baseline = current;
-                            inbound_baselines_fresh = true;
-                            0
-                        };
-                        if growth > 0 {
-                            let observed =
-                                kvm_platform::capture::inbound_while_driving_count();
-                            tracing::info!(growth, "fresh peer input arrived while driving; yielding to the inbound drive");
-                            yield_drive_to_inbound(
-                                &mut router,
-                                &mut active,
-                                &mut parked,
-                                &capture_control,
-                                &mut discarded_event_barrier,
-                                &mut last_transfer,
-                                &mut last_yield,
-                                &mut suppression_requested,
-                                observed,
-                            )
-                            .await;
-                        }
+                        probe_inbound_yield(
+                            &mut router,
+                            &mut active,
+                            &mut parked,
+                            &capture_control,
+                            &mut discarded_event_barrier,
+                            &mut last_transfer,
+                            &mut last_yield,
+                            &mut suppression_requested,
+                            &mut inbound_baseline,
+                            &mut inbound_baselines_fresh,
+                            &last_outbound_input,
+                            &mut last_inbound_growth_at,
+                            &control_dirs,
+                        )
+                        .await;
                     }
                 }
                 if let Some(session) = active.as_mut() {
@@ -2719,8 +2747,12 @@ fn daemon_control_candidates(primary: &std::path::Path) -> Vec<std::path::PathBu
 /// that reach the same daemon can never double-count.
 async fn snapshot_inbound_inputs(
     candidates: &[std::path::PathBuf],
-) -> std::collections::HashMap<String, u64> {
+) -> (
+    std::collections::HashMap<String, u64>,
+    std::collections::HashSet<String>,
+) {
     let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut driving: std::collections::HashSet<String> = std::collections::HashSet::new();
     for dir in candidates {
         let request =
             crate::control::request(dir.clone(), kvm_protocol::control::ControlRequest::Status);
@@ -2733,10 +2765,17 @@ async fn snapshot_inbound_inputs(
                         *total = (*total).max(session.input_events);
                     })
                     .or_insert(session.input_events);
+                // Driving (cursor taken), not merely linked: the
+                // idle-dual arbitration below reads it. Older daemons
+                // report false — their links keep the pre-arbitration
+                // behavior (growth-yield only).
+                if session.driving {
+                    driving.insert(session.fingerprint_hex.clone());
+                }
             }
         }
     }
-    totals
+    (totals, driving)
 }
 
 /// Fresh inbound input since the baseline snapshot, and refresh the
@@ -2784,6 +2823,98 @@ fn inbound_inputs_growth(
         baseline.insert(fingerprint.clone(), *count);
     }
     growth
+}
+
+/// Shared inbound-yield probe body (300ms fast probe + 5s keep-alive
+/// backup): fresh inbound INPUT ACTIVITY pre-empts our drive within one
+/// tick, and the idle-dual arbitration below breaks the both-suppressed
+/// standoff when neither side touches input. Pure routing except for the
+/// snapshot read and the yield itself.
+#[allow(clippy::too_many_arguments)]
+async fn probe_inbound_yield(
+    router: &mut EdgeRouter,
+    active: &mut Option<TopologySession>,
+    parked: &mut Option<TopologySession>,
+    capture_control: &CaptureGuard,
+    discarded_event_barrier: &mut u64,
+    last_transfer: &mut Option<std::time::Instant>,
+    last_yield: &mut Option<std::time::Instant>,
+    suppression_requested: &mut bool,
+    inbound_baseline: &mut std::collections::HashMap<String, u64>,
+    inbound_baselines_fresh: &mut bool,
+    last_outbound_input: &Option<std::time::Instant>,
+    last_inbound_growth_at: &mut Option<std::time::Instant>,
+    control_dirs: &[std::path::PathBuf],
+) {
+    // Fresh-inbound-input path (see inbound_inputs_growth): the first
+    // probe of a drive only records its baseline, so input the peer sent
+    // on an older drive can never fire a new crossing.
+    let (current, driving) = snapshot_inbound_inputs(control_dirs).await;
+    let growth = if *inbound_baselines_fresh {
+        inbound_inputs_growth(inbound_baseline, &current)
+    } else {
+        *inbound_baseline = current;
+        *inbound_baselines_fresh = true;
+        0
+    };
+    if growth > 0 {
+        *last_inbound_growth_at = Some(std::time::Instant::now());
+        let observed = kvm_platform::capture::inbound_while_driving_count();
+        tracing::info!(
+            growth,
+            "fresh peer input arrived while driving; yielding to the inbound drive"
+        );
+        yield_drive_to_inbound(
+            router,
+            active,
+            parked,
+            capture_control,
+            discarded_event_barrier,
+            last_transfer,
+            last_yield,
+            suppression_requested,
+            observed,
+        )
+        .await;
+        return;
+    }
+    if active.is_none() || driving.is_empty() {
+        return;
+    }
+    // Idle-dual arbitration: BOTH directions drive but nobody has touched
+    // input for a while — no outbound forwards here, no inbound growth
+    // there. Without this each side sits suppressed forever waiting for
+    // the other (the dual-drive freeze both users report after crossing).
+    // The peer-DRIVING signal (cursor taken, not mere link existence)
+    // gates it, so a solo idle drive — hands off, reading the peer's
+    // screen — NEVER yields. Either side's next input re-takes instantly
+    // (fresh baseline each drive), so the cost of a wrong yield is one
+    // re-push, not a freeze.
+    let now = std::time::Instant::now();
+    let drive_old =
+        last_transfer.is_some_and(|when| now.duration_since(when) > Duration::from_secs(5));
+    let out_idle =
+        last_outbound_input.is_none_or(|when| now.duration_since(when) > Duration::from_secs(5));
+    let in_idle =
+        last_inbound_growth_at.is_none_or(|when| now.duration_since(when) > Duration::from_secs(5));
+    if drive_old && out_idle && in_idle {
+        let observed = kvm_platform::capture::inbound_while_driving_count();
+        tracing::info!(
+            "dual idle drive with the peer (no input either way for 5s); yielding to local"
+        );
+        yield_drive_to_inbound(
+            router,
+            active,
+            parked,
+            capture_control,
+            discarded_event_barrier,
+            last_transfer,
+            last_yield,
+            suppression_requested,
+            observed,
+        )
+        .await;
+    }
 }
 
 /// Step the router cursor a few pixels inside the screen after a refused
@@ -2938,6 +3069,10 @@ struct TopologyEventContext<'a> {
     /// refuse new handoffs briefly so opposite-edge holding cannot
     /// ping-pong the drive.
     last_yield: &'a mut Option<std::time::Instant>,
+    /// Last event forwarded to the peer on the active drive (any kind):
+    /// the idle-dual arbitration reads it. Stamped in the Forward arm
+    /// only — local input while nobody is driven must not count.
+    last_outbound_input: &'a mut Option<std::time::Instant>,
 }
 
 async fn handle_topology_event(
@@ -2976,6 +3111,7 @@ async fn handle_topology_event(
         divert_baseline,
         inbound_baselines_fresh,
         last_yield,
+        last_outbound_input,
     } = context;
     // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
     // Raw deltas keep flowing after the OS pointer has stopped at the edge,
@@ -3085,6 +3221,10 @@ async fn handle_topology_event(
             if session.target != target {
                 bail!("topology router/session target mismatch");
             }
+            // Outbound-activity stamp for the idle-dual arbitration (see
+            // probe_inbound_yield): any event routed to the peer proves
+            // this drive is live, not stalled.
+            *last_outbound_input = Some(std::time::Instant::now());
             // Pinch gestures expand-or-pass HERE, per this session's peer
             // capability (see `pinch_for_send`): capable peers get raw
             // gestures with no synthetic modifier anywhere; older peers
@@ -5298,6 +5438,7 @@ async fn handle_connection(
                     Ok(Ok(lane)) => {
                         tracing::info!(
                             peer = %peer_fingerprint,
+                            stream = ?lane.id(),
                             "episode motion lane accepted",
                         );
                         Some(lane)
@@ -5323,7 +5464,7 @@ async fn handle_connection(
             // daemon address and otherwise the inbound IP on the standard
             // daemon port.
             let peer_book = peers.read().await;
-            let (link_id, mut link_drop, link_input_events) = register_inbound_link(
+            let (link_id, mut link_drop, link_input_events, link_driving) = register_inbound_link(
                 &peer_fingerprint,
                 &hello.node_name,
                 &dialable_peer_address(
@@ -5500,6 +5641,19 @@ async fn handle_connection(
                                 y,
                                 screen_geometry,
                             } => {
+                                // A handoff IS inbound drive intent (the peer
+                                // takes the cursor), so it feeds the same
+                                // live-drive signal as input frames (see
+                                // snapshot_inbound_inputs): a peer that opens
+                                // a drive and then sits still must still
+                                // pre-empt our outbound drive within one
+                                // probe — otherwise both sides sit
+                                // suppressed with no input flowing anywhere
+                                // (the dual-drive freeze). Baselines absorb
+                                // older handoffs, so only a handoff DURING
+                                // our drive fires.
+                                link_input_events
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 // Lazy single-driver slot: the first handoff
                                 // on this stream claims it; a second live
                                 // driver is rejected on THIS stream (the
@@ -5563,6 +5717,13 @@ async fn handle_connection(
                                 let (x, y) = remap_position(x, y, screen_geometry, truthful);
                                 remote_screen = Some(target);
                                 remote_cursor = Some((x, y));
+                                // The peer has taken the cursor: mark this
+                                // inbound session as DRIVING (not merely
+                                // linked) for the Status snapshot — the
+                                // outbound loop's idle-dual arbitration
+                                // reads it. Removal at session end clears
+                                // it implicitly with the entry.
+                                link_driving.store(true, std::sync::atomic::Ordering::Relaxed);
                                 // Arm proportional absolute motion BEFORE
                                 // the warp (Windows-service bridge only):
                                 // the helper tracks the REMOTE cursor in
@@ -5612,6 +5773,12 @@ async fn handle_connection(
                             }
                             WireMessage::ReleaseAll => injector.release_all()?,
                             WireMessage::Ping { nonce } => {
+                                // A Ping proves the peer app is alive on
+                                // THIS episode: refresh the input lease, or
+                                // parked (idle-but-resumable) episodes die
+                                // at 15s and every return-then-repush pays
+                                // a cold redial.
+                                last_activity = Instant::now();
                                 write_frame(&mut send, &WireMessage::Pong { nonce }).await?;
                             }
                             WireMessage::ClipboardText { revision, text }
@@ -5886,6 +6053,47 @@ async fn handle_connection(
                 if let Err(error) = stream_result {
                     tracing::debug!(%error, "episode stream ended");
                 }
+            }
+            WireMessage::LinkEnded { link_id } => {
+                // The peer's user pressed Disconnect: end the link on THIS
+                // side too, so one Disconnect lands on both computers even
+                // when no episode stream is live to close. Only a paired
+                // peer's association can deliver this (checked like Hello).
+                // The epoch bans unconditionally: paired-peer trust is
+                // binary, and every Connect mints a fresh epoch, so a
+                // stray value can neither kill a live link nor plant a
+                // useful ban — while a real one keeps redials dead.
+                if !peers.read().await.is_pinned(&peer_fingerprint) {
+                    bail!("untrusted peer fingerprint {peer_fingerprint}");
+                }
+                let _ = send.finish();
+                if let Some(id) = link_id {
+                    peer_end_link(id);
+                    audit_event(
+                        audit_dir,
+                        &format!(
+                            "link-ended-by-peer peer={peer_fingerprint} remote={} link_id={id}",
+                            conn.remote_address(),
+                        ),
+                    );
+                } else {
+                    audit_event(
+                        audit_dir,
+                        &format!(
+                            "link-ended-by-peer peer={peer_fingerprint} remote={} link_id=none",
+                            conn.remote_address(),
+                        ),
+                    );
+                }
+                // Drop their live inbound sessions: our outbound child (if
+                // any) sees its episodes fail and tears down; a still-idle
+                // child learns via the peer_ended_links Status watch.
+                drop_inbound_link(&peer_fingerprint);
+                tracing::info!(
+                    peer = %peer_fingerprint,
+                    link_id = ?link_id,
+                    "peer ended the link; our side bans and drops with it",
+                );
             }
             other => {
                 reject(&mut send, &format!("expected hello, received {other:?}")).await?;
@@ -6682,6 +6890,42 @@ fn load_fallback_dial(
     Some((identity, merged))
 }
 
+/// Deliver our Disconnect to the peer's daemon (see `LinkEnded`):
+/// cold-dial the paired peer, send one bare frame, close. Best-effort
+/// with an 8s cap: a peer that is already gone learns nothing and needs
+/// nothing — local teardown proceeds either way. Never opens a session
+/// (no Hello), so this cannot resurrect anything or disturb the ban sets.
+/// The peer application-layer checks our fingerprint before acting, so a
+/// stranger's association cannot trigger anything.
+pub(crate) async fn notify_peer_ended(
+    peers: &PeerBook,
+    fingerprint_hex: &str,
+    link_id: Option<u64>,
+    dir: &std::path::Path,
+) -> Result<()> {
+    let address = peers
+        .peers
+        .iter()
+        .find(|peer| peer.fingerprint_hex == fingerprint_hex)
+        .and_then(|peer| peer.address.clone())
+        .context("no dialable address for peer")?;
+    let identity = Identity::load_or_create(dir)?;
+    let endpoint = transport::make_client_endpoint(&identity)?;
+    let addr = normalize_addr(&address)?;
+    let connecting = endpoint.connect(addr, "thekvm").context("notify connect")?;
+    let conn = tokio::time::timeout(Duration::from_secs(8), connecting)
+        .await
+        .context("notify handshake timed out")?
+        .context("notify handshake")?;
+    let (mut send, _recv) = tokio::time::timeout(Duration::from_secs(8), conn.open_bi())
+        .await
+        .context("notify stream open timed out")?
+        .context("notify stream open")?;
+    write_frame(&mut send, &WireMessage::LinkEnded { link_id }).await?;
+    let _ = send.finish();
+    Ok(())
+}
+
 /// Dial with automatic identity fallback: the primary identity first; when
 /// the peer reports us unknown and an alternate local identity exists, one
 /// retry with it. Trust never weakens — either identity must be pinned by
@@ -6997,8 +7241,17 @@ async fn open_episode_stream(
             // any input flows, so stream-accept order on their side is
             // deterministic (episode stream first, motion lane second —
             // episodes are served sequentially per association).
+            // BOUNDED (5s): open_uni waits for stream quota, and a
+            // saturated association must fail THIS episode (teardown +
+            // redial, suppression released) instead of parking the drive
+            // task forever with a hold requested.
             let motion_send = if motion_lane {
-                Some(conn.open_uni().await?)
+                let lane = tokio::time::timeout(Duration::from_secs(5), conn.open_uni())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("motion lane open timed out after 5s"))?
+                    .map_err(|error| anyhow::anyhow!("motion lane open failed: {error}"))?;
+                tracing::debug!(stream = ?lane.id(), "episode motion lane opened");
+                Some(lane)
             } else {
                 None
             };
@@ -8066,7 +8319,8 @@ mod tests {
         assert!(!drop_inbound_link(&fp));
         assert!(list_inbound_links().iter().all(|s| s.fingerprint_hex != fp));
         // Register: listed with name and address, droppable.
-        let (id, _rx, inputs) = register_inbound_link(&fp, "mint", "192.168.1.7:42110", Some(7));
+        let (id, _rx, inputs, driving) =
+            register_inbound_link(&fp, "mint", "192.168.1.7:42110", Some(7));
         let listed: Vec<_> = list_inbound_links()
             .into_iter()
             .filter(|s| s.fingerprint_hex == fp)
@@ -8075,16 +8329,19 @@ mod tests {
         assert_eq!(listed[0].node_name, "mint");
         assert_eq!(listed[0].address, "192.168.1.7:42110");
         assert_eq!(listed[0].link_id, Some(7));
-        // Fresh registration reports zero input activity.
+        // Fresh registration reports zero input activity and not driving.
         assert_eq!(listed[0].input_events, 0);
+        assert!(!listed[0].driving);
         // Serve-loop bumps surface through the listing (the yield
         // probe's activity signal).
         inputs.fetch_add(25, std::sync::atomic::Ordering::Relaxed);
+        driving.store(true, std::sync::atomic::Ordering::Relaxed);
         let relisted: Vec<_> = list_inbound_links()
             .into_iter()
             .filter(|s| s.fingerprint_hex == fp)
             .collect();
         assert_eq!(relisted[0].input_events, 25);
+        assert!(relisted[0].driving);
         assert!(drop_inbound_link(&fp));
         // Wrong id must not unregister (a redialed successor survives).
         remove_inbound_link(&fp, id + 999);

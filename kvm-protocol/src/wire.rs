@@ -258,6 +258,17 @@ pub enum WireMessage {
         text: String,
     },
     ReleaseAll,
+    /// Administrative link teardown: the sender's user pressed Disconnect
+    /// for `link_id`. The receiver bans the epoch (like a local Disconnect
+    /// would), drops the peer's live inbound sessions, and audits — so one
+    /// Disconnect ends the link on BOTH computers even when no episode
+    /// stream is live to close. First-frame only (like Hello); only a
+    /// paired peer's association can deliver it, and the epoch still has
+    /// to be served (unknown epochs audit-and-ignore... see receiver).
+    /// Absent (None) on older peers, which never send it.
+    LinkEnded {
+        link_id: Option<u64>,
+    },
     Ping {
         nonce: u64,
     },
@@ -737,6 +748,27 @@ mod tests {
             server_fingerprint_hex: "ab".repeat(32),
         })
         .is_ok());
+    }
+
+    #[test]
+    fn link_ended_frame_round_trips_and_validates() {
+        // The bilateral-Disconnect frame carries only the epoch (identity
+        // comes from the pinned association); it must survive a serde
+        // round trip and pass validation with or without the epoch.
+        for message in [
+            WireMessage::LinkEnded {
+                link_id: Some(12345),
+            },
+            WireMessage::LinkEnded { link_id: None },
+        ] {
+            assert!(validate_message(&message).is_ok());
+            let encoded = serde_json::to_vec(&message).unwrap();
+            let decoded: WireMessage = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&decoded).unwrap(),
+                serde_json::to_vec(&message).unwrap()
+            );
+        }
     }
 
     #[test]

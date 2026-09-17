@@ -312,12 +312,14 @@ mod win32_hooks {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetMessageW, PeekMessageW, PostThreadMessageW, RegisterClassW, SetWindowsHookExW,
-        TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HMENU, HWND_MESSAGE, KBDLLHOOKSTRUCT,
-        MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
-        WINDOW_STYLE, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-        WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
-        WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+        GetCursorPos, GetMessageW, PeekMessageW, PostThreadMessageW, RegisterClassW, SetWindowPos,
+        SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HMENU,
+        HWND_MESSAGE, HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+        WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         XBUTTON1, XBUTTON2,
     };
 
@@ -332,6 +334,8 @@ mod win32_hooks {
     static RAW_WINDOW: AtomicIsize = AtomicIsize::new(0);
     static RAW_NOLEGACY: AtomicBool = AtomicBool::new(false);
     static PTP_NOLEGACY: AtomicBool = AtomicBool::new(false);
+    /// Scroll-guard pixel window (see scroll_guard_pixel): 0 when absent.
+    static GUARD_PIXEL: AtomicIsize = AtomicIsize::new(0);
     /// Private thread message (WM_APP range): wparam != 0 enables RawInput
     /// legacy suppression while driving, 0 restores normal delivery.
     const WM_THEKVM_NOLEGACY: u32 = 0x8000 + 11;
@@ -566,6 +570,9 @@ mod win32_hooks {
         unsafe {
             let _ = UnhookWindowsHookEx(keyboard);
             let _ = UnhookWindowsHookEx(mouse);
+            // Thread-owned windows die with it, but lift suppression state
+            // explicitly so a lingering flag can never outlive the hooks.
+            scroll_guard_pixel(false);
             RAW_INPUT_ACTIVE.store(false, Ordering::Release);
             RAW_NOLEGACY.store(false, Ordering::Release);
             PTP_NOLEGACY.store(false, Ordering::Release);
@@ -767,6 +774,12 @@ mod win32_hooks {
     /// the mouse-usage flag entirely, so it gets the same NOLEGACY toggle
     /// on the same sink window (WM_INPUT still flows for forwarding).
     /// Runs on the hook thread; idempotent across repeated transitions.
+    ///
+    /// Belt and braces for the digitizer path: the OS translates PTP pan
+    /// straight into app windows (past both the hook and NOLEGACY), so
+    /// the drive ALSO parks a 1x1 guard pixel under the held cursor (see
+    /// scroll_guard_pixel) to catch that translation. Either layer alone
+    /// leaks on some hardware; together they hold.
     fn apply_raw_legacy_suppression(suppress: bool) {
         let mouse_changed = RAW_NOLEGACY.swap(suppress, Ordering::AcqRel) != suppress;
         let ptp_changed = PTP_NOLEGACY.swap(suppress, Ordering::AcqRel) != suppress;
@@ -835,6 +848,93 @@ mod win32_hooks {
                     suppress,
                     "precision-touchpad legacy toggle unavailable; local scroll may apply while driving"
                 ),
+            }
+        }
+        // Park/lift the scroll-guard pixel with the same transition (same
+        // thread: it owns the window, like the RawInput window above).
+        scroll_guard_pixel(suppress);
+    }
+
+    /// Scroll-guard pixel: a 1x1 topmost window parked exactly under the
+    /// held cursor while driving. The OS translates precision-touchpad
+    /// pan straight into the window under the cursor — past the low-level
+    /// hook (which never sees it) and past RIDEV_NOLEGACY (which stops
+    /// raw-legacy synthesis, not the PTP stack's own translation). Giving
+    /// that translation OUR pixel to land on keeps local apps from
+    /// scrolling while we drive the peer. The window ignores everything
+    /// (DefWindowProc), never activates, never shows in the taskbar, and
+    /// dies with the drive (or the thread): positioned under the cursor
+    /// sprite it is invisible in practice. Best-effort creation — a
+    /// missing pixel only costs the pre-existing behavior, never the
+    /// drive.
+    fn scroll_guard_pixel(show: bool) {
+        unsafe extern "system" fn guard_proc(
+            hwnd: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+        unsafe {
+            if !show {
+                let raw = GUARD_PIXEL.swap(0, Ordering::AcqRel);
+                if raw != 0 {
+                    let _ = DestroyWindow(HWND(raw as *mut std::ffi::c_void));
+                }
+                return;
+            }
+            if GUARD_PIXEL.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            let mut point = POINT::default();
+            if GetCursorPos(&mut point).is_err() {
+                return;
+            }
+            let instance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+            const GUARD_CLASS: &[u16] = &[
+                'T' as u16, 'h' as u16, 'e' as u16, 'K' as u16, 'v' as u16, 'm' as u16, 'G' as u16,
+                'u' as u16, 'a' as u16, 'r' as u16, 'd' as u16, 0,
+            ];
+            let _ = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(guard_proc),
+                hInstance: instance,
+                lpszClassName: PCWSTR(GUARD_CLASS.as_ptr()),
+                ..Default::default()
+            });
+            const GUARD_NAME: &[u16] = &[0];
+            let hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                PCWSTR(GUARD_CLASS.as_ptr()),
+                PCWSTR(GUARD_NAME.as_ptr()),
+                WS_POPUP,
+                point.x,
+                point.y,
+                1,
+                1,
+                HWND::default(),
+                HMENU::default(),
+                instance,
+                None,
+            );
+            match hwnd {
+                Ok(window) => {
+                    let _ = SetWindowPos(
+                        window,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                    let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
+                    GUARD_PIXEL.store(window.0 as isize, Ordering::Release);
+                    tracing::debug!("scroll-guard pixel parked under the held cursor");
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "scroll-guard pixel unavailable; local scroll may apply while driving");
+                }
             }
         }
     }

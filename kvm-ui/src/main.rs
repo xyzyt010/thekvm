@@ -286,6 +286,24 @@ fn main() -> Result<()> {
                             &last_dialback_state,
                             &last_link_seen_state,
                         );
+                        // Bilateral Disconnect: the peer hung up (their
+                        // LinkEnded banned the epoch here). End our side
+                        // too — even an idle child with no live episodes
+                        // — so one Disconnect lands on both computers.
+                        // Stale entries can only match a dead epoch (every
+                        // Connect mints fresh), never a live link.
+                        let peer_ended_ours = session_for_poll.lock().ok().and_then(|slot| {
+                            slot.as_ref()
+                                .and_then(|session| session.link_id)
+                                .filter(|id| status.peer_ended_links.contains(id))
+                        });
+                        if let Some(link_id) = peer_ended_ours {
+                            stop_session(&weak, &session_for_poll, "Peer disconnected");
+                            ui_log(&format!(
+                                "link: peer ended epoch {link_id} — our side down too"
+                            ));
+                            set_status(&weak, "Peer disconnected — link down on both sides".into());
+                        }
                         let port = status.listen_port;
                         let fingerprint = status.fingerprint_hex.clone();
                         set_daemon_status(&weak, status);
@@ -696,12 +714,28 @@ fn main() -> Result<()> {
         if let Some(link_id) = outbound_link {
             end_link(link_id);
         }
+        // Remember the outbound peer before the child dies: its daemon
+        // gets our Disconnect delivered (NotifyPeerEnded) so THEIR side
+        // bans and drops too — one Disconnect ends the link on both
+        // computers even with no live episode to close.
+        let outbound_peer = disconnect_session.lock().ok().and_then(|slot| {
+            slot.as_ref().and_then(|session| {
+                session
+                    .link_id
+                    .map(|link_id| (session.address.clone(), link_id))
+            })
+        });
         stop_session(&weak, &disconnect_session, "Disconnected");
         // Hanging up a link we never dialed needs the daemon's help: drop
         // every live inbound session (trust untouched). The dialer's side
         // sees its connection close and tears down with it, so one
         // Disconnect ends the whole link on both computers.
         std::thread::spawn(move || {
+            if let Some((address, link_id)) = outbound_peer {
+                if let Some(fingerprint) = fingerprint_for_address(&data_dir(), &address) {
+                    notify_peer_ended(&fingerprint, Some(link_id));
+                }
+            }
             let sessions = match control_request(ControlRequest::Status) {
                 Ok(ControlResponse::Status(status)) => status.sessions,
                 _ => Vec::new(),
@@ -713,6 +747,9 @@ fn main() -> Result<()> {
                 if let Some(link_id) = link.link_id {
                     end_link(link_id);
                 }
+                // Their daemon hangs up too (see above): one Disconnect
+                // ends the link on both computers.
+                notify_peer_ended(&link.fingerprint_hex, link.link_id);
                 match control_request(ControlRequest::DropSession {
                     fingerprint_hex: link.fingerprint_hex.clone(),
                 }) {
@@ -1798,6 +1835,16 @@ fn adopt_link_fingerprint(data_dir: &std::path::Path, address: &str) {
         return;
     };
     adopt_layout_fingerprint(&peer.name.clone(), &peer.fingerprint_hex.clone());
+}
+
+/// Fingerprint for a dial address from the user peer book (Disconnect
+/// path): mirrors adopt_link_fingerprint's matching.
+fn fingerprint_for_address(data_dir: &std::path::Path, address: &str) -> Option<String> {
+    let book = kvm_protocol::pairing::PeerBook::load_or_create(data_dir).ok()?;
+    book.peers
+        .iter()
+        .find(|peer| peer.address.as_deref() == Some(address))
+        .map(|peer| peer.fingerprint_hex.clone())
 }
 
 /// Mirror ceremony trust into the DAEMON book so the reverse direction can
@@ -3231,6 +3278,24 @@ fn end_link(link_id: u64) {
         Ok(ControlResponse::LinkEnded { .. }) => ui_log(&format!("link: banned epoch {link_id}")),
         Ok(other) => ui_log(&format!("link: end link unexpected: {other:?}")),
         Err(error) => ui_log(&format!("link: end link failed: {error:#}")),
+    }
+}
+
+/// Deliver our Disconnect to the peer's daemon (Disconnect path): the peer
+/// bans the epoch and drops sessions too, so one Disconnect ends the link
+/// on BOTH computers even with no live episode to close. Best effort and
+/// quiet on failure — local teardown already ended our side; an unreachable
+/// peer learns nothing and needs nothing.
+fn notify_peer_ended(fingerprint_hex: &str, link_id: Option<u64>) {
+    match control_request(ControlRequest::NotifyPeerEnded {
+        fingerprint_hex: fingerprint_hex.to_owned(),
+        link_id,
+    }) {
+        Ok(ControlResponse::PeerNotified { .. }) => ui_log(&format!(
+            "link: peer notified of disconnect ({fingerprint_hex})"
+        )),
+        Ok(other) => ui_log(&format!("link: peer notify unexpected: {other:?}")),
+        Err(error) => ui_log(&format!("link: peer notify failed: {error:#}")),
     }
 }
 
