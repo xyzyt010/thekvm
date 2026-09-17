@@ -189,10 +189,11 @@ fn main() -> Result<()> {
     // per poll window so a broken install cannot fork-bomb the machine.
     let last_autostart = Arc::new(Mutex::new(None::<std::time::Instant>));
     let autostart_state = last_autostart.clone();
-    // Link-following state: last seen inbound fingerprint (transition
-    // detection), last dial-back attempt (30s throttle), and last proof
-    // the link is alive (45s display grace latch).
-    let last_inbound = Arc::new(Mutex::new(None::<String>));
+    // Link-following state: last seen inbound identity (fingerprint plus
+    // link epoch) for transition detection, last dial-back attempt (30s
+    // throttle for retries, bypassed for fresh links), and last proof the
+    // link is alive (45s display grace latch).
+    let last_inbound = Arc::new(Mutex::new(None::<(String, Option<u64>)>));
     let last_inbound_state = last_inbound.clone();
     let last_dialback = Arc::new(Mutex::new(None::<std::time::Instant>));
     let last_dialback_state = last_dialback.clone();
@@ -1822,28 +1823,60 @@ fn adopt_layout_fingerprint(peer_name: &str, fingerprint_hex: &str) {
 }
 
 /// Adopt by dial address: resolve the live (name, fingerprint) from the
-/// peer-book entry carrying this address, then adopt by name.
+/// peer-book entry carrying this address, then adopt by name. Matches the
+/// full address first, then the host part, so a DHCP move (same host, new
+/// lease recorded under the fresh dial address) still heals the layout
+/// instead of leaving a ghost pin that vetoes every handoff in both
+/// directions after a reconnect.
 fn adopt_link_fingerprint(data_dir: &std::path::Path, address: &str) {
     let Ok(book) = kvm_protocol::pairing::PeerBook::load_or_create(data_dir) else {
         return;
     };
-    let Some(peer) = book
+    let host = address.split(':').next().unwrap_or(address);
+    let peer = book
         .peers
         .iter()
         .find(|peer| peer.address.as_deref() == Some(address))
-    else {
+        .or_else(|| {
+            book.peers.iter().find(|peer| {
+                peer.address
+                    .as_deref()
+                    .is_some_and(|stored| stored.split(':').next() == Some(host))
+            })
+        });
+    let Some(peer) = peer else {
         return;
     };
+    // Heal the stored dial address to the fresh one so the next
+    // Disconnect-notify and the next dial-back knock on the live IP.
+    if peer.address.as_deref() != Some(address) {
+        let (name, fingerprint) = (peer.name.clone(), peer.fingerprint_hex.clone());
+        drop(book);
+        if let Ok(mut book) = kvm_protocol::pairing::PeerBook::load_or_create(data_dir) {
+            let _ =
+                book.pin_with_address(name.clone(), fingerprint.clone(), Some(address.to_owned()));
+        }
+        adopt_layout_fingerprint(&name, &fingerprint);
+        return;
+    }
     adopt_layout_fingerprint(&peer.name.clone(), &peer.fingerprint_hex.clone());
 }
 
 /// Fingerprint for a dial address from the user peer book (Disconnect
-/// path): mirrors adopt_link_fingerprint's matching.
+/// path): mirrors adopt_link_fingerprint's matching (exact, then host).
 fn fingerprint_for_address(data_dir: &std::path::Path, address: &str) -> Option<String> {
     let book = kvm_protocol::pairing::PeerBook::load_or_create(data_dir).ok()?;
+    let host = address.split(':').next().unwrap_or(address);
     book.peers
         .iter()
         .find(|peer| peer.address.as_deref() == Some(address))
+        .or_else(|| {
+            book.peers.iter().find(|peer| {
+                peer.address
+                    .as_deref()
+                    .is_some_and(|stored| stored.split(':').next() == Some(host))
+            })
+        })
         .map(|peer| peer.fingerprint_hex.clone())
 }
 
@@ -2318,24 +2351,26 @@ fn should_dial_back(mode: kvm_core::Mode, ceremony_open: bool) -> bool {
 /// Display is touched on transitions only, so the relay owns the status
 /// line the rest of the time. Dial-back attempts are throttled (30s) so a
 /// peer that accepts but never answers our dial cannot fork-bomb us.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn follow_link(
     weak: &slint::Weak<AppWindow>,
     status: &kvm_protocol::control::DaemonStatus,
     session: &Arc<Mutex<Option<Session>>>,
     pending: &Arc<Mutex<Option<PendingPair>>>,
     data_dir: &std::path::Path,
-    last_inbound: &Arc<Mutex<Option<String>>>,
+    last_inbound: &Arc<Mutex<Option<(String, Option<u64>)>>>,
     last_attempt: &Arc<Mutex<Option<std::time::Instant>>>,
     last_link_seen: &Arc<Mutex<Option<std::time::Instant>>>,
 ) {
     let outbound_running = session.lock().ok().is_some_and(|slot| slot.is_some());
     let ceremony_open = pending.lock().ok().is_some_and(|slot| slot.is_some());
     let inbound = status.sessions.first().cloned();
-    let inbound_fp = inbound.as_ref().map(|link| link.fingerprint_hex.clone());
+    let inbound_id = inbound
+        .as_ref()
+        .map(|link| (link.fingerprint_hex.clone(), link.link_id));
     let previous = last_inbound.lock().ok().and_then(|mut slot| {
         let prev = slot.clone();
-        *slot = inbound_fp.clone();
+        *slot = inbound_id.clone();
         prev
     });
     // The link is alive while the peer holds a session OR our child runs:
@@ -2346,9 +2381,21 @@ fn follow_link(
             *seen = Some(std::time::Instant::now());
         }
     }
+    // Idle reset: with no link in either direction the next inbound is a
+    // fresh link, never a retry — clear the dial-back throttle now so a
+    // quick Disconnect -> Connect re-arms both directions immediately
+    // instead of stalling the reverse half for up to 30s (one side showed
+    // Connected while the other stayed dark and neither direction crossed).
+    if inbound.is_none() && !outbound_running {
+        if let Ok(mut slot) = last_attempt.lock() {
+            *slot = None;
+        }
+    }
     if !outbound_running {
         match (&previous, &inbound) {
-            (old, Some(link)) if old.as_deref() != Some(link.fingerprint_hex.as_str()) => {
+            (old, Some(link))
+                if old.as_ref() != Some(&(link.fingerprint_hex.clone(), link.link_id)) =>
+            {
                 ensure_station_arrangement(&link.node_name, &link.fingerprint_hex);
                 adopt_layout_fingerprint(&link.node_name, &link.fingerprint_hex);
                 set_session(&weak, Some(link.node_name.clone()));
@@ -2442,14 +2489,32 @@ fn follow_link(
         }
     }
     if inbound.is_some() && !outbound_running && should_dial_back(status.mode, ceremony_open) {
-        let mut attempt = false;
+        // Fresh links (new fingerprint, or same peer with a fresh epoch
+        // after their Disconnect -> Connect) bypass the 30s retry throttle:
+        // the throttle only paces retries of the SAME link, never the first
+        // dial of a new one. Without this, a quick reconnect left the
+        // dialer Connected while the station waited out the old throttle
+        // with no reverse half — and neither direction crossed.
+        let is_fresh_link = match (&previous, &inbound) {
+            (None, Some(_)) => true,
+            (Some((old_fp, old_id)), Some(link)) => {
+                old_fp != &link.fingerprint_hex || *old_id != link.link_id
+            }
+            _ => false,
+        };
+        let mut attempt = is_fresh_link;
         if let Ok(mut slot) = last_attempt.lock() {
-            let due = slot
-                .map(|last| last.elapsed() >= std::time::Duration::from_secs(30))
-                .unwrap_or(true);
-            if due {
+            if is_fresh_link {
                 *slot = Some(std::time::Instant::now());
                 attempt = true;
+            } else {
+                let due = slot
+                    .map(|last| last.elapsed() >= std::time::Duration::from_secs(30))
+                    .unwrap_or(true);
+                if due {
+                    *slot = Some(std::time::Instant::now());
+                    attempt = true;
+                }
             }
         }
         if attempt {

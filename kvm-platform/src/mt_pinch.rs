@@ -28,10 +28,12 @@ const ABS_MT_POSITION_Y: u16 = 0x36;
 const ABS_MT_TRACKING_ID: u16 = 0x39;
 const ABS_BITS_LEN: usize = 8;
 /// Same engage gate as the PTP tap: spread must move this far before the
-/// fingers own a pinch (a steady two-finger scroll stays pan).
-const PINCH_ENGAGE_UNITS: i64 = 48;
-/// Full sensor span earns this many detents (PTP parity).
-const DETENTS_PER_SPAN: i64 = 48;
+/// fingers own a pinch (a steady two-finger scroll stays pan). Raised from
+/// 48 (way too eager) to require a deliberate spread.
+const PINCH_ENGAGE_UNITS: i64 = 96;
+/// Full sensor span earns this many detents (PTP parity). Lowered from 48
+/// to 16 (~3x calmer) so a slight slide is a slight zoom.
+const DETENTS_PER_SPAN: i64 = 16;
 
 type IoctlRequest = libc::c_ulong;
 
@@ -347,10 +349,14 @@ mod tests {
         let mut pinch = state();
         assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
         assert!(!pinch.engaged);
+        // Below the calmed engage gate (96): still scrolling fingers.
         assert_eq!(pinch.feed(&[(0, 0), (120, 0)]), (0, false));
-        assert_eq!(pinch.feed(&[(0, 0), (160, 0)]), (480, false));
+        assert!(!pinch.engaged);
+        // Past the gate: engaged, spread change emits zoom-in (+).
+        // Anchor 100, prev 120, spread 230: acc 110 => 11 detents.
+        assert_eq!(pinch.feed(&[(0, 0), (230, 0)]), (1320, false));
         assert!(pinch.engaged);
-        assert_eq!(pinch.feed(&[(0, 0), (140, 0)]), (-240, false));
+        assert_eq!(pinch.feed(&[(0, 0), (210, 0)]), (-240, false));
     }
 
     #[test]

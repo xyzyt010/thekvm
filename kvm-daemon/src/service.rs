@@ -6105,13 +6105,18 @@ async fn handle_connection(
 
 /// Render a wire-native pinch gesture on the receiver. The gesture is
 /// zoom-to-cursor by construction (no focus coordinates cross the wire):
-/// Windows injects it as a genuine two-finger OS touch gesture at the
-/// current cursor (see the injector's touch driver — browsers, photo
-/// viewers, maps and every other gesture-aware app respond exactly as to
-/// local trackpad pinch, not as browser-only Ctrl+wheel). Platforms without
-/// OS-level gesture injection expand it into Ctrl+wheel at the cursor
-/// here, reusing the sender's legacy expansion against the INJECTOR's
-/// held keys so a physically held Ctrl is never stolen or released by us.
+/// every platform expands it into Ctrl+wheel at the cursor here, reusing
+/// the sender's legacy expansion against the INJECTOR's held keys so a
+/// physically held Ctrl is never stolen or released by us. Ctrl+wheel is
+/// the browser-native page zoom (zoom popup at the top right, layout
+/// reflows) that a local precision-touchpad pinch produces in Chrome/Edge.
+/// The Windows touchscreen InjectTouchInput path is opt-in only
+/// (THEKVM_NATIVE_TOUCH_PINCH=1): it renders a touchscreen point zoom
+/// (huge scaled text under the cursor, no popup) which reads as wrong next
+/// to native, and true HID-level trackpad emulation (usage page 0x0D
+/// contact reports) is impossible from user mode — it needs a kernel
+/// virtual-HID driver, not SendInput/uinput. Set the env var on the
+/// RECEIVER to force the old touch path for comparison.
 fn handle_inbound_pinch(
     event: InputEvent,
     injector: &mut ReceiverInjector,
@@ -6119,17 +6124,16 @@ fn handle_inbound_pinch(
 ) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let _ = pinch_held;
-        injector.send(event)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let physical_ctrl = injector.key_pressed(HID_LEFT_CTRL);
-        for out in pinch_expansion(event, physical_ctrl, pinch_held) {
-            injector.send(out)?;
+        if std::env::var("THEKVM_NATIVE_TOUCH_PINCH").as_deref() == Ok("1") {
+            let _ = pinch_held;
+            return injector.send(event);
         }
-        Ok(())
     }
+    let physical_ctrl = injector.key_pressed(HID_LEFT_CTRL);
+    for out in pinch_expansion(event, physical_ctrl, pinch_held) {
+        injector.send(out)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6969,12 +6973,16 @@ async fn dial_session(
     }
 }
 
-/// Address the station side dials back for its half of a link: the peer
-/// book's saved daemon address for this fingerprint (exact entry, else a
-/// same-named sibling from a re-pairing), else the inbound IP on the
-/// standard daemon port. NEVER the socket's remote address verbatim: that
-/// is an ephemeral source port, and dialling it back fails forever — the
-/// defect that made Both-ways return control impossible. Pure so the
+/// Address the station side dials back for its half of a link: the inbound
+/// IP (always fresh, even across DHCP moves) on the peer book's saved port
+/// when one exists, else the inbound IP on the standard daemon port. The
+/// book's saved IP is only used verbatim when it already matches the inbound
+/// IP — a stale book IP after a DHCP lease change used to make every
+/// dial-back (and every reconnect's reverse half) knock on a dead address
+/// while the dialer showed Connected and the station showed nothing, with
+/// neither direction crossing. NEVER the socket's remote address verbatim:
+/// that is an ephemeral source port, and dialling it back fails forever —
+/// the defect that made Both-ways return control impossible. Pure so the
 /// determinism is unit-tested.
 fn dialable_peer_address(
     peers: &PeerBook,
@@ -6982,8 +6990,17 @@ fn dialable_peer_address(
     peer_name: &str,
     inbound_remote: SocketAddr,
 ) -> String {
-    if let Ok(address) = resolve_peer_address(peers, fingerprint, peer_name) {
-        return address;
+    if let Ok(saved) = resolve_peer_address(peers, fingerprint, peer_name) {
+        // Preserve a custom listen port from the book, but always trust the
+        // live inbound IP over a possibly stale saved IP (DHCP moves).
+        if let Ok(saved_addr) = saved.parse::<SocketAddr>() {
+            if saved_addr.ip() == inbound_remote.ip() {
+                return saved;
+            }
+            return std::net::SocketAddr::new(inbound_remote.ip(), saved_addr.port()).to_string();
+        }
+        // Unparseable saved value (hostname, etc.): keep today's behavior.
+        return saved;
     }
     std::net::SocketAddr::new(inbound_remote.ip(), DEFAULT_PORT).to_string()
 }
@@ -8579,6 +8596,23 @@ mod tests {
         let dialed = dialable_peer_address(&book, &fp, "mint", inbound);
         assert_eq!(dialed, "192.168.1.6:42110");
         assert!(!dialed.contains("53622"));
+        // Stale book IP after a DHCP move: the live inbound IP wins, but
+        // the book's custom port is preserved (disconnect/reconnect must
+        // re-arm both directions even when the LAN address changed).
+        book.peers.push(Peer {
+            name: "mint".into(),
+            fingerprint_hex: fp.clone(),
+            address: Some("192.168.1.7:42110".into()),
+        });
+        assert_eq!(
+            dialable_peer_address(&book, &fp, "mint", inbound),
+            "192.168.1.6:42110"
+        );
+        book.peers[0].address = Some("192.168.1.7:43110".into());
+        assert_eq!(
+            dialable_peer_address(&book, &fp, "mint", inbound),
+            "192.168.1.6:43110"
+        );
     }
 
     #[test]

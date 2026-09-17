@@ -1266,8 +1266,10 @@ mod win32_hooks {
     const PTP_GENERIC_PAGE: u16 = 0x01;
     /// Full-span swipe earns this many detents: smooth enough to feel
     /// analog through the 120ths accumulator, coarse enough that sensor
-    /// noise never emits.
-    const PTP_DETENTS_PER_SPAN: i64 = 48;
+    /// noise never emits. Pinch shares this scale (see ptp_subscribe): 16
+    /// full-span detents (~3x calmer than the old 48) so a slight
+    /// two-finger slide is a slight zoom, not a full-page leap.
+    const PTP_DETENTS_PER_SPAN: i64 = 16;
 
     struct PtpDevice {
         /// Raw device handle as isize (HWND-style rendezvous precedent:
@@ -1426,8 +1428,10 @@ mod win32_hooks {
     /// Spread changes past this many sensor units own the gesture: below
     /// it two fingers are scrolling (pan keeps them), above it they are
     /// pinching (zoom takes over, pan stays silent for the gesture).
-    /// Sensor jitter on a steady scroll stays far below this.
-    const PINCH_ENGAGE_UNITS: i64 = 48;
+    /// Sensor jitter on a steady scroll stays far below this. Raised from
+    /// 48 (way too eager: a slight two-finger slide owned a pinch and each
+    /// report then sprayed zoom) to require a deliberate spread.
+    const PINCH_ENGAGE_UNITS: i64 = 96;
 
     /// Two-finger pinch → zoom accumulator. Pure apart from construction,
     /// so the gesture math is unit-tested without HID hardware. Fed the
@@ -1452,7 +1456,9 @@ mod win32_hooks {
                 anchor: None,
                 prev: None,
                 acc: 0,
-                units_per_detent: 64,
+                // Matches the live axis scale (LogicalMax/16): a fresh tap
+                // before subscribe is already calm, not 3x eager.
+                units_per_detent: 192,
                 engaged: false,
             }
         }
@@ -2186,14 +2192,15 @@ mod win32_hooks {
             // Anchor: spread 100.
             assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
             assert!(!pinch.engaged());
-            // Below the engage gate: still scrolling fingers, no zoom.
+            // Below the calmed engage gate (96): still scrolling fingers.
             assert_eq!(pinch.feed(&[(0, 0), (120, 0)]), (0, false));
             assert!(!pinch.engaged());
             // Past the gate: engaged, spread change emits zoom-in (+).
-            assert_eq!(pinch.feed(&[(0, 0), (160, 0)]), (480, false));
+            // Anchor 100, prev 120, spread 230: acc 110 => 11 detents.
+            assert_eq!(pinch.feed(&[(0, 0), (230, 0)]), (1320, false));
             assert!(pinch.engaged());
             // Fingers close: zoom-out (−).
-            assert_eq!(pinch.feed(&[(0, 0), (140, 0)]), (-240, false));
+            assert_eq!(pinch.feed(&[(0, 0), (210, 0)]), (-240, false));
         }
 
         #[test]

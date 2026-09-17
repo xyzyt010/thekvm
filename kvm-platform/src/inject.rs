@@ -772,11 +772,15 @@ mod win32_inject {
     }
 
     /// OS-level pinch-zoom gesture state. A remote trackpad pinch arrives
-    /// as `Pinch` deltas (see `inject_pinch`) and is rendered as a genuine
-    /// two-finger touch gesture at the cursor via InjectTouchInput — the
-    /// OS gesture recognizer turns it into the same zoom every
-    /// gesture-aware app gives a local trackpad pinch (browser, photos,
-    /// maps, …), not the app-by-app Ctrl+wheel approximation.
+    /// as `Pinch` deltas (see `inject_pinch`). By default it renders as
+    /// Ctrl+wheel at the cursor — the browser-native page zoom (zoom popup
+    /// at the top right, zoom-to-cursor) that a local precision-touchpad
+    /// pinch produces in Chrome/Edge. The InjectTouchInput touchscreen path
+    /// is opt-in only (`THEKVM_NATIVE_TOUCH_PINCH=1`): it renders as a
+    /// touchscreen pinch (cursor point zoom, huge scaled text, no zoom
+    /// popup) which reads as wrong next to the native behavior, and true
+    /// HID-level precision-touchpad emulation (usage page 0x0D reports) is
+    /// impossible from user mode — it needs a kernel virtual-HID driver.
     #[derive(Debug)]
     struct PinchTouch {
         /// Touch contacts are currently down on the local desktop.
@@ -817,10 +821,12 @@ mod win32_inject {
     /// 120ths of finger spread; a gentle gain plus a per-event clamp keeps
     /// a slight two-finger slide a slight zoom (not a full-page leap):
     /// small deltas track proportionally, pathological single-event spikes
-    /// clamp instead of teleporting the contacts.
+    /// clamp instead of teleporting the contacts. Calmed ~3x (0.08->0.025,
+    /// 30->10px) alongside the capture-side engage/gain cut: the old gain
+    /// turned a slight slide into a full-page leap.
     fn pinch_separation(current_px: f64, delta_120ths: i32) -> f64 {
-        const PX_PER_UNIT: f64 = 0.08;
-        const MAX_STEP_PX: f64 = 30.0;
+        const PX_PER_UNIT: f64 = 0.025;
+        const MAX_STEP_PX: f64 = 10.0;
         const MIN_SEPARATION_PX: f64 = 40.0;
         const MAX_SEPARATION_PX: f64 = 700.0;
         let step = (f64::from(delta_120ths) * PX_PER_UNIT).clamp(-MAX_STEP_PX, MAX_STEP_PX);
@@ -881,18 +887,23 @@ mod win32_inject {
             }
         }
 
-        /// Render one pinch-delta as OS-level touch motion. The first call
-        /// of a gesture puts two contacts down around the cursor, later
-        /// calls spread/pinch them, `end_pinch` lifts them. A stale active
-        /// gesture (lost gesture end upstream) lifts before restarting, so
-        /// contacts never stick. Touch failures degrade the gesture to a
-        /// Ctrl+wheel tail instead of erroring — a gesture must never kill
-        /// the session.
+        /// Render one pinch-delta. DEFAULT is browser-native Ctrl+wheel at
+        /// the cursor (page zoom with the top-right zoom popup, matching a
+        /// local precision-touchpad pinch in Chrome/Edge). The touchscreen
+        /// InjectTouchInput path (cursor point zoom, no popup) is opt-in
+        /// via THEKVM_NATIVE_TOUCH_PINCH=1 only: it answers a different
+        /// gesture (touchscreen, not trackpad) and reads as wrong next to
+        /// native. A gesture must never kill the session.
         pub fn inject_pinch(&self, delta: i32) -> Result<(), PlatformError> {
             let mut pinch = self
                 .pinch
                 .lock()
                 .map_err(|_| PlatformError::Win32("pinch state lock poisoned".into()))?;
+            // Browser-native default: Ctrl+wheel zoom-to-cursor. Touch only
+            // on explicit opt-in (see struct docs for why).
+            if std::env::var("THEKVM_NATIVE_TOUCH_PINCH").as_deref() != Ok("1") {
+                return self.fallback_pinch_wheel(&mut pinch, delta);
+            }
             if pinch.touch_ready.is_none() {
                 let ready = unsafe { InitializeTouchInjection(2, TOUCH_FEEDBACK_NONE) }.is_ok();
                 pinch.touch_ready = Some(ready);
@@ -1610,14 +1621,15 @@ mod win32_inject {
         fn pinch_separation_tracks_deltas_within_clamps() {
             // Symmetric contacts around the center; separation grows with
             // zoom-in deltas, shrinks with zoom-out, and clamps instead of
-            // running away on a pathological flood.
+            // running away on a pathological flood. Calmed gain: 120 units
+            // earn 3px (not 9.6), spikes clamp to 10px (not 30).
             assert_eq!(super::pinch_contacts(960, 120.0), (900, 1020));
-            assert_eq!(super::pinch_separation(120.0, 120), 129.6);
-            assert_eq!(super::pinch_separation(120.0, -120), 110.4);
+            assert_eq!(super::pinch_separation(120.0, 120), 123.0);
+            assert_eq!(super::pinch_separation(120.0, -120), 117.0);
             assert_eq!(super::pinch_separation(120.0, 0), 120.0);
-            // Single-event spikes clamp to a 30px step instead of leaping.
-            assert_eq!(super::pinch_separation(120.0, 10_000), 150.0);
-            assert_eq!(super::pinch_separation(120.0, -10_000), 90.0);
+            // Single-event spikes clamp to a 10px step instead of leaping.
+            assert_eq!(super::pinch_separation(120.0, 10_000), 130.0);
+            assert_eq!(super::pinch_separation(120.0, -10_000), 110.0);
             assert_eq!(super::pinch_separation(690.0, 10_000), 700.0);
             assert_eq!(super::pinch_separation(50.0, -10_000), 40.0);
         }

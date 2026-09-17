@@ -33,11 +33,13 @@ pub enum InputEvent {
         y: i32,
     },
     /// Trackpad pinch gesture in 120ths of spread change (same unit as
-    /// SmoothWheel). Positive = fingers spreading = zoom in. This is a
-    /// CAPTURE-side transport only: the sending thread expands it into
-    /// Ctrl+wheel (which every receiver already applies at its cursor,
-    /// i.e. zoom-to-cursor) before recording or queueing, so it never
-    /// reaches the wire, snapshots, or old peers.
+    /// SmoothWheel). Positive = fingers spreading = zoom in. Capable
+    /// receivers (pinch_zoom) get it raw and expand it into Ctrl+wheel at
+    /// the cursor — the browser-native page zoom (top-right zoom popup,
+    /// zoom-to-cursor). Older peers get the sender-side Ctrl+wheel
+    /// expansion instead. True HID-level trackpad reports (usage page
+    /// 0x0D) cannot be synthesized from user mode; Ctrl+wheel is the
+    /// compatible rendering of the same gesture.
     Pinch {
         delta: i32,
     },
