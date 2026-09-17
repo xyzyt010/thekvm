@@ -2928,7 +2928,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-core"
-version = "0.9.37"
+version = "0.9.38"
 dependencies = [
  "serde",
  "serde_json",
@@ -2937,7 +2937,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-daemon"
-version = "0.9.37"
+version = "0.9.38"
 dependencies = [
  "anyhow",
  "clap",
@@ -2956,11 +2956,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows 0.58.0",
+ "winres",
 ]
 
 [[package]]
 name = "kvm-platform"
-version = "0.9.37"
+version = "0.9.38"
 dependencies = [
  "arboard",
  "futures",
@@ -2977,7 +2978,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-protocol"
-version = "0.9.37"
+version = "0.9.38"
 dependencies = [
  "kvm-core",
  "quinn",
@@ -2993,7 +2994,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-ui"
-version = "0.9.37"
+version = "0.9.38"
 dependencies = [
  "anyhow",
  "kvm-core",
@@ -3008,6 +3009,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "winres",
 ]
 
 [[package]]
@@ -5139,7 +5141,7 @@ dependencies = [
  "regex",
  "serde_json",
  "tar",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
@@ -5776,6 +5778,15 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "toml"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -6920,6 +6931,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winres"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b68db261ef59e9e52806f688020631e987592bd83619edccda9c47d42cde4f6c"
+dependencies = [
+ "toml 0.5.11",
 ]
 
 [[package]]

@@ -1,10 +1,13 @@
 fn main() {
-    slint_build::compile("ui/app.slint").unwrap();
-    // Windows version resource: see kvm-daemon/build.rs — a named product
-    // identity instead of an anonymous binary in verdict dialogs.
+    // Windows version resource: SmartScreen/Defender verdict dialogs and
+    // file Properties show a real product identity instead of a blank
+    // anonymous binary (unsigned, anonymous binaries score worst in
+    // reputation heuristics). Not a substitute for Authenticode signing —
+    // see packaging/windows/README-signing.md — but standard hygiene.
     #[cfg(target_os = "windows")]
     {
         let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+        // winres needs numeric comma-separated version components.
         let numeric = version
             .split('.')
             .map(|part| {
@@ -24,9 +27,9 @@ fn main() {
         let mut resource = winres::WindowsResource::new();
         resource
             .set("ProductName", "TheKVM")
-            .set("FileDescription", "TheKVM cross-device control UI")
+            .set("FileDescription", "TheKVM privileged receiver service")
             .set("CompanyName", "TheKVM project")
-            .set("OriginalFilename", "kvm-ui.exe")
+            .set("OriginalFilename", "kvm-daemon.exe")
             .set("LegalCopyright", "GPL-3.0-or-later, TheKVM project")
             .set("ProductVersion", &version)
             .set("FileVersion", &numeric);
