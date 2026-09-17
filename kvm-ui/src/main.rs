@@ -535,6 +535,33 @@ fn main() -> Result<()> {
                     // Applied result now; the poll refreshes it again when
                     // healthy.
                     set_role_display(&weak, requested);
+                    // One-way roles silently strand the other direction
+                    // (the classic trap: "Control other only" reads as
+                    // "drive the peer" but also rejects every incoming
+                    // session, so the peer can never drive back). When a
+                    // link is live, say the cost out loud at press time.
+                    let mut one_way_cost = String::new();
+                    if requested != Mode::Bidirectional {
+                        let inbound = match control_request(ControlRequest::Status) {
+                            Ok(ControlResponse::Status(status)) => status.sessions.first().cloned(),
+                            _ => None,
+                        };
+                        if let Some(link) = inbound {
+                            one_way_cost = match requested {
+                                Mode::ServerClient => format!(
+                                    " {} can no longer drive this computer — switch back to Both ways to restore two-way control.",
+                                    link.node_name
+                                ),
+                                _ => format!(
+                                    " This computer can no longer drive {} — switch back to Both ways to restore two-way control.",
+                                    link.node_name
+                                ),
+                            };
+                            ui_log(&format!(
+                                "role change: one-way role with a live link:{one_way_cost}"
+                            ));
+                        }
+                    }
                     // Edge control drives under a role contract: a role
                     // change stops it rather than letting it drive under a
                     // stale one (e.g. receiver-only still crossing).
@@ -548,14 +575,14 @@ fn main() -> Result<()> {
                         set_status(
                             &weak,
                             format!(
-                                "Role set: {}. Link stopped — Connect again to re-link.",
+                                "Role set: {}. Link stopped — Connect again to re-link.{one_way_cost}",
                                 role_name(requested)
                             ),
                         );
                     } else {
                         set_status(
                             &weak,
-                            format!("Role set: {}.", role_name(requested)),
+                            format!("Role set: {}.{one_way_cost}", role_name(requested)),
                         );
                     }
                 }
@@ -1212,8 +1239,8 @@ fn set_edge_mode_display(weak: &slint::Weak<AppWindow>, mode: EdgeMode) {
 fn role_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Bidirectional => "Both ways",
-        Mode::ServerClient => "Control other",
-        Mode::ClientOnly => "Be controlled",
+        Mode::ServerClient => "Control other only",
+        Mode::ClientOnly => "Be controlled only",
     }
 }
 
@@ -1443,8 +1470,9 @@ fn decide_incoming_pairing(weak: &slint::Weak<AppWindow>, fingerprint: String, a
 /// Deskflow-simple connect flow: type (or scan) the other computer's
 /// address, press Connect. A trusted peer connects immediately; a new peer
 /// runs the six-digit ceremony first, then connects. The controller session
-/// dials with the USER identity (the same peer book the ceremony pins), so
-/// no privileged state is ever needed on the controller side.
+/// dials with the daemon identity (the same fingerprint the ceremony pins),
+/// so no privileged state is ever needed on the controller side and
+/// reconnects never re-run the ceremony.
 ///
 /// NODE side of the station/node contract: this computer dials out to a
 /// waiting station. "Connected" is reported only after the session child
@@ -1507,7 +1535,7 @@ fn start_session_flow(
             if status.mode == kvm_core::Mode::ClientOnly {
                 set_status(
                     &weak,
-                    "This computer is set to 'Be controlled', so it cannot dial out. Press 'Control other' or 'Both ways' above, then Connect again.".into(),
+                    "This computer is set to 'Be controlled only', so it cannot dial out. Press 'Control other only' or 'Both ways' above, then Connect again.".into(),
                 );
                 return;
             }
@@ -2409,7 +2437,7 @@ fn follow_link(
                 // Reverse-path honesty: if this computer will NOT dial its
                 // half back, say why ONCE per new link instead of silently
                 // staying one-way (the top user trap: this side set to
-                // "Be controlled" can never drive back).
+                // "Be controlled only" can never drive back).
                 if status.mode == kvm_core::Mode::ClientOnly {
                     ui_log(&format!(
                         "link: {} is one-way while this computer is Be-controlled-only; set Both ways to drive back",
@@ -3482,18 +3510,66 @@ fn control_request(request: ControlRequest) -> Result<ControlResponse> {
     })
 }
 
-/// Preview-dial the peer with the USER identity (the identity the
-/// controller session will use), returning its fingerprint, advertised
-/// name, and the ceremony code. The receiver shows the identical code for
-/// the dialing fingerprint because verification_code() is order
-/// independent.
+/// The daemon-owned identity for pairing and sessions (one face per
+/// machine). Controller children inherit it via --identity-stdin, so the
+/// ceremony must present it too: pairing with the interactive user's
+/// files while sessions present the daemon's pinned a SECOND fingerprint
+/// for the same computer, the ghost-retire pass unpinned the pairing
+/// face after every session, and every reconnect re-ran the full code
+/// ceremony (or wedged on it). Falls back to the user files when the
+/// daemon is unreachable (same as sessions do).
+fn pairing_identity(dir: &std::path::Path) -> Result<Identity> {
+    match control_request(ControlRequest::ExportIdentity) {
+        Ok(ControlResponse::Identity {
+            cert_der_hex,
+            key_der_hex,
+        }) => match (decode_hex(&cert_der_hex), decode_hex(&key_der_hex)) {
+            (Some(cert_der), Some(key_der)) => match Identity::from_der(cert_der, key_der) {
+                Ok(identity) => {
+                    ui_log("pairing: presenting the daemon identity (one face per machine)");
+                    return Ok(identity);
+                }
+                Err(error) => ui_log(&format!(
+                    "pairing: daemon identity unusable ({error:#}); pairing with local files"
+                )),
+            },
+            _ => ui_log("pairing: daemon identity undecodable; pairing with local files"),
+        },
+        Ok(other) => ui_log(&format!(
+            "pairing: daemon identity unavailable ({other:?}); pairing with local files"
+        )),
+        Err(error) => ui_log(&format!(
+            "pairing: daemon identity unavailable ({error:#}); pairing with local files"
+        )),
+    }
+    Identity::load_or_create(dir).map_err(|error| anyhow::anyhow!("pairing identity: {error:#}"))
+}
+
+/// Strict hex decode for exported identity material. None on any defect.
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    let value = value.trim();
+    if value.is_empty() || value.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for index in (0..value.len()).step_by(2) {
+        bytes.push(u8::from_str_radix(&value[index..index + 2], 16).ok()?);
+    }
+    Some(bytes)
+}
+
+/// Preview-dial the peer with the pairing identity (the daemon identity
+/// when reachable — the same fingerprint controller sessions present),
+/// returning its fingerprint, advertised name, and the ceremony code.
+/// The receiver shows the identical code for the dialing fingerprint
+/// because verification_code() is order independent.
 fn pair_prepare(
     address: &str,
     dir: &std::path::Path,
     node_name: &str,
     pairing_code: Option<String>,
 ) -> Result<PendingPair> {
-    let identity = Identity::load_or_create(dir)?;
+    let identity = pairing_identity(dir)?;
     let address = normalize_addr(address)?;
     let generation = PAIRING_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let runtime = runtime();

@@ -161,11 +161,11 @@ export component AppWindow inherits Window {
                         // click, no feedback) whenever the status poll
                         // failed, with no way to tell why.
                         Button {
-                            text: "Control other";
+                            text: "Control other only";
                             clicked => { set-role(1); }
                         }
                         Button {
-                            text: "Be controlled";
+                            text: "Be controlled only";
                             clicked => { set-role(2); }
                         }
                         Button {
@@ -174,7 +174,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text {
-                        text: mode-index == 1 ? "Control other: your keyboard, mouse and touchpad (including two-finger scroll) drive the other computer past any edge. The other computer cannot drive this one." : mode-index == 2 ? "Be controlled: the other computer drives this keyboard and mouse past any edge. This computer cannot dial out or drive back." : "Both ways: either computer drives the other past any edge — push to take control, push back to return. Both stay usable.";
+                        text: mode-index == 1 ? "Control other only: your keyboard, mouse and touchpad (including two-finger scroll) drive the other computer past any edge. The other computer cannot drive this one — pick Both ways for two-way control." : mode-index == 2 ? "Be controlled only: the other computer drives this keyboard and mouse past any edge. This computer cannot dial out or drive back — pick Both ways for two-way control." : "Both ways: either computer drives the other past any edge — push to take control, push back to return. Both stay usable.";
                         color: #9ca3af;
                         font-size: 12px;
                         wrap: word-wrap;

@@ -385,9 +385,11 @@ impl PeerBook {
     }
 
     pub fn is_pinned(&self, fingerprint_hex: &str) -> bool {
-        self.peers
-            .iter()
-            .any(|p| p.fingerprint_hex == fingerprint_hex)
+        // Case-insensitive: stored entries are lowercased, but a caller
+        // handing over an uppercased fingerprint must never silently miss
+        // (a miss re-runs the whole pairing ceremony on every Connect).
+        let wanted = fingerprint_hex.trim().to_ascii_lowercase();
+        self.peers.iter().any(|p| p.fingerprint_hex == wanted)
     }
 
     pub fn pin(&mut self, name: impl Into<String>, fingerprint_hex: String) -> std::io::Result<()> {
