@@ -2530,6 +2530,10 @@ fn transfer_debounced(last_transfer: Option<std::time::Instant>) -> bool {
 /// retrying a resisting hold every 5s instead of forgetting it. The old
 /// unconditional clear wedged the hold forever: daemon belief false while
 /// the platform grab stayed held (keys/clicks dead, cursor moving).
+/// DUAL-SCROLL ARMOR: every drive end MUST pass through here (never a
+/// bare set_exclusive(false)), or the belief flag lies and the reaper
+/// either leaks a hold (dead local input) or — if a later path clears
+/// belief without releasing — drops suppression mid-drive (dual scroll).
 fn release_suppression(capture_control: &CaptureGuard, requested: Option<&mut bool>) {
     if let Err(error) = capture_control.set_exclusive(false) {
         tracing::warn!(%error, "suppression release failed; belief kept, reaper will retry");
@@ -5556,6 +5560,11 @@ async fn handle_connection(
             // receivers only): sticky across PinchEnd, closed on factor
             // 1.0 or session teardown (Drop). Never survives the session.
             let mut recv_viewport = kvm_platform::ViewportZoom::new();
+            // Session X display for the viewport lens (see
+            // handle_inbound_pinch): resolved once per session, because
+            // the headless service carries no $DISPLAY of its own and
+            // the sidecar is per-boot truth, not per-event work.
+            let recv_display = receiver_display();
             let mut clipboard_revision = 0u64;
             let mut remote_clipboard_revision = 0u64;
             let mut lease_check = tokio::time::interval(Duration::from_secs(5));
@@ -5613,6 +5622,7 @@ async fn handle_connection(
                                         &mut injector,
                                         &mut recv_pinch_held,
                                         &mut recv_viewport,
+                                        recv_display.as_deref(),
                                     )?;
                                     continue;
                                 }
@@ -5929,6 +5939,7 @@ async fn handle_connection(
                                         &mut injector,
                                         &mut recv_pinch_held,
                                         &mut recv_viewport,
+                                        recv_display.as_deref(),
                                     )?;
                                     continue;
                                 }
@@ -6133,20 +6144,27 @@ async fn handle_connection(
 /// Ctrl+wheel at the cursor (reusing the sender's legacy expansion
 /// against the INJECTOR's held keys so a physically held Ctrl is never
 /// stolen or released by us). `THEKVM_LINUX_VIEWPORT_ZOOM=0` forces the
-/// page-zoom path on Linux. True HID-level trackpad emulation (usage
-/// page 0x0D contact reports) is impossible from user mode — it needs a
-/// kernel virtual-HID driver, not SendInput/uinput.
+/// page-zoom path on Linux. `display` is the receiver's session X
+/// display (see receiver_display): a headless service has none of its
+/// own, and without it the lens fails closed into the page-zoom
+/// fallback — the exact shape of the first live failure (0.9.42 journal:
+/// `$DISPLAY not set` while the desktop-user smoke test passed). True
+/// HID-level trackpad emulation (usage page 0x0D contact reports) is
+/// impossible from user mode — it needs a kernel virtual-HID driver,
+/// not SendInput/uinput.
 fn handle_inbound_pinch(
     event: InputEvent,
     injector: &mut ReceiverInjector,
     pinch_held: &mut bool,
     viewport: &mut kvm_platform::ViewportZoom,
+    display: Option<&str>,
 ) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         if std::env::var("THEKVM_WHEEL_PINCH").as_deref() != Ok("1") {
             let _ = pinch_held;
             let _ = viewport;
+            let _ = display;
             return injector.send(event);
         }
     }
@@ -6156,7 +6174,7 @@ fn handle_inbound_pinch(
     #[cfg(not(target_os = "windows"))]
     match event {
         InputEvent::Pinch { delta } => {
-            if viewport.update(delta) {
+            if viewport.update(delta, display) {
                 return Ok(());
             }
         }

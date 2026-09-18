@@ -6,6 +6,17 @@
 //! in local mode it observes raw input and leaves the normal X11 event path
 //! untouched. HID usages use the standard X11 keycode-to-evdev offset, which
 //! preserves physical keys rather than translating through the local layout.
+//!
+//! DUAL-SCROLL CONTRACT (Linux half) — read before touching set_exclusive,
+//! GrabKind, or ignored_sources. While this machine drives a peer, scroll
+//! must reach ONLY the peer. The active grab (see set_exclusive) diverts
+//! local delivery into the grab window; WITHOUT the hold, every scroll
+//! applies locally AND remotely (dual scroll). The own-device filter (see
+//! ignored_sources) drops our own uinput injector's echo so a received
+//! drive is never re-captured and sent back (that loop reads as dual
+//! scroll from the other side, plus a drive fight). Removing either half
+//! reopens one of those shapes. The Windows half lives in capture.rs
+//! (DUAL-SCROLL CONTRACT there).
 
 use crate::{capture::CaptureBackend, PlatformError};
 use kvm_core::{InputEvent, KeyEvent, MouseButton};

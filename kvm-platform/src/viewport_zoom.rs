@@ -201,19 +201,23 @@ impl ViewportZoom {
         self.factor
     }
 
-    /// Render one pinch delta as viewport zoom. Returns true when the
-    /// event was consumed (lens open, opening, or closing back to
-    /// unity); false when the caller must use the Ctrl+wheel fallback
-    /// for this event instead. Never fails the send.
-    pub fn update(&mut self, delta: i32) -> bool {
+    /// Render one pinch delta as viewport zoom. `display` is the X
+    /// display to open (the receiver's session display: a headless
+    /// service has none of its own, so the daemon passes its sidecar
+    /// truth here — without it the lens fails closed and the caller
+    /// falls back to page zoom). Returns true when the event was
+    /// consumed (lens open, opening, or closing back to unity); false
+    /// when the caller must use the Ctrl+wheel fallback for this event
+    /// instead. Never fails the send.
+    pub fn update(&mut self, delta: i32, display: Option<&str>) -> bool {
         if !viewport_enabled() {
             return false;
         }
-        self.update_platform(delta)
+        self.update_platform(delta, display)
     }
 
     #[cfg(target_os = "linux")]
-    fn update_platform(&mut self, delta: i32) -> bool {
+    fn update_platform(&mut self, delta: i32, display: Option<&str>) -> bool {
         if self.degraded {
             return false;
         }
@@ -226,7 +230,7 @@ impl ViewportZoom {
             return false;
         }
         if self.session.is_none() {
-            match LensSession::open() {
+            match LensSession::open(display) {
                 Ok(session) => self.session = Some(session),
                 Err(error) => {
                     self.degraded = true;
@@ -272,7 +276,7 @@ impl ViewportZoom {
     /// Off Linux there is no lens: every gesture falls back (Windows
     /// renders touch injection in its own injector instead).
     #[cfg(not(target_os = "linux"))]
-    fn update_platform(&mut self, _delta: i32) -> bool {
+    fn update_platform(&mut self, _delta: i32, _display: Option<&str>) -> bool {
         false
     }
 
@@ -342,12 +346,14 @@ struct LensSession {
 #[cfg(target_os = "linux")]
 impl LensSession {
     /// Connect to the session X server and raise the lens window.
-    /// Fails closed with a reason whenever the lens cannot be honest:
+    /// `display` names the server explicitly (headless services pass
+    /// their session sidecar truth; `None` leans on `$DISPLAY`). Fails
+    /// closed with a reason whenever the lens cannot be honest:
     /// Wayland (an XWayland root would show the wrong content),
     /// unreachable display, non-LSB image order, non-24-bit root, or a
     /// missing SHAPE extension (without an empty input shape the lens
     /// would swallow clicks landing on it).
-    fn open() -> Result<Self, String> {
+    fn open(display: Option<&str>) -> Result<Self, String> {
         use x11rb::connection::{Connection, RequestConnection};
         use x11rb::protocol::shape::ConnectionExt as _;
         use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
@@ -356,7 +362,7 @@ impl LensSession {
             return Err("Wayland session (lens needs the X11 root)".into());
         }
         let (connection, screen) =
-            x11rb::connect(None).map_err(|error| format!("X11 connect: {error}"))?;
+            x11rb::connect(display).map_err(|error| format!("X11 connect: {error}"))?;
         if connection.setup().image_byte_order != x11rb::protocol::xproto::ImageOrder::LSB_FIRST {
             return Err("non-LSB X image order".into());
         }
@@ -648,7 +654,7 @@ mod tests {
         let mut zoom = super::ViewportZoom::new();
         let mut rendered = false;
         for _ in 0..12 {
-            rendered |= zoom.update(120);
+            rendered |= zoom.update(120, None);
         }
         assert!(rendered, "lens should render on the session X server");
         assert!(zoom.factor() > 1.5);

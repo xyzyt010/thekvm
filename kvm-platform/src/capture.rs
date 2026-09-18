@@ -325,6 +325,27 @@ mod win32_hooks {
 
     static SENDER: OnceLock<Mutex<Option<Sender<InputEvent>>>> = OnceLock::new();
     static LAST_POINT: OnceLock<Mutex<Option<POINT>>> = OnceLock::new();
+    // DUAL-SCROLL CONTRACT — read before touching anything in this
+    // module that mentions suppression, NOLEGACY, guard, echo, or dedup.
+    // While this machine drives a peer, a trackpad/mouse scroll must reach
+    // ONLY the peer. Local delivery leaks through THREE independent OS
+    // paths, each closed by its own layer below; removing ANY layer
+    // reopens dual scroll (both machines scroll) on some hardware:
+    //   1. hook swallow (mouse_hook/keyboard_hook return 1 while
+    //      BLOCK_LOCAL): stops legacy wheel the hook sees. Precision
+    //      touchpads bypass the hook, so this alone never suffices.
+    //   2. RIDEV_NOLEGACY re-registration (apply_raw_legacy_suppression):
+    //      stops the OS synthesizing legacy WM_MOUSEWHEEL for our usages.
+    //      The PTP digitizer collection bypasses it, so this alone never
+    //      suffices either.
+    //   3. scroll-guard pixel (scroll_guard_pixel + repark_guard_pixel):
+    //      a 1x1 topmost window under the cursor that catches the PTP
+    //      stack's direct-to-window translation.
+    // Symptom of a broken layer: scroll on the peer ALSO scrolls the
+    // local app under the parked cursor, usually "sometimes" (race or
+    // hardware dependent). See also the echo oracle + WheelDedup below:
+    // they keep our own injected wheel from looping back as a phantom
+    // drive, which is the same visible symptom from the opposite side.
     static BLOCK_LOCAL: AtomicBool = AtomicBool::new(false);
     static RAW_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
     // Hook-thread rendezvous for the trackpad-scroll suppression toggle:
@@ -387,16 +408,25 @@ mod win32_hooks {
         // event, so the hook swallow above cannot stop it reaching local
         // windows. Ask the hook thread (which owns the RawInput window)
         // to toggle legacy suppression; the WM_INPUT channel keeps
-        // flowing, so forwarding is unaffected.
+        // flowing, so forwarding is unaffected. A lost post (dead hook
+        // thread) warns loudly: silent loss here IS dual scroll with no
+        // evidence, the worst kind.
         let thread_id = HOOK_THREAD_ID.load(Ordering::Acquire);
         if thread_id != 0 {
             unsafe {
-                let _ = PostThreadMessageW(
+                if PostThreadMessageW(
                     thread_id,
                     WM_THEKVM_NOLEGACY,
                     WPARAM(exclusive as usize),
                     LPARAM(0),
-                );
+                )
+                .is_err()
+                {
+                    tracing::warn!(
+                        exclusive,
+                        "suppression toggle lost: hook thread gone; local scroll may apply while driving"
+                    );
+                }
             }
         }
     }
@@ -548,6 +578,15 @@ mod win32_hooks {
         if let Some(window) = raw_input_window {
             RAW_WINDOW.store(window.0 as isize, Ordering::Release);
         }
+        // A suppress that arrived before the window existed parked the
+        // flags un-applied (see apply_raw_legacy_suppression): force the
+        // live BLOCK_LOCAL state now, or an early drive start leaks local
+        // scroll for the whole session. The pre-reset makes this a real
+        // transition even when the flags happen to match already.
+        let exclusive = BLOCK_LOCAL.load(Ordering::Acquire);
+        RAW_NOLEGACY.store(!exclusive, Ordering::Release);
+        PTP_NOLEGACY.store(!exclusive, Ordering::Release);
+        apply_raw_legacy_suppression(exclusive);
         let _ = ready.send(Ok(thread_id));
 
         let mut message = MSG::default();
@@ -739,6 +778,7 @@ mod win32_hooks {
                             send(InputEvent::SmoothWheel { x: 0, y });
                         }
                         if BLOCK_LOCAL.load(Ordering::Acquire) {
+                            repark_guard_pixel(info.pt);
                             return LRESULT(1);
                         }
                     }
@@ -751,6 +791,7 @@ mod win32_hooks {
                             send(InputEvent::SmoothWheel { x, y: 0 });
                         }
                         if BLOCK_LOCAL.load(Ordering::Acquire) {
+                            repark_guard_pixel(info.pt);
                             return LRESULT(1);
                         }
                     }
@@ -779,8 +820,29 @@ mod win32_hooks {
     /// straight into app windows (past both the hook and NOLEGACY), so
     /// the drive ALSO parks a 1x1 guard pixel under the held cursor (see
     /// scroll_guard_pixel) to catch that translation. Either layer alone
-    /// leaks on some hardware; together they hold.
+    /// leaks on some hardware; together they hold. DO NOT remove one
+    /// side of this pairing to "simplify": that simplification is dual
+    /// scroll (see the DUAL-SCROLL CONTRACT above).
     fn apply_raw_legacy_suppression(suppress: bool) {
+        // Park/lift the guard pixel on the same transition (same thread:
+        // it owns the window, like the RawInput window above). The pixel
+        // is independent of RawInput registration, so it parks even on a
+        // RawInput-less machine and the PTP-direct path stays closed
+        // there too. Idempotent: parking an existing pixel (or lifting a
+        // missing one) is a no-op.
+        scroll_guard_pixel(suppress);
+        if !RAW_INPUT_ACTIVE.load(Ordering::Acquire) {
+            // The RawInput window is not up yet: a suppress request now
+            // must NOT consume the flag transition. The swaps below would
+            // eat it (armed-but-never-applied) and the drive would scroll
+            // locally forever with zero evidence. Park the flags
+            // un-applied instead; hook-thread init force-applies the live
+            // BLOCK_LOCAL right after creating the window (see
+            // hook_thread), so an early drive start still holds.
+            RAW_NOLEGACY.store(false, Ordering::Release);
+            PTP_NOLEGACY.store(false, Ordering::Release);
+            return;
+        }
         let mouse_changed = RAW_NOLEGACY.swap(suppress, Ordering::AcqRel) != suppress;
         let ptp_changed = PTP_NOLEGACY.swap(suppress, Ordering::AcqRel) != suppress;
         if !mouse_changed && !ptp_changed {
@@ -850,9 +912,6 @@ mod win32_hooks {
                 ),
             }
         }
-        // Park/lift the scroll-guard pixel with the same transition (same
-        // thread: it owns the window, like the RawInput window above).
-        scroll_guard_pixel(suppress);
     }
 
     /// Scroll-guard pixel: a 1x1 topmost window parked exactly under the
@@ -866,7 +925,11 @@ mod win32_hooks {
     /// dies with the drive (or the thread): positioned under the cursor
     /// sprite it is invisible in practice. Best-effort creation — a
     /// missing pixel only costs the pre-existing behavior, never the
-    /// drive.
+    /// drive. DO NOT delete this to "simplify" the three suppression
+    /// layers: without it, precision-touchpad scroll applies locally on
+    /// every drive (dual scroll), because neither the hook nor NOLEGACY
+    /// can see that path. Paired with repark_guard_pixel below, which
+    /// keeps it glued to a nudged cursor mid-drive.
     fn scroll_guard_pixel(show: bool) {
         unsafe extern "system" fn guard_proc(
             hwnd: HWND,
@@ -936,6 +999,32 @@ mod win32_hooks {
                     tracing::debug!(%error, "scroll-guard pixel unavailable; local scroll may apply while driving");
                 }
             }
+        }
+    }
+
+    /// Drag the guard pixel back under the live cursor. Parked once at
+    /// suppression time, the pixel goes stale the moment a palm brush
+    /// nudges the real cursor a pixel or two mid-drive — and the PTP
+    /// stack translates into whatever window is under the cursor NOW,
+    /// so one nudge reopens dual scroll for the rest of the drive.
+    /// Called on every swallowed wheel tick (hook thread, no allocs, one
+    /// syscall): the leak window closes after a single tick instead of
+    /// staying open. No-op when the pixel was never parked.
+    fn repark_guard_pixel(point: POINT) {
+        let raw = GUARD_PIXEL.load(Ordering::Acquire);
+        if raw == 0 {
+            return;
+        }
+        unsafe {
+            let _ = SetWindowPos(
+                HWND(raw as *mut std::ffi::c_void),
+                HWND_TOPMOST,
+                point.x,
+                point.y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE,
+            );
         }
     }
 
