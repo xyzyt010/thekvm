@@ -576,7 +576,9 @@ mod tests {
         let src = (0..16).flat_map(|_| [0u8, 0, 255, 0]).collect::<Vec<_>>();
         let dst = upscale_xrgb(&src, 4, 4, 8, 6);
         assert_eq!(dst.len(), 8 * 6 * 4);
-        for pixel in dst.chunks_exact(4) {
+        let (pixels, remainder) = dst.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        for pixel in pixels {
             assert_eq!(pixel, &[0, 0, 255, 0]);
         }
         // 1:1 is bit-identical on color bytes (the pad byte zeroes).
