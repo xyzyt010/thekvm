@@ -340,7 +340,7 @@ impl LensSession {
     /// missing SHAPE extension (without an empty input shape the lens
     /// would swallow clicks landing on it).
     fn open() -> Result<Self, String> {
-        use x11rb::connection::Connection;
+        use x11rb::connection::{Connection, RequestConnection};
         use x11rb::protocol::shape::ConnectionExt as _;
         use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
 
@@ -349,7 +349,7 @@ impl LensSession {
         }
         let (connection, screen) =
             x11rb::connect(None).map_err(|error| format!("X11 connect: {error}"))?;
-        if connection.setup().image_byte_order != x11rb::protocol::setup::ImageOrder::LsbFirst {
+        if connection.setup().image_byte_order != x11rb::protocol::xproto::ImageOrder::LSB_FIRST {
             return Err("non-LSB X image order".into());
         }
         let info = connection
@@ -410,12 +410,12 @@ impl LensSession {
         // below, so drive continues underneath the lens untouched.
         connection
             .shape_mask(
-                x11rb::protocol::shape::ShapeKind::INPUT,
-                x11rb::protocol::shape::ShapeOp::SET,
+                x11rb::protocol::shape::SO::SET,
+                x11rb::protocol::shape::SK::INPUT,
                 window,
                 0,
                 0,
-                x11rb::NONE.into(),
+                x11rb::NONE,
             )
             .map_err(|error| format!("lens click-through: {error}"))?
             .check()
