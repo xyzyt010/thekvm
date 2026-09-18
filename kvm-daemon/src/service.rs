@@ -5552,6 +5552,10 @@ async fn handle_connection(
             // physically held Ctrl, and never survives the session (the
             // teardown release_all frees it anyway).
             let mut recv_pinch_held = false;
+            // Our magnifier-lens viewport zoom for THIS session (Linux
+            // receivers only): sticky across PinchEnd, closed on factor
+            // 1.0 or session teardown (Drop). Never survives the session.
+            let mut recv_viewport = kvm_platform::ViewportZoom::new();
             let mut clipboard_revision = 0u64;
             let mut remote_clipboard_revision = 0u64;
             let mut lease_check = tokio::time::interval(Duration::from_secs(5));
@@ -5608,6 +5612,7 @@ async fn handle_connection(
                                         packet.event,
                                         &mut injector,
                                         &mut recv_pinch_held,
+                                        &mut recv_viewport,
                                     )?;
                                     continue;
                                 }
@@ -5923,6 +5928,7 @@ async fn handle_connection(
                                         packet.event,
                                         &mut injector,
                                         &mut recv_pinch_held,
+                                        &mut recv_viewport,
                                     )?;
                                     continue;
                                 }
@@ -6119,23 +6125,49 @@ async fn handle_connection(
 /// local trackpad pinch produces in Chrome/Edge (optical zoom anchored at
 /// the cursor, no layout reflow, no zoom badge in the address bar, nothing
 /// persisted per site). `THEKVM_WHEEL_PINCH=1` on the receiver forces the
-/// old Ctrl+wheel page-zoom rendering for comparison. Off Windows the
-/// gesture expands here into Ctrl+wheel at the cursor (reusing the
-/// sender's legacy expansion against the INJECTOR's held keys so a
-/// physically held Ctrl is never stolen or released by us). True HID-level
-/// trackpad emulation (usage page 0x0D contact reports) is impossible from
-/// user mode — it needs a kernel virtual-HID driver, not SendInput/uinput.
+/// old Ctrl+wheel page-zoom rendering for comparison. On Linux the gesture
+/// renders through our own magnifier lens (an always-on-top click-through
+/// window showing a live magnified capture around the cursor — OS-level
+/// zoom with no compositor or browser support needed); where the lens
+/// cannot run (Wayland, no X display, X errors) it expands here into
+/// Ctrl+wheel at the cursor (reusing the sender's legacy expansion
+/// against the INJECTOR's held keys so a physically held Ctrl is never
+/// stolen or released by us). `THEKVM_LINUX_VIEWPORT_ZOOM=0` forces the
+/// page-zoom path on Linux. True HID-level trackpad emulation (usage
+/// page 0x0D contact reports) is impossible from user mode — it needs a
+/// kernel virtual-HID driver, not SendInput/uinput.
 fn handle_inbound_pinch(
     event: InputEvent,
     injector: &mut ReceiverInjector,
     pinch_held: &mut bool,
+    viewport: &mut kvm_platform::ViewportZoom,
 ) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         if std::env::var("THEKVM_WHEEL_PINCH").as_deref() != Ok("1") {
             let _ = pinch_held;
+            let _ = viewport;
             return injector.send(event);
         }
+    }
+    // Linux viewport lens first: consumed events never reach the
+    // Ctrl+wheel expansion below, so the two renderings never mix
+    // inside one gesture.
+    #[cfg(not(target_os = "windows"))]
+    match event {
+        InputEvent::Pinch { delta } => {
+            if viewport.update(delta) {
+                return Ok(());
+            }
+        }
+        InputEvent::PinchEnd => {
+            // Sticky lens: the window stays at its factor (like the
+            // browser zoom persisting after fingers lift). The expansion
+            // below then only releases a synthetic Ctrl if the fallback
+            // path held one — a lens gesture holds none.
+            viewport.end();
+        }
+        _ => {}
     }
     let physical_ctrl = injector.key_pressed(HID_LEFT_CTRL);
     for out in pinch_expansion(event, physical_ctrl, pinch_held) {
