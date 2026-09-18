@@ -4181,7 +4181,9 @@ async fn prewarm_link_stream(
                 if is_link_ended_rejection(&error) {
                     return Err(error);
                 }
-                tracing::debug!(%error, "pre-warm on the warm link failed; dialling cold");
+                // INFO, not debug: a silent prewarm miss reads as "first
+                // crossing flaps/dies" with nothing in the journal.
+                tracing::info!(%error, "pre-warm on the warm link failed; dialling cold");
                 match cold_topology_dial(
                     identity,
                     peers,
@@ -4200,7 +4202,7 @@ async fn prewarm_link_stream(
                         if is_link_ended_rejection(&error) {
                             return Err(error);
                         }
-                        tracing::debug!(%error, "pre-warm cold dial failed");
+                        tracing::info!(%error, "pre-warm cold dial failed; first crossing opens cold");
                         return Ok(None);
                     }
                 }
@@ -4225,7 +4227,7 @@ async fn prewarm_link_stream(
                     if is_link_ended_rejection(&error) {
                         return Err(error);
                     }
-                    tracing::debug!(%error, "pre-warm cold dial failed");
+                    tracing::info!(%error, "pre-warm cold dial failed (no warm link); first crossing opens cold");
                     return Ok(None);
                 }
             }
@@ -5651,42 +5653,17 @@ async fn handle_connection(
                 remote = %conn.remote_address(),
                 "input session accepted",
             );
-            // Motion-lane accept (see open_episode_stream): the sender
-            // opens its lane right after reading our Accepted, so accept
-            // order on this association is deterministic (episode first,
-            // lane second — episodes are served sequentially, so this
-            // accept pairs with THIS episode's lane exactly). A missing
-            // lane is a hard episode failure, never a silent downgrade:
-            // the sender WILL send motion on it, and an unread lane
-            // would stall the episode into the lease instead.
-            let mut motion_recv: Option<quinn::RecvStream> = if hello.motion_lane {
-                match tokio::time::timeout(Duration::from_secs(10), conn.accept_uni()).await {
-                    Ok(Ok(lane)) => {
-                        tracing::info!(
-                            peer = %peer_fingerprint,
-                            stream = ?lane.id(),
-                            "episode motion lane accepted",
-                        );
-                        Some(lane)
-                    }
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "motion lane accept failed; ending episode");
-                        bail!("peer negotiated a motion lane but the accept failed");
-                    }
-                    Err(_) => {
-                        tracing::warn!("motion lane accept timed out; ending episode");
-                        bail!("peer negotiated a motion lane but never opened it");
-                    }
-                }
-            } else {
-                None
-            };
-            // Publish the live inbound link: the station-side UI arms its
-            // own half of the link from here (it never dialed), and hangs
-            // the link up from here too. The address MUST be dialable: the
-            // socket's remote address is an ephemeral source port that
-            // accepts no connections (dialling it back was why Both-ways
-            // return control never worked), so prefer the peer book's saved
+            // Publish the live inbound link FIRST, before the motion-lane
+            // wait below: the station-side UI arms its half of the link
+            // from this registry (it never dialed), and hangs the link up
+            // from here too. A lane that never arrives must NEVER make an
+            // accepted handshake invisible — an unregistered session is a
+            // station that stays dark and a dial-back that never fires
+            // (one side Connects, the other never syncs, crossings die
+            // with it). The address MUST be dialable: the socket's remote
+            // address is an ephemeral source port that accepts no
+            // connections (dialling it back was why Both-ways return
+            // control never worked), so prefer the peer book's saved
             // daemon address and otherwise the inbound IP on the standard
             // daemon port.
             let peer_book = peers.read().await;
@@ -5729,6 +5706,40 @@ async fn handle_connection(
                 node = %hello.node_name,
                 "inbound link live; waiting for the peer's dial-back for two-way edge",
             );
+            // Motion-lane accept (see open_episode_stream): the sender
+            // opens its lane right after reading our Accepted, so accept
+            // order on this association is deterministic (episode first,
+            // lane second — episodes are served sequentially, so this
+            // accept pairs with THIS episode's lane exactly). A missing
+            // lane ends the episode: serving laneless while the sender
+            // keeps writing motion into an unread stream would stall the
+            // whole association on flow control (a full drive freeze with
+            // suppression held) — and the sender has no signal to stop.
+            // Registration above already ran, so even a bailed episode
+            // stays visible in Status (recent_inbound) instead of blinding
+            // the dial-back.
+            let mut motion_recv: Option<quinn::RecvStream> = if hello.motion_lane {
+                match tokio::time::timeout(Duration::from_secs(10), conn.accept_uni()).await {
+                    Ok(Ok(lane)) => {
+                        tracing::info!(
+                            peer = %peer_fingerprint,
+                            stream = ?lane.id(),
+                            "episode motion lane accepted",
+                        );
+                        Some(lane)
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "motion lane accept failed; ending episode");
+                        bail!("peer negotiated a motion lane but the accept failed");
+                    }
+                    Err(_) => {
+                        tracing::warn!("motion lane accept timed out; ending episode");
+                        bail!("peer negotiated a motion lane but never opened it");
+                    }
+                }
+            } else {
+                None
+            };
             let mut seen_sequences = BTreeSet::new();
             let mut motion_sequence = MotionSequence::default();
             let mut last_activity = Instant::now();
