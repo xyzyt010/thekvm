@@ -33,6 +33,13 @@
 //!   never fails the send.
 //! - `THEKVM_LINUX_VIEWPORT_ZOOM=0` forces the old page-zoom path, and the
 //!   global `THEKVM_WHEEL_PINCH=1` opt-out keeps forcing it too.
+//!
+//! Video feedback: the source rect sits under the cursor, which is also
+//! where the lens window is — re-capturing with the lens visible would
+//! magnify the previous lens frame over and over until the picture melts
+//! into a flat blur (proven live: grey mush, then black). Every render
+//! therefore unmaps the lens, captures the naked desktop, then re-maps
+//! and presents, all inside one flush so the hide never reaches the eye.
 
 /// Minimum/maximum magnification the lens renders.
 const MIN_FACTOR: f64 = 1.0;
@@ -329,6 +336,7 @@ struct LensSession {
     window: u32,
     gc: u32,
     cursor: (u32, u32),
+    mapped: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -440,11 +448,15 @@ impl LensSession {
             window,
             gc,
             cursor: (screen_px.0 / 2, screen_px.1 / 2),
+            mapped: true,
         })
     }
 
     /// One lens frame at the current factor: follow the cursor, capture
-    /// the source rect, upscale, present, restack above.
+    /// the source rect, upscale, present, restack above. The lens unmaps
+    /// for the capture (its own old frame sits inside the source rect —
+    /// see the module docs) and re-maps for the present; the whole
+    /// sequence flushes once so the hide never reaches the eye.
     fn render(&mut self, factor: f64) -> Result<(), String> {
         use x11rb::connection::Connection;
         use x11rb::protocol::xproto::{
@@ -462,17 +474,22 @@ impl LensSession {
         }
         let ((lx, ly, lw, lh), (sx, sy, sw, sh)) =
             lens_geometry(self.cursor, self.screen_px, factor);
-        let pixels = self
-            .connection
-            .get_image(
-                ImageFormat::Z_PIXMAP,
-                self.root,
-                sx as i16,
-                sy as i16,
-                sw as u16,
-                sh as u16,
-                u32::MAX,
-            )
+        if self.mapped {
+            self.connection
+                .unmap_window(self.window)
+                .map_err(|error| format!("lens hide: {error}"))?;
+            self.mapped = false;
+        }
+        let capture = self.connection.get_image(
+            ImageFormat::Z_PIXMAP,
+            self.root,
+            sx as i16,
+            sy as i16,
+            sw as u16,
+            sh as u16,
+            u32::MAX,
+        );
+        let pixels = capture
             .map_err(|error| format!("desktop capture: {error}"))?
             .reply()
             .map_err(|error| format!("capture read: {error}"))?
@@ -494,6 +511,12 @@ impl LensSession {
             .map_err(|error| format!("lens place: {error}"))?
             .check()
             .map_err(|error| format!("lens place: {error}"))?;
+        self.connection
+            .map_window(self.window)
+            .map_err(|error| format!("lens show: {error}"))?
+            .check()
+            .map_err(|error| format!("lens show: {error}"))?;
+        self.mapped = true;
         self.connection
             .put_image(
                 ImageFormat::Z_PIXMAP,
