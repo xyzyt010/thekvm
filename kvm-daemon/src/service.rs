@@ -2704,6 +2704,20 @@ fn store_warm_link(connection: &quinn::Connection, fingerprint: &str) {
     }
 }
 
+/// Live-association redial candidate (see cold_topology_dial): the remote
+/// address of the pooled warm link for this peer, when alive. Every pooled
+/// link was dialed outbound, so the remote is the peer's daemon port —
+/// never an ephemeral source port. Non-destructive peek; the pool keeps
+/// its link for the warm-episode fast path.
+fn peek_live_remote(fingerprint: &str) -> Option<String> {
+    let pool = warm_link_pool().lock().ok()?;
+    let warm = pool.as_ref()?;
+    if warm.fingerprint != fingerprint || warm.connection.close_reason().is_some() {
+        return None;
+    }
+    Some(warm.connection.remote_address().to_string())
+}
+
 /// MWB lastJump parity: ignore a new edge transfer within 100ms of the last
 /// completed one, so two facing edges can never ping-pong the cursor
 /// forever. Pure so the determinism is unit-tested.
@@ -3899,6 +3913,10 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
     // association falls back to a cold dial, which re-warms the pool. Only
     // a cold dial teaches us anything new about the peer's address (it
     // heals the book across DHCP moves); warm episodes skip re-resolving.
+    // Snapshot the live-remote fallback BEFORE take_warm_link drains the
+    // pool: a failed warm episode still leaves its address behind for the
+    // cold dial's second knock (see cold_topology_dial).
+    let live_fallback = peek_live_remote(fingerprint);
     let (conn, mut send, recv, motion_send, capabilities, dialed_address) =
         match take_warm_link(fingerprint) {
             Some(warm) => match open_episode_stream(&warm, policy).await {
@@ -3909,15 +3927,30 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
                 Err(error) => {
                     tracing::debug!(%error, ?target, "warm link episode failed; re-dialling");
                     let (conn, send, recv, motion_send, capabilities, address) =
-                        cold_topology_dial(identity, peers, fingerprint, &peer_name, policy, dir)
-                            .await?;
+                        cold_topology_dial(
+                            identity,
+                            peers,
+                            fingerprint,
+                            &peer_name,
+                            policy,
+                            dir,
+                            live_fallback,
+                        )
+                        .await?;
                     (conn, send, recv, motion_send, capabilities, Some(address))
                 }
             },
             None => {
-                let (conn, send, recv, motion_send, capabilities, address) =
-                    cold_topology_dial(identity, peers, fingerprint, &peer_name, policy, dir)
-                        .await?;
+                let (conn, send, recv, motion_send, capabilities, address) = cold_topology_dial(
+                    identity,
+                    peers,
+                    fingerprint,
+                    &peer_name,
+                    policy,
+                    dir,
+                    live_fallback,
+                )
+                .await?;
                 (conn, send, recv, motion_send, capabilities, Some(address))
             }
         };
@@ -4191,6 +4224,7 @@ async fn prewarm_link_stream(
                     &screen.name,
                     policy,
                     dir,
+                    None,
                 )
                 .await
                 {
@@ -4216,6 +4250,7 @@ async fn prewarm_link_stream(
                 &screen.name,
                 policy,
                 dir,
+                None,
             )
             .await
             {
@@ -4375,6 +4410,7 @@ async fn cold_topology_dial(
     peer_name: &str,
     policy: ConnectPolicy<'_>,
     dir: &std::path::Path,
+    live_fallback: Option<String>,
 ) -> Result<(
     quinn::Connection,
     quinn::SendStream,
@@ -4384,9 +4420,25 @@ async fn cold_topology_dial(
     String,
 )> {
     let address = resolve_peer_address(peers, fingerprint, peer_name)?;
-    let (conn, send, recv, motion_send, capabilities) =
-        dial_session(identity, peers, &address, policy, Some(fingerprint), dir).await?;
-    Ok((conn, send, recv, motion_send, capabilities, address))
+    match dial_session(identity, peers, &address, policy, Some(fingerprint), dir).await {
+        Ok((conn, send, recv, motion_send, capabilities)) => {
+            Ok((conn, send, recv, motion_send, capabilities, address))
+        }
+        Err(first) => {
+            // Stale book after a DHCP move: the live association (when
+            // one exists) is by definition reachable — retry there once
+            // instead of failing after a 60s knock on a dead address.
+            // dial_session records the winner, so the book heals either
+            // way and the next dial goes straight there.
+            let Some(live) = live_fallback.filter(|live| *live != address) else {
+                return Err(first);
+            };
+            tracing::info!(%first, book = %address, live = %live, "cold dial failed; retrying on the live association address");
+            let (conn, send, recv, motion_send, capabilities) =
+                dial_session(identity, peers, &live, policy, Some(fingerprint), dir).await?;
+            Ok((conn, send, recv, motion_send, capabilities, live))
+        }
+    }
 }
 
 async fn drain_peer_responses(
@@ -7260,13 +7312,31 @@ async fn dial_session(
     )
     .await
     {
-        Ok(session) => Ok(session),
+        Ok(session) => {
+            // The book heals on EVERY verified dial, not only on cold
+            // episode opens: this address just completed the handshake
+            // (DHCP moves, UI dial-back children with explicit addresses,
+            // manual dials), so record it before a later cold dial has to
+            // guess from a stale entry and knock on a dead address for
+            // 60s. Fingerprint-verified truth — an address only decides
+            // where to knock.
+            if let Ok(presented) = peer_fingerprint(&session.0) {
+                note_peer_address(dir, &presented, address);
+            }
+            Ok(session)
+        }
         Err(first) if unknown_peer_rejection(&first) => {
             let primary_fp = primary_identity.fingerprint_hex();
             match load_fallback_dial(dir, &primary_fp) {
                 Some((identity, merged)) => {
                     tracing::info!(peer = %address, "peer reports this computer unknown; retrying with the alternate local identity");
-                    connect_input(&identity, &merged, address, policy, intended_fingerprint).await
+                    let session =
+                        connect_input(&identity, &merged, address, policy, intended_fingerprint)
+                            .await?;
+                    if let Ok(presented) = peer_fingerprint(&session.0) {
+                        note_peer_address(dir, &presented, address);
+                    }
+                    Ok(session)
                 }
                 None => Err(first),
             }

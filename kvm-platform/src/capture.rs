@@ -312,15 +312,15 @@ mod win32_hooks {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetCursorPos, GetMessageW, PeekMessageW, PostThreadMessageW, RegisterClassW, SetCursorPos,
-        SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
-        HC_ACTION, HMENU, HWND_MESSAGE, HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-        PM_NOREMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, WH_KEYBOARD_LL,
-        WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-        WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
-        WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-        XBUTTON1, XBUTTON2,
+        GetCursorPos, GetMessageW, LoadCursorW, PeekMessageW, PostThreadMessageW, RegisterClassW,
+        SetCursor, SetCursorPos, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
+        UnhookWindowsHookEx, HC_ACTION, HMENU, HWND_MESSAGE, HWND_TOPMOST, IDC_ARROW,
+        KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SW_SHOWNOACTIVATE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT,
+        WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+        WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, XBUTTON1, XBUTTON2,
     };
 
     static SENDER: OnceLock<Mutex<Option<Sender<InputEvent>>>> = OnceLock::new();
@@ -1015,6 +1015,20 @@ mod win32_hooks {
             wparam: WPARAM,
             lparam: LPARAM,
         ) -> LRESULT {
+            // Deterministic cursor while driving: this pixel sits exactly
+            // under the parked cursor, so the OS asks IT for the cursor
+            // shape. The class registers no cursor, so DefWindowProc would
+            // leave whatever was showing — a frozen hourglass from a busy
+            // app under the park point reads as our glitch for the whole
+            // drive. Answer arrow ourselves; handled means TRUE.
+            if message == WM_SETCURSOR {
+                if let Ok(arrow) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+                    unsafe {
+                        SetCursor(arrow);
+                    }
+                }
+                return LRESULT(1);
+            }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         unsafe {
