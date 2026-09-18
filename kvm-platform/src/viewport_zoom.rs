@@ -633,4 +633,45 @@ mod tests {
         zoom.close();
         assert_eq!(zoom.factor(), 1.0);
     }
+
+    /// Debug helper (manual): dumps a full-root GetImage to /tmp/cap.ppm
+    /// so we can see exactly what the capture path reads. Run on Mint:
+    /// `DISPLAY=:0 cargo test -p kvm-platform --lib -- --ignored
+    /// capture_dump --nocapture`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "manual: writes /tmp/cap.ppm from the raw GetImage path"]
+    fn capture_dump_writes_root_ppm() {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
+        if std::env::var("DISPLAY").is_err() {
+            std::env::set_var("DISPLAY", ":0");
+        }
+        let (connection, screen) = x11rb::connect(None).expect("x11 connect");
+        let info = connection.setup().roots.get(screen).expect("screen");
+        let (width, height) = (
+            u32::from(info.width_in_pixels),
+            u32::from(info.height_in_pixels),
+        );
+        eprintln!("root {width}x{height} depth {}", info.root_depth);
+        let reply = connection
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                info.root,
+                0,
+                0,
+                width as u16,
+                height as u16,
+                u32::MAX,
+            )
+            .expect("get_image")
+            .reply()
+            .expect("reply");
+        eprintln!("captured {} bytes", reply.data.len());
+        let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+        for pixel in reply.data.chunks_exact(4) {
+            ppm.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+        }
+        std::fs::write("/tmp/cap.ppm", &ppm).expect("write ppm");
+    }
 }
