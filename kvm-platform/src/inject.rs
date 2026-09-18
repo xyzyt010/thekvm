@@ -479,6 +479,12 @@ mod linux_uinput {
     const INPUT_PROP_DIRECT: i32 = 0x01;
     const MT_SLOTS: u32 = 9;
     const MT_ID_MAX: i32 = 65535;
+    /// Hotplug settle after UI_DEV_CREATE before the first DOWN may
+    /// emit: Xorg/libinput needs on the order of 100ms (live-proven in
+    /// Xorg.0.log: udev add to XINPUT-ready) before the device exists
+    /// server-side. 700ms is ample margin yet short enough that the
+    /// gesture that created the device still zooms.
+    const TOUCH_SETTLE_MS: u64 = 700;
 
     /// `struct uinput_abs_setup` bytes for one axis: u16 code LE, then
     /// input_absinfo {value, minimum, maximum, fuzz, flat, resolution}
@@ -560,6 +566,9 @@ mod linux_uinput {
         ids: [i32; 2],
         next_id: i32,
         last_update: Option<std::time::Instant>,
+        /// Device birth (UI_DEV_CREATE return): gates the first DOWN
+        /// until the hotplug settle elapses (see TOUCH_SETTLE_MS).
+        created_at: std::time::Instant,
     }
 
     impl UinputTouch {
@@ -613,6 +622,7 @@ mod linux_uinput {
                 ids: [1, 2],
                 next_id: 3,
                 last_update: None,
+                created_at: std::time::Instant::now(),
             })
         }
 
@@ -650,6 +660,17 @@ mod linux_uinput {
                 self.next_id = (self.next_id + 2) % (MT_ID_MAX - 1) + 1;
             }
             self.separation_px = touch_separation(self.separation_px, delta);
+            // Hotplug settle (see TOUCH_SETTLE_MS): an early DOWN is
+            // silently lost server-side AND poisons the gesture (later
+            // UPDATEs arrive for never-Begun ids and are dropped — the
+            // whole pinch reads as nothing). Absorb spread meanwhile:
+            // the DOWN lands mid-gesture with the accumulated separation
+            // and the zoom still happens, anchored slightly late.
+            if now.duration_since(self.created_at)
+                < std::time::Duration::from_millis(TOUCH_SETTLE_MS)
+            {
+                return Ok(());
+            }
             let contacts = touch_contacts(self.center, self.separation_px, self.bounds);
             let ids = self.ids;
             let mut frame = |touch: &mut Self| -> std::io::Result<()> {
