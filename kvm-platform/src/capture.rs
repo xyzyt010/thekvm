@@ -302,9 +302,14 @@ mod win32_hooks {
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Mutex, OnceLock};
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows::Win32::Foundation::{
+        CloseHandle, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::System::Threading::{
+        GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     use windows::Win32::UI::Input::{
         GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUTDEVICE,
         RAWINPUTHEADER, RAWMOUSE, RIDEV_INPUTSINK, RIDEV_NOLEGACY, RIDEV_REMOVE, RID_INPUT,
@@ -312,15 +317,16 @@ mod win32_hooks {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetCursorPos, GetMessageW, LoadCursorW, PeekMessageW, PostThreadMessageW, RegisterClassW,
-        SetCursor, SetCursorPos, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
-        UnhookWindowsHookEx, HC_ACTION, HMENU, HWND_MESSAGE, HWND_TOPMOST, IDC_ARROW,
-        KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SW_SHOWNOACTIVATE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT,
-        WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-        WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-        WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, XBUTTON1, XBUTTON2,
+        GetCursorPos, GetMessageW, GetWindowThreadProcessId, LoadCursorW, PeekMessageW,
+        PostThreadMessageW, RegisterClassW, SetCursor, SetCursorPos, SetWindowPos,
+        SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, WindowFromPoint,
+        HC_ACTION, HMENU, HWND_MESSAGE, HWND_TOPMOST, IDC_ARROW, KBDLLHOOKSTRUCT, MSG,
+        MSLLHOOKSTRUCT, PM_NOREMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE,
+        WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+        WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN,
+        WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_POPUP, XBUTTON1, XBUTTON2,
     };
 
     static SENDER: OnceLock<Mutex<Option<Sender<InputEvent>>>> = OnceLock::new();
@@ -1055,6 +1061,7 @@ mod win32_hooks {
                 Ordering::Release,
             );
             PARK_VALID.store(true, Ordering::Release);
+            log_park_window(point);
             let instance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
             const GUARD_CLASS: &[u16] = &[
                 'T' as u16, 'h' as u16, 'e' as u16, 'K' as u16, 'v' as u16, 'm' as u16, 'G' as u16,
@@ -1106,6 +1113,40 @@ mod win32_hooks {
                     }
                 }
             }
+        }
+    }
+
+    /// Park-context telemetry (see the hourglass reports): name the window
+    /// under the parked cursor once per drive. A parked cursor over a
+    /// busy/loading app flickers that app's hourglass against the pixel's
+    /// arrow as physical moves jitter past the glue — which reads as our
+    /// glitch while the app underneath is the one busy. Best effort, one
+    /// INFO line, no behavior change.
+    fn log_park_window(point: POINT) {
+        unsafe {
+            let hwnd = WindowFromPoint(point);
+            if hwnd.0.is_null() {
+                return;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            let mut name = String::from("?");
+            if let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                let mut buf = [0u16; 260];
+                let mut len = buf.len() as u32;
+                if QueryFullProcessImageNameW(
+                    handle,
+                    PROCESS_NAME_WIN32,
+                    windows::core::PWSTR(buf.as_mut_ptr()),
+                    &mut len,
+                )
+                .is_ok()
+                {
+                    name = String::from_utf16_lossy(&buf[..len as usize]);
+                }
+                let _ = CloseHandle(handle);
+            }
+            tracing::info!(x = point.x, y = point.y, pid, window_process = %name, "drive parked over this window");
         }
     }
 
