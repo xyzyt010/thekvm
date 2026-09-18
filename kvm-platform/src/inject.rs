@@ -996,8 +996,7 @@ mod linux_uinput {
         }
 
         #[test]
-        fn touch_contacts_stay_symmetric_and_inside() {
-            // Centered: symmetric pair around the anchor.
+        fn touch_contacts_stay_symmetric_and_inside() {            // Centered: symmetric pair around the anchor.
             assert_eq!(
                 touch_contacts((960, 540), 120.0, (1919, 1079)),
                 [(900, 540), (1020, 540)]
@@ -1009,6 +1008,24 @@ mod linux_uinput {
             assert_eq!((left.1, right.1), (5, 5));
             let [left, right] = touch_contacts((1918, 1078), 700.0, (1919, 1079));
             assert!(left.0 >= 0 && right.0 <= 1919);
+        }
+
+        /// Manual end-to-end: creates the REAL virtual touchscreen for
+        /// ~25s (no contacts emitted — nothing clicks, nothing moves) so
+        /// `xinput list` in another shell can prove Xorg/libinput picked
+        /// it up. Run on Mint: `cargo test -p kvm-platform --lib --
+        /// --ignored touch_device_enumerates`. Fails honestly when
+        /// /dev/uinput is unreachable (that is the fallback path working
+        /// as designed).
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore = "manual: creates the real virtual touchscreen for 25s for xinput inspection"]
+        fn touch_device_enumerates_on_session_bus() {
+            let touch =
+                super::UinputTouch::create(1536, 864).expect("uinput touchscreen creates");
+            assert!(touch.created);
+            assert_eq!(touch.bounds, (1535, 863));
+            std::thread::sleep(std::time::Duration::from_secs(25));
         }
     }
 }
