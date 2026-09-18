@@ -1755,6 +1755,11 @@ mod win32_hooks {
     #[derive(Debug)]
     struct PtpPinch {
         anchor: Option<i64>,
+        /// Midpoint where the current anchor was taken: the unengaged
+        /// veto compares EXCURSIONS from here (see feed), so a drifty
+        /// close still accumulates toward the gate instead of sliding
+        /// the anchor away one vetoed frame at a time.
+        anchor_mid: Option<(i64, i64)>,
         prev: Option<i64>,
         prev_mid: Option<(i64, i64)>,
         acc: i64,
@@ -1767,6 +1772,7 @@ mod win32_hooks {
         const fn new() -> Self {
             Self {
                 anchor: None,
+                anchor_mid: None,
                 prev: None,
                 prev_mid: None,
                 acc: 0,
@@ -1788,6 +1794,7 @@ mod win32_hooks {
             if contacts.len() != 2 {
                 let ended = self.engaged;
                 self.anchor = None;
+                self.anchor_mid = None;
                 self.prev = None;
                 self.prev_mid = None;
                 self.acc = 0;
@@ -1803,6 +1810,7 @@ mod win32_hooks {
             );
             let Some(anchor) = self.anchor else {
                 self.anchor = Some(spread);
+                self.anchor_mid = Some(mid);
                 self.prev = Some(spread);
                 self.prev_mid = Some(mid);
                 return (0, false);
@@ -1814,14 +1822,36 @@ mod win32_hooks {
             self.prev = Some(spread);
             self.prev_mid = Some(mid);
             // Scroll-vs-pinch arbitration: a two-finger scroll moves both
-            // contacts together (large midpoint step, small spread
-            // change); a pinch changes the spread around a near-still
-            // midpoint. Scroll-dominated frames slide the anchor, so
-            // finger wobble during a scroll can never accumulate to the
-            // engage gate and mute pan.
-            if mid_step >= SCROLL_NOISE_FLOOR && mid_step > spread_step.abs() * SCROLL_DOMINANCE {
+            // contacts together (large midpoint excursion, small spread
+            // excursion); a pinch changes the spread around a near-still
+            // midpoint. While UNENGAGED the veto compares EXCURSIONS from
+            // the anchor: per-frame steps misread a drifty close (small
+            // spread shrinkage plus midpoint wander per frame) as scroll
+            // and slide the anchor after it, so the gate debt never
+            // accumulates and zoom-out never engages — the stranded
+            // zoom-in shape. Excursions keep the anchor fixed through
+            // drift (a close trends away from the anchor and engages)
+            // while a traveling scroll still vetoes and slides (its
+            // midpoint runs away from the anchor). While ENGAGED the
+            // veto stays per-frame: the 8-frame scroll takeover must
+            // hand a resumed scroll back to pan fast, and excursions
+            // would delay it by the already-banked spread.
+            let vetoed = if self.engaged {
+                mid_step >= SCROLL_NOISE_FLOOR && mid_step > spread_step.abs() * SCROLL_DOMINANCE
+            } else {
+                let (anchor_mid_x, anchor_mid_y) = self.anchor_mid.unwrap_or(mid);
+                let mid_excursion = (mid.0 - anchor_mid_x).abs() + (mid.1 - anchor_mid_y).abs();
+                let spread_excursion = (spread - anchor).abs();
+                mid_excursion >= SCROLL_NOISE_FLOOR
+                    && mid_excursion > spread_excursion.saturating_mul(SCROLL_DOMINANCE)
+            };
+            // Scroll-dominated frames slide the anchor, so finger wobble
+            // during a scroll can never accumulate to the engage gate
+            // and mute pan.
+            if vetoed {
                 self.scroll_streak += 1;
                 self.anchor = Some(spread);
+                self.anchor_mid = Some(mid);
                 if self.engaged && self.scroll_streak >= TAKEOVER_FRAMES {
                     // The fingers went back to scrolling mid-gesture: end
                     // the pinch so pan (which kept feeding underneath)
@@ -2411,20 +2441,21 @@ mod win32_hooks {
             let now = std::time::Instant::now();
             // Pinch owns engaged fingers: zoom instead of scroll (the
             // pan anchor still feeds so a post-pinch scroll never jumps).
+            let was_pinching = ptp_pinch_slot().engaged();
             let (zoom, pinch_ended) = ptp_pinch_slot().feed(&contacts);
             let pinching = ptp_pinch_slot().engaged();
+            // Per-gesture verdicts (not warn-once): a pinch that never
+            // engages reads as "nothing happens", and only a journal line
+            // per engage/end can tell capture-arbitration from a dead
+            // receiver. Gesture volume, not report volume.
+            if pinching && !was_pinching {
+                tracing::info!("precision-touchpad pinch engaged");
+            }
             if zoom != 0 {
-                static FIRST_PINCH: std::sync::Once = std::sync::Once::new();
-                FIRST_PINCH.call_once(|| {
-                    tracing::info!(
-                        contacts = contacts.len(),
-                        zoom,
-                        "precision-touchpad first pinch report"
-                    );
-                });
                 send(InputEvent::Pinch { delta: zoom });
             }
             if pinch_ended {
+                tracing::info!("precision-touchpad pinch ended");
                 send(InputEvent::PinchEnd);
             }
             let (x, y) = ptp_pan_slot().feed(&contacts);
@@ -2586,6 +2617,58 @@ mod win32_hooks {
                 assert!(!pinch.engaged());
             }
             assert_eq!(pinch.feed(&[]), (0, false));
+        }
+
+        #[test]
+        fn ptp_drifty_close_still_engages_zoom_out() {
+            // Pinch-out with midpoint wander: per-frame steps look like
+            // scroll (mid_step ~4 vs spread_step ~10), but excursions
+            // from the anchor trend apart, so the gate debt accumulates
+            // and zoom-out engages. The per-frame veto slid the anchor
+            // after the drift and the gate never tripped — zoom-in
+            // stranded with no way back.
+            let mut pinch = PtpPinch::new();
+            pinch.units_per_detent = 10;
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (0, false));
+            for step in 1..=12 {
+                let s = step as i32;
+                // Spread shrinks 10/frame; midpoint wanders 4/frame.
+                let (zoom, ended) = pinch.feed(&[(s, 0), (300 - 9 * s, 0)]);
+                assert_eq!((zoom, ended), (0, false));
+                assert!(!pinch.engaged());
+            }
+            // Spread 300 -> 170: excursion 130 past the 128 gate.
+            let (zoom, ended) = pinch.feed(&[(13, 0), (300 - 9 * 13, 0)]);
+            assert_eq!(ended, false);
+            assert!(pinch.engaged());
+            assert!(zoom < 0);
+            // Further closing keeps emitting zoom-out.
+            let (zoom, ended) = pinch.feed(&[(14, 0), (300 - 9 * 14, 0)]);
+            assert_eq!(ended, false);
+            assert!(zoom < 0);
+            // Lift ends exactly once.
+            assert_eq!(pinch.feed(&[]), (0, true));
+        }
+
+        #[test]
+        fn ptp_anchored_finger_close_engages() {
+            // One finger stays planted while the other closes in: the
+            // midpoint moves at half the spread rate, a genuine pinch
+            // the excursion veto must not misread as scroll.
+            let mut pinch = PtpPinch::new();
+            pinch.units_per_detent = 10;
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (0, false));
+            for step in 1..=12 {
+                let s = step as i32;
+                let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * s, 0)]);
+                assert_eq!((zoom, ended), (0, false));
+                assert!(!pinch.engaged());
+            }
+            let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * 13, 0)]);
+            assert_eq!(ended, false);
+            assert!(pinch.engaged());
+            assert!(zoom < 0);
+            assert_eq!(pinch.feed(&[]), (0, true));
         }
 
         #[test]

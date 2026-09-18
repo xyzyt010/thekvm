@@ -673,6 +673,18 @@ mod linux_uinput {
             }
             let contacts = touch_contacts(self.center, self.separation_px, self.bounds);
             let ids = self.ids;
+            // Per-gesture verdict (not warn-once): pairs with the
+            // sender's engage/end lines, so a dead pinch can be laid at
+            // capture-arbitration or receiver-rendering from the journal.
+            // Gesture volume, not frame volume.
+            if !self.down {
+                tracing::info!(
+                    x = anchor.0,
+                    y = anchor.1,
+                    separation = self.separation_px.round() as i32,
+                    "touchscreen pinch gesture started"
+                );
+            }
             let mut frame = |touch: &mut Self| -> std::io::Result<()> {
                 for (slot, ((x, y), id)) in contacts.iter().zip(ids.iter()).enumerate() {
                     touch.write_raw(EV_ABS, ABS_MT_SLOT, slot as i32)?;
@@ -698,6 +710,7 @@ mod linux_uinput {
             if !self.down {
                 return;
             }
+            tracing::info!("touchscreen pinch gesture ended");
             let mut frame = || -> std::io::Result<()> {
                 for slot in 0..2 {
                     self.write_raw(EV_ABS, ABS_MT_SLOT, slot)?;
