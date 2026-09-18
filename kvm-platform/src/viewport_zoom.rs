@@ -363,6 +363,9 @@ impl LensSession {
         if info.root_depth != 24 {
             return Err(format!("root depth {} (lens needs 24)", info.root_depth));
         }
+        // Copy the scalars out: `info` borrows the connection, which
+        // moves into the session below.
+        let root_depth = info.root_depth;
         if connection
             .extension_information(x11rb::protocol::shape::X11_EXTENSION_NAME)
             .map_err(|error| format!("SHAPE probe: {error}"))?
@@ -432,7 +435,7 @@ impl LensSession {
         Ok(Self {
             connection,
             root,
-            root_depth: info.root_depth,
+            root_depth,
             screen_px,
             window,
             gc,
