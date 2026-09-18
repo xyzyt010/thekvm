@@ -698,7 +698,9 @@ mod tests {
             .expect("reply");
         eprintln!("captured {} bytes", reply.data.len());
         let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
-        for pixel in reply.data.chunks_exact(4) {
+        let (pixels, remainder) = reply.data.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        for pixel in pixels {
             ppm.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
         }
         std::fs::write("/tmp/cap.ppm", &ppm).expect("write ppm");
