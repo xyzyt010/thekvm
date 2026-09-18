@@ -20,7 +20,7 @@
 
 use crate::{capture::CaptureBackend, PlatformError};
 use kvm_core::{InputEvent, KeyEvent, MouseButton};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -80,6 +80,12 @@ pub struct X11Capture {
     /// injector creates its devices per receiver session, which can postdate
     /// this capture backend.
     ignored_sources: Vec<xinput::DeviceId>,
+    /// Slave-device ids EVER observed on this backend (own or physical):
+    /// a never-seen id triggers exactly one own-device re-query (see
+    /// is_own_source), so hot steady-state costs nothing and a device born
+    /// after the last refresh leaks at most one event instead of seconds
+    /// of them. Bounded (cleared past 512 — re-queries heal).
+    seen_sources: HashSet<xinput::DeviceId>,
     last_source_refresh: std::time::Instant,
     /// XI2 smooth-scroll valuators per slave device (axis number +
     /// 120ths per raw unit): trackpads whose scroll classes carry
@@ -477,6 +483,7 @@ impl X11Capture {
             grab_window,
             core_last: None,
             ignored_sources,
+            seen_sources: HashSet::new(),
             last_source_refresh: std::time::Instant::now(),
             scroll_axes,
             scroll_bank: HashMap::new(),
@@ -630,6 +637,38 @@ impl X11Capture {
         }))
     }
 
+    /// Own-injector echo filter with query-on-miss. Slave-device ids churn
+    /// per receiver session while the periodic refresh runs every few
+    /// seconds; without this, freshly injected input is re-captured and
+    /// forwarded back for the whole window — read on the peer as dual
+    /// scroll (our own echo is injected locally and scrolls local apps:
+    /// the echo tag only stops capture, never delivery) plus a drive
+    /// fight. Pure steady-state cost is two set lookups per event; one X
+    /// round trip per device birth. Order matters: the refreshed own-set
+    /// is checked first, so a reused id that changed owners is still
+    /// caught by the refresh (a physical id reused by a dead own device
+    /// can drop at most until the next refresh — rare and self-healing).
+    fn is_own_source(&mut self, sourceid: xinput::DeviceId) -> bool {
+        if self.ignored_sources.contains(&sourceid) {
+            return true;
+        }
+        if self.seen_sources.contains(&sourceid) {
+            return false;
+        }
+        // Never-seen id (device birth or first event): re-resolve once. A
+        // failed query keeps the previous set (same contract as the
+        // periodic refresh) and the id is still recorded, so an X outage
+        // can never turn into a per-event storm.
+        if let Some(fresh) = query_own_sources(&self.connection) {
+            self.ignored_sources = fresh;
+        }
+        if self.seen_sources.len() > 512 {
+            self.seen_sources.clear();
+        }
+        self.seen_sources.insert(sourceid);
+        self.ignored_sources.contains(&sourceid)
+    }
+
     fn translate(&mut self, event: x11rb::protocol::Event) -> Option<InputEvent> {
         // Inbound-drive visibility while grabbed (see INBOUND_DIVERTED):
         // our own virtual injector devices keep emitting raw events into
@@ -637,9 +676,12 @@ impl X11Capture {
         // moving the local cursor, which reads as "the peer drives but
         // nothing moves here". Count them so the journal names the
         // shape; the existing arms below still drop them as own-echo.
+        // Query-on-miss (see is_own_source): fresh own devices count
+        // from their first event, so the auto-yield works inside the
+        // refresh window too.
         if self.grab_kind != GrabKind::None {
             if let Some(source) = raw_source_id(&event) {
-                if self.ignored_sources.contains(&source) {
+                if self.is_own_source(source) {
                     INBOUND_DIVERTED.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -653,7 +695,7 @@ impl X11Capture {
                 if self.grab_kind == GrabKind::Core {
                     return None;
                 }
-                if self.ignored_sources.contains(&event.sourceid) {
+                if self.is_own_source(event.sourceid) {
                     return None;
                 }
                 XI_KEY.fetch_add(1, Ordering::Relaxed);
@@ -664,7 +706,7 @@ impl X11Capture {
                 if self.grab_kind == GrabKind::Core {
                     return None;
                 }
-                if self.ignored_sources.contains(&event.sourceid) {
+                if self.is_own_source(event.sourceid) {
                     return None;
                 }
                 XI_KEY.fetch_add(1, Ordering::Relaxed);
@@ -675,7 +717,7 @@ impl X11Capture {
                 if self.grab_kind == GrabKind::Core {
                     return None;
                 }
-                if self.ignored_sources.contains(&event.sourceid) {
+                if self.is_own_source(event.sourceid) {
                     return None;
                 }
                 count_button_event(button_event(event.detail, true))
@@ -684,7 +726,7 @@ impl X11Capture {
                 if self.grab_kind == GrabKind::Core {
                     return None;
                 }
-                if self.ignored_sources.contains(&event.sourceid) {
+                if self.is_own_source(event.sourceid) {
                     return None;
                 }
                 count_button_event(button_event(event.detail, false))
@@ -693,7 +735,7 @@ impl X11Capture {
                 if self.grab_kind == GrabKind::Core {
                     return None;
                 }
-                if self.ignored_sources.contains(&event.sourceid) {
+                if self.is_own_source(event.sourceid) {
                     return None;
                 }
                 // Smooth-scroll valuators FIRST: a scroll gesture carries
