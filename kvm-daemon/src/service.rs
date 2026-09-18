@@ -94,6 +94,9 @@ pub(crate) fn register_inbound_link(
     let (drop_tx, drop_rx) = tokio::sync::watch::channel(false);
     let input_events = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let driving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Stamp last-seen BEFORE inserting: even a replaced stale entry
+    // counts as proof this peer linked (the dial-back trigger).
+    note_inbound_seen(fingerprint_hex, node_name, address, link_id);
     if let Ok(mut links) = inbound_link_registry().lock() {
         links.insert(
             fingerprint_hex.to_owned(),
@@ -234,6 +237,179 @@ fn link_ended(link_id: u64) -> bool {
         .ok()
         .is_some_and(|ended| ended.contains(&link_id))
         || peer_link_ended(link_id)
+}
+
+/// Last-seen verified inbound peer: stamped on every registration and
+/// kept after the session ends, so a station UI that starts late (or
+/// polls past the brief verify blip) still learns who linked and dials
+/// its half back within a poll or two — instead of staying one-way
+/// until the next drive episode. Keyed by peer fingerprint.
+struct RecentInboundRecord {
+    node_name: String,
+    address: String,
+    link_id: Option<u64>,
+    last_seen: std::time::Instant,
+}
+
+static LAST_INBOUND: std::sync::OnceLock<std::sync::Mutex<HashMap<String, RecentInboundRecord>>> =
+    std::sync::OnceLock::new();
+
+fn last_inbound_map() -> &'static std::sync::Mutex<HashMap<String, RecentInboundRecord>> {
+    LAST_INBOUND.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Seconds a dead inbound stays dial-backable via Status: long enough
+/// to cover UI restarts and slow polls, short enough that an ancient
+/// link is never resurrected unprompted.
+const RECENT_INBOUND_MAX_SECS: u64 = 15 * 60;
+
+fn note_inbound_seen(fingerprint_hex: &str, node_name: &str, address: &str, link_id: Option<u64>) {
+    if let Ok(mut seen) = last_inbound_map().lock() {
+        // Bounded: one entry per peer, and dead entries older than the
+        // window are reaped on write (plus filtered on read).
+        seen.retain(|_, record| record.last_seen.elapsed().as_secs() <= RECENT_INBOUND_MAX_SECS);
+        if seen.len() >= 64 {
+            return;
+        }
+        seen.insert(
+            fingerprint_hex.to_owned(),
+            RecentInboundRecord {
+                node_name: node_name.to_owned(),
+                address: address.to_owned(),
+                link_id,
+                last_seen: std::time::Instant::now(),
+            },
+        );
+    }
+}
+
+/// Recently seen inbound peers for the Status snapshot (see
+/// `RecentInbound`): banned epochs never appear (a deliberate
+/// Disconnect stays dead), expired entries never appear. Pure over the
+/// input slice so the expiry/ban rules are unit-tested without the
+/// global map.
+fn recent_inbound_view(
+    records: &[(&str, &RecentInboundRecordView)],
+    banned: &dyn Fn(Option<u64>) -> bool,
+) -> Vec<kvm_protocol::control::RecentInbound> {
+    let mut out = Vec::new();
+    for (fingerprint, record) in records {
+        if banned(record.link_id) {
+            continue;
+        }
+        if record.age_secs > RECENT_INBOUND_MAX_SECS {
+            continue;
+        }
+        out.push(kvm_protocol::control::RecentInbound {
+            fingerprint_hex: (*fingerprint).to_owned(),
+            node_name: record.node_name.clone(),
+            address: record.address.clone(),
+            link_id: record.link_id,
+            last_seen_secs_ago: record.age_secs,
+        });
+    }
+    out.sort_by_key(|entry| entry.last_seen_secs_ago);
+    out
+}
+
+/// Owned, lock-free snapshot of one recent-inbound record: the view
+/// above reads these, never the guarded map, so borrows cannot escape.
+struct RecentInboundRecordView {
+    node_name: String,
+    address: String,
+    link_id: Option<u64>,
+    age_secs: u64,
+}
+
+/// Snapshot of recently seen inbound peers (see above): live sessions
+/// are included too (the UI prefers them), so one field covers both.
+pub(crate) fn recent_inbound_links() -> Vec<kvm_protocol::control::RecentInbound> {
+    // Owned snapshot under the lock: borrows must not escape the guard.
+    let records: Vec<(String, RecentInboundRecordView)> =
+        if let Ok(seen) = last_inbound_map().lock() {
+            seen.iter()
+                .map(|(key, record)| {
+                    (
+                        key.clone(),
+                        RecentInboundRecordView {
+                            node_name: record.node_name.clone(),
+                            address: record.address.clone(),
+                            link_id: record.link_id,
+                            age_secs: record.last_seen.elapsed().as_secs(),
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let borrowed = records
+        .iter()
+        .map(|(key, view)| (key.as_str(), view))
+        .collect::<Vec<_>>();
+    recent_inbound_view(&borrowed, &|link_id| link_id.is_some_and(link_ended))
+}
+
+/// Persisted resting place of deliberate-Disconnect bans
+/// (`ended_links.json` beside the identity): a daemon restart must not
+/// resurrect a dead link — especially now that recently seen inbound
+/// peers auto-dial-back across UI restarts.
+fn ended_links_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("ended_links.json")
+}
+
+/// Load persisted bans at startup (idempotent, bounded, best-effort:
+/// a corrupt file bans nothing instead of breaking startup).
+pub(crate) fn load_ended_links(dir: &std::path::Path) {
+    let raw = std::fs::read_to_string(ended_links_path(dir)).unwrap_or_default();
+    if raw.trim().is_empty() {
+        return;
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "ignoring corrupt ended-links file; no epochs banned");
+            return;
+        }
+    };
+    let take = |key: &str| -> Vec<u64> {
+        parsed
+            .get(key)
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_u64())
+                    .take(32)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for id in take("ended") {
+        end_link(id);
+    }
+    for id in take("peer_ended") {
+        peer_end_link(id);
+    }
+}
+
+/// Persist current bans beside the identity (best-effort, never fails
+/// the Disconnect it follows).
+pub(crate) fn persist_ended_links(dir: &std::path::Path) {
+    let ended: Vec<u64> = ended_link_ids()
+        .lock()
+        .ok()
+        .map(|set| set.iter().copied().take(32).collect())
+        .unwrap_or_default();
+    let peer_ended: Vec<u64> = peer_ended_link_ids()
+        .lock()
+        .ok()
+        .map(|set| set.iter().copied().take(32).collect())
+        .unwrap_or_default();
+    let body = serde_json::json!({ "ended": ended, "peer_ended": peer_ended });
+    if let Err(error) = std::fs::write(ended_links_path(dir), body.to_string()) {
+        tracing::warn!(path = %ended_links_path(dir).display(), %error, "cannot persist ended-link bans; a restart may resurrect a dead link");
+    }
 }
 
 /// True when the dial failed because the peer deliberately ended this link
@@ -2231,6 +2407,11 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         if let Some(detail) = ping_error {
                             tracing::warn!(detail, "topology peer keep-alive failed");
                         }
+                        // Suppression first (see yield_drive_to_inbound):
+                        // the peer is already proven silent, so its stream
+                        // teardown must not gate local input for another
+                        // round trip.
+                        release_suppression(&capture_control, Some(&mut suppression_requested));
                         let session = active.take().expect("active session exists");
                         let target = session.target;
                         session.finish().await;
@@ -2240,7 +2421,6 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         if let Some(stale) = parked.take() {
                             stale.finish().await;
                         }
-                        release_suppression(&capture_control, Some(&mut suppression_requested));
                         discarded_event_barrier = discarded_event_barrier
                             .max(capture_control.snapshot().last_event_id);
                         let _ = router.restore_local(target);
@@ -2444,7 +2624,15 @@ impl TopologySession {
             );
         }
         let mut send = self.send;
-        let _ = write_frame(&mut send, &WireMessage::ReleaseAll).await;
+        // Bounded teardown: an unbounded write pends forever on a
+        // half-dead association and stalls every teardown behind it
+        // (suppression release included) — the persistent freeze shape.
+        // 2s, then the association is dead anyway.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            write_frame(&mut send, &WireMessage::ReleaseAll),
+        )
+        .await;
         let _ = send.finish();
         // The motion lane carries no teardown frame (motion-only by
         // construction): finish it so the receiver's lane reader lands
@@ -3011,10 +3199,16 @@ async fn yield_drive_to_inbound(
         return;
     };
     let target = session.target;
+    // Suppression FIRST, network teardown after: the peer stream may be
+    // half-dead (finish is bounded but still waits), and local input
+    // must never wait on it — clicks-dead-while-cursor-moves is exactly
+    // a held grab outliving its drive. Every teardown path below keeps
+    // this order (never a bare set_exclusive(false) either — see
+    // release_suppression).
+    release_suppression(capture_control, Some(&mut *suppression_requested));
     if let Some(stale) = parked.replace(session) {
         stale.finish().await;
     }
-    release_suppression(capture_control, Some(&mut *suppression_requested));
     *discarded_event_barrier =
         (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
     *last_transfer = Some(std::time::Instant::now());
@@ -3160,8 +3354,10 @@ async fn handle_topology_event(
         } else {
             if let Some(session) = active.take() {
                 let target = session.target;
+                // Suppression first (see yield_drive_to_inbound), stream
+                // teardown after: same freeze shape as every other path.
+                release_suppression(capture_control, Some(&mut *suppression_requested));
                 session.finish().await;
-                release_suppression(&capture_control, Some(&mut *suppression_requested));
                 *discarded_event_barrier =
                     (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
                 let _ = router.restore_local(target);
@@ -3317,8 +3513,10 @@ async fn handle_topology_event(
                     // link (and the next crossing) survives a wobbly network.
                     // This used to `return Err`, killing the whole child — one
                     // dropped datagram ended every future crossing until the
-                    // UI noticed the exit and redialled.
+                    // UI noticed the exit and redialled. Suppression first
+                    // (see yield_drive_to_inbound), teardown after.
                     tracing::warn!(%error, "topology episode send failed; control is local");
+                    release_suppression(capture_control, Some(&mut *suppression_requested));
                     let session = active.take().expect("active session exists");
                     let target = session.target;
                     session.finish().await;
@@ -3327,7 +3525,6 @@ async fn handle_topology_event(
                     if let Some(stale) = parked.take() {
                         stale.finish().await;
                     }
-                    release_suppression(&capture_control, Some(&mut *suppression_requested));
                     *discarded_event_barrier =
                         (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
                     let _ = router.restore_local(target);
@@ -3360,13 +3557,16 @@ async fn handle_topology_event(
             // session death, no mid-screen landing. The stream stays open
             // (parked): the next push resumes it with one Handoff frame
             // instead of a dial. The transfer stamp doubles as MWB
-            // lastJump debounce against instant re-exit.
+            // lastJump debounce against instant re-exit. Suppression
+            // releases BEFORE the park/finish awaits (see
+            // yield_drive_to_inbound): local input never waits on
+            // network teardown.
+            release_suppression(capture_control, Some(&mut *suppression_requested));
             if let Some(session) = active.take() {
                 if let Some(stale) = parked.replace(session) {
                     stale.finish().await;
                 }
             }
-            release_suppression(&capture_control, Some(&mut *suppression_requested));
             *discarded_event_barrier =
                 (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
             *last_transfer = Some(std::time::Instant::now());
@@ -3421,7 +3621,13 @@ async fn handle_topology_event(
                     .and_then(|screen| screen.peer_fingerprint.as_deref())
                     == Some(link.fingerprint.as_str());
                 if !linked {
-                    tracing::debug!(?target, "edge faces an unlinked screen; staying local");
+                    // INFO, not debug: a refused push reads as a freeze
+                    // ("drag back and nothing happens"), so every refusal
+                    // names itself in the journal under one grep.
+                    tracing::info!(
+                        ?target,
+                        "crossing_refused: edge faces an unlinked screen; staying local"
+                    );
                     let _ = router.restore_local(target);
                     park_inside(router, edge);
                     return Ok(());
@@ -3429,7 +3635,11 @@ async fn handle_topology_event(
             }
             // MWB lastJump debounce: let the last transfer settle first.
             if transfer_debounced(*last_transfer) {
-                tracing::debug!(?target, ?edge, "edge push debounced after a transfer");
+                tracing::info!(
+                    ?target,
+                    ?edge,
+                    "crossing_refused: edge push debounced after a transfer"
+                );
                 let _ = router.restore_local(target);
                 park_inside(router, edge);
                 return Ok(());
@@ -3439,10 +3649,10 @@ async fn handle_topology_event(
             // holding against the edge — refuse an instant re-push so
             // the drive cannot ping-pong while both hold their edges.
             if yield_cooling_down(*last_yield) {
-                tracing::debug!(
+                tracing::info!(
                     ?target,
                     ?edge,
-                    "edge push in yield cooldown after yielding to inbound"
+                    "crossing_refused: edge push in yield cooldown after yielding to inbound"
                 );
                 let _ = router.restore_local(target);
                 park_inside(router, edge);
@@ -3453,7 +3663,11 @@ async fn handle_topology_event(
             // full QUIC handshake — the dial storm that flapped control.
             // The user simply keeps pushing; a fresh crossing retries.
             if episode_cooling_down(*last_failed_episode) {
-                tracing::debug!(?target, ?edge, "edge push in failed-episode cooldown");
+                tracing::info!(
+                    ?target,
+                    ?edge,
+                    "crossing_refused: edge push in failed-episode cooldown"
+                );
                 let _ = router.restore_local(target);
                 park_inside(router, edge);
                 return Ok(());
@@ -3463,6 +3677,7 @@ async fn handle_topology_event(
             // visible cursor is still mid-screen. Truth decides — genuine
             // pushes (truth at the edge) proceed below instantly.
             if let Some((truth_x, truth_y)) = phantom_handoff_veto(router, from, edge) {
+                tracing::info!(?target, ?edge, truth_x, truth_y, "crossing_refused: OS pointer truth is mid-screen, flick vetoed; keep pushing deliberately to cross");
                 let _ = router.restore_local(target);
                 router.resync_if_local(truth_x, truth_y);
                 park_inside(router, edge);
@@ -4937,6 +5152,10 @@ async fn run_capture_stream(
 
 pub async fn run() -> Result<()> {
     let dir = data_dir();
+    // Deliberate-Disconnect bans survive restarts (see
+    // ended_links.json): without this a restart resurrects a dead link
+    // — now that recently seen inbound peers auto-dial-back.
+    load_ended_links(&dir);
     // Station-side edge control runs as the desktop user (same machine,
     // service group): it must READ the system identity and peer book to
     // dial with the identity the peers already trust. Access is only ever
@@ -5550,17 +5769,13 @@ async fn handle_connection(
             // whenever motion comes back inside.
             let mut hop_edge: Option<kvm_core::Edge> = None;
             let mut hop_accum: i64 = 0;
-            // OUR synthetic pinch-zoom Ctrl hold for THIS session's local
-            // Ctrl+wheel fallback (non-Windows receivers only): pressed on
-            // gesture start, released on gesture end. Never touches a
-            // physically held Ctrl, and never survives the session (the
-            // teardown release_all frees it anyway).
+            // OUR synthetic pinch-zoom Ctrl hold for THIS session's
+            // opt-in page-zoom fallback (see handle_inbound_pinch):
+            // pressed on gesture start, released on gesture end. Never
+            // touches a physically held Ctrl, and never survives the
+            // session (the teardown release_all frees it anyway).
             let mut recv_pinch_held = false;
-            // Our magnifier-lens viewport zoom for THIS session (Linux
-            // receivers only): sticky across PinchEnd, closed on factor
-            // 1.0 or session teardown (Drop). Never survives the session.
-            let mut recv_viewport = kvm_platform::ViewportZoom::new();
-            // Session X display for the viewport lens (see
+            // Session X display for the touch anchor (see
             // handle_inbound_pinch): resolved once per session, because
             // the headless service carries no $DISPLAY of its own and
             // the sidecar is per-boot truth, not per-event work.
@@ -5621,7 +5836,6 @@ async fn handle_connection(
                                         packet.event,
                                         &mut injector,
                                         &mut recv_pinch_held,
-                                        &mut recv_viewport,
                                         recv_display.as_deref(),
                                     )?;
                                     continue;
@@ -5938,7 +6152,6 @@ async fn handle_connection(
                                         packet.event,
                                         &mut injector,
                                         &mut recv_pinch_held,
-                                        &mut recv_viewport,
                                         recv_display.as_deref(),
                                     )?;
                                     continue;
@@ -6095,6 +6308,7 @@ async fn handle_connection(
                 let _ = send.finish();
                 if let Some(id) = link_id {
                     peer_end_link(id);
+                    persist_ended_links(audit_dir);
                     audit_event(
                         audit_dir,
                         &format!(
@@ -6137,53 +6351,53 @@ async fn handle_connection(
 /// the cursor, no layout reflow, no zoom badge in the address bar, nothing
 /// persisted per site). `THEKVM_WHEEL_PINCH=1` on the receiver forces the
 /// old Ctrl+wheel page-zoom rendering for comparison. On Linux the gesture
-/// renders through our own magnifier lens (an always-on-top click-through
-/// window showing a live magnified capture around the cursor — OS-level
-/// zoom with no compositor or browser support needed); where the lens
-/// cannot run (Wayland, no X display, X errors) it expands here into
-/// Ctrl+wheel at the cursor (reusing the sender's legacy expansion
-/// against the INJECTOR's held keys so a physically held Ctrl is never
-/// stolen or released by us). `THEKVM_LINUX_VIEWPORT_ZOOM=0` forces the
-/// page-zoom path on Linux. `display` is the receiver's session X
-/// display (see receiver_display): a headless service has none of its
-/// own, and without it the lens fails closed into the page-zoom
-/// fallback — the exact shape of the first live failure (0.9.42 journal:
-/// `$DISPLAY not set` while the desktop-user smoke test passed). True
-/// HID-level trackpad emulation (usage page 0x0D contact reports) is
-/// impossible from user mode — it needs a kernel virtual-HID driver,
-/// not SendInput/uinput.
+/// renders through our own virtual touchscreen (two contacts spreading
+/// around the cursor — the same native gesture a local touchscreen pinch
+/// produces, so Chromium's own recognizer viewport-zooms with no widget,
+/// no compositor support, no browser involvement). There is deliberately
+/// NO page-zoom fallback on the gesture path: a failed touch frame
+/// swallows (warned once), so browsers never see a synthetic Ctrl+wheel
+/// from a trackpad pinch; `THEKVM_LINUX_PINCH_PAGE_ZOOM=1` restores the
+/// legacy Ctrl+wheel rendering where it is explicitly wanted.
+/// `display` is the receiver's session X display (see receiver_display):
+/// a headless service has none of its own, and without it the anchor
+/// query fails closed into the swallow. True HID-level trackpad
+/// emulation (usage page 0x0D contact reports) is impossible from user
+/// mode — it needs a kernel virtual-HID driver, not SendInput/uinput.
 fn handle_inbound_pinch(
     event: InputEvent,
     injector: &mut ReceiverInjector,
     pinch_held: &mut bool,
-    viewport: &mut kvm_platform::ViewportZoom,
     display: Option<&str>,
 ) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         if std::env::var("THEKVM_WHEEL_PINCH").as_deref() != Ok("1") {
             let _ = pinch_held;
-            let _ = viewport;
             let _ = display;
             return injector.send(event);
         }
     }
-    // Linux viewport lens first: consumed events never reach the
-    // Ctrl+wheel expansion below, so the two renderings never mix
-    // inside one gesture.
+    // Native touch first: consumed events never reach the Ctrl+wheel
+    // expansion below, so the two renderings never mix inside one
+    // gesture. FreeBSD keeps the legacy page-zoom rendering (no touch
+    // channel there) — only Linux swallows by default.
     #[cfg(not(target_os = "windows"))]
     match event {
         InputEvent::Pinch { delta } => {
-            if viewport.update(delta, display) {
+            if injector.inject_pinch(delta, display) {
+                return Ok(());
+            }
+            #[cfg(target_os = "linux")]
+            if std::env::var("THEKVM_LINUX_PINCH_PAGE_ZOOM").as_deref() != Ok("1") {
                 return Ok(());
             }
         }
         InputEvent::PinchEnd => {
-            // Sticky lens: the window stays at its factor (like the
-            // browser zoom persisting after fingers lift). The expansion
-            // below then only releases a synthetic Ctrl if the fallback
-            // path held one — a lens gesture holds none.
-            viewport.end();
+            injector.end_pinch();
+            // A touch gesture holds no synthetic Ctrl, so the expansion
+            // below only releases one if the opt-in fallback path held
+            // it — exactly like the sender-side legacy gesture.
         }
         _ => {}
     }
@@ -6534,6 +6748,25 @@ impl ReceiverInjector {
             Self::Native(injector) => injector.send(event).map_err(Into::into),
             #[cfg(target_os = "windows")]
             Self::Service(proxy) => proxy.send(event),
+        }
+    }
+
+    /// Render one inbound pinch delta as a native two-finger touch
+    /// gesture (Linux UinputTouch; Windows renders through `send`
+    /// instead and never calls this). Returns true when consumed.
+    /// `display` names the session X server for the touch anchor.
+    #[cfg(not(target_os = "windows"))]
+    fn inject_pinch(&mut self, delta: i32, display: Option<&str>) -> bool {
+        match self {
+            Self::Native(injector) => injector.inject_pinch(delta, display),
+        }
+    }
+
+    /// Lift pinch contacts (PinchEnd / teardown). Idempotent.
+    #[cfg(not(target_os = "windows"))]
+    fn end_pinch(&mut self) {
+        match self {
+            Self::Native(injector) => injector.end_pinch(),
         }
     }
 
@@ -8019,6 +8252,31 @@ mod tests {
         )));
         // Display-case text never matches (the matcher is lowercase-only).
         assert!(!is_link_ended_rejection(&anyhow::anyhow!("Link ended")));
+    }
+
+    #[test]
+    fn recent_inbound_hides_banned_and_expired_peers() {
+        let fresh = RecentInboundRecordView {
+            node_name: "mint".into(),
+            address: "192.168.1.7:42110".into(),
+            link_id: Some(11),
+            age_secs: 0,
+        };
+        let old = RecentInboundRecordView {
+            node_name: "old".into(),
+            address: "192.168.1.9:42110".into(),
+            link_id: None,
+            age_secs: RECENT_INBOUND_MAX_SECS + 1,
+        };
+        let records = vec![("fp-fresh", &fresh), ("fp-old", &old)];
+        // Banned epoch hidden, expired entry hidden, fresh survives.
+        let view = recent_inbound_view(&records, &|id| id == Some(11));
+        assert!(view.is_empty());
+        let view = recent_inbound_view(&records, &|id| id == Some(99));
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0].fingerprint_hex, "fp-fresh");
+        assert_eq!(view[0].link_id, Some(11));
+        assert_eq!(view[0].last_seen_secs_ago, 0);
     }
 
     #[test]

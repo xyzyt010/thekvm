@@ -14,13 +14,10 @@ pub mod evdev_capture;
 pub mod inject;
 #[cfg(target_os = "linux")]
 pub mod mt_pinch;
-pub mod viewport_zoom;
 #[cfg(target_os = "linux")]
 pub mod wayland_capture;
 #[cfg(target_os = "linux")]
 pub mod x11_capture;
-
-pub use viewport_zoom::ViewportZoom;
 
 use thiserror::Error;
 

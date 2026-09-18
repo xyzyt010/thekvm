@@ -161,6 +161,15 @@ pub struct DaemonStatus {
     /// ban set (recent epochs only).
     #[serde(default)]
     pub peer_ended_links: Vec<u64>,
+    /// Recently seen inbound peers (link half THEY dialed), live session
+    /// or not. The station UI dials its half back from this when no live
+    /// session is visible — a UI that starts late, polls slowly, or
+    /// missed the brief verify blip still syncs both directions within a
+    /// poll or two instead of staying one-way until the next drive.
+    /// Banned epochs never appear here, and entries older than a few
+    /// minutes expire daemon-side. Empty on older daemons.
+    #[serde(default)]
+    pub recent_inbound: Vec<RecentInbound>,
 }
 
 /// One live inbound input session: who dialed in, from where.
@@ -188,6 +197,21 @@ pub struct ActiveSession {
     /// flowing either way would otherwise sit suppressed forever.
     #[serde(default)]
     pub driving: bool,
+}
+
+/// A recently seen inbound peer: dialed us, session since ended (or
+/// still live — live ones also appear in `sessions`). Lets a late UI
+/// dial its half back without waiting for the next drive episode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentInbound {
+    pub fingerprint_hex: String,
+    pub node_name: String,
+    pub address: String,
+    /// Administrative link epoch from the dialer's Hello, if any.
+    #[serde(default)]
+    pub link_id: Option<u64>,
+    /// Seconds since this peer last held a live inbound session.
+    pub last_seen_secs_ago: u64,
 }
 
 /// A remote identity that completed the network half of pairing and is
@@ -487,5 +511,37 @@ mod tests {
         assert!(!status.sessions[0].driving);
         assert!(!status.sessions[1].driving);
         assert!(status.peer_ended_links.is_empty());
+        assert!(status.recent_inbound.is_empty());
+    }
+
+    #[test]
+    fn recent_inbound_parses_and_defaults() {
+        let status: DaemonStatus = serde_json::from_str(
+            r#"{
+                "node_name": "new",
+                "fingerprint_hex": "bb",
+                "listen_port": 42110,
+                "mode": "Bidirectional",
+                "allow_lock_screen_control": false,
+                "auto_connect_address": null,
+                "clipboard_enabled": false,
+                "peer_count": 0,
+                "active_session_count": 0,
+                "uptime_seconds": 0,
+                "recent_inbound": [
+                    {
+                        "fingerprint_hex": "cc",
+                        "node_name": "peer2",
+                        "address": "192.168.1.8:42110",
+                        "link_id": 8,
+                        "last_seen_secs_ago": 3
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(status.recent_inbound.len(), 1);
+        assert_eq!(status.recent_inbound[0].link_id, Some(8));
+        assert_eq!(status.recent_inbound[0].last_seen_secs_ago, 3);
     }
 }

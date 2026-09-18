@@ -264,6 +264,7 @@ where
                 active_session_count: active_sessions.load(std::sync::atomic::Ordering::Relaxed),
                 sessions: crate::service::list_inbound_links(),
                 peer_ended_links: crate::service::peer_ended_links(),
+                recent_inbound: crate::service::recent_inbound_links(),
                 uptime_seconds: started.elapsed().as_secs(),
             })
         }
@@ -374,6 +375,7 @@ where
         }
         ControlRequest::EndLink { link_id } => {
             crate::service::end_link(link_id);
+            crate::service::persist_ended_links(&data_dir);
             crate::service::audit_event(&data_dir, &format!("link-ended link_id={link_id}"));
             ControlResponse::LinkEnded { link_id }
         }

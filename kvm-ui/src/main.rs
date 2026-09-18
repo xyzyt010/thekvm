@@ -458,7 +458,7 @@ fn main() -> Result<()> {
                 ui_log("poll: 10 consecutive failures; backing off to 15s intervals");
             }
             std::thread::sleep(std::time::Duration::from_secs(
-                if consecutive_failures >= 10 { 15 } else { 3 },
+                if consecutive_failures >= 10 { 15 } else { 1 },
             ));
         }
     });
@@ -2363,6 +2363,12 @@ fn should_dial_back(mode: kvm_core::Mode, ceremony_open: bool) -> bool {
     mode != kvm_core::Mode::ClientOnly && !ceremony_open
 }
 
+/// Seconds after a session ends during which its memory still arms the
+/// dial-back (see follow_link): covers late UI starts and slow polls
+/// without ever resurrecting ancient links (banned epochs are already
+/// daemon-filtered out).
+const RECENT_FALLBACK_MAX_SECS: u64 = 300;
+
 /// Link-following (MWB arming), run on every healthy poll tick: this UI
 /// runs a child ONLY inside a live link — never at boot, never unprompted.
 /// Outbound links (user pressed Connect) are owned by the session flow and
@@ -2392,7 +2398,24 @@ fn follow_link(
 ) {
     let outbound_running = session.lock().ok().is_some_and(|slot| slot.is_some());
     let ceremony_open = pending.lock().ok().is_some_and(|slot| slot.is_some());
-    let inbound = status.sessions.first().cloned();
+    // Live inbound wins; otherwise the freshest recently seen inbound
+    // (session since ended — late UI start, slow poll, missed verify
+    // blip) arms the dial-back identically. Banned epochs never arrive
+    // here (daemon-filtered), so a deliberate Disconnect stays dead.
+    let inbound = status.sessions.first().cloned().or_else(|| {
+        status
+            .recent_inbound
+            .iter()
+            .find(|recent| recent.last_seen_secs_ago <= RECENT_FALLBACK_MAX_SECS)
+            .map(|recent| kvm_protocol::control::ActiveSession {
+                fingerprint_hex: recent.fingerprint_hex.clone(),
+                node_name: recent.node_name.clone(),
+                address: recent.address.clone(),
+                link_id: recent.link_id,
+                input_events: 0,
+                driving: false,
+            })
+    });
     let inbound_id = inbound
         .as_ref()
         .map(|link| (link.fingerprint_hex.clone(), link.link_id));
@@ -2427,13 +2450,26 @@ fn follow_link(
                 ensure_station_arrangement(&link.node_name, &link.fingerprint_hex);
                 adopt_layout_fingerprint(&link.node_name, &link.fingerprint_hex);
                 set_session(&weak, Some(link.node_name.clone()));
-                set_status(
-                    &weak,
-                    format!(
-                        "{} is linked — push past the arranged edge to take control. Both computers stay usable; Disconnect ends the link.",
-                        link.node_name
-                    ),
-                );
+                // One-way honesty: a Be-controlled-only station never dials
+                // back, so the status must say one-way HERE (not just in
+                // ui.log) or the user pushes an edge that can never drive.
+                if status.mode == kvm_core::Mode::ClientOnly {
+                    set_status(
+                        &weak,
+                        format!(
+                            "{} is linked one-way (this computer is Be-controlled-only and cannot drive back). Set Both ways to cross either direction; Disconnect ends the link.",
+                            link.node_name
+                        ),
+                    );
+                } else {
+                    set_status(
+                        &weak,
+                        format!(
+                            "{} is linked — push past the arranged edge to take control. Both computers stay usable; Disconnect ends the link.",
+                            link.node_name
+                        ),
+                    );
+                }
                 // Reverse-path honesty: if this computer will NOT dial its
                 // half back, say why ONCE per new link instead of silently
                 // staying one-way (the top user trap: this side set to

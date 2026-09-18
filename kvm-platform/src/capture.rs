@@ -312,11 +312,11 @@ mod win32_hooks {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetCursorPos, GetMessageW, PeekMessageW, PostThreadMessageW, RegisterClassW, SetWindowPos,
-        SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HMENU,
-        HWND_MESSAGE, HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, WH_KEYBOARD_LL, WH_MOUSE_LL,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+        GetCursorPos, GetMessageW, PeekMessageW, PostThreadMessageW, RegisterClassW, SetCursorPos,
+        SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
+        HC_ACTION, HMENU, HWND_MESSAGE, HWND_TOPMOST, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+        PM_NOREMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, WH_KEYBOARD_LL,
+        WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
         WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
         WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
         WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -357,6 +357,17 @@ mod win32_hooks {
     static PTP_NOLEGACY: AtomicBool = AtomicBool::new(false);
     /// Scroll-guard pixel window (see scroll_guard_pixel): 0 when absent.
     static GUARD_PIXEL: AtomicIsize = AtomicIsize::new(0);
+    /// Cursor park point the guard pixel (and the cursor glue below) hold
+    /// while driving: packed x/i32-low + y/i32-high. Written when the
+    /// pixel parks, read on every swallowed motion tick. PARK_VALID gates
+    /// it: no park yet (or lifted) means no glue.
+    static PARK_POINT: AtomicU64 = AtomicU64::new(0);
+    static PARK_VALID: AtomicBool = AtomicBool::new(false);
+    /// One-shot journal verdicts (see apply_raw_legacy_suppression and
+    /// scroll_guard_pixel): deterministic platform refusals log once per
+    /// process instead of hiding at debug or spamming per drive.
+    static WARNED_PTP_NOLEGACY: AtomicBool = AtomicBool::new(false);
+    static WARNED_GUARD_PIXEL: AtomicBool = AtomicBool::new(false);
     /// Private thread message (WM_APP range): wparam != 0 enables RawInput
     /// legacy suppression while driving, 0 restores normal delivery.
     const WM_THEKVM_NOLEGACY: u32 = 0x8000 + 11;
@@ -696,6 +707,14 @@ mod win32_hooks {
                     WM_MOUSEMOVE => {
                         if RAW_INPUT_ACTIVE.load(Ordering::Acquire) {
                             if BLOCK_LOCAL.load(Ordering::Acquire) {
+                                // Swallowed delivery does not stop the OS
+                                // cursor itself from wandering (absolute
+                                // devices move it past the hook): keep the
+                                // pixel glued and snap the cursor home so
+                                // PTP-direct translation cannot escape the
+                                // pixel mid-drive (see glue_cursor_to_park).
+                                repark_guard_pixel(info.pt);
+                                glue_cursor_to_park(info.pt);
                                 return LRESULT(1);
                             }
                             return CallNextHookEx(None, code, wparam, lparam);
@@ -713,6 +732,11 @@ mod win32_hooks {
                             }
                             *guard = Some(point);
                             if BLOCK_LOCAL.load(Ordering::Acquire) {
+                                // Same glue as the RawInput motion arm
+                                // above: the fallback path moves the real
+                                // cursor too, and must not escape the pixel.
+                                repark_guard_pixel(point);
+                                glue_cursor_to_park(point);
                                 return LRESULT(1);
                             }
                         }
@@ -849,10 +873,24 @@ mod win32_hooks {
             return;
         }
         if !RAW_INPUT_ACTIVE.load(Ordering::Acquire) {
+            // Window died between the check above and the swaps: un-eat
+            // the transitions (see the park-unapplied comment above) so
+            // the flags never claim a suppression that is not applied.
+            RAW_NOLEGACY.store(false, Ordering::Release);
+            PTP_NOLEGACY.store(false, Ordering::Release);
             return;
         }
         let hwnd = HWND(RAW_WINDOW.load(Ordering::Acquire) as *mut std::ffi::c_void);
         if hwnd.0.is_null() {
+            // Same strand shape as above (live-proven: the PTP flag sat
+            // claimed-but-never-applied and its engage line never logged
+            // again): un-eat, loudly, instead of returning claimed.
+            RAW_NOLEGACY.store(false, Ordering::Release);
+            PTP_NOLEGACY.store(false, Ordering::Release);
+            tracing::warn!(
+                suppress,
+                "suppression window missing at toggle time; flags parked un-applied, init force-applies"
+            );
             return;
         }
         let flags = if suppress {
@@ -877,11 +915,18 @@ mod win32_hooks {
                     suppress,
                     "RawInput legacy delivery toggled for the drive session"
                 ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    suppress,
-                    "RawInput legacy toggle failed; trackpad scroll may apply locally while driving"
-                ),
+                Err(error) => {
+                    // A failed registration must not leave the flag
+                    // claiming suppression: the drive-start proof line
+                    // below reads these flags, and a lie there is dual
+                    // scroll with a clean journal — the worst kind.
+                    RAW_NOLEGACY.store(false, Ordering::Release);
+                    tracing::warn!(
+                        %error,
+                        suppress,
+                        "RawInput legacy toggle failed; trackpad scroll may apply locally while driving"
+                    );
+                }
             }
         }
         if ptp_changed {
@@ -905,12 +950,35 @@ mod win32_hooks {
                     suppress,
                     "precision-touchpad legacy delivery toggled for the drive session"
                 ),
-                Err(error) => tracing::debug!(
-                    %error,
-                    suppress,
-                    "precision-touchpad legacy toggle unavailable; local scroll may apply while driving"
-                ),
+                Err(error) => {
+                    // Live-proven deterministic on some stacks (Windows
+                    // rejects NOLEGACY for the digitizer collection): the
+                    // flag must not claim it, and the refusal must be
+                    // VISIBLE (once per process) — a debug here hid the
+                    // missing layer for entire releases. The guard pixel
+                    // below is then the only PTP-direct layer standing.
+                    PTP_NOLEGACY.store(false, Ordering::Release);
+                    if !WARNED_PTP_NOLEGACY.swap(true, Ordering::AcqRel) {
+                        tracing::warn!(
+                            %error,
+                            "precision-touchpad NOLEGACY refused by Windows; guard pixel is the only PTP-direct suppression layer"
+                        );
+                    }
+                }
             }
+        }
+        if suppress {
+            // Drive-start suppression proof: one INFO line naming every
+            // layer's armed state, so the next dual-scroll report starts
+            // from evidence (which layer stood down) instead of guesses.
+            tracing::info!(
+                block_local = BLOCK_LOCAL.load(Ordering::Acquire),
+                raw_nolegacy = RAW_NOLEGACY.load(Ordering::Acquire),
+                ptp_nolegacy = PTP_NOLEGACY.load(Ordering::Acquire),
+                guard_pixel = GUARD_PIXEL.load(Ordering::Acquire) != 0,
+                raw_active = RAW_INPUT_ACTIVE.load(Ordering::Acquire),
+                "local suppression armed for the drive session"
+            );
         }
     }
 
@@ -945,6 +1013,7 @@ mod win32_hooks {
                 if raw != 0 {
                     let _ = DestroyWindow(HWND(raw as *mut std::ffi::c_void));
                 }
+                PARK_VALID.store(false, Ordering::Release);
                 return;
             }
             if GUARD_PIXEL.load(Ordering::Acquire) != 0 {
@@ -954,6 +1023,14 @@ mod win32_hooks {
             if GetCursorPos(&mut point).is_err() {
                 return;
             }
+            // The park point doubles as the cursor glue below (see
+            // glue_cursor_to_park): store it before creating, so a
+            // failed create still leaves a valid glue target.
+            PARK_POINT.store(
+                (point.x as u32 as u64) | ((point.y as u32 as u64) << 32),
+                Ordering::Release,
+            );
+            PARK_VALID.store(true, Ordering::Release);
             let instance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
             const GUARD_CLASS: &[u16] = &[
                 'T' as u16, 'h' as u16, 'e' as u16, 'K' as u16, 'v' as u16, 'm' as u16, 'G' as u16,
@@ -996,7 +1073,13 @@ mod win32_hooks {
                     tracing::debug!("scroll-guard pixel parked under the held cursor");
                 }
                 Err(error) => {
-                    tracing::debug!(%error, "scroll-guard pixel unavailable; local scroll may apply while driving");
+                    // A missing pixel used to hide at debug while the PTP
+                    // NOLEGACY refusal hid beside it — both PTP-direct
+                    // layers down with a clean journal. Warn once per
+                    // process instead.
+                    if !WARNED_GUARD_PIXEL.swap(true, Ordering::AcqRel) {
+                        tracing::warn!(%error, "scroll-guard pixel unavailable; precision-touchpad scroll may apply locally while driving");
+                    }
                 }
             }
         }
@@ -1025,6 +1108,34 @@ mod win32_hooks {
                 0,
                 SWP_NOSIZE | SWP_NOACTIVATE,
             );
+        }
+    }
+
+    /// Glue the local cursor back onto the park point while driving.
+    /// Swallowing a motion event stops its DELIVERY, but absolute-position
+    /// devices (and any reposition the hook never sees) still move the OS
+    /// cursor itself — and the PTP stack translates into whatever window
+    /// is under the cursor NOW, not where the pixel was parked. Snapping
+    /// back keeps cursor, pixel, and translation target glued to one
+    /// pixel for the whole drive (a parked cursor that cannot wander is
+    /// also the honest UX: local input is driving the peer, not here).
+    /// No-op unless parked, and a no-op syscall when already home — so
+    /// the common case costs one packed-integer compare. Terminates: the
+    /// snap-back motion re-enters the hook already home.
+    fn glue_cursor_to_park(point: POINT) {
+        if !PARK_VALID.load(Ordering::Acquire) {
+            return;
+        }
+        let packed = PARK_POINT.load(Ordering::Acquire);
+        let park = POINT {
+            x: packed as u32 as i32,
+            y: (packed >> 32) as u32 as i32,
+        };
+        if point.x == park.x && point.y == park.y {
+            return;
+        }
+        unsafe {
+            let _ = SetCursorPos(park.x, park.y);
         }
     }
 

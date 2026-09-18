@@ -99,6 +99,18 @@ mod linux_uinput {
         /// detents instead of dropping it.
         wheel_debt_x: i32,
         wheel_debt_y: i32,
+        /// Lazily created virtual touchscreen for native pinch gestures
+        /// (see UinputTouch): None until the first pinch, and back to
+        /// None if the device ever fails mid-gesture (recreated next
+        /// gesture). Never touches key/button/wheel state.
+        touch: Option<UinputTouch>,
+        /// Last good touch anchor (gesture-start cursor): reused when a
+        /// mid-life anchor query fails, so one X hiccup never teleports
+        /// the contacts to a corner.
+        touch_anchor: (i32, i32),
+        /// The touch-unavailable journal line fires once per process,
+        /// never per event (every later pinch degrades silently).
+        touch_warned: bool,
     }
 
     /// Bank one smooth-scroll axis (120ths): returns the whole detents to
@@ -180,6 +192,9 @@ mod linux_uinput {
                 keyboard_created: true,
                 wheel_debt_x: 0,
                 wheel_debt_y: 0,
+                touch: None,
+                touch_anchor: (0, 0),
+                touch_warned: false,
             })
         }
 
@@ -292,6 +307,83 @@ mod linux_uinput {
             Ok(())
         }
 
+        /// Render one inbound pinch delta as a native two-finger touch
+        /// gesture (see UinputTouch): the viewport pinch a local
+        /// touchscreen pinch produces — no widget, no Ctrl, no page
+        /// zoom. `display` names the session X server for the anchor/dims
+        /// query. Returns true when the event was consumed; false when
+        /// touch is unavailable (the caller swallows by default, or
+        /// renders legacy page zoom under its explicit opt-in).
+        /// Linux only: x11rb (anchor/dims) is a Linux-only dependency —
+        /// elsewhere this is always false and the caller keeps its legacy
+        /// rendering.
+        #[cfg(target_os = "linux")]
+        pub fn inject_pinch(&mut self, delta: i32, display: Option<&str>) -> bool {
+            if self.touch.is_none() {
+                let Some(((cx, cy), (width, height))) = session_touch_anchor(display) else {
+                    self.warn_touch_once("no session cursor/dims for the touch anchor");
+                    return false;
+                };
+                match UinputTouch::create(width, height) {
+                    Ok(touch) => {
+                        tracing::info!(
+                            "touchscreen pinch channel armed (native gesture zoom: browsers zoom, others ignore, never page zoom)"
+                        );
+                        self.touch_anchor = (cx, cy);
+                        self.touch = Some(touch);
+                    }
+                    Err(error) => {
+                        self.warn_touch_once(format!("touchscreen unavailable ({error})"));
+                        return false;
+                    }
+                }
+            }
+            let Some(touch) = self.touch.as_mut() else {
+                return false;
+            };
+            // Fresh anchor per gesture (zoom-to-cursor like the touch
+            // path); a failed mid-life query reuses the last good one.
+            if !touch.down {
+                #[cfg(target_os = "linux")]
+                if let Some(((cx, cy), _)) = session_touch_anchor(display) {
+                    self.touch_anchor = (cx, cy);
+                }
+            }
+            let anchor = self.touch_anchor;
+            match touch.pinch(anchor, delta) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.warn_touch_once(format!("touchscreen frame failed ({error})"));
+                    // Drop the broken device: the next gesture recreates
+                    // it instead of failing forever on a dead fd.
+                    self.touch = None;
+                    false
+                }
+            }
+        }
+
+        /// Touch gestures are unavailable here: the caller keeps its
+        /// legacy rendering (today: page zoom, exactly as before).
+        #[cfg(not(target_os = "linux"))]
+        pub fn inject_pinch(&mut self, _delta: i32, _display: Option<&str>) -> bool {
+            false
+        }
+
+        /// Lift pinch contacts (PinchEnd, session teardown via
+        /// release_all below). Idempotent: no gesture, no-op.
+        pub fn end_pinch(&mut self) {
+            if let Some(touch) = self.touch.as_mut() {
+                touch.lift();
+            }
+        }
+
+        fn warn_touch_once(&mut self, message: impl Into<String>) {
+            if !self.touch_warned {
+                self.touch_warned = true;
+                tracing::warn!("{}; pinch gestures have no rendering (page zoom only under THEKVM_LINUX_PINCH_PAGE_ZOOM=1)", message.into());
+            }
+        }
+
         /// Whether a key is currently held in this injector. Feeds the
         /// receiver-side pinch fallback so the synthetic zoom Ctrl never
         /// fights a physically held one.
@@ -300,6 +392,10 @@ mod linux_uinput {
         }
 
         pub fn release_all(&mut self) -> Result<(), PlatformError> {
+            // A session that ends mid-pinch must not leave touch contacts
+            // down (stuck DOWN contacts eat every later tap): lift first,
+            // then release keys/buttons as usual.
+            self.end_pinch();
             let keys = self.pressed_keys.iter().copied().collect::<Vec<_>>();
             for code in keys {
                 Self::emit(&mut self.keyboard, EV_KEY, code, 0).map_err(io_error)?;
@@ -328,6 +424,280 @@ mod linux_uinput {
 
     fn io_error(error: std::io::Error) -> PlatformError {
         PlatformError::Uinput(error.to_string())
+    }
+
+    // -- Native two-finger touch-pinch injection (the Linux viewport-zoom
+    // rendering, no widget, no compositor support, no browser API needed).
+    //
+    // Why a touchscreen: on Windows the receiver renders an inbound pinch
+    // as a real two-finger touch gesture, so Chrome performs its viewport
+    // pinch (optical scale at the cursor, no reflow, no badge). Linux X11
+    // delivers no gesture to clients (the compositor magnifier schema is
+    // dead and xf86-input-libinput swallows touchpad gestures), but it
+    // DOES deliver XI2 touch events from touchscreens — and Chromium
+    // selects XI_TouchBegin/Update/End on every window and runs its own
+    // pinch recognizer over them. So this module owns a uinput
+    // touchscreen ("TheKVM Virtual Touchscreen", ignored by our own
+    // capture exactly like the virtual mouse/keyboard) and renders each
+    // pinch as two contacts spreading symmetrically around the cursor:
+    // every gesture-aware app responds exactly as to a local touchscreen
+    // pinch — browsers zoom natively, other apps ignore it, and no
+    // Ctrl+wheel page zoom is ever synthesized. Firefox on X11 additionally
+    // needs MOZ_USE_XINPUT2=1 to route touch into its gesture pipeline.
+    //
+    // Behavior contract:
+    // - Contacts anchor at the cursor when the gesture starts and spread
+    //   with the shared delta math (same gain/clamp as the Windows touch
+    //   renderer, so one protocol feels identical both ways).
+    // - A lost PinchEnd auto-lifts after 2s of silence (stuck DOWN
+    //   contacts would eat every later tap); release_all and Drop always
+    //   lift.
+    // - No uinput permission / no X dims / no cursor anchor degrades to
+    //   `false` (warned once): the caller then swallows by default, or
+    //   renders legacy Ctrl+wheel page zoom only under the explicit
+    //   `THEKVM_LINUX_PINCH_PAGE_ZOOM=1` opt-in. A gesture never fails
+    //   the send.
+    const EV_ABS: u16 = 0x03;
+    const ABS_X: u16 = 0x00;
+    const ABS_Y: u16 = 0x01;
+    const ABS_MT_SLOT: u16 = 0x2f;
+    const ABS_MT_POSITION_X: u16 = 0x35;
+    const ABS_MT_POSITION_Y: u16 = 0x36;
+    const ABS_MT_TRACKING_ID: u16 = 0x39;
+    const BTN_TOUCH: u16 = 0x14a;
+    // uinput.h ioctl numbers (verified against the existing EV/KEY/REL
+    // values above: _IOW('U', nr, int) = 0x40045500 + nr).
+    const UI_SET_ABSBIT: IoctlRequest = 0x4004_5567;
+    // _IOW('U', 110, int): INPUT_PROP_DIRECT so the stack classifies the
+    // device as a touchscreen (direct touch), which is what Chromium's
+    // X11 touch factory accepts.
+    const UI_SET_PROPBIT: IoctlRequest = 0x4004_556e;
+    // _IOW('U', 4, struct uinput_abs_setup): 28 bytes (u16 code + pad +
+    // 6x s32 absinfo). Mandatory — without absinfo every axis reads 0..0
+    // and libinput discards the device.
+    const UI_ABS_SETUP: IoctlRequest = 0x401c_5504;
+    const INPUT_PROP_DIRECT: i32 = 0x01;
+    const MT_SLOTS: u32 = 9;
+    const MT_ID_MAX: i32 = 65535;
+
+    /// `struct uinput_abs_setup` bytes for one axis: u16 code LE, then
+    /// input_absinfo {value, minimum, maximum, fuzz, flat, resolution}
+    /// as s32 LE. Pure for tests.
+    fn abs_setup_bytes(code: u16, minimum: i32, maximum: i32) -> [u8; 28] {
+        let mut bytes = [0u8; 28];
+        bytes[0..2].copy_from_slice(&code.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&0i32.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&minimum.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&maximum.to_ne_bytes());
+        bytes[16..20].copy_from_slice(&0i32.to_ne_bytes());
+        bytes[20..24].copy_from_slice(&0i32.to_ne_bytes());
+        bytes[24..28].copy_from_slice(&0i32.to_ne_bytes());
+        bytes
+    }
+
+    /// Contact separation after a pinch delta. Twin of the Windows touch
+    /// renderer's `pinch_separation` (same gain, same clamps): one wire
+    /// protocol, one feel, both directions. Pure for tests.
+    fn touch_separation(current_px: f64, delta_120ths: i32) -> f64 {
+        const PX_PER_UNIT: f64 = 0.025;
+        const MAX_STEP_PX: f64 = 10.0;
+        const MIN_SEPARATION_PX: f64 = 40.0;
+        const MAX_SEPARATION_PX: f64 = 700.0;
+        let step = (f64::from(delta_120ths) * PX_PER_UNIT).clamp(-MAX_STEP_PX, MAX_STEP_PX);
+        (current_px + step).clamp(MIN_SEPARATION_PX, MAX_SEPARATION_PX)
+    }
+
+    /// Two contact points for a separation around a center, clamped into
+    /// the screen. Pure for tests: symmetric horizontal pair, like two
+    /// fingers; the gesture midpoint never leaves the anchor.
+    fn touch_contacts(
+        center: (i32, i32),
+        separation_px: f64,
+        bounds: (i32, i32),
+    ) -> [(i32, i32); 2] {
+        let half = (separation_px / 2.0).round() as i32;
+        let clamp = |value: i32, max: i32| value.clamp(0, max.max(0));
+        [
+            (clamp(center.0 - half, bounds.0), clamp(center.1, bounds.1)),
+            (clamp(center.0 + half, bounds.0), clamp(center.1, bounds.1)),
+        ]
+    }
+
+    /// Session X cursor + root dims for the touch anchor
+    /// (`display` names the server explicitly; `None` leans on
+    /// `$DISPLAY`). Linux only: x11rb is a Linux-only dependency.
+    #[cfg(target_os = "linux")]
+    fn session_touch_anchor(display: Option<&str>) -> Option<((i32, i32), (u32, u32))> {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::ConnectionExt;
+        let (connection, screen) = x11rb::connect(display).ok()?;
+        let info = connection.setup().roots.get(screen)?;
+        if info.width_in_pixels == 0 || info.height_in_pixels == 0 {
+            return None;
+        }
+        let dims = (
+            u32::from(info.width_in_pixels),
+            u32::from(info.height_in_pixels),
+        );
+        let pointer = connection.query_pointer(info.root).ok()?.reply().ok()?;
+        Some(((i32::from(pointer.root_x), i32::from(pointer.root_y)), dims))
+    }
+
+    /// One receiver-side two-finger gesture driver: owns the virtual
+    /// touchscreen lifetime (created lazily on the first pinch, destroyed
+    /// with the injector) and the contact state of the live gesture.
+    pub struct UinputTouch {
+        file: File,
+        created: bool,
+        bounds: (i32, i32),
+        down: bool,
+        center: (i32, i32),
+        separation_px: f64,
+        /// Tracking ids of the live contact pair: assigned once at DOWN
+        /// and kept for every UPDATE — the slot protocol tracks a contact
+        /// by (slot, id), so minting fresh ids per frame would read as
+        /// lift+retap (taps, not a pinch) to every recognizer.
+        ids: [i32; 2],
+        next_id: i32,
+        last_update: Option<std::time::Instant>,
+    }
+
+    impl UinputTouch {
+        pub fn create(width: u32, height: u32) -> Result<Self, PlatformError> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/uinput")
+                .map_err(|e| PlatformError::Uinput(format!("open /dev/uinput for touch: {e}")))?;
+            for event_type in [EV_KEY, EV_ABS, EV_SYN] {
+                ioctl_value(&file, UI_SET_EVBIT, event_type as i32)?;
+            }
+            ioctl_value(&file, UI_SET_KEYBIT, BTN_TOUCH as i32)?;
+            for axis in [
+                ABS_X,
+                ABS_Y,
+                ABS_MT_SLOT,
+                ABS_MT_POSITION_X,
+                ABS_MT_POSITION_Y,
+                ABS_MT_TRACKING_ID,
+            ] {
+                ioctl_value(&file, UI_SET_ABSBIT, axis as i32)?;
+            }
+            ioctl_value(&file, UI_SET_PROPBIT, INPUT_PROP_DIRECT)?;
+            let width = width.max(2) as i32;
+            let height = height.max(2) as i32;
+            for (code, minimum, maximum) in [
+                (ABS_X, 0, width - 1),
+                (ABS_Y, 0, height - 1),
+                (ABS_MT_SLOT, 0, MT_SLOTS as i32),
+                (ABS_MT_POSITION_X, 0, width - 1),
+                (ABS_MT_POSITION_Y, 0, height - 1),
+                (ABS_MT_TRACKING_ID, 0, MT_ID_MAX),
+            ] {
+                let setup = abs_setup_bytes(code, minimum, maximum);
+                ioctl_ptr(&file, UI_ABS_SETUP, setup.as_ptr().cast())?;
+            }
+            let setup = setup_bytes("TheKVM Virtual Touchscreen");
+            ioctl_ptr(&file, UI_DEV_SETUP, setup.as_ptr().cast())?;
+            ioctl_value(&file, UI_DEV_CREATE, 0)?;
+            // udev/Xorg enumeration is asynchronous (same 50ms as the
+            // mouse/keyboard pair): the first gesture lands reliably.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(Self {
+                file,
+                created: true,
+                bounds: (width - 1, height - 1),
+                down: false,
+                center: (width / 2, height / 2),
+                separation_px: 120.0,
+                ids: [1, 2],
+                next_id: 3,
+                last_update: None,
+            })
+        }
+
+        fn write_raw(&mut self, event_type: u16, code: u16, value: i32) -> std::io::Result<()> {
+            use std::io::Write as _;
+            self.file.write_all(&event_bytes(event_type, code, value))
+        }
+
+        fn syn(&mut self) -> std::io::Result<()> {
+            use std::io::Write as _;
+            self.file.write_all(&event_bytes(EV_SYN, 0, SYN_REPORT))
+        }
+
+        /// One pinch delta around `anchor`: DOWN on gesture start,
+        /// UPDATE after. Emits slot-protocol frames for both contacts
+        /// plus BTN_TOUCH and first-contact ABS_X/Y (single-touch
+        /// emulation for stacks that still read it).
+        pub fn pinch(&mut self, anchor: (i32, i32), delta: i32) -> Result<(), PlatformError> {
+            let now = std::time::Instant::now();
+            // Stale active gesture (lost PinchEnd): lift before starting
+            // over, so contacts can never stick down past the gesture.
+            if self.down
+                && self.last_update.is_some_and(|when| {
+                    now.duration_since(when) > std::time::Duration::from_secs(2)
+                })
+            {
+                self.lift();
+            }
+            if !self.down {
+                self.center = anchor;
+                self.separation_px = 120.0;
+                // Fresh pair per gesture (ids never repeat while down):
+                // recognizers match contacts across frames by these.
+                self.ids = [self.next_id, self.next_id + 1];
+                self.next_id = (self.next_id + 2) % (MT_ID_MAX - 1) + 1;
+            }
+            self.separation_px = touch_separation(self.separation_px, delta);
+            let contacts = touch_contacts(self.center, self.separation_px, self.bounds);
+            let ids = self.ids;
+            let mut frame = |touch: &mut Self| -> std::io::Result<()> {
+                for (slot, ((x, y), id)) in contacts.iter().zip(ids.iter()).enumerate() {
+                    touch.write_raw(EV_ABS, ABS_MT_SLOT, slot as i32)?;
+                    touch.write_raw(EV_ABS, ABS_MT_TRACKING_ID, *id)?;
+                    touch.write_raw(EV_ABS, ABS_MT_POSITION_X, *x)?;
+                    touch.write_raw(EV_ABS, ABS_MT_POSITION_Y, *y)?;
+                }
+                touch.write_raw(EV_ABS, ABS_X, contacts[0].0)?;
+                touch.write_raw(EV_ABS, ABS_Y, contacts[0].1)?;
+                touch.write_raw(EV_KEY, BTN_TOUCH, 1)?;
+                touch.syn()
+            };
+            frame(self).map_err(io_error)?;
+            self.down = true;
+            self.last_update = Some(now);
+            Ok(())
+        }
+
+        /// Lift both contacts (PinchEnd, stale recovery, release_all,
+        /// Drop). Best-effort and idempotent: lifting raised contacts is
+        /// a no-op, so every teardown path funnels here unconditionally.
+        pub fn lift(&mut self) {
+            if !self.down {
+                return;
+            }
+            let mut frame = || -> std::io::Result<()> {
+                for slot in 0..2 {
+                    self.write_raw(EV_ABS, ABS_MT_SLOT, slot)?;
+                    self.write_raw(EV_ABS, ABS_MT_TRACKING_ID, -1)?;
+                }
+                self.write_raw(EV_KEY, BTN_TOUCH, 0)?;
+                self.syn()
+            };
+            let _ = frame();
+            self.down = false;
+            self.last_update = None;
+        }
+    }
+
+    impl Drop for UinputTouch {
+        fn drop(&mut self) {
+            self.lift();
+            if self.created {
+                unsafe { libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY) };
+            }
+        }
     }
 
     fn button_code(button: MouseButton) -> u16 {
@@ -453,7 +823,9 @@ mod linux_uinput {
 
     #[cfg(test)]
     mod tests {
-        use super::{bank_smooth_debt, hid_to_evdev};
+        use super::{
+            abs_setup_bytes, bank_smooth_debt, hid_to_evdev, touch_contacts, touch_separation,
+        };
 
         #[test]
         fn preserves_non_linear_linux_keypad_codes() {
@@ -587,6 +959,56 @@ mod linux_uinput {
             for (usage, evdev, name) in pairs {
                 assert_eq!(hid_to_evdev(*usage), Some(*evdev), "key {name}");
             }
+        }
+
+        #[test]
+        fn abs_setup_packs_code_min_max_for_the_kernel() {
+            // uinput_abs_setup: u16 code LE, 2 pad bytes, then value/min/
+            // max/fuzz/flat/resolution as s32 LE. The kernel reads min/max
+            // at bytes 8..16 — wrong offsets silently yield 0..0 axes and
+            // libinput discards the touchscreen.
+            let bytes = abs_setup_bytes(0x35, 0, 1535);
+            assert_eq!(bytes.len(), 28);
+            assert_eq!(u16::from_ne_bytes([bytes[0], bytes[1]]), 0x35);
+            assert_eq!(
+                i32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+                0
+            );
+            assert_eq!(
+                i32::from_ne_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+                1535
+            );
+            assert_eq!(
+                i32::from_ne_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+                0
+            );
+        }
+
+        #[test]
+        fn touch_separation_mirrors_the_windows_gain() {
+            // Same contract as the Windows touch renderer: one 120 detent
+            // earns 3px, spikes clamp at 10px, hard clamps at 40/700.
+            assert!((touch_separation(120.0, 120) - 123.0).abs() < 1e-9);
+            assert!((touch_separation(120.0, 10_000) - 130.0).abs() < 1e-9);
+            assert_eq!(touch_separation(41.0, -10_000), 40.0);
+            assert_eq!(touch_separation(699.0, 10_000), 700.0);
+            assert_eq!(touch_separation(200.0, 0), 200.0);
+        }
+
+        #[test]
+        fn touch_contacts_stay_symmetric_and_inside() {
+            // Centered: symmetric pair around the anchor.
+            assert_eq!(
+                touch_contacts((960, 540), 120.0, (1919, 1079)),
+                [(900, 540), (1020, 540)]
+            );
+            // Corner anchor: both contacts clamp inside, midpoint holds
+            // the gesture near the anchor instead of leaving the screen.
+            let [left, right] = touch_contacts((5, 5), 120.0, (1919, 1079));
+            assert!(left.0 >= 0 && right.0 <= 1919);
+            assert_eq!((left.1, right.1), (5, 5));
+            let [left, right] = touch_contacts((1918, 1078), 700.0, (1919, 1079));
+            assert!(left.0 >= 0 && right.0 <= 1919);
         }
     }
 }
