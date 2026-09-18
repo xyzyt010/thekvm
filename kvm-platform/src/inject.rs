@@ -996,7 +996,8 @@ mod linux_uinput {
         }
 
         #[test]
-        fn touch_contacts_stay_symmetric_and_inside() {            // Centered: symmetric pair around the anchor.
+        fn touch_contacts_stay_symmetric_and_inside() {
+            // Centered: symmetric pair around the anchor.
             assert_eq!(
                 touch_contacts((960, 540), 120.0, (1919, 1079)),
                 [(900, 540), (1020, 540)]
@@ -1021,8 +1022,7 @@ mod linux_uinput {
         #[test]
         #[ignore = "manual: creates the real virtual touchscreen for 25s for xinput inspection"]
         fn touch_device_enumerates_on_session_bus() {
-            let touch =
-                super::UinputTouch::create(1536, 864).expect("uinput touchscreen creates");
+            let touch = super::UinputTouch::create(1536, 864).expect("uinput touchscreen creates");
             assert!(touch.created);
             assert_eq!(touch.bounds, (1535, 863));
             std::thread::sleep(std::time::Duration::from_secs(25));

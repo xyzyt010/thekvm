@@ -341,6 +341,12 @@ mod win32_hooks {
     //   3. scroll-guard pixel (scroll_guard_pixel + repark_guard_pixel):
     //      a 1x1 topmost window under the cursor that catches the PTP
     //      stack's direct-to-window translation.
+    //   3b. cursor/pixel glue (glue_cursor_to_park on swallowed motion +
+    //      slow_glue_tick every capture-loop iteration): the pixel only
+    //      catches translation aimed AT the pixel, so the parked cursor
+    //      is snapped home and the pixel re-asserted whenever anything
+    //      (touchscreen jumps, echo motion, absolute devices) moves the
+    //      OS cursor past the hook fast path.
     // Symptom of a broken layer: scroll on the peer ALSO scrolls the
     // local app under the parked cursor, usually "sometimes" (race or
     // hardware dependent). See also the echo oracle + WheelDedup below:
@@ -497,6 +503,10 @@ mod win32_hooks {
         ) -> Result<InputEvent, PlatformError> {
             loop {
                 BLOCK_LOCAL.store(exclusive.load(Ordering::Acquire), Ordering::Release);
+                // Slow-path cursor/pixel glue (see slow_glue_tick): every
+                // iteration, so a cursor that escaped past the hook fast
+                // path is pulled home within one tick.
+                slow_glue_tick();
                 if stop.load(Ordering::Acquire) {
                     return Err(PlatformError::Capture("capture stopped".into()));
                 }
@@ -1136,6 +1146,40 @@ mod win32_hooks {
         }
         unsafe {
             let _ = SetCursorPos(park.x, park.y);
+        }
+    }
+
+    /// Slow-path glue tick: the hook fast path above only sees motion the
+    /// low-level hook delivers — touchscreen jumps, peer-injected echo
+    /// motion during a dual drive, and absolute devices move the OS
+    /// cursor past it, stranding cursor AND pixel apart until the next
+    /// swallowed tick (or forever, for pure-PTP scrollers). The capture
+    /// loop calls this every iteration (~10Hz idle, event-driven when
+    /// busy): any escape is pulled home within one tick, and the pixel
+    /// is re-asserted at the park point with it. Crash-safe by
+    /// construction (no global clip state — a dead process simply stops
+    /// gluing). No-op unless a drive holds suppression.
+    fn slow_glue_tick() {
+        if !BLOCK_LOCAL.load(Ordering::Acquire) || !PARK_VALID.load(Ordering::Acquire) {
+            return;
+        }
+        let packed = PARK_POINT.load(Ordering::Acquire);
+        let park = POINT {
+            x: packed as u32 as i32,
+            y: (packed >> 32) as u32 as i32,
+        };
+        unsafe {
+            let mut point = POINT::default();
+            if GetCursorPos(&mut point).is_err() {
+                return;
+            }
+            if point.x != park.x || point.y != park.y {
+                let _ = SetCursorPos(park.x, park.y);
+            }
+            // Pixel back to the park point (not the cursor): the cursor
+            // is being pulled home, and the translation target must be
+            // the pixel, never the wandered position.
+            repark_guard_pixel(park);
         }
     }
 
