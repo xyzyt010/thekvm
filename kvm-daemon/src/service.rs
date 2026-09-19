@@ -3801,24 +3801,14 @@ async fn handle_topology_event(
                 park_inside(router, edge);
                 return Ok(());
             }
-            // Cooldown after a failed episode: the cursor sits at the edge
-            // pouring motion in, and every event would otherwise open a
-            // full QUIC handshake — the dial storm that flapped control.
-            // The user simply keeps pushing; a fresh crossing retries.
-            if episode_cooling_down(*last_failed_episode) {
-                tracing::info!(
-                    ?target,
-                    ?edge,
-                    "crossing_refused: edge push in failed-episode cooldown"
-                );
-                let _ = router.restore_local(target);
-                park_inside(router, edge);
-                return Ok(());
-            }
             // Phantom-handoff veto (see phantom_handoff_veto): a fast
             // in-flight flick can satisfy the push budget while the
             // visible cursor is still mid-screen. Truth decides — genuine
             // pushes (truth at the edge) proceed below instantly.
+            // (No failed-episode gate here: the parked-stream reuse below
+            // costs one Handoff frame, never a dial, so a stall must not
+            // wedge reversals for a second. The gate lives on the cold
+            // open only, where the dial storm it prevents can start.)
             if let Some((truth_x, truth_y)) = phantom_handoff_veto(router, from, edge) {
                 tracing::info!(?target, ?edge, truth_x, truth_y, "crossing_refused: OS pointer truth is mid-screen, flick vetoed; keep pushing deliberately to cross");
                 let _ = router.restore_local(target);
@@ -3863,6 +3853,22 @@ async fn handle_topology_event(
                 None => None,
             };
             if session.is_none() {
+                // Cooldown after a failed episode, scoped to the cold
+                // open: the cursor sits at the edge pouring motion in,
+                // and every event would otherwise open a full QUIC
+                // handshake — the dial storm that flapped control. Parked
+                // reuse above is exempt (no handshake can start there).
+                // The user simply keeps pushing; a fresh crossing retries.
+                if episode_cooling_down(*last_failed_episode) {
+                    tracing::info!(
+                        ?target,
+                        ?edge,
+                        "crossing_refused: edge push in failed-episode cooldown"
+                    );
+                    let _ = router.restore_local(target);
+                    park_inside(router, edge);
+                    return Ok(());
+                }
                 match open_topology_session(TopologyOpen {
                     router,
                     identity,

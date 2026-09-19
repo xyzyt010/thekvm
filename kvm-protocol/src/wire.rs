@@ -491,8 +491,7 @@ pub fn validate_message(message: &WireMessage) -> std::io::Result<()> {
         }
         // Chunks are capped above, so the count must cover the total:
         // a header promising 1GB in two chunks is a lie either way.
-        let min_chunks =
-            total_bytes.div_ceil(MAX_CLIPBOARD_TEXT_BYTES as u64);
+        let min_chunks = total_bytes.div_ceil(MAX_CLIPBOARD_TEXT_BYTES as u64);
         if u64::from(*chunks) < min_chunks {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
