@@ -259,6 +259,7 @@ where
                 allow_lock_screen_control: current.allow_lock_screen_control,
                 auto_connect_address: current.auto_connect_address,
                 clipboard_enabled: current.clipboard_enabled,
+                clipboard_max_mb: current.clipboard_max_mb,
                 edge_mode: current.edge_mode,
                 peer_count,
                 active_session_count: active_sessions.load(std::sync::atomic::Ordering::Relaxed),
@@ -468,6 +469,7 @@ where
             auto_connect_address,
             clear_auto_connect,
             clipboard_enabled,
+            clipboard_max_mb,
             edge_mode,
         } => {
             if listen_port == Some(0) {
@@ -515,6 +517,22 @@ where
                     }
                     if let Some(enabled) = clipboard_enabled {
                         updated.clipboard_enabled = enabled;
+                    }
+                    if let Some(max_mb) = clipboard_max_mb {
+                        if max_mb == 0 || max_mb > kvm_core::config::MAX_CLIPBOARD_MAX_MB {
+                            return write_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    message: format!(
+                                        "clipboard limit must be 1..={} MB",
+                                        kvm_core::config::MAX_CLIPBOARD_MAX_MB
+                                    ),
+                                },
+                            )
+                            .await
+                            .map_err(Into::into);
+                        }
+                        updated.clipboard_max_mb = max_mb;
                     }
                     if let Some(edge_mode) = edge_mode {
                         updated.edge_mode = edge_mode;

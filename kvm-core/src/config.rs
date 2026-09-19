@@ -4,6 +4,13 @@ use std::path::PathBuf;
 
 pub const MAX_DEVICE_NAME_BYTES: usize = 128;
 
+/// Default clipboard update limit (MiB) when the config predates the
+/// field. Matches the in-app default shown in Settings.
+pub const DEFAULT_CLIPBOARD_MAX_MB: u32 = 2;
+/// Absolute clipboard update limit (MiB): the wire protocol hard-caps
+/// here regardless of configuration (see MAX_CLIPBOARD_TEXT_BYTES).
+pub const MAX_CLIPBOARD_MAX_MB: u32 = 16;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub device_name: String,
@@ -30,6 +37,11 @@ pub struct Config {
     /// never required for privileged pre-login input.
     #[serde(default)]
     pub clipboard_enabled: bool,
+    /// Largest single clipboard update synchronized, in MiB (default 2,
+    /// adjustable in Settings). Anything larger stays local. Old config
+    /// files without this field load as the default.
+    #[serde(default = "default_clipboard_max_mb")]
+    pub clipboard_max_mb: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,8 +76,14 @@ impl Default for Config {
             allow_lock_screen_control: false,
             auto_connect_address: None,
             clipboard_enabled: false,
+            clipboard_max_mb: DEFAULT_CLIPBOARD_MAX_MB,
         }
     }
+}
+
+/// Default clipboard update limit for configs that predate the field.
+fn default_clipboard_max_mb() -> u32 {
+    DEFAULT_CLIPBOARD_MAX_MB
 }
 
 impl Config {
@@ -111,7 +129,18 @@ impl Config {
         if self.mode == Mode::ClientOnly && self.auto_connect_address.is_some() {
             return Err("receiver-only mode cannot have an auto-connect controller peer".into());
         }
+        if self.clipboard_max_mb == 0 || self.clipboard_max_mb > MAX_CLIPBOARD_MAX_MB {
+            return Err(format!(
+                "clipboard limit must be 1..={MAX_CLIPBOARD_MAX_MB} MB"
+            ));
+        }
         self.layout.validate()
+    }
+
+    /// Largest single clipboard update synchronized, in bytes. Clamped to
+    /// the valid range so a hand-edited config can never widen the wire.
+    pub fn clipboard_max_bytes(&self) -> usize {
+        (self.clipboard_max_mb.clamp(1, MAX_CLIPBOARD_MAX_MB) as usize) * 1024 * 1024
     }
 }
 
@@ -293,8 +322,33 @@ mod tests {
         assert!(!config.allow_lock_screen_control);
         assert!(config.auto_connect_address.is_none());
         assert!(!config.clipboard_enabled);
+        assert_eq!(config.clipboard_max_mb, DEFAULT_CLIPBOARD_MAX_MB);
+        assert_eq!(
+            config.clipboard_max_bytes(),
+            DEFAULT_CLIPBOARD_MAX_MB as usize * 1024 * 1024
+        );
         assert_eq!(config.edge_mode, EdgeMode::Single);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn clipboard_limit_defaults_and_rejects_out_of_range() {
+        assert_eq!(Config::default().clipboard_max_mb, 2);
+        let zero = Config {
+            clipboard_max_mb: 0,
+            ..Config::default()
+        };
+        assert!(zero.validate().is_err());
+        let huge = Config {
+            clipboard_max_mb: MAX_CLIPBOARD_MAX_MB + 1,
+            ..Config::default()
+        };
+        assert!(huge.validate().is_err());
+        let max = Config {
+            clipboard_max_mb: MAX_CLIPBOARD_MAX_MB,
+            ..Config::default()
+        };
+        assert!(max.validate().is_ok());
     }
 
     #[test]

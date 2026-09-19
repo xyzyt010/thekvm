@@ -160,6 +160,7 @@ fn main() -> Result<()> {
     if let Ok(config) = kvm_core::Config::load(&startup_dir.join("config.json")) {
         ui.set_lock_screen_control(config.allow_lock_screen_control);
         ui.set_clipboard_enabled(config.clipboard_enabled);
+        ui.set_clipboard_max_mb(SharedString::from(config.clipboard_max_mb.to_string()));
         ui.set_device_name(SharedString::from(config.device_name.clone()));
         ui.set_auto_connect_address(SharedString::from(
             config.auto_connect_address.unwrap_or_default(),
@@ -519,6 +520,7 @@ fn main() -> Result<()> {
                 auto_connect_address: current.auto_connect_address.clone(),
                 clear_auto_connect: current.auto_connect_address.is_none(),
                 clipboard_enabled: Some(current.clipboard_enabled),
+                clipboard_max_mb: None,
                 edge_mode: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
@@ -527,6 +529,7 @@ fn main() -> Result<()> {
                         requested,
                         current.allow_lock_screen_control,
                         current.clipboard_enabled,
+                        None,
                         None,
                         Some(current.edge_mode),
                     );
@@ -644,6 +647,7 @@ fn main() -> Result<()> {
                 auto_connect_address: current.auto_connect_address.clone(),
                 clear_auto_connect: current.auto_connect_address.is_none(),
                 clipboard_enabled: Some(current.clipboard_enabled),
+                clipboard_max_mb: None,
                 edge_mode: Some(requested),
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
@@ -652,6 +656,7 @@ fn main() -> Result<()> {
                         current.mode,
                         current.allow_lock_screen_control,
                         current.clipboard_enabled,
+                        None,
                         None,
                         Some(requested),
                     );
@@ -987,16 +992,35 @@ fn main() -> Result<()> {
 
     let weak = ui.as_weak();
     ui.on_apply_config(
-        move |allow_lock_screen, mode_index, device_name, auto_address, clipboard_enabled| {
+        move |allow_lock_screen, mode_index, device_name, auto_address, clipboard_enabled, clipboard_max_mb| {
             let weak = weak.clone();
             let device_name = device_name.to_string();
             let auto_address = auto_address.to_string();
+            let clipboard_max_mb = clipboard_max_mb.to_string();
             let config_session = session_state.clone();
             std::thread::spawn(move || {
                 let requested_mode = match mode_index {
                     1 => Mode::ServerClient,
                     2 => Mode::ClientOnly,
                     _ => Mode::Bidirectional,
+                };
+                // Clipboard cap from the MB field: refuse garbage instead
+                // of silently keeping the old limit.
+                let max_mb: u32 = match clipboard_max_mb.trim().parse() {
+                    Ok(mb)
+                        if (1..=kvm_core::config::MAX_CLIPBOARD_MAX_MB).contains(&mb) =>
+                    {
+                        mb
+                    }
+                    _ => {
+                        let message = format!(
+                            "Clipboard limit must be 1..={} MB",
+                            kvm_core::config::MAX_CLIPBOARD_MAX_MB
+                        );
+                        ui_log(&format!("settings save refused: {message}"));
+                        set_status(&weak, message);
+                        return;
+                    }
                 };
                 // The supervised controller session reads the USER config, so
                 // mirror the same choices there (without any boot peer, which
@@ -1007,6 +1031,7 @@ fn main() -> Result<()> {
                     requested_mode,
                     allow_lock_screen,
                     clipboard_enabled,
+                    Some(max_mb),
                     None,
                     None,
                 );
@@ -1042,6 +1067,7 @@ fn main() -> Result<()> {
                 } else {
                     command.arg("--disable-clipboard");
                 }
+                command.arg("--clipboard-max-mb").arg(max_mb.to_string());
                 match control_request(ControlRequest::SetConfig {
                     device_name: Some(device_name.clone()),
                     mode: Some(requested_mode),
@@ -1052,6 +1078,7 @@ fn main() -> Result<()> {
                         .then_some(auto_address.clone()),
                     clear_auto_connect: auto_address.trim().is_empty(),
                     clipboard_enabled: Some(clipboard_enabled),
+                    clipboard_max_mb: Some(max_mb),
                     // The Settings form has no edge control: preserve it.
                     edge_mode: None,
                 }) {
@@ -1130,6 +1157,7 @@ fn main() -> Result<()> {
                             auto_connect_address: None,
                             clear_auto_connect: false,
                             clipboard_enabled: Some(current.clipboard_enabled),
+                            clipboard_max_mb: None,
                             edge_mode: None,
                         })? {
                             ControlResponse::Applied { .. } => Ok(()),
@@ -1338,6 +1366,7 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                 )));
                 ui.set_lock_screen_control(status.allow_lock_screen_control);
                 ui.set_clipboard_enabled(status.clipboard_enabled);
+                ui.set_clipboard_max_mb(SharedString::from(status.clipboard_max_mb.to_string()));
                 ui.set_device_name(SharedString::from(status.node_name));
                 ui.set_auto_connect_address(SharedString::from(
                     status.auto_connect_address.unwrap_or_default(),
@@ -1949,6 +1978,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         auto_connect_address: current.auto_connect_address.clone(),
         clear_auto_connect: current.auto_connect_address.is_none(),
         clipboard_enabled: Some(current.clipboard_enabled),
+        clipboard_max_mb: None,
         edge_mode: None,
     }) {
         Ok(ControlResponse::Applied { .. }) => {}
@@ -1961,6 +1991,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         current.mode,
         current.allow_lock_screen_control,
         current.clipboard_enabled,
+        None,
         Some(layout.clone()),
         None,
     );
@@ -3713,6 +3744,7 @@ fn mirror_user_config(
     mode: Mode,
     allow_lock_screen: bool,
     clipboard_enabled: bool,
+    clipboard_max_mb: Option<u32>,
     layout: Option<kvm_core::Layout>,
     edge_mode: Option<EdgeMode>,
 ) {
@@ -3724,6 +3756,11 @@ fn mirror_user_config(
     config.mode = mode;
     config.allow_lock_screen_control = allow_lock_screen;
     config.clipboard_enabled = clipboard_enabled;
+    // Same preserve rule as layout/edge: only an explicit Settings save
+    // writes the cap, so role/edge/arrange presses can never reset it.
+    if let Some(max_mb) = clipboard_max_mb {
+        config.clipboard_max_mb = max_mb;
+    }
     config.auto_connect_address = None;
     // A supplied layout replaces the user's topology (arrangement UI,
     // auto-layout); omission preserves whatever is there so role presses

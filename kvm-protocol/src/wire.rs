@@ -7,10 +7,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_FRAME_SIZE: usize = 64 * 1024;
 pub const MAX_NODE_NAME_BYTES: usize = 128;
 const MAX_REJECT_REASON_BYTES: usize = 1024;
-/// Text clipboard synchronization intentionally remains a single bounded
-/// message in this first implementation. Large rich/file clipboard payloads
-/// belong to the future chunked transfer protocol.
+/// Text clipboard synchronization stays inside the 64KB framing: small
+/// pastes ride one bounded message, large ones stream as 48KB chunks
+/// (see ClipboardStart/Chunk/End). Rich/file payloads belong to a future
+/// transfer protocol. The absolute per-update ceiling lives here so no
+/// peer can force unbounded buffering; the per-link cap is configured
+/// (see Config::clipboard_max_bytes) and always <= this.
 pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 48 * 1024;
+/// Largest single clipboard update any peer may announce, in bytes. Must
+/// stay in sync with Config::MAX_CLIPBOARD_MAX_MB.
+pub const MAX_CLIPBOARD_UPDATE_BYTES: u64 = 16 * 1024 * 1024;
 /// Keep motion datagrams below the usual QUIC path-MTU budget. Key/button
 /// transitions remain on the reliable stream; motion and wheel updates may be
 /// dropped when the network is congested.
@@ -253,9 +259,34 @@ pub enum WireMessage {
     /// newly established input session.
     StateSync(InputState),
     /// Bounded plain-text clipboard update for normal logged-in sessions.
+    /// Single-shot path for small pastes; larger ones use the
+    /// Start/Chunk/End stream below (same revision across all three).
     ClipboardText {
         revision: u64,
         text: String,
+    },
+    /// Large-paste header: total UTF-8 bytes and chunk count. The receiver
+    /// buffers only up to its configured cap and drops anything larger
+    /// before the first chunk arrives.
+    ClipboardStart {
+        revision: u64,
+        total_bytes: u64,
+        chunks: u32,
+    },
+    /// One chunk of a large paste (UTF-8, split on char boundaries,
+    /// `index` from 0). Ordered with everything else on the episode
+    /// stream, so the receiver appends in arrival order.
+    ClipboardChunk {
+        revision: u64,
+        index: u32,
+        data: String,
+    },
+    /// End of a large paste: the receiver applies the buffer only when
+    /// the revision matches an open assembly and the received bytes equal
+    /// the declared total (truncation fails closed, like Deskflow's
+    /// DataEnd).
+    ClipboardEnd {
+        revision: u64,
     },
     ReleaseAll,
     /// Administrative link teardown: the sender's user pressed Disconnect
@@ -438,6 +469,37 @@ pub fn validate_message(message: &WireMessage) -> std::io::Result<()> {
             ));
         }
     }
+    if let WireMessage::ClipboardChunk { data, .. } = message {
+        if data.len() > MAX_CLIPBOARD_TEXT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "clipboard chunk exceeds maximum size",
+            ));
+        }
+    }
+    if let WireMessage::ClipboardStart {
+        total_bytes,
+        chunks,
+        ..
+    } = message
+    {
+        if *total_bytes > MAX_CLIPBOARD_UPDATE_BYTES || *chunks == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "clipboard transfer header is empty or exceeds maximum size",
+            ));
+        }
+        // Chunks are capped above, so the count must cover the total:
+        // a header promising 1GB in two chunks is a lie either way.
+        let min_chunks =
+            total_bytes.div_ceil(MAX_CLIPBOARD_TEXT_BYTES as u64);
+        if u64::from(*chunks) < min_chunks {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "clipboard transfer header undercounts its chunks",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -575,6 +637,44 @@ mod tests {
             text: "x".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1),
         };
         assert!(write_frame(&mut left, &message).await.is_err());
+    }
+
+    #[test]
+    fn clipboard_chunk_protocol_rejects_lies() {
+        // Oversized chunk.
+        assert!(validate_message(&WireMessage::ClipboardChunk {
+            revision: 1,
+            index: 0,
+            data: "x".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1),
+        })
+        .is_err());
+        // Empty or over-ceiling header.
+        assert!(validate_message(&WireMessage::ClipboardStart {
+            revision: 1,
+            total_bytes: 0,
+            chunks: 0,
+        })
+        .is_err());
+        assert!(validate_message(&WireMessage::ClipboardStart {
+            revision: 1,
+            total_bytes: MAX_CLIPBOARD_UPDATE_BYTES + 1,
+            chunks: u32::MAX,
+        })
+        .is_err());
+        // Header undercounting its chunks (1MB needs 22 chunks of 48KB).
+        assert!(validate_message(&WireMessage::ClipboardStart {
+            revision: 1,
+            total_bytes: 1024 * 1024,
+            chunks: 2,
+        })
+        .is_err());
+        // Honest header passes.
+        assert!(validate_message(&WireMessage::ClipboardStart {
+            revision: 1,
+            total_bytes: 1024 * 1024,
+            chunks: 22,
+        })
+        .is_ok());
     }
 
     #[tokio::test]

@@ -120,6 +120,10 @@ pub enum ControlRequest {
         /// Set or preserve normal logged-in text clipboard synchronization.
         #[serde(default)]
         clipboard_enabled: Option<bool>,
+        /// Largest single clipboard update (MiB, 1..=16); omission
+        /// preserves the current limit so partial CLI/UI updates are safe.
+        #[serde(default)]
+        clipboard_max_mb: Option<u32>,
         /// Replace the edge-crossing discipline when supplied (Single =
         /// arranged facing edge only; Double = both horizontal outer edges
         /// on a two-machine link); omission preserves the current one so
@@ -127,6 +131,11 @@ pub enum ControlRequest {
         #[serde(default)]
         edge_mode: Option<EdgeMode>,
     },
+}
+
+/// Default clipboard cap for status frames from older daemons.
+fn default_clipboard_max_mb() -> u32 {
+    kvm_core::config::DEFAULT_CLIPBOARD_MAX_MB
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +147,10 @@ pub struct DaemonStatus {
     pub allow_lock_screen_control: bool,
     pub auto_connect_address: Option<String>,
     pub clipboard_enabled: bool,
+    /// Largest single clipboard update (MiB). Defaults to 2 for older
+    /// daemons that predate the field.
+    #[serde(default = "default_clipboard_max_mb")]
+    pub clipboard_max_mb: u32,
     /// The daemon's current edge-crossing discipline. Defaults to Single
     /// for older daemons that predate the field.
     #[serde(default)]
@@ -363,6 +376,7 @@ mod tests {
             auto_connect_address: Some("127.0.0.1:42110".into()),
             clear_auto_connect: false,
             clipboard_enabled: Some(true),
+            clipboard_max_mb: Some(2),
             edge_mode: Some(EdgeMode::Double),
         };
         let expected_address = "127.0.0.1:42110".to_owned();
@@ -378,6 +392,7 @@ mod tests {
             auto_connect_address,
             clear_auto_connect,
             clipboard_enabled,
+            clipboard_max_mb,
             edge_mode,
         }) = read_request(&mut right).await.unwrap()
         else {
@@ -394,6 +409,7 @@ mod tests {
         );
         assert!(!clear_auto_connect);
         assert_eq!(clipboard_enabled, Some(true));
+        assert_eq!(clipboard_max_mb, Some(2));
         assert_eq!(edge_mode, Some(EdgeMode::Double));
         sender.await.unwrap();
     }
@@ -467,6 +483,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status.edge_mode, EdgeMode::Single);
+        assert_eq!(status.clipboard_max_mb, 2);
     }
 
     #[test]

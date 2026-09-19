@@ -135,6 +135,9 @@ enum Command {
         /// Disable normal logged-in text clipboard synchronization.
         #[arg(long, conflicts_with = "enable_clipboard")]
         disable_clipboard: bool,
+        /// Largest single clipboard update in MiB (1..=16, default 2).
+        #[arg(long)]
+        clipboard_max_mb: Option<u32>,
     },
 }
 
@@ -369,6 +372,7 @@ async fn async_main() -> Result<()> {
             clear_auto_connect,
             enable_clipboard,
             disable_clipboard,
+            clipboard_max_mb,
         } => {
             service::configure(service::ConfigureOptions {
                 device_name: device_name.as_deref(),
@@ -391,6 +395,7 @@ async fn async_main() -> Result<()> {
                 } else {
                     None
                 },
+                clipboard_max_mb,
             })
             .await
         }

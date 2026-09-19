@@ -29,6 +29,7 @@ export component AppWindow inherits Window {
     in-out property <string> incoming-verification-code: "";
     in-out property <bool> lock-screen-control: false;
     in-out property <bool> clipboard-enabled: false;
+    in-out property <string> clipboard-max-mb: "2";
     in-out property <int> mode-index: 0;
     in-out property <int> edge-mode-index: 0;
     in property <string> role-text: "Both ways";
@@ -65,7 +66,7 @@ export component AppWindow inherits Window {
     callback place-peer-left();
     callback place-peer-right();
     callback open-log-folder();
-    callback apply-config(bool, int, string, string, bool);
+    callback apply-config(bool, int, string, string, bool, string);
     callback import-layout(string);
 
 
@@ -587,7 +588,7 @@ export component AppWindow inherits Window {
                         Button {
                             text: "Save";
                             enabled: name.text != "";
-                            clicked => { apply-config(lock-screen-control, mode-index, name.text, auto-connect-address, clipboard-enabled); }
+                            clicked => { apply-config(lock-screen-control, mode-index, name.text, auto-connect-address, clipboard-enabled, root.clipboard-max-mb); }
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }
@@ -600,7 +601,7 @@ export component AppWindow inherits Window {
                         }
                         Switch {
                             checked <=> root.lock-screen-control;
-                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled); }
+                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb); }
                         }
                     }
                     HorizontalLayout {
@@ -612,7 +613,23 @@ export component AppWindow inherits Window {
                         }
                         Switch {
                             checked <=> root.clipboard-enabled;
-                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled); }
+                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Largest paste to sync (MB, 1-16)";
+                            color: #d1d5db;
+                            vertical-alignment: center;
+                        }
+                        clipboard-max := LineEdit {
+                            text <=> root.clipboard-max-mb;
+                            placeholder-text: "2";
+                        }
+                        Button {
+                            text: "Save";
+                            clicked => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }
@@ -630,7 +647,7 @@ export component AppWindow inherits Window {
                         }
                         Button {
                             text: "Save";
-                            clicked => { apply-config(lock-screen-control, mode-index, device-name, startup.text, clipboard-enabled); }
+                            clicked => { apply-config(lock-screen-control, mode-index, device-name, startup.text, clipboard-enabled, root.clipboard-max-mb); }
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }

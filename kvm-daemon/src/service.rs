@@ -819,6 +819,7 @@ pub(crate) struct ConfigureOptions<'a> {
     pub(crate) auto_connect_address: Option<&'a str>,
     pub(crate) clear_auto_connect: bool,
     pub(crate) clipboard_enabled: Option<bool>,
+    pub(crate) clipboard_max_mb: Option<u32>,
 }
 
 pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
@@ -831,6 +832,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
         auto_connect_address,
         clear_auto_connect,
         clipboard_enabled,
+        clipboard_max_mb,
     } = options;
     let requested_mode = mode
         .map(|mode| match mode.to_ascii_lowercase().as_str() {
@@ -874,6 +876,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
             auto_connect_address: auto_connect_address.map(|address| address.trim().to_owned()),
             clear_auto_connect,
             clipboard_enabled,
+            clipboard_max_mb,
             edge_mode: None,
         },
     )
@@ -921,6 +924,15 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     }
     if let Some(enabled) = clipboard_enabled {
         config.clipboard_enabled = enabled;
+    }
+    if let Some(max_mb) = clipboard_max_mb {
+        if max_mb == 0 || max_mb > kvm_core::config::MAX_CLIPBOARD_MAX_MB {
+            bail!(
+                "clipboard limit must be 1..={} MB",
+                kvm_core::config::MAX_CLIPBOARD_MAX_MB
+            );
+        }
+        config.clipboard_max_mb = max_mb;
     }
     config.save(&path).context("saving config")?;
     if config.mode != previous_mode {
@@ -1235,6 +1247,7 @@ pub async fn capture(address: &str) -> Result<()> {
         &mut clipboard,
         clipboard_enabled,
         &mut clipboard_revision,
+        config.clipboard_max_bytes() as u64,
         capabilities.smooth_scroll,
         capabilities.pinch_zoom,
     )
@@ -1777,6 +1790,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut clipboard_enabled = config.clipboard_enabled;
     let mut clipboard_revision = 0u64;
     let mut latest_clipboard: Option<String> = None;
+    let clipboard_max_bytes = config.clipboard_max_bytes() as u64;
+    // Open chunked-paste assembly for this link (see ClipboardAssembly):
+    // at most one transfer buffers at a time, bounded by the cap above.
+    let mut clipboard_assembly = ClipboardAssembly::default();
     let mut discarded_event_barrier = 0u64;
     let mut last_transfer: Option<std::time::Instant> = None;
     let mut last_failed_episode: Option<std::time::Instant> = None;
@@ -1943,6 +1960,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                     first_event,
                                     latest_clipboard.clone(),
                                     &mut clipboard_revision,
+                                    config.clipboard_max_bytes() as u64,
                                     &mut sequence,
                                     snapshot.last_event_id,
                                 )
@@ -1976,6 +1994,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                 initial_clipboard: latest_clipboard.clone(),
                                 sequence: &mut sequence,
                                 clipboard_revision: &mut clipboard_revision,
+                                clipboard_max_bytes: config.clipboard_max_bytes() as u64,
                                 dir: &dir,
                                 link_id: link.as_ref().and_then(|link| link.link_id),
                             }).await {
@@ -2037,10 +2056,87 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         if !session.clipboard_enabled || revision <= session.remote_clipboard_revision {
                             continue;
                         }
-                        session.remote_clipboard_revision = revision;
-                        if let Some(agent) = clipboard.as_ref() {
-                            agent.apply_remote(text.clone())?;
-                            latest_clipboard = Some(text);
+                        if text.len() as u64 > clipboard_max_bytes {
+                            tracing::warn!(bytes = text.len(), "peer sent oversized clipboard text; dropped");
+                            continue;
+                        }
+                        apply_inbound_clipboard(
+                            &clipboard,
+                            &mut latest_clipboard,
+                            &mut session.remote_clipboard_revision,
+                            revision,
+                            text,
+                        )?;
+                    }
+                    Some(RemoteSignal::ClipboardStart {
+                        revision,
+                        total_bytes,
+                        chunks,
+                    }) => {
+                        let Some(session) = active.as_mut() else {
+                            continue;
+                        };
+                        if !session.clipboard_enabled
+                            || revision <= session.remote_clipboard_revision
+                        {
+                            continue;
+                        }
+                        if matches!(
+                            clipboard_assembly.feed_start(
+                                revision,
+                                total_bytes,
+                                chunks,
+                                clipboard_max_bytes
+                            ),
+                            ClipboardFeed::Dropped
+                        ) {
+                            tracing::warn!(revision, total_bytes, "peer clipboard transfer refused (over cap or malformed header)");
+                        }
+                    }
+                    Some(RemoteSignal::ClipboardChunk {
+                        revision,
+                        index,
+                        data,
+                    }) => {
+                        let Some(session) = active.as_mut() else {
+                            continue;
+                        };
+                        if !session.clipboard_enabled
+                            || revision <= session.remote_clipboard_revision
+                        {
+                            continue;
+                        }
+                        if matches!(
+                            clipboard_assembly.feed_chunk(revision, index, &data),
+                            ClipboardFeed::Dropped
+                        ) {
+                            tracing::warn!(revision, index, "peer clipboard transfer aborted (chunk mismatch)");
+                        }
+                    }
+                    Some(RemoteSignal::ClipboardEnd { revision }) => {
+                        let Some(session) = active.as_mut() else {
+                            continue;
+                        };
+                        if !session.clipboard_enabled
+                            || revision <= session.remote_clipboard_revision
+                        {
+                            continue;
+                        }
+                        match clipboard_assembly.feed_end(revision) {
+                            ClipboardFeed::Ready(text) => {
+                                tracing::info!(bytes = text.len(), "peer clipboard transfer complete");
+                                apply_inbound_clipboard(
+                                    &clipboard,
+                                    &mut latest_clipboard,
+                                    &mut session.remote_clipboard_revision,
+                                    revision,
+                                    text,
+                                )?;
+                            }
+                            ClipboardFeed::Dropped => {
+                                tracing::warn!(revision, "peer clipboard transfer failed validation; dropped");
+                            }
+                            ClipboardFeed::Pending => {}
                         }
                     }
                     Some(RemoteSignal::Closed) | None => {
@@ -2093,6 +2189,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     clipboard_enabled,
                     initial_clipboard: latest_clipboard.clone(),
                     clipboard_revision: &mut clipboard_revision,
+                    clipboard_max_bytes: config.clipboard_max_bytes() as u64,
                     dir: &dir,
                     discarded_event_barrier: &mut discarded_event_barrier,
                     local_wheel_dropped: &mut local_wheel_dropped,
@@ -2219,6 +2316,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     clipboard_enabled,
                     initial_clipboard: latest_clipboard.clone(),
                     clipboard_revision: &mut clipboard_revision,
+                    clipboard_max_bytes: config.clipboard_max_bytes() as u64,
                     dir: &dir,
                     discarded_event_barrier: &mut discarded_event_barrier,
                     local_wheel_dropped: &mut local_wheel_dropped,
@@ -2239,17 +2337,17 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     let Some(session) = active.as_mut().filter(|session| session.clipboard_enabled) else {
                         continue;
                     };
-                    if text.len() > kvm_protocol::wire::MAX_CLIPBOARD_TEXT_BYTES {
+                    // Per-link cap from Settings (default 2MB): anything
+                    // larger stays local, never half-sent.
+                    if text.len() as u64 > config.clipboard_max_bytes() as u64 {
                         tracing::debug!(bytes = text.len(), "skipping oversized clipboard text");
                         continue;
                     }
                     clipboard_revision = clipboard_revision.wrapping_add(1);
-                    if let Err(error) = write_frame(
+                    if let Err(error) = send_clipboard_text(
                         &mut session.send,
-                        &WireMessage::ClipboardText {
-                            revision: clipboard_revision,
-                            text,
-                        },
+                        clipboard_revision,
+                        text,
                     )
                     .await
                     {
@@ -2606,6 +2704,21 @@ enum RemoteSignal {
     Clipboard {
         revision: u64,
         text: String,
+    },
+    /// Chunked-paste frames (see ClipboardAssembly): forwarded like
+    /// ClipboardText and assembled in the drive loop.
+    ClipboardStart {
+        revision: u64,
+        total_bytes: u64,
+        chunks: u32,
+    },
+    ClipboardChunk {
+        revision: u64,
+        index: u32,
+        data: String,
+    },
+    ClipboardEnd {
+        revision: u64,
     },
     Closed,
     /// The peer app answered a keep-alive Ping: the episode stream is
@@ -3265,6 +3378,8 @@ struct TopologyEventContext<'a> {
     clipboard_enabled: bool,
     initial_clipboard: Option<String>,
     clipboard_revision: &'a mut u64,
+    /// Per-link clipboard cap (Settings, default 2MB), loop-local copy.
+    clipboard_max_bytes: u64,
     dir: &'a std::path::Path,
     discarded_event_barrier: &'a mut u64,
     /// Scroll events routed locally while nobody is driven (scroll alone
@@ -3329,6 +3444,7 @@ async fn handle_topology_event(
         clipboard_enabled,
         initial_clipboard,
         clipboard_revision,
+        clipboard_max_bytes,
         dir,
         discarded_event_barrier,
         local_wheel_dropped,
@@ -3728,6 +3844,7 @@ async fn handle_topology_event(
                         Some(event),
                         initial_clipboard.clone(),
                         &mut *clipboard_revision,
+                        clipboard_max_bytes,
                         &mut *sequence,
                         snapshot.last_event_id,
                     )
@@ -3763,6 +3880,7 @@ async fn handle_topology_event(
                     clipboard_enabled,
                     initial_clipboard,
                     clipboard_revision,
+                    clipboard_max_bytes,
                     sequence,
                     dir,
                     link_id: link.and_then(|link| link.link_id),
@@ -3877,6 +3995,9 @@ struct TopologyOpen<'a> {
     clipboard_enabled: bool,
     initial_clipboard: Option<String>,
     clipboard_revision: &'a mut u64,
+    /// Per-link clipboard cap (Settings, default 2MB): the initial sync
+    /// sends chunked up to this, never more.
+    clipboard_max_bytes: u64,
     sequence: &'a mut u64,
     dir: &'a std::path::Path,
     /// Administrative epoch both sides share (None for legacy children).
@@ -3901,6 +4022,7 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         clipboard_enabled,
         initial_clipboard,
         clipboard_revision,
+        clipboard_max_bytes,
         sequence,
         dir,
         link_id,
@@ -4001,16 +4123,14 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
     send_state_sync(&mut send, state).await?;
     if clipboard_enabled {
         if let Some(text) = initial_clipboard {
-            if text.len() <= kvm_protocol::wire::MAX_CLIPBOARD_TEXT_BYTES {
+            if text.len() as u64 <= clipboard_max_bytes {
                 *clipboard_revision = clipboard_revision.wrapping_add(1);
-                write_frame(
-                    &mut send,
-                    &WireMessage::ClipboardText {
-                        revision: *clipboard_revision,
-                        text,
-                    },
-                )
-                .await?;
+                send_clipboard_text(&mut send, *clipboard_revision, text).await?;
+            } else {
+                tracing::debug!(
+                    bytes = text.len(),
+                    "skipping oversized initial clipboard text"
+                );
             }
         }
     }
@@ -4132,6 +4252,7 @@ async fn resume_parked_session(
     first_event: Option<InputEvent>,
     initial_clipboard: Option<String>,
     clipboard_revision: &mut u64,
+    clipboard_max_bytes: u64,
     sequence: &mut u64,
     event_barrier: u64,
 ) -> Result<TopologySession> {
@@ -4157,16 +4278,14 @@ async fn resume_parked_session(
     send_state_sync(&mut session.send, state).await?;
     if session.clipboard_enabled {
         if let Some(text) = initial_clipboard {
-            if text.len() <= kvm_protocol::wire::MAX_CLIPBOARD_TEXT_BYTES {
+            if text.len() as u64 <= clipboard_max_bytes {
                 *clipboard_revision = clipboard_revision.wrapping_add(1);
-                write_frame(
-                    &mut session.send,
-                    &WireMessage::ClipboardText {
-                        revision: *clipboard_revision,
-                        text,
-                    },
-                )
-                .await?;
+                send_clipboard_text(&mut session.send, *clipboard_revision, text).await?;
+            } else {
+                tracing::debug!(
+                    bytes = text.len(),
+                    "skipping oversized resumed clipboard text"
+                );
             }
         }
     }
@@ -4481,6 +4600,31 @@ async fn drain_peer_responses(
             }
             WireMessage::ClipboardText { revision, text } => {
                 let _ = signal.send(RemoteSignal::Clipboard { revision, text });
+            }
+            WireMessage::ClipboardStart {
+                revision,
+                total_bytes,
+                chunks,
+            } => {
+                let _ = signal.send(RemoteSignal::ClipboardStart {
+                    revision,
+                    total_bytes,
+                    chunks,
+                });
+            }
+            WireMessage::ClipboardChunk {
+                revision,
+                index,
+                data,
+            } => {
+                let _ = signal.send(RemoteSignal::ClipboardChunk {
+                    revision,
+                    index,
+                    data,
+                });
+            }
+            WireMessage::ClipboardEnd { revision } => {
+                let _ = signal.send(RemoteSignal::ClipboardEnd { revision });
             }
             WireMessage::Pong { .. } => {
                 let _ = signal.send(RemoteSignal::Progress);
@@ -4830,6 +4974,167 @@ async fn receive_clipboard(
     agent.recv().await
 }
 
+/// Apply one fully-received paste (single-shot or assembled) to the
+/// local clipboard. Shared by the connect drive loop and the serve loop
+/// so both directions behave identically.
+fn apply_inbound_clipboard(
+    clipboard: &Option<ClipboardAgent>,
+    latest_clipboard: &mut Option<String>,
+    session_remote_revision: &mut u64,
+    revision: u64,
+    text: String,
+) -> Result<()> {
+    *session_remote_revision = revision;
+    if let Some(agent) = clipboard.as_ref() {
+        agent.apply_remote(text.clone())?;
+    }
+    *latest_clipboard = Some(text);
+    Ok(())
+}
+
+/// Wire-sized clipboard pieces: chunks stay inside the 64KB framing with
+/// JSON overhead to spare (matches MAX_CLIPBOARD_TEXT_BYTES, the
+/// single-shot ceiling).
+const CLIPBOARD_CHUNK_BYTES: usize = 48 * 1024;
+
+/// Split pasted text into wire-sized chunks on UTF-8 char boundaries.
+/// Pure for tests.
+fn split_clipboard_chunks(text: &str) -> Vec<&str> {
+    if text.len() <= CLIPBOARD_CHUNK_BYTES {
+        return vec![text];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + CLIPBOARD_CHUNK_BYTES).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&text[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+/// Send one clipboard update: single-shot for small pastes, a
+/// Start/Chunk/End stream for large ones (same revision throughout, so
+/// the receiver attributes every chunk). The caller enforces the
+/// configured per-link cap before calling; the wire validator enforces
+/// the absolute ceilings on both ends.
+async fn send_clipboard_text(
+    send: &mut quinn::SendStream,
+    revision: u64,
+    text: String,
+) -> Result<()> {
+    if text.len() <= kvm_protocol::wire::MAX_CLIPBOARD_TEXT_BYTES {
+        write_frame(send, &WireMessage::ClipboardText { revision, text }).await?;
+        return Ok(());
+    }
+    let chunks = split_clipboard_chunks(&text);
+    write_frame(
+        send,
+        &WireMessage::ClipboardStart {
+            revision,
+            total_bytes: text.len() as u64,
+            chunks: chunks.len() as u32,
+        },
+    )
+    .await?;
+    for (index, data) in chunks.into_iter().enumerate() {
+        write_frame(
+            send,
+            &WireMessage::ClipboardChunk {
+                revision,
+                index: index as u32,
+                data: data.to_owned(),
+            },
+        )
+        .await?;
+    }
+    write_frame(send, &WireMessage::ClipboardEnd { revision }).await?;
+    Ok(())
+}
+
+/// Receiver-side assembly of one chunked paste. The buffer can never
+/// exceed the configured cap (Start over cap is refused before the first
+/// chunk, and every chunk is checked against the declared total), so a
+/// hostile peer cannot force unbounded buffering.
+#[derive(Default)]
+struct ClipboardAssembly {
+    revision: u64,
+    total_bytes: u64,
+    expected_chunks: u32,
+    next_index: u32,
+    received_bytes: u64,
+    buffer: String,
+}
+
+enum ClipboardFeed {
+    /// Not part of a transfer, over cap, or a mismatch (assembly reset):
+    /// nothing buffered.
+    Dropped,
+    /// Chunk buffered, transfer still open.
+    Pending,
+    /// Transfer complete and byte-exact: apply this text.
+    Ready(String),
+}
+
+impl ClipboardAssembly {
+    /// Open a chunked paste. Anything over the per-link cap (or empty,
+    /// or chunkless) is refused before the first chunk arrives.
+    fn feed_start(
+        &mut self,
+        revision: u64,
+        total_bytes: u64,
+        chunks: u32,
+        max_bytes: u64,
+    ) -> ClipboardFeed {
+        *self = Self::default();
+        if total_bytes == 0 || total_bytes > max_bytes || chunks == 0 {
+            return ClipboardFeed::Dropped;
+        }
+        self.revision = revision;
+        self.total_bytes = total_bytes;
+        self.expected_chunks = chunks;
+        ClipboardFeed::Pending
+    }
+
+    /// Append one chunk. Anything out of order, over the declared total,
+    /// or for another revision aborts the whole transfer (the sender
+    /// retries from Start on its next change, like any new paste).
+    fn feed_chunk(&mut self, revision: u64, index: u32, data: &str) -> ClipboardFeed {
+        if revision != self.revision
+            || self.expected_chunks == 0
+            || index != self.next_index
+            || self.received_bytes + data.len() as u64 > self.total_bytes
+        {
+            *self = Self::default();
+            return ClipboardFeed::Dropped;
+        }
+        self.buffer.push_str(data);
+        self.received_bytes += data.len() as u64;
+        self.next_index += 1;
+        ClipboardFeed::Pending
+    }
+
+    /// Close a chunked paste. Applies only when the revision matches an
+    /// open assembly, every expected chunk arrived, and the received
+    /// bytes equal the declared total (truncation fails closed).
+    fn feed_end(&mut self, revision: u64) -> ClipboardFeed {
+        if revision != self.revision
+            || self.expected_chunks == 0
+            || self.next_index != self.expected_chunks
+            || self.received_bytes != self.total_bytes
+        {
+            *self = Self::default();
+            return ClipboardFeed::Dropped;
+        }
+        let text = std::mem::take(&mut self.buffer);
+        *self = Self::default();
+        ClipboardFeed::Ready(text)
+    }
+}
+
 struct CaptureGuard {
     stop: Arc<std::sync::atomic::AtomicBool>,
     exclusive: Arc<std::sync::atomic::AtomicBool>,
@@ -5092,6 +5397,7 @@ async fn run_capture_stream(
     clipboard: &mut Option<ClipboardAgent>,
     clipboard_enabled: bool,
     clipboard_revision: &mut u64,
+    clipboard_max_bytes: u64,
     peer_smooth: bool,
     peer_pinch: bool,
 ) -> Result<()> {
@@ -5105,7 +5411,10 @@ async fn run_capture_stream(
         let mut recv = recv;
         while let Ok(Some(message)) = read_frame(&mut recv).await {
             match message {
-                WireMessage::ClipboardText { .. } => {
+                WireMessage::ClipboardText { .. }
+                | WireMessage::ClipboardStart { .. }
+                | WireMessage::ClipboardChunk { .. }
+                | WireMessage::ClipboardEnd { .. } => {
                     if remote_message_tx.send(message).is_err() {
                         break;
                     }
@@ -5121,6 +5430,10 @@ async fn run_capture_stream(
     let mut sequence = 0u64;
     let mut clipboard_enabled = clipboard_enabled;
     let mut remote_clipboard_revision = 0u64;
+    let mut latest_clipboard: Option<String> = None;
+    // Open chunked-paste assembly for this stream (see
+    // ClipboardAssembly): bounded by the configured cap.
+    let mut clipboard_assembly = ClipboardAssembly::default();
     let mut wheel_debt = WheelDowngrade::default();
     // Legacy pinch-expansion state for old peers (see pinch_for_send),
     // plus a shadow of the physical Ctrl hold: this stream sees every
@@ -5212,17 +5525,15 @@ async fn run_capture_stream(
             },
             text = receive_clipboard(clipboard, clipboard_enabled) => match text {
                 Some(text) => {
-                    if text.len() > kvm_protocol::wire::MAX_CLIPBOARD_TEXT_BYTES {
+                    if text.len() as u64 > clipboard_max_bytes {
                         tracing::debug!(bytes = text.len(), "skipping oversized clipboard text");
                         continue;
                     }
                     *clipboard_revision = clipboard_revision.wrapping_add(1);
-                    if let Err(error) = write_frame(
+                    if let Err(error) = send_clipboard_text(
                         &mut send,
-                        &WireMessage::ClipboardText {
-                            revision: *clipboard_revision,
-                            text,
-                        },
+                        *clipboard_revision,
+                        text,
                     )
                     .await
                     {
@@ -5235,9 +5546,65 @@ async fn run_capture_stream(
                 Some(WireMessage::ClipboardText { revision, text })
                     if clipboard_enabled && revision > remote_clipboard_revision =>
                 {
-                    remote_clipboard_revision = revision;
-                    if let Some(agent) = clipboard.as_ref() {
-                        agent.apply_remote(text)?;
+                    if text.len() as u64 > clipboard_max_bytes {
+                        tracing::warn!(bytes = text.len(), "peer sent oversized clipboard text; dropped");
+                    } else {
+                        apply_inbound_clipboard(
+                            clipboard,
+                            &mut latest_clipboard,
+                            &mut remote_clipboard_revision,
+                            revision,
+                            text,
+                        )?;
+                    }
+                }
+                Some(WireMessage::ClipboardStart {
+                    revision,
+                    total_bytes,
+                    chunks,
+                }) if clipboard_enabled && revision > remote_clipboard_revision => {
+                    if matches!(
+                        clipboard_assembly.feed_start(
+                            revision,
+                            total_bytes,
+                            chunks,
+                            clipboard_max_bytes
+                        ),
+                        ClipboardFeed::Dropped
+                    ) {
+                        tracing::warn!(revision, total_bytes, "peer clipboard transfer refused (over cap or malformed header)");
+                    }
+                }
+                Some(WireMessage::ClipboardChunk {
+                    revision,
+                    index,
+                    data,
+                }) if clipboard_enabled && revision > remote_clipboard_revision => {
+                    if matches!(
+                        clipboard_assembly.feed_chunk(revision, index, &data),
+                        ClipboardFeed::Dropped
+                    ) {
+                        tracing::warn!(revision, index, "peer clipboard transfer aborted (chunk mismatch)");
+                    }
+                }
+                Some(WireMessage::ClipboardEnd { revision })
+                    if clipboard_enabled && revision > remote_clipboard_revision =>
+                {
+                    match clipboard_assembly.feed_end(revision) {
+                        ClipboardFeed::Ready(text) => {
+                            tracing::info!(bytes = text.len(), "peer clipboard transfer complete");
+                            apply_inbound_clipboard(
+                                clipboard,
+                                &mut latest_clipboard,
+                                &mut remote_clipboard_revision,
+                                revision,
+                                text,
+                            )?;
+                        }
+                        ClipboardFeed::Dropped => {
+                            tracing::warn!(revision, "peer clipboard transfer failed validation; dropped");
+                        }
+                        ClipboardFeed::Pending => {}
                     }
                 }
                 Some(_) => {}
@@ -5707,6 +6074,13 @@ async fn handle_connection(
                 None
             };
             let mut clipboard_enabled = clipboard.is_some();
+            let clipboard_max_bytes = config.clipboard_max_bytes() as u64;
+            // Open chunked-paste assembly for this association (see
+            // ClipboardAssembly): bounded by the cap above.
+            let mut clipboard_assembly = ClipboardAssembly::default();
+            // Last paste applied from the peer (mirrors the connect
+            // loop's copy; feeds the shared apply helper).
+            let mut latest_clipboard: Option<String> = None;
             // Provision the native receiver before advertising an accepted
             // session. Otherwise a missing /dev/uinput device or unavailable
             // Windows interactive helper can make the sender believe input is
@@ -6146,9 +6520,70 @@ async fn handle_connection(
                                 if clipboard_enabled
                                     && revision > remote_clipboard_revision =>
                             {
-                                remote_clipboard_revision = revision;
-                                if let Some(agent) = clipboard.as_ref() {
-                                    agent.apply_remote(text)?;
+                                if text.len() as u64 > clipboard_max_bytes {
+                                    tracing::warn!(bytes = text.len(), "peer sent oversized clipboard text; dropped");
+                                    continue;
+                                }
+                                apply_inbound_clipboard(
+                                    &clipboard,
+                                    &mut latest_clipboard,
+                                    &mut remote_clipboard_revision,
+                                    revision,
+                                    text,
+                                )?;
+                            }
+                            WireMessage::ClipboardStart {
+                                revision,
+                                total_bytes,
+                                chunks,
+                            } if clipboard_enabled
+                                && revision > remote_clipboard_revision =>
+                            {
+                                if matches!(
+                                    clipboard_assembly.feed_start(
+                                        revision,
+                                        total_bytes,
+                                        chunks,
+                                        clipboard_max_bytes
+                                    ),
+                                    ClipboardFeed::Dropped
+                                ) {
+                                    tracing::warn!(revision, total_bytes, "peer clipboard transfer refused (over cap or malformed header)");
+                                }
+                            }
+                            WireMessage::ClipboardChunk {
+                                revision,
+                                index,
+                                data,
+                            } if clipboard_enabled
+                                && revision > remote_clipboard_revision =>
+                            {
+                                if matches!(
+                                    clipboard_assembly.feed_chunk(revision, index, &data),
+                                    ClipboardFeed::Dropped
+                                ) {
+                                    tracing::warn!(revision, index, "peer clipboard transfer aborted (chunk mismatch)");
+                                }
+                            }
+                            WireMessage::ClipboardEnd { revision }
+                                if clipboard_enabled
+                                    && revision > remote_clipboard_revision =>
+                            {
+                                match clipboard_assembly.feed_end(revision) {
+                                    ClipboardFeed::Ready(text) => {
+                                        tracing::info!(bytes = text.len(), "peer clipboard transfer complete");
+                                        apply_inbound_clipboard(
+                                            &clipboard,
+                                            &mut latest_clipboard,
+                                            &mut remote_clipboard_revision,
+                                            revision,
+                                            text,
+                                        )?;
+                                    }
+                                    ClipboardFeed::Dropped => {
+                                        tracing::warn!(revision, "peer clipboard transfer failed validation; dropped");
+                                    }
+                                    ClipboardFeed::Pending => {}
                                 }
                             }
                             WireMessage::Pong { .. } => {}
@@ -6216,17 +6651,15 @@ async fn handle_connection(
                     }
                     text = receive_clipboard(&mut clipboard, clipboard_enabled) => match text {
                         Some(text) => {
-                            if text.len() > kvm_protocol::wire::MAX_CLIPBOARD_TEXT_BYTES {
+                            if text.len() as u64 > clipboard_max_bytes {
                                 tracing::debug!(bytes = text.len(), "skipping oversized clipboard text");
                                 continue;
                             }
                             clipboard_revision = clipboard_revision.wrapping_add(1);
-                            write_frame(
+                            send_clipboard_text(
                                 &mut send,
-                                &WireMessage::ClipboardText {
-                                    revision: clipboard_revision,
-                                    text,
-                                },
+                                clipboard_revision,
+                                text,
                             )
                             .await?;
                         }
@@ -8969,6 +9402,86 @@ mod tests {
         assert_eq!(released.event_id, 3);
         assert_eq!(snapshot.last_event_id, 3);
         assert!(snapshot.state.pressed_keys.is_empty());
+    }
+
+    #[test]
+    #[test]
+    fn clipboard_chunks_split_on_char_boundaries() {
+        // Small text is a single piece.
+        assert_eq!(split_clipboard_chunks("hello"), vec!["hello"]);
+        // Large multi-byte text splits without breaking UTF-8: every
+        // piece re-joins exactly, and no piece exceeds the wire chunk.
+        let text = "é".repeat(100_000);
+        let chunks = split_clipboard_chunks(&text);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.len() <= CLIPBOARD_CHUNK_BYTES);
+        }
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn clipboard_assembly_applies_only_byte_exact_transfers() {
+        let cap = 2 * 1024 * 1024;
+        let mut assembly = ClipboardAssembly::default();
+        // Over-cap header refused before any chunk.
+        assert!(matches!(
+            assembly.feed_start(1, cap + 1, 50, cap),
+            ClipboardFeed::Dropped
+        ));
+        // Happy path: 100KB in 3 chunks applies.
+        let text = "x".repeat(100_000);
+        let pieces = split_clipboard_chunks(&text);
+        assert!(matches!(
+            assembly.feed_start(7, text.len() as u64, pieces.len() as u32, cap),
+            ClipboardFeed::Pending
+        ));
+        for (index, piece) in pieces.iter().enumerate() {
+            assert!(matches!(
+                assembly.feed_chunk(7, index as u32, piece),
+                ClipboardFeed::Pending
+            ));
+        }
+        assert!(matches!(
+            assembly.feed_end(7),
+            ClipboardFeed::Ready(done) if done == text
+        ));
+        // Wrong index aborts.
+        assert!(matches!(
+            assembly.feed_start(8, 10, 1, cap),
+            ClipboardFeed::Pending
+        ));
+        assert!(matches!(
+            assembly.feed_chunk(8, 3, "late"),
+            ClipboardFeed::Dropped
+        ));
+        // Truncated End (bytes short of declared total) fails closed.
+        assert!(matches!(
+            assembly.feed_start(9, 10, 1, cap),
+            ClipboardFeed::Pending
+        ));
+        assert!(matches!(
+            assembly.feed_chunk(9, 0, "short"),
+            ClipboardFeed::Pending
+        ));
+        assert!(matches!(assembly.feed_end(9), ClipboardFeed::Dropped));
+        // A newer Start supersedes an open transfer.
+        assert!(matches!(
+            assembly.feed_start(10, 5, 1, cap),
+            ClipboardFeed::Pending
+        ));
+        assert!(matches!(
+            assembly.feed_start(11, 5, 1, cap),
+            ClipboardFeed::Pending
+        ));
+        assert!(matches!(
+            assembly.feed_chunk(11, 0, "hello"),
+            ClipboardFeed::Pending
+        ));
+        assert!(matches!(
+            assembly.feed_end(11),
+            ClipboardFeed::Ready(done) if done == "hello"
+        ));
     }
 
     #[test]
