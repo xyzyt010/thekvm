@@ -48,11 +48,34 @@ pub enum InputEvent {
     PinchEnd,
 }
 
+impl InputEvent {
+    /// A hold-ending event: key/button release or pinch end. Releases are
+    /// always safe to forward (releasing an unheld control is a no-op on
+    /// every platform), so teardown barriers skip everything EXCEPT these
+    /// — a barrier-dropped release strands the hold on the receiver, where
+    /// the OS auto-repeat turns it into a runaway (the WIIIIIL bug).
+    pub fn is_release(&self) -> bool {
+        matches!(
+            self,
+            InputEvent::Key(KeyEvent { pressed: false, .. })
+                | InputEvent::MouseButton { pressed: false, .. }
+                | InputEvent::PinchEnd
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyEvent {
     /// USB HID usage ID, not a Linux evdev code or a Windows virtual-key code.
     pub usage: HidUsage,
     pub pressed: bool,
+    /// Typematic repeat: a press for a usage the sender already holds
+    /// (the OS auto-repeat, not a fresh finger). Receivers that repeat
+    /// held keys natively (Linux/X11) drop repeats on held keys;
+    /// receivers that do not (Windows) re-tap them. Missing on the wire
+    /// from older peers, where it defaults to a fresh press.
+    #[serde(default)]
+    pub repeat: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -117,6 +140,49 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<InputState>(&encoded).unwrap(),
             state
+        );
+    }
+
+    #[test]
+    fn releases_bypass_barriers_but_presses_and_motion_do_not() {
+        let key = |usage, pressed| {
+            InputEvent::Key(KeyEvent {
+                usage,
+                pressed,
+                repeat: false,
+            })
+        };
+        assert!(key(0x04, false).is_release());
+        assert!(!key(0x04, true).is_release());
+        assert!(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: false,
+        }
+        .is_release());
+        assert!(!InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        }
+        .is_release());
+        assert!(InputEvent::PinchEnd.is_release());
+        assert!(!InputEvent::Pinch { delta: 10 }.is_release());
+        assert!(!InputEvent::MouseMove { dx: 1, dy: 0 }.is_release());
+        assert!(!InputEvent::Wheel(WheelDelta { x: 0, y: 1 }).is_release());
+    }
+
+    #[test]
+    fn repeat_defaults_false_for_older_peers() {
+        // Pre-repeat wire JSON has no `repeat` key: it must decode as a
+        // fresh press, never fail.
+        let event: InputEvent =
+            serde_json::from_str(r#"{"Key":{"usage":4,"pressed":true}}"#).unwrap();
+        assert_eq!(
+            event,
+            InputEvent::Key(KeyEvent {
+                usage: 4,
+                pressed: true,
+                repeat: false,
+            })
         );
     }
 }

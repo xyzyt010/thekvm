@@ -1367,6 +1367,7 @@ mod tests {
             router.route(InputEvent::Key(crate::KeyEvent {
                 usage: 0x04,
                 pressed: true,
+                repeat: false,
             })),
             RoutedEvent::Forward {
                 target: ScreenId(2),

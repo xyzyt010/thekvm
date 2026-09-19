@@ -279,7 +279,7 @@ mod linux_uinput {
                             .map_err(io_error)?;
                     }
                 }
-                InputEvent::Key(KeyEvent { usage, pressed, .. }) => {
+                InputEvent::Key(KeyEvent { usage, pressed }) => {
                     let code = hid_to_evdev(usage).ok_or_else(|| {
                         PlatformError::Uinput(format!("unsupported HID keyboard usage: {usage:#x}"))
                     })?;
@@ -308,10 +308,9 @@ mod linux_uinput {
         }
 
         /// Render one inbound pinch delta as a native two-finger touch
-        /// gesture (see UinputTouch): the parked viewport-pinch experiment
-        /// (see PINCH-ZOOM/README.md). Only used when the receiver opts in
-        /// via `THEKVM_LINUX_PINCH_VIEWPORT=1`; the default rendering is
-        /// Ctrl+wheel page zoom. `display` names the session X server for the anchor/dims
+        /// gesture (see UinputTouch): the viewport pinch a local
+        /// touchscreen pinch produces — no widget, no Ctrl, no page
+        /// zoom. `display` names the session X server for the anchor/dims
         /// query. Returns true when the event was consumed; false when
         /// touch is unavailable (the caller swallows by default, or
         /// renders legacy page zoom under its explicit opt-in).
@@ -381,7 +380,7 @@ mod linux_uinput {
         fn warn_touch_once(&mut self, message: impl Into<String>) {
             if !self.touch_warned {
                 self.touch_warned = true;
-                tracing::warn!("{}; page zoom is the default rendering (viewport touch only under THEKVM_LINUX_PINCH_VIEWPORT=1, see PINCH-ZOOM/README.md)", message.into());
+                tracing::warn!("{}; pinch gestures have no rendering (page zoom only under THEKVM_LINUX_PINCH_PAGE_ZOOM=1)", message.into());
             }
         }
 
@@ -454,10 +453,10 @@ mod linux_uinput {
     //   contacts would eat every later tap); release_all and Drop always
     //   lift.
     // - No uinput permission / no X dims / no cursor anchor degrades to
-    //   `false` (warned once): the caller renders Ctrl+wheel page zoom
-    //   by default and only reaches this touch path under the explicit
-    //   `THEKVM_LINUX_PINCH_VIEWPORT=1` opt-in (parked work, see
-    //   PINCH-ZOOM/README.md). A gesture never fails the send.
+    //   `false` (warned once): the caller then swallows by default, or
+    //   renders legacy Ctrl+wheel page zoom only under the explicit
+    //   `THEKVM_LINUX_PINCH_PAGE_ZOOM=1` opt-in. A gesture never fails
+    //   the send.
     const EV_ABS: u16 = 0x03;
     const ABS_X: u16 = 0x00;
     const ABS_Y: u16 = 0x01;
@@ -1790,7 +1789,6 @@ mod win32_inject {
                 self.send(InputEvent::Key(kvm_core::KeyEvent {
                     usage,
                     pressed: false,
-                    repeat: false,
                 }))?;
             }
             for button in buttons {

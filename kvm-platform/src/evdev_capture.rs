@@ -212,6 +212,7 @@ impl Device {
                 self.queue.push_back(InputEvent::Key(KeyEvent {
                     usage,
                     pressed: true,
+                    repeat: true,
                 }));
                 return None;
             }
@@ -219,7 +220,11 @@ impl Device {
         } else {
             self.pressed_keys.remove(&usage);
         }
-        Some(InputEvent::Key(KeyEvent { usage, pressed }))
+        Some(InputEvent::Key(KeyEvent {
+            usage,
+            pressed,
+            repeat: false,
+        }))
     }
 }
 
@@ -364,6 +369,7 @@ impl EvdevCapture {
                 self.pending_events.push_back(InputEvent::Key(KeyEvent {
                     usage: *usage,
                     pressed: false,
+                    repeat: false,
                 }));
             }
         }
@@ -379,7 +385,7 @@ impl EvdevCapture {
 
     fn accept_event(&mut self, source: usize, event: InputEvent) -> Option<InputEvent> {
         match event {
-            InputEvent::Key(KeyEvent { usage, pressed }) => {
+            InputEvent::Key(KeyEvent { usage, pressed, .. }) => {
                 if pressed {
                     self.pressed_keys.insert(usage).then_some(event)
                 } else if self

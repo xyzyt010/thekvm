@@ -682,7 +682,13 @@ mod win32_hooks {
                         .or_else(|| hid_from_vk(info.vkCode as u16));
                     if let Some(usage) = usage {
                         HOOK_KEY.fetch_add(1, Ordering::Relaxed);
-                        send(InputEvent::Key(KeyEvent { usage, pressed }));
+                        send(InputEvent::Key(KeyEvent {
+                            usage,
+                            pressed,
+                            // The LL hook carries no repeat bit; record()
+                            // tags presses-while-held as repeats.
+                            repeat: false,
+                        }));
                         if BLOCK_LOCAL.load(Ordering::Acquire) {
                             return LRESULT(1);
                         }

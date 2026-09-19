@@ -1167,6 +1167,7 @@ pub async fn send_test(address: &str, usage: u16) -> Result<()> {
             event: InputEvent::Key(kvm_core::KeyEvent {
                 usage,
                 pressed: true,
+                repeat: false,
             }),
         }),
     )
@@ -1178,6 +1179,7 @@ pub async fn send_test(address: &str, usage: u16) -> Result<()> {
             event: InputEvent::Key(kvm_core::KeyEvent {
                 usage,
                 pressed: false,
+                repeat: false,
             }),
         }),
     )
@@ -2059,10 +2061,17 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
             }
             event = priority_rx.recv() => {
                 let Some(captured) = event else { bail!("priority input capture stopped") };
-                if captured.event_id <= discarded_event_barrier
-                    || active
-                        .as_ref()
-                        .is_some_and(|session| captured.event_id <= session.event_barrier)
+                // Releases bypass teardown barriers (see is_release): a
+                // barrier-dropped key/button release strands the hold on
+                // the receiver, where OS auto-repeat turns it into a
+                // runaway. Releasing an unheld control is a no-op
+                // everywhere, so a stale release is harmless while a
+                // dropped one is a stuck key.
+                if !captured.event.is_release()
+                    && (captured.event_id <= discarded_event_barrier
+                        || active
+                            .as_ref()
+                            .is_some_and(|session| captured.event_id <= session.event_barrier))
                 {
                     continue;
                 }
@@ -2181,10 +2190,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         captured.event = InputEvent::SmoothWheel { x, y };
                     }
                 }
-                if captured.event_id <= discarded_event_barrier
-                    || active
-                        .as_ref()
-                        .is_some_and(|session| captured.event_id <= session.event_barrier)
+                // Releases bypass teardown barriers (see the priority arm
+                // above): same stuck-hold reasoning, same harmless
+                // stale-release no-op.
+                if !captured.event.is_release()
+                    && (captured.event_id <= discarded_event_barrier
+                        || active
+                            .as_ref()
+                            .is_some_and(|session| captured.event_id <= session.event_barrier))
                 {
                     continue;
                 }
@@ -4842,7 +4855,17 @@ struct CapturedState {
     last_event_id: u64,
     keys: std::collections::BTreeSet<HidUsage>,
     buttons: std::collections::BTreeSet<MouseButton>,
+    /// Last time a typematic repeat was RECORDED per usage (see record):
+    /// the repeat throttle reads this, so floods collapse here instead of
+    /// in the bounded channel behind a future release.
+    last_repeat: std::collections::HashMap<HidUsage, std::time::Instant>,
 }
+
+/// Fastest typematic rate any OS produces (~30/s on Windows): repeats
+/// inside this window of the last recorded one are the same finger, and
+/// the receiver already holds the key — dropping them here keeps the
+/// bounded channel shallow so releases never queue behind a flood.
+const REPEAT_THROTTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(33);
 
 impl CapturedState {
     /// Fresh event id for unrecorded pass-through events (raw `Pinch` on
@@ -4855,27 +4878,64 @@ impl CapturedState {
     }
 
     fn record(&mut self, event: InputEvent) -> Option<CapturedEvent> {
-        let changed = match event {
+        let mut event = event;
+        let changed = match &mut event {
             InputEvent::Key(key) => {
                 if key.pressed {
-                    // Typematic repeats arrive as duplicate presses: they
-                    // MUST reach the receiver (Windows does not auto-repeat
-                    // injected holds, so the receiver re-taps them; Linux
-                    // skips re-presses on held keys and repeats natively).
-                    // Dropping them here is what made held keys emit one
-                    // char remotely. Buttons have no repeat and stay
-                    // deduped below.
+                    if self.keys.contains(&key.usage) {
+                        // Typematic repeat (press while already held): tag
+                        // it so receivers can tell a live hold from a
+                        // stranded one, and throttle to the fastest real
+                        // typematic rate — a held key otherwise queues one
+                        // QUIC frame + flush per OS tick, and under flood
+                        // the key's own release waits behind its repeats
+                        // (the mid-sentence WIIIIIL: native auto-repeat
+                        // runs while the release is still queued).
+                        key.repeat = true;
+                        let now = std::time::Instant::now();
+                        if self
+                            .last_repeat
+                            .get(&key.usage)
+                            .is_some_and(|at| now.duration_since(*at) < REPEAT_THROTTLE_WINDOW)
+                        {
+                            return None;
+                        }
+                        self.last_repeat.insert(key.usage, now);
+                    } else {
+                        // Fresh press: not a repeat, and any stale
+                        // throttle stamp from an older hold must not
+                        // swallow the new hold's first repeats. Force
+                        // the flag canonical (capture input never
+                        // sets it).
+                        key.repeat = false;
+                        self.last_repeat.remove(&key.usage);
+                    }
+                    // Repeats MUST reach the receiver at the throttled
+                    // rate (Windows does not auto-repeat injected holds,
+                    // so the receiver re-taps them; Linux skips re-presses
+                    // on held keys and repeats natively). Dropping them
+                    // here is what made held keys emit one char remotely.
+                    // Buttons have no repeat and stay deduped below.
                     self.keys.insert(key.usage);
                     true
                 } else {
-                    self.keys.remove(&key.usage)
+                    self.last_repeat.remove(&key.usage);
+                    if !self.keys.remove(&key.usage) {
+                        // Press was never recorded (capture armed
+                        // mid-hold): the receiver never held it either,
+                        // so there is nothing to release.
+                        return None;
+                    }
+                    // Releases are never repeats.
+                    key.repeat = false;
+                    true
                 }
             }
             InputEvent::MouseButton { button, pressed } => {
-                if pressed {
-                    self.buttons.insert(button)
+                if *pressed {
+                    self.buttons.insert(*button)
                 } else {
-                    self.buttons.remove(&button)
+                    self.buttons.remove(button)
                 }
             }
             InputEvent::MouseMove { .. }
@@ -4954,6 +5014,9 @@ fn pinch_expansion(
                 out.push(InputEvent::Key(kvm_core::KeyEvent {
                     usage: HID_LEFT_CTRL,
                     pressed: true,
+                    // Synthetic gesture modifier, not typematic: never
+                    // marked repeat, never throttled in record().
+                    repeat: false,
                 }));
             }
             if delta != 0 {
@@ -4967,6 +5030,7 @@ fn pinch_expansion(
                 vec![InputEvent::Key(kvm_core::KeyEvent {
                     usage: HID_LEFT_CTRL,
                     pressed: false,
+                    repeat: false,
                 })]
             } else {
                 Vec::new()
@@ -5072,7 +5136,9 @@ async fn run_capture_stream(
         tokio::select! {
             biased;
             event = priority_rx.recv() => match event {
-                Some(captured) if captured.event_id <= event_barrier => continue,
+                // Releases bypass the barrier (see is_release): a dropped
+                // release strands the hold on the receiver.
+                Some(captured) if captured.event_id <= event_barrier && !captured.event.is_release() => continue,
                 Some(captured) => {
                     // Drive-task heartbeat (see TASK_HEARTBEAT_MS).
                     stamp_task_heartbeat();
@@ -5112,7 +5178,7 @@ async fn run_capture_stream(
                 None => break Err(anyhow::anyhow!("priority input capture stopped")),
             },
             event = motion_rx.recv() => match event {
-                Some(captured) if captured.event_id <= event_barrier => continue,
+                Some(captured) if captured.event_id <= event_barrier && !captured.event.is_release() => continue,
                 Some(captured) => {
                     // Drive-task heartbeat (see TASK_HEARTBEAT_MS).
                     stamp_task_heartbeat();
@@ -6414,14 +6480,13 @@ async fn handle_connection(
 /// the cursor, no layout reflow, no zoom badge in the address bar, nothing
 /// persisted per site). `THEKVM_WHEEL_PINCH=1` on the receiver forces the
 /// old Ctrl+wheel page-zoom rendering for comparison. On Linux the gesture
-/// renders through our own virtual touchscreen (two contacts spreading
-/// around the cursor — the same native gesture a local touchscreen pinch
-/// produces, so Chromium's own recognizer viewport-zooms with no widget,
-/// no compositor support, no browser involvement). There is deliberately
-/// NO page-zoom fallback on the gesture path: a failed touch frame
-/// swallows (warned once), so browsers never see a synthetic Ctrl+wheel
-/// from a trackpad pinch; `THEKVM_LINUX_PINCH_PAGE_ZOOM=1` restores the
-/// legacy Ctrl+wheel rendering where it is explicitly wanted.
+/// renders as Ctrl+wheel page zoom by default (browser-native layout zoom
+/// at the cursor, normal sensitivity, no widget). The experimental virtual
+/// touchscreen viewport rendering (see PINCH-ZOOM/README.md) runs only
+/// under the explicit opt-in `THEKVM_LINUX_PINCH_VIEWPORT=1` (parked work:
+/// see PINCH-ZOOM/README.md). When the opt-in touch frame fails, the
+/// gesture falls through to page zoom rather than swallowing, so a pinch
+/// never dies silently.
 /// `display` is the receiver's session X display (see receiver_display):
 /// a headless service has none of its own, and without it the anchor
 /// query fails closed into the swallow. True HID-level trackpad
@@ -6441,26 +6506,26 @@ fn handle_inbound_pinch(
             return injector.send(event);
         }
     }
-    // Native touch first: consumed events never reach the Ctrl+wheel
-    // expansion below, so the two renderings never mix inside one
-    // gesture. FreeBSD keeps the legacy page-zoom rendering (no touch
-    // channel there) — only Linux swallows by default.
+    // Page zoom is the default: only the explicit viewport opt-in tries
+    // native touch first, and a failed touch frame falls through to the
+    // Ctrl+wheel expansion below (never a silent swallow). The two
+    // renderings never mix inside one working gesture: a consumed touch
+    // frame returns early. FreeBSD keeps page zoom (no touch channel).
     #[cfg(not(target_os = "windows"))]
     match event {
         InputEvent::Pinch { delta } => {
-            if injector.inject_pinch(delta, display) {
-                return Ok(());
-            }
             #[cfg(target_os = "linux")]
-            if std::env::var("THEKVM_LINUX_PINCH_PAGE_ZOOM").as_deref() != Ok("1") {
+            if std::env::var("THEKVM_LINUX_PINCH_VIEWPORT").as_deref() == Ok("1")
+                && injector.inject_pinch(delta, display)
+            {
                 return Ok(());
             }
         }
         InputEvent::PinchEnd => {
             injector.end_pinch();
             // A touch gesture holds no synthetic Ctrl, so the expansion
-            // below only releases one if the opt-in fallback path held
-            // it — exactly like the sender-side legacy gesture.
+            // below only releases one if the page-zoom path held it —
+            // exactly like the sender-side legacy gesture.
         }
         _ => {}
     }
@@ -6975,6 +7040,9 @@ impl ReceiverInjector {
             self.send(InputEvent::Key(kvm_core::KeyEvent {
                 usage: *usage,
                 pressed: true,
+                // State restore, not typematic: a fresh press the
+                // receiver must hold (repeats follow on the wire).
+                repeat: false,
             }))?;
         }
         for button in &state.pressed_buttons {
@@ -7184,7 +7252,7 @@ const SCROLL_LOCK_USAGE: u16 = 0x47;
 fn is_scroll_lock_press(event: &kvm_core::InputEvent) -> bool {
     matches!(
         event,
-        kvm_core::InputEvent::Key(kvm_core::KeyEvent { usage, pressed: true })
+        kvm_core::InputEvent::Key(kvm_core::KeyEvent { usage, pressed: true, .. })
             if *usage == SCROLL_LOCK_USAGE
     )
 }
@@ -8582,7 +8650,8 @@ mod tests {
             vec![
                 InputEvent::Key(KeyEvent {
                     usage: HID_LEFT_CTRL,
-                    pressed: true
+                    pressed: true,
+                    repeat: false,
                 }),
                 InputEvent::SmoothWheel { x: 0, y: 240 },
             ]
@@ -8593,7 +8662,8 @@ mod tests {
             out,
             vec![InputEvent::Key(KeyEvent {
                 usage: HID_LEFT_CTRL,
-                pressed: false
+                pressed: false,
+                repeat: false,
             })]
         );
         // Non-gestures pass through on both paths.
@@ -8601,6 +8671,7 @@ mod tests {
         let key = InputEvent::Key(KeyEvent {
             usage: 0x04,
             pressed: true,
+            repeat: false,
         });
         assert_eq!(pinch_for_send(key, true, false, &mut held), vec![key]);
         assert_eq!(pinch_for_send(key, false, false, &mut held), vec![key]);
@@ -8675,10 +8746,12 @@ mod tests {
         let ctrl_down = InputEvent::Key(KeyEvent {
             usage: HID_LEFT_CTRL,
             pressed: true,
+            repeat: false,
         });
         let ctrl_up = InputEvent::Key(KeyEvent {
             usage: HID_LEFT_CTRL,
             pressed: false,
+            repeat: false,
         });
         // Gesture start: synthetic Ctrl down, then the wheel.
         let mut held = false;
@@ -8798,14 +8871,17 @@ mod tests {
         assert!(is_scroll_lock_press(&InputEvent::Key(KeyEvent {
             usage: SCROLL_LOCK_USAGE,
             pressed: true,
+            repeat: false,
         })));
         assert!(!is_scroll_lock_press(&InputEvent::Key(KeyEvent {
             usage: SCROLL_LOCK_USAGE,
             pressed: false,
+            repeat: false,
         })));
         assert!(!is_scroll_lock_press(&InputEvent::Key(KeyEvent {
             usage: 0x04,
             pressed: true,
+            repeat: false,
         })));
         assert!(!is_scroll_lock_press(&InputEvent::MouseMove {
             dx: 1,
@@ -8873,6 +8949,7 @@ mod tests {
             .record(InputEvent::Key(kvm_core::KeyEvent {
                 usage: 0xe0,
                 pressed: true,
+                repeat: false,
             }))
             .unwrap();
         let motion = captured
@@ -8882,6 +8959,7 @@ mod tests {
             .record(InputEvent::Key(kvm_core::KeyEvent {
                 usage: 0xe0,
                 pressed: false,
+                repeat: false,
             }))
             .unwrap();
         let snapshot = captured.snapshot();
@@ -8894,27 +8972,64 @@ mod tests {
     }
 
     #[test]
-    fn capture_state_forwards_key_repeats_but_dedupes_buttons() {
+    fn capture_state_tags_and_throttles_key_repeats_but_dedupes_buttons() {
+        use kvm_core::KeyEvent;
         let mut captured = CapturedState::default();
-        let key = InputEvent::Key(kvm_core::KeyEvent {
-            usage: 0x04,
-            pressed: true,
-        });
-        // First press plus two typematic repeats: all three must reach
-        // the receiver (Windows re-taps repeats; Linux skips held keys).
-        assert!(captured.record(key).is_some());
-        assert!(captured.record(key).is_some());
-        assert!(captured.record(key).is_some());
-        assert!(captured
+        let press = || {
+            InputEvent::Key(kvm_core::KeyEvent {
+                usage: 0x04,
+                pressed: true,
+                repeat: false,
+            })
+        };
+        // Fresh press flows untagged.
+        let first = captured.record(press()).unwrap();
+        assert!(matches!(
+            first.event,
+            InputEvent::Key(KeyEvent {
+                pressed: true,
+                repeat: false,
+                ..
+            })
+        ));
+        // First typematic repeat flows TAGGED (Windows re-taps it; Linux
+        // drops it on the held key and repeats natively).
+        let second = captured.record(press()).unwrap();
+        assert!(matches!(
+            second.event,
+            InputEvent::Key(KeyEvent {
+                pressed: true,
+                repeat: true,
+                ..
+            })
+        ));
+        // An immediate second repeat is the same finger inside the
+        // throttle window: collapsed here so the release never queues
+        // behind its own flood (the WIIIIIL shape).
+        assert!(captured.record(press()).is_none());
+        std::thread::sleep(REPEAT_THROTTLE_WINDOW + std::time::Duration::from_millis(10));
+        assert!(captured.record(press()).is_some());
+        // Release flows untagged; a duplicate release is nothing.
+        let release = captured
             .record(InputEvent::Key(kvm_core::KeyEvent {
                 usage: 0x04,
                 pressed: false,
+                repeat: false,
             }))
-            .is_some());
+            .unwrap();
+        assert!(matches!(
+            release.event,
+            InputEvent::Key(KeyEvent {
+                pressed: false,
+                repeat: false,
+                ..
+            })
+        ));
         assert!(captured
             .record(InputEvent::Key(kvm_core::KeyEvent {
                 usage: 0x04,
                 pressed: false,
+                repeat: false,
             }))
             .is_none());
 

@@ -503,6 +503,7 @@ mod tests {
             event: InputEvent::Key(KeyEvent {
                 usage: 0x04,
                 pressed: true,
+                repeat: false,
             }),
         });
         let sender = tokio::spawn(async move {
@@ -857,6 +858,7 @@ mod tests {
             event: InputEvent::Key(KeyEvent {
                 usage: 0x04,
                 pressed: true,
+                repeat: false,
             }),
         })
         .is_err());
