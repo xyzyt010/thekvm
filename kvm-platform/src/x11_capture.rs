@@ -634,6 +634,9 @@ impl X11Capture {
         Some(InputEvent::Key(KeyEvent {
             usage,
             pressed: true,
+            // Synthetic hold repeat by construction (see due_repeat):
+            // tagged so the wire tells live holds from stranded ones.
+            repeat: true,
         }))
     }
 
@@ -1037,8 +1040,15 @@ impl Drop for X11Capture {
 fn key_event(detail: u32, pressed: bool) -> Option<InputEvent> {
     let keycode = u8::try_from(detail).ok()?;
     let evdev_code = keycode.checked_sub(8)?;
-    crate::evdev_capture::hid_from_evdev(u16::from(evdev_code))
-        .map(|usage| InputEvent::Key(KeyEvent { usage, pressed }))
+    crate::evdev_capture::hid_from_evdev(u16::from(evdev_code)).map(|usage| {
+        InputEvent::Key(KeyEvent {
+            usage,
+            pressed,
+            // Raw X11 carries no repeat flag; record() tags
+            // presses-while-held as repeats.
+            repeat: false,
+        })
+    })
 }
 
 fn raw_mask() -> u32 {
@@ -1485,6 +1495,7 @@ mod tests {
             Some(InputEvent::Key(KeyEvent {
                 usage: 0x04,
                 pressed: true,
+                repeat: false,
             }))
         );
         assert_eq!(key_event(7, true), None);

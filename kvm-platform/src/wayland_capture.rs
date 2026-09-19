@@ -270,8 +270,13 @@ fn translate_event(event: Event, accumulator: &mut EventAccumulator) -> Option<I
                 1 => true,
                 _ => return None,
             };
-            crate::evdev_capture::hid_from_evdev(key as u16)
-                .map(|usage| InputEvent::Key(KeyEvent { usage, pressed }))
+            crate::evdev_capture::hid_from_evdev(key as u16).map(|usage| {
+                InputEvent::Key(KeyEvent {
+                    usage,
+                    pressed,
+                    repeat: false,
+                })
+            })
         }
         Event::Keyboard(KeyboardEvent::Modifiers { .. }) => None,
         Event::Pointer(PointerEvent::Motion { dx, dy, .. }) => {
@@ -348,6 +353,7 @@ mod tests {
             Some(InputEvent::Key(KeyEvent {
                 usage: 0x04,
                 pressed: true,
+                repeat: false,
             }))
         );
         assert_eq!(

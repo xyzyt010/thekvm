@@ -847,18 +847,25 @@ mod tests {
         let expected = InputEvent::Key(KeyEvent {
             usage: 0x2a,
             pressed: true,
+            repeat: false,
+        });
+        let expected_repeat = InputEvent::Key(KeyEvent {
+            usage: 0x2a,
+            pressed: true,
+            repeat: true,
         });
         assert_eq!(device.process(key(1)), vec![expected]);
         // Repeats take the direct queue path, leaving process output empty.
         assert!(device.process(key(2)).is_empty());
         assert!(device.process(key(2)).is_empty());
-        assert_eq!(device.queue.pop_front(), Some(expected));
-        assert_eq!(device.queue.pop_front(), Some(expected));
+        assert_eq!(device.queue.pop_front(), Some(expected_repeat));
+        assert_eq!(device.queue.pop_front(), Some(expected_repeat));
         assert_eq!(
             device.process(key(0)),
             vec![InputEvent::Key(KeyEvent {
                 usage: 0x2a,
-                pressed: false
+                pressed: false,
+                repeat: false,
             })]
         );
     }
@@ -963,7 +970,8 @@ mod tests {
             vec![
                 InputEvent::Key(KeyEvent {
                     usage: 0x04,
-                    pressed: false
+                    pressed: false,
+                    repeat: false,
                 }),
                 InputEvent::MouseButton {
                     button: MouseButton::Left,
@@ -987,6 +995,7 @@ mod tests {
         let key = InputEvent::Key(KeyEvent {
             usage: 0x04,
             pressed: true,
+            repeat: false,
         });
         capture.devices[0].pressed_keys.insert(0x04);
         assert_eq!(capture.accept_event(0, key), Some(key));
@@ -996,6 +1005,7 @@ mod tests {
         let release = InputEvent::Key(KeyEvent {
             usage: 0x04,
             pressed: false,
+            repeat: false,
         });
         capture.devices[0].pressed_keys.remove(&0x04);
         assert_eq!(capture.accept_event(0, release), None);
