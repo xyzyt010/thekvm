@@ -3357,6 +3357,7 @@ name = "kvm-ui"
 version = "0.9.49"
 dependencies = [
  "anyhow",
+ "gtk",
  "kvm-core",
  "kvm-protocol",
  "qrcode",

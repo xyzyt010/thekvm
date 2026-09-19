@@ -26,8 +26,23 @@ pub enum TrayCommand {
 
 /// Build the tray icon + menu and pump its events on a background thread.
 /// Returns the command channel, or None when no system tray is available
-/// (the app keeps working window-only).
+/// (the app keeps working window-only). Never panics: a tray backend that
+/// cannot initialize (no GTK display, no watcher) degrades to window-only
+/// instead of taking the whole UI down.
 pub fn spawn_tray() -> Option<Receiver<TrayCommand>> {
+    // libappindicator's menu backend needs GTK initialized before the
+    // first Menu exists; Slint's own backend never does that for us.
+    // Idempotent and display-safe (no main loop taken).
+    #[cfg(target_os = "linux")]
+    {
+        if gtk::init().is_err() {
+            return None;
+        }
+    }
+    std::panic::catch_unwind(build_tray).ok()?
+}
+
+fn build_tray() -> Option<Receiver<TrayCommand>> {
     let (tx, rx) = channel::<TrayCommand>();
     let menu = Menu::new();
     let show = MenuItem::new("Show TheKVM", true, None);
