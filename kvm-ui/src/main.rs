@@ -4,6 +4,8 @@
 
 slint::include_modules!();
 
+mod tray;
+
 use anyhow::{Context, Result};
 use kvm_core::{EdgeMode, Mode};
 use kvm_protocol::control::{
@@ -221,7 +223,6 @@ fn main() -> Result<()> {
     let poll_weak = weak.clone();
     std::thread::spawn(move || {
         let weak = poll_weak;
-        let mut tick: u64 = 0;
         let mut consecutive_failures: u32 = 0;
         let mut was_failing = false;
         ui_log("poll thread started");
@@ -238,8 +239,6 @@ fn main() -> Result<()> {
             // One panicking iteration must never kill the whole poll thread:
             // catch it, log it, count it as a failure, keep polling.
             let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tick += 1;
-                set_poll_count(&weak, tick);
                 match control_request(ControlRequest::Status) {
                     Ok(ControlResponse::Status(status)) => {
                         // Make every success transition provable in ui.log: a poll
@@ -708,26 +707,7 @@ fn main() -> Result<()> {
 
     let _weak = ui.as_weak();
     ui.on_open_log_folder(move || {
-        let dir = data_dir();
-        ui_log("log folder opened from Settings");
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("explorer.exe")
-                .arg(dir)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let _ = std::process::Command::new("xdg-open")
-                .arg(dir)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
+        open_log_folder();
     });
 
     let weak = ui.as_weak();
@@ -1201,35 +1181,71 @@ fn main() -> Result<()> {
         });
     });
 
-    // Close == Disconnect: window close bans the link epoch and kills
-    // the supervised child. Rust does NOT kill Child on drop, so without
-    // this a closed UI orphans a live `kvm-daemon connect` that keeps
-    // driving the peer with nobody watching — on Mint that froze the
-    // machine (its dial-back kept driving a Windows service whose app
-    // was gone, holding input suppression with no way back except a
-    // manual Disconnect). No UI calls here: the event loop is going
-    // away, so this only touches the child, the daemon, and the log.
+    // System tray (best effort): right-click menu with Show, Open logs,
+    // and Quit. Quit is the ONLY full terminate (link banned both sides,
+    // supervised child killed, UI-spawned user daemon killed, exit).
+    // Without a tray the app stays window-only and close still hides
+    // nothing — the fallback keeps the old exit-on-close.
+    let tray_commands = tray::spawn_tray();
+    let tray_alive = tray_commands.is_some();
+    if !tray_alive {
+        ui_log("no system tray available; running window-only");
+    }
+    if let Some(rx) = tray_commands {
+        let watch_weak = ui.as_weak();
+        let watch_session = session.clone();
+        std::thread::Builder::new()
+            .name("thekvm-tray-commands".into())
+            .spawn(move || {
+                for command in rx {
+                    match command {
+                        tray::TrayCommand::Show => {
+                            let weak = watch_weak.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = weak.upgrade() {
+                                    let _ = ui.window().show();
+                                }
+                            });
+                        }
+                        tray::TrayCommand::OpenLogs => open_log_folder(),
+                        tray::TrayCommand::Quit => quit_full_terminate(&watch_session),
+                    }
+                }
+            })
+            .ok();
+    }
+
+    // Close hides to the tray (the link keeps running); tray Quit is the
+    // full terminate. Window-only fallback (no tray): keep the old
+    // exit-on-close so a closed window can never orphan a live child.
     {
         let close_session = session.clone();
         ui.window().on_close_requested(move || {
-            if let Ok(mut slot) = close_session.lock() {
-                if let Some(mut session) = slot.take() {
-                    if let Some(link_id) = session.link_id {
-                        end_link(link_id);
+            if !tray_alive {
+                if let Ok(mut slot) = close_session.lock() {
+                    if let Some(mut session) = slot.take() {
+                        if let Some(link_id) = session.link_id {
+                            end_link(link_id);
+                        }
+                        ui_log(&format!(
+                            "app closing; stopped supervised child for {}",
+                            session.address
+                        ));
+                        // SIGKILL-equivalent: cannot be ignored, so no orphan
+                        // survives this. try_wait reaps if already dead
+                        // without ever blocking the exit; init reaps the rest.
+                        let _ = session.child.kill();
+                        let _ = session.child.try_wait();
                     }
-                    ui_log(&format!(
-                        "app closing; stopped supervised child for {}",
-                        session.address
-                    ));
-                    // SIGKILL-equivalent: cannot be ignored, so no orphan
-                    // survives this. try_wait reaps if already dead without
-                    // ever blocking the exit; init reaps the rest.
-                    let _ = session.child.kill();
-                    let _ = session.child.try_wait();
                 }
+                kill_user_daemon();
+                ui_log("app closing");
+                std::process::exit(0);
             }
-            ui_log("app closing");
-            std::process::exit(0);
+            ui_log(
+                "window closed to the tray; the link keeps running (tray Quit stops everything)",
+            );
+            slint::CloseRequestResponse::HideWindow
         });
     }
 
@@ -1367,6 +1383,9 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                 ui.set_lock_screen_control(status.allow_lock_screen_control);
                 ui.set_clipboard_enabled(status.clipboard_enabled);
                 ui.set_clipboard_max_mb(SharedString::from(status.clipboard_max_mb.to_string()));
+                // Tray tooltip stays static ("TheKVM"): the TrayIcon is
+                // owned by its pump thread (neither Send nor Sync), so
+                // live status lives in the window, not the tooltip.
                 ui.set_device_name(SharedString::from(status.node_name));
                 ui.set_auto_connect_address(SharedString::from(
                     status.auto_connect_address.unwrap_or_default(),
@@ -3309,7 +3328,8 @@ fn ensure_user_daemon() -> Result<()> {
     }
     command
         .spawn()
-        .with_context(|| format!("start {}", binary.display()))?;
+        .with_context(|| format!("start {}", binary.display()))
+        .map(track_user_daemon)?;
     Ok(())
 }
 
@@ -3345,8 +3365,115 @@ fn systemctl_unit_present(unit: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Show this machine's LAN address even while the daemon is unreachable; it
-/// is needed to tell the peer operator what to type.
+/// Open the user state dir (ui.log lives here) in the OS file manager.
+/// Shared by the Settings button and the tray menu so both paths behave
+/// identically.
+fn open_log_folder() {
+    let dir = data_dir();
+    ui_log("log folder opened");
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
+/// UI-spawned user-session daemon, tracked so tray Quit can kill the whole
+/// tree. The installed system service (thekvmd / TheKVM) is deliberately
+/// NOT tracked here: Quit stops everything the APP started, never the
+/// machine's service.
+static USER_DAEMON: std::sync::OnceLock<std::sync::Mutex<Option<std::process::Child>>> =
+    std::sync::OnceLock::new();
+
+/// Remember a UI-spawned user daemon, replacing a dead previous one. A
+/// live previous daemon means control should have worked and this spawn
+/// is redundant — but a second user daemon fights over the port, so the
+/// newcomer is dropped and the tracked one kept.
+fn track_user_daemon(child: std::process::Child) {
+    let slot = USER_DAEMON.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        if let Some(previous) = guard.as_mut() {
+            if previous.try_wait().ok().flatten().is_none() {
+                drop(child);
+                return;
+            }
+        }
+        *guard = Some(child);
+    }
+}
+
+/// Kill the UI-spawned user daemon, if any. Never touches the system
+/// service. Best effort: Quit must exit even if the kill fails.
+fn kill_user_daemon() {
+    if let Some(slot) = USER_DAEMON.get() {
+        if let Ok(mut guard) = slot.lock() {
+            if let Some(mut child) = guard.take() {
+                ui_log("tray quit: stopping the UI-spawned user daemon");
+                let _ = child.kill();
+                let _ = child.try_wait();
+            }
+        }
+    }
+}
+
+/// Tray Quit: fully terminate the app. Bans our epoch plus every live
+/// inbound epoch and notifies the peer (same bilateral hangup as
+/// Disconnect, so their side drops too), kills the supervised child,
+/// kills the UI-spawned user daemon, and exits. The installed system
+/// service keeps running — it belongs to the machine, not the app.
+/// Runs on the tray watcher thread; nothing here touches the UI.
+fn quit_full_terminate(session: &Arc<Mutex<Option<Session>>>) {
+    ui_log("tray quit: terminating the app fully");
+    let (address, link_id) = session
+        .lock()
+        .ok()
+        .and_then(|mut slot| {
+            slot.take().map(|mut child_session| {
+                let _ = child_session.child.kill();
+                let _ = child_session.child.try_wait();
+                (child_session.address, child_session.link_id)
+            })
+        })
+        .unwrap_or_default();
+    if let Some(link_id) = link_id {
+        end_link(link_id);
+    }
+    if !address.is_empty() {
+        if let Some(fingerprint) = fingerprint_for_address(&data_dir(), &address) {
+            notify_peer_ended(&fingerprint, link_id);
+        }
+    }
+    // Hang up links we never dialed (same bilateral rule as
+    // Disconnect): ban each live epoch, notify its peer, drop it.
+    if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
+        for link in &status.sessions {
+            if let Some(link_id) = link.link_id {
+                end_link(link_id);
+            }
+            notify_peer_ended(&link.fingerprint_hex, link.link_id);
+            let _ = control_request(ControlRequest::DropSession {
+                fingerprint_hex: link.fingerprint_hex.clone(),
+            });
+        }
+    }
+    kill_user_daemon();
+    ui_log("tray quit: exit");
+    std::process::exit(0);
+}
+
 /// Append a timestamped line to the UI log beside the user state. The UI
 /// never shows a console, so this file is the ground truth when something
 /// looks dead: every poll failure, role change, and session event lands
@@ -3393,17 +3520,6 @@ fn grant_daemon_x_access() {
             ));
         }
     }
-}
-
-fn set_poll_count(weak: &slint::Weak<AppWindow>, count: u64) {
-    let _ = slint::invoke_from_event_loop({
-        let weak = weak.clone();
-        move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.set_poll_count(count as i32);
-            }
-        }
-    });
 }
 
 fn set_local_address_direct(weak: &slint::Weak<AppWindow>) {

@@ -68,29 +68,30 @@ if [ ! -x "$RELEASE_DIR/kvm-daemon" ]; then
     exit 1
 fi
 
-# The desktop UI needs the system font stack. Install it automatically when a
-# supported package manager is available; pass --no-dependencies to skip.
+# The desktop UI needs the system font stack plus the tray indicator
+# runtime. Install them automatically when a supported package manager is
+# available; pass --no-dependencies to skip.
 if [ -z "${SKIP_DEPENDENCIES:-}" ] && [ -x "$RELEASE_DIR/kvm-ui" ]; then
     if [ -e /etc/debian_version ] && command -v apt-get >/dev/null 2>&1; then
         echo "installing UI dependencies with apt-get..."
-        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y libfontconfig1
+        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y libfontconfig1 libayatana-appindicator3-1
     elif command -v dnf >/dev/null 2>&1; then
         echo "installing UI dependencies with dnf..."
-        dnf install -y fontconfig
+        dnf install -y fontconfig libappindicator-gtk3
     elif command -v yum >/dev/null 2>&1; then
         echo "installing UI dependencies with yum..."
-        yum install -y fontconfig
+        yum install -y fontconfig libappindicator-gtk3
     elif command -v pacman >/dev/null 2>&1; then
         echo "installing UI dependencies with pacman..."
-        pacman -Sy --noconfirm fontconfig
+        pacman -Sy --noconfirm fontconfig libappindicator-gtk3
     elif command -v zypper >/dev/null 2>&1; then
         echo "installing UI dependencies with zypper..."
-        zypper install -y fontconfig
+        zypper install -y fontconfig libappindicator-gtk3
     elif command -v apk >/dev/null 2>&1; then
         echo "installing UI dependencies with apk..."
-        apk add fontconfig
+        apk add fontconfig libappindicator
     else
-        echo "warning: no supported package manager found; install the 'fontconfig' system package manually or the UI cannot start" >&2
+        echo "warning: no supported package manager found; install the 'fontconfig' and tray-indicator system packages manually or the UI cannot start" >&2
     fi
 fi
 

@@ -12,6 +12,7 @@ kvm-core = { path = "../kvm-core" }
 kvm-protocol = { path = "../kvm-protocol" }
 qrcode = "0.14"
 slint = "1.8"
+tray-icon = "0.2"
 tokio = { workspace = true }
 quinn = { workspace = true }
 rustls-pki-types = "1"

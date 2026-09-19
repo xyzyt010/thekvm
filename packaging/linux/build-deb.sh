@@ -130,7 +130,7 @@ Version: $VER
 Section: net
 Priority: optional
 Architecture: amd64
-Depends: libfontconfig1 (>= 2.13)
+Depends: libfontconfig1 (>= 2.13), libayatana-appindicator3-1 | libappindicator3-1
 Maintainer: TheKVM project
 Homepage: https://github.com/xyzyt010/thekvm
 Description: Cross-OS software KVM over QUIC

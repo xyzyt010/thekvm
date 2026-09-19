@@ -37,7 +37,6 @@ export component AppWindow inherits Window {
     // Taskbar/dock alert: set while an incoming pairing waits, so a
     // minimized window still announces the request.
     in property <string> title-alert: "";
-    in property <int> poll-count: 0;
     in-out property <string> layout-path: "";
     in-out property <string> peer-address: "";
     in-out property <string> pair-code: "";
@@ -668,12 +667,6 @@ export component AppWindow inherits Window {
                     Text { text: "This computer's fingerprint:"; color: #9ca3af; font-size: 12px; }
                     Text { text: fingerprint; color: #ef4444; font-size: 12px; }
                     Rectangle { height: 1px; background: #262626; }
-                    Text {
-                        text: "Background updates: " + poll-count + " (grows every few seconds while the app talks to its background service)";
-                        color: #6b7280;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
                     Button {
                         text: "Open log folder";
                         clicked => { open-log-folder(); }
