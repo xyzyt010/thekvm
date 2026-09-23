@@ -32,6 +32,7 @@ export component AppWindow inherits Window {
     in-out property <string> clipboard-max-mb: "2";
     in-out property <int> mode-index: 0;
     in-out property <int> edge-mode-index: 0;
+    in-out property <int> transport-index: 0;
     in property <string> role-text: "Both ways";
     in property <string> app-version: "";
     // Taskbar/dock alert: set while an incoming pairing waits, so a
@@ -54,6 +55,7 @@ export component AppWindow inherits Window {
     callback disconnect();
     callback set-role(int /* 0 both, 1 controller, 2 receiver */);
     callback set-edge-mode(int /* 0 single facing edge, 1 double horizontal edges */);
+    callback set-transport(int /* 0 QUIC, 1 UDP */);
     callback pair-from-invite(string /* invite */);
     callback discover-lan();
     callback start-daemon();
@@ -65,7 +67,7 @@ export component AppWindow inherits Window {
     callback place-peer-left();
     callback place-peer-right();
     callback open-log-folder();
-    callback apply-config(bool, int, string, string, bool, string);
+    callback apply-config(bool, int, string, string, bool, string, int);
     callback import-layout(string);
 
 
@@ -174,7 +176,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text {
-                        text: mode-index == 1 ? "Control other only: your keyboard, mouse and touchpad (including two-finger scroll) drive the other computer past any edge. The other computer cannot drive this one — pick Both ways for two-way control." : mode-index == 2 ? "Be controlled only: the other computer drives this keyboard and mouse past any edge. This computer cannot dial out or drive back — pick Both ways for two-way control." : "Both ways: either computer drives the other past any edge — push to take control, push back to return. Both stay usable.";
+                        text: mode-index == 1 ? "Control other only: this computer drives the peer. The peer cannot drive back." : mode-index == 2 ? "Be controlled only: the peer drives this computer. This computer cannot drive back." : "Both ways: either computer can drive the other.";
                         color: #9ca3af;
                         font-size: 12px;
                         wrap: word-wrap;
@@ -206,7 +208,7 @@ export component AppWindow inherits Window {
                         spacing: 12px;
                         code-field := LineEdit {
                             text <=> root.pair-code;
-                            placeholder-text: "6-digit code shown on the other computer (recommended — skips its popup)";
+                            placeholder-text: "6-digit code from the other computer (optional)";
                             enabled: !session-active;
                         }
                     }
@@ -218,7 +220,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 1px; background: #262626; }
                     Text {
-                        text: "Your pairing code — the other computer types this instead of waiting for a popup:";
+                        text: "Your pairing code — the other computer types this to pair:";
                         color: white;
                         font-size: 16px;
                         font-weight: 700;
@@ -232,7 +234,7 @@ export component AppWindow inherits Window {
                         horizontal-alignment: center;
                     }
                     Text {
-                        text: "Read it over once (phone, chat, sticky note). Whoever types it can pair — no approval click needed here, and it changes every 30 minutes.";
+                        text: "Rotates every 30 minutes.";
                         color: #9ca3af;
                         font-size: 11px;
                         wrap: word-wrap;
@@ -278,7 +280,7 @@ export component AppWindow inherits Window {
                             horizontal-alignment: center;
                         }
                         Text {
-                            text: "The other computer shows this request under its own INCOMING section — compare the codes, press Allow there, then confirm here to connect.";
+                            text: "Compare with the code on the other computer, then confirm.";
                             color: #9ca3af;
                             font-size: 11px;
                             wrap: word-wrap;
@@ -367,7 +369,7 @@ export component AppWindow inherits Window {
                     Rectangle { height: 1px; background: #262626; }
                     Text { text: "Share this computer"; color: white; font-size: 16px; font-weight: 700; }
                     Text {
-                        text: "The other computer scans this code or pastes the invite text instead of typing your address. Connecting still asks both sides to compare the code.";
+                        text: "The other computer scans this code or pastes the invite text.";
                         color: #9ca3af;
                         font-size: 12px;
                         wrap: word-wrap;
@@ -529,7 +531,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text {
-                        text: "Put the linked screen where it physically sits — the crossing edge is the facing edge between the two icons above. A wrong side makes pushes toward the other computer silently do nothing.";
+                        text: "Place the linked screen where it physically sits. The crossing edge is the facing edge between the icons.";
                         color: #9ca3af;
                         font-size: 12px;
                         wrap: word-wrap;
@@ -549,7 +551,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text {
-                        text: edge-mode-index == 1 ? "Double edge: on a two-computer link both the left and right outer edges cross to the other screen (top and bottom never cross). Grids always use facing edges only." : "Single edge: only the arranged facing edge crosses — the edge that points at the other screen's icon above. Top, bottom and the outer edge do nothing.";
+                        text: edge-mode-index == 1 ? "Double edge: both left and right outer edges cross on a two-computer link." : "Single edge: only the facing edge crosses.";
                         color: #9ca3af;
                         font-size: 12px;
                         wrap: word-wrap;
@@ -587,7 +589,7 @@ export component AppWindow inherits Window {
                         Button {
                             text: "Save";
                             enabled: name.text != "";
-                            clicked => { apply-config(lock-screen-control, mode-index, name.text, auto-connect-address, clipboard-enabled, root.clipboard-max-mb); }
+                            clicked => { apply-config(lock-screen-control, mode-index, name.text, auto-connect-address, clipboard-enabled, root.clipboard-max-mb, transport-index); }
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }
@@ -600,7 +602,7 @@ export component AppWindow inherits Window {
                         }
                         Switch {
                             checked <=> root.lock-screen-control;
-                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb); }
+                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb, root.transport-index); }
                         }
                     }
                     HorizontalLayout {
@@ -612,7 +614,7 @@ export component AppWindow inherits Window {
                         }
                         Switch {
                             checked <=> root.clipboard-enabled;
-                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
+                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text, root.transport-index); }
                         }
                     }
                     HorizontalLayout {
@@ -628,12 +630,31 @@ export component AppWindow inherits Window {
                         }
                         Button {
                             text: "Save";
-                            clicked => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
+                            clicked => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text, root.transport-index); }
+                        }
+                    }
+                    Rectangle { height: 1px; background: #262626; }
+                    Text { text: "Transport"; color: white; font-size: 16px; font-weight: 700; }
+                    Text {
+                        text: transport-index == 1 ? "UDP: pointer motion takes the low-latency fast path (falls back to QUIC per packet)." : "QUIC: all input on the encrypted stream.";
+                        color: #9ca3af;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Button {
+                            text: "QUIC";
+                            clicked => { set-transport(0); }
+                        }
+                        Button {
+                            text: "UDP";
+                            clicked => { set-transport(1); }
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }
                     Text {
-                        text: "Reconnect at startup to (optional)";
+                        text: "Reconnect at startup (optional)";
                         color: white;
                         font-size: 16px;
                         font-weight: 700;
@@ -646,7 +667,7 @@ export component AppWindow inherits Window {
                         }
                         Button {
                             text: "Save";
-                            clicked => { apply-config(lock-screen-control, mode-index, device-name, startup.text, clipboard-enabled, root.clipboard-max-mb); }
+                            clicked => { apply-config(lock-screen-control, mode-index, device-name, startup.text, clipboard-enabled, root.clipboard-max-mb, root.transport-index); }
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }

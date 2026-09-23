@@ -67,6 +67,129 @@ type LinkRegistry =
 static INBOUND_LINKS: std::sync::OnceLock<LinkRegistry> = std::sync::OnceLock::new();
 static LINK_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// UDP fast-path motion keys: derived from the authenticated QUIC verify
+/// (both fingerprints + link epoch) when a Hello negotiates `udp_motion`.
+/// The UDP listener decrypts motion with these; each entry also carries the
+/// peer identity and lock-screen privilege for injector selection.
+/// Bounded (64): a fresh Connect mints a fresh epoch, so old keys are
+/// worthless and evicted FIFO.
+struct UdpMotionKey {
+    key: [u8; 32],
+    fingerprint_hex: String,
+    lock_screen_enabled: bool,
+    last_seen: std::time::Instant,
+}
+
+static UDP_MOTION_KEYS: std::sync::OnceLock<std::sync::Mutex<Vec<UdpMotionKey>>> =
+    std::sync::OnceLock::new();
+
+fn udp_motion_keys() -> &'static std::sync::Mutex<Vec<UdpMotionKey>> {
+    UDP_MOTION_KEYS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Register a UDP motion key after a QUIC Hello accepts `udp_motion`.
+/// Returns the derived key for the dialer-side sender.
+pub(crate) fn register_udp_motion_key(
+    local_fingerprint_hex: &str,
+    peer_fingerprint_hex: &str,
+    link_id: u64,
+    lock_screen_enabled: bool,
+) -> [u8; 32] {
+    let key =
+        kvm_protocol::udp::derive_udp_key(local_fingerprint_hex, peer_fingerprint_hex, link_id);
+    if let Ok(mut keys) = udp_motion_keys().lock() {
+        keys.retain(|entry| entry.key != key && entry.last_seen.elapsed().as_secs() <= 15 * 60);
+        if keys.len() >= 64 {
+            keys.remove(0);
+        }
+        keys.push(UdpMotionKey {
+            key,
+            fingerprint_hex: peer_fingerprint_hex.to_owned(),
+            lock_screen_enabled,
+            last_seen: std::time::Instant::now(),
+        });
+    }
+    key
+}
+
+/// Snapshot of motion keys for the UDP listener decrypt ring.
+fn udp_motion_key_snapshot() -> Vec<([u8; 32], String, bool)> {
+    udp_motion_keys()
+        .lock()
+        .ok()
+        .map(|keys| {
+            keys.iter()
+                .map(|entry| {
+                    (
+                        entry.key,
+                        entry.fingerprint_hex.clone(),
+                        entry.lock_screen_enabled,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Outbound UDP motion sender for this `connect` child (one link per
+/// process). Set after the QUIC verify when both sides negotiate
+/// `udp_motion`; episode drivers read it for MouseMove fast-path sends
+/// with automatic fallback to the episode stream.
+struct UdpMotionSender {
+    socket: std::sync::Arc<tokio::net::UdpSocket>,
+    peer_addr: std::net::SocketAddr,
+    key: [u8; 32],
+}
+
+static UDP_SENDER: std::sync::OnceLock<std::sync::Mutex<Option<UdpMotionSender>>> =
+    std::sync::OnceLock::new();
+
+fn udp_sender_slot() -> &'static std::sync::Mutex<Option<UdpMotionSender>> {
+    UDP_SENDER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn set_udp_sender(sender: Option<UdpMotionSender>) {
+    if let Ok(mut slot) = udp_sender_slot().lock() {
+        *slot = sender;
+    }
+}
+
+/// Resolve the peer's UDP motion address (same host, `udp_port`) and bind
+/// an ephemeral outbound socket. Returns None when the address is
+/// unresolvable or the socket cannot bind — the caller falls back to QUIC.
+async fn setup_udp_sender(address: &str, key: [u8; 32]) -> Option<UdpMotionSender> {
+    let base = normalize_addr(address).ok()?;
+    let peer_addr = std::net::SocketAddr::new(base.ip(), kvm_protocol::udp::udp_port(base.port()));
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    Some(UdpMotionSender {
+        socket: std::sync::Arc::new(socket),
+        peer_addr,
+        key,
+    })
+}
+
+/// Send one coalesced motion delta over UDP. Returns true when the packet
+/// left on the fast path; false means the caller must use the episode
+/// stream instead (no sender, send error).
+fn send_motion_udp(seq: u64, dx: i32, dy: i32) -> bool {
+    let packet = udp_sender_slot().lock().ok().and_then(|slot| {
+        slot.as_ref().map(|sender| {
+            (
+                sender.socket.clone(),
+                sender.peer_addr,
+                kvm_protocol::udp::encode_motion_packet(&sender.key, seq, dx, dy),
+            )
+        })
+    });
+    let Some((socket, peer_addr, packet)) = packet else {
+        return false;
+    };
+    // Fire-and-forget: motion is loss-tolerant by design (the next delta
+    // supersedes a dropped one). try_send never blocks the drive task;
+    // a full buffer drops this delta instead of stalling input.
+    socket.try_send_to(&packet, peer_addr).is_ok()
+}
+
 pub(crate) fn inbound_link_registry() -> LinkRegistry {
     INBOUND_LINKS
         .get_or_init(|| Arc::new(std::sync::Mutex::new(HashMap::new())))
@@ -813,6 +936,7 @@ pub fn doctor() -> Result<()> {
 pub(crate) struct ConfigureOptions<'a> {
     pub(crate) device_name: Option<&'a str>,
     pub(crate) mode: Option<&'a str>,
+    pub(crate) transport: Option<kvm_core::TransportProtocol>,
     pub(crate) allow_lock_screen_control: Option<bool>,
     pub(crate) listen_port: Option<u16>,
     pub(crate) layout_path: Option<&'a std::path::Path>,
@@ -826,6 +950,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     let ConfigureOptions {
         device_name,
         mode,
+        transport,
         allow_lock_screen_control,
         listen_port,
         layout_path,
@@ -878,6 +1003,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
             clipboard_enabled,
             clipboard_max_mb,
             edge_mode: None,
+            transport,
         },
     )
     .await
@@ -933,6 +1059,9 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
             );
         }
         config.clipboard_max_mb = max_mb;
+    }
+    if let Some(transport) = transport {
+        config.transport = transport;
     }
     config.save(&path).context("saving config")?;
     if config.mode != previous_mode {
@@ -1168,6 +1297,7 @@ pub async fn send_test(address: &str, usage: u16) -> Result<()> {
             clipboard_enabled: false,
             screen_geometry: local_screen_geometry(&config.layout),
             link_id: None,
+            udp_motion: false,
         },
         None,
     )
@@ -1225,6 +1355,7 @@ pub async fn capture(address: &str) -> Result<()> {
             clipboard_enabled: config.clipboard_enabled,
             screen_geometry: local_screen_geometry(&config.layout),
             link_id: None,
+            udp_motion: false,
         },
         None,
         &data_dir(),
@@ -1340,21 +1471,43 @@ pub async fn connect(
                 clipboard_enabled: config.clipboard_enabled,
                 screen_geometry: truthful_local_geometry(&config.layout),
                 link_id,
+                udp_motion: config.transport == kvm_core::TransportProtocol::Udp,
             },
             None,
             &data_dir(),
         )
         .await
         {
-            Ok((conn, mut send, _recv, _motion_send, _capabilities)) => {
+            Ok((conn, mut send, _recv, _motion_send, capabilities)) => {
                 // Verified logical link: this is the LIVE fingerprint — ghost
                 // pins elsewhere can no longer misroute. Episodes dial fresh
                 // per crossing, so the handshake connection itself is done.
+                let peer_fp = peer_fingerprint(&conn)?.to_ascii_lowercase();
                 let link = TopologyLink {
-                    fingerprint: peer_fingerprint(&conn)?.to_ascii_lowercase(),
+                    fingerprint: peer_fp.clone(),
                     address: address.clone(),
                     link_id,
                 };
+                // UDP fast-path motion: when both sides negotiated it on a
+                // link with an epoch, derive the session key and arm the
+                // outbound sender. Failures fall back to the episode stream
+                // per packet, so a blocked UDP port never breaks the link.
+                if capabilities.udp_motion {
+                    if let Some(epoch) = link_id {
+                        let key = kvm_protocol::udp::derive_udp_key(
+                            &identity.fingerprint_hex(),
+                            &peer_fp,
+                            epoch,
+                        );
+                        match setup_udp_sender(&address, key).await {
+                            Some(sender) => {
+                                set_udp_sender(Some(sender));
+                                tracing::info!("udp motion fast path armed");
+                            }
+                            None => tracing::info!("udp motion unavailable; motion stays on QUIC"),
+                        }
+                    }
+                }
                 tracing::info!(
                     peer = %address,
                     elapsed_ms = dial_started.elapsed().as_millis() as u64,
@@ -1371,7 +1524,11 @@ pub async fn connect(
                 let _ = send.finish();
                 store_warm_link(&conn, &link.fingerprint);
                 eprintln!("THEKVM_STATUS established {address}");
-                return connect_topology(Some(link), identity).await;
+                let result = connect_topology(Some(link), identity).await;
+                // Link over: disarm the fast path so a stale key can never
+                // address the next link (which mints a fresh epoch anyway).
+                set_udp_sender(None);
+                return result;
             }
             Err(error) => {
                 // A banned epoch is a deliberate remote Disconnect, not an
@@ -1389,9 +1546,10 @@ pub async fn connect(
         }
 
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("THEKVM_STATUS ended interrupted");
+                set_udp_sender(None);
                 return Ok(());
             }
         }
@@ -1449,6 +1607,7 @@ async fn run_windows_service_controller(
                     clipboard_enabled: false,
                     screen_geometry,
                     link_id: None,
+                    udp_motion: false,
                 },
                 None,
             )
@@ -1997,6 +2156,8 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                 clipboard_max_bytes: config.clipboard_max_bytes() as u64,
                                 dir: &dir,
                                 link_id: link.as_ref().and_then(|link| link.link_id),
+                                want_udp_motion: config.transport
+                                    == kvm_core::TransportProtocol::Udp,
                             }).await {
                                 Ok(opened) => session = Some(opened),
                                 Err(error) => {
@@ -2201,6 +2362,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     inbound_baselines_fresh: &mut inbound_baselines_fresh,
                     last_yield: &mut last_yield,
                     last_outbound_input: &mut last_outbound_input,
+                    want_udp_motion: config.transport == kvm_core::TransportProtocol::Udp,
                 })
                 .await?;
             }
@@ -2328,6 +2490,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     inbound_baselines_fresh: &mut inbound_baselines_fresh,
                     last_yield: &mut last_yield,
                     last_outbound_input: &mut last_outbound_input,
+                    want_udp_motion: config.transport == kvm_core::TransportProtocol::Udp,
                 })
                 .await?;
             }
@@ -2679,6 +2842,13 @@ struct TopologySession {
     /// sent>0 with receiver motion=0 proves wire/task loss instead of a
     /// sender-side drop.
     datagrams_sent: u64,
+    /// UDP fast-path motion negotiated for this episode's link. When true,
+    /// `MouseMove` goes over the encrypted UDP socket (fire-and-forget)
+    /// instead of the episode stream, with automatic fallback per packet.
+    udp_motion: bool,
+    /// UDP motion packets emitted on the fast path. Logged at teardown
+    /// next to `datagrams_sent`.
+    udp_packets_sent: u64,
     /// The peer's self-reported geometry (for re-mapping re-entry points
     /// when this stream is reused after parking).
     peer_geometry: Option<ScreenGeometry>,
@@ -2744,6 +2914,8 @@ impl TopologySession {
                 motion_sum_dx = self.motion_sum_dx,
                 motion_sum_dy = self.motion_sum_dy,
                 datagrams_sent = self.datagrams_sent,
+                udp_motion = self.udp_motion,
+                udp_packets_sent = self.udp_packets_sent,
                 peer_smooth = self.peer_smooth,
                 peer_pinch = self.peer_pinch,
                 "topology episode ended",
@@ -3416,6 +3588,8 @@ struct TopologyEventContext<'a> {
     /// the idle-dual arbitration reads it. Stamped in the Forward arm
     /// only — local input while nobody is driven must not count.
     last_outbound_input: &'a mut Option<std::time::Instant>,
+    /// Dialer wants UDP fast-path motion for fresh episodes.
+    want_udp_motion: bool,
 }
 
 async fn handle_topology_event(
@@ -3456,6 +3630,7 @@ async fn handle_topology_event(
         inbound_baselines_fresh,
         last_yield,
         last_outbound_input,
+        want_udp_motion,
     } = context;
     // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
     // Raw deltas keep flowing after the OS pointer has stopped at the edge,
@@ -3632,12 +3807,27 @@ async fn handle_topology_event(
                         | InputEvent::SmoothWheel { .. }
                 );
                 *sequence = sequence.wrapping_add(1);
-                // Pointer motion rides the motion lane when negotiated (own
-                // QUIC stream, own loss domain — a stalled motion packet
-                // delays the cursor instead of head-of-line-blocking the
-                // keystroke behind it). Everything else stays ordered on the
-                // episode stream; the shared sequence spans both, so the
-                // receiver's dedup/stale sets work unchanged.
+                // Pointer motion rides the UDP fast path when negotiated
+                // (encrypted datagrams on their own socket — no stream,
+                // no head-of-line blocking, no 3s write stall), else the
+                // motion lane when negotiated (own QUIC stream, own loss
+                // domain), else the episode stream. The shared sequence
+                // spans all paths so the receiver's dedup works unchanged.
+                // UDP is fire-and-forget per packet: a dropped delta is
+                // superseded by the next one instead of ending the episode.
+                if session.udp_motion {
+                    if let InputEvent::MouseMove { dx, dy } = outgoing {
+                        if send_motion_udp(*sequence, dx, dy) {
+                            session.udp_packets_sent += 1;
+                            if outgoing_is_motion {
+                                session.motion_forwarded += 1;
+                            }
+                            continue;
+                        }
+                        // Fast path missed (no sender, buffer full):
+                        // fall through to the stream below.
+                    }
+                }
                 let lane = match outgoing {
                     InputEvent::MouseMove { .. } => session.motion_send.as_mut(),
                     _ => None,
@@ -3890,6 +4080,7 @@ async fn handle_topology_event(
                     sequence,
                     dir,
                     link_id: link.and_then(|link| link.link_id),
+                    want_udp_motion,
                 })
                 .await
                 {
@@ -4008,6 +4199,8 @@ struct TopologyOpen<'a> {
     dir: &'a std::path::Path,
     /// Administrative epoch both sides share (None for legacy children).
     link_id: Option<u64>,
+    /// Dialer wants UDP fast-path motion for episodes on this link.
+    want_udp_motion: bool,
 }
 
 async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySession> {
@@ -4032,6 +4225,7 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         sequence,
         dir,
         link_id,
+        want_udp_motion,
     } = request;
     let screen = router
         .screen(target)
@@ -4048,6 +4242,7 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
         clipboard_enabled,
         screen_geometry: local_geometry,
         link_id,
+        udp_motion: want_udp_motion,
     };
     // Warm first: an episode on the live association skips endpoint setup
     // and the QUIC handshake, so the crossing feels instant. A stale
@@ -4189,6 +4384,7 @@ fn episode_policy<'a>(
         clipboard_enabled: config.clipboard_enabled,
         screen_geometry: local_geometry,
         link_id: link.and_then(|link| link.link_id),
+        udp_motion: config.transport == kvm_core::TransportProtocol::Udp,
     }
 }
 
@@ -4534,6 +4730,8 @@ fn spawn_episode_driver(
         motion_sum_dx: 0,
         motion_sum_dy: 0,
         datagrams_sent: 0,
+        udp_motion: capabilities.udp_motion,
+        udp_packets_sent: 0,
     }
 }
 
@@ -5733,7 +5931,10 @@ pub async fn run() -> Result<()> {
     let pairing_approvals = crate::control::PairingApprovals::default();
     let endpoint = transport::make_server_endpoint(&identity, listen_port)?;
     tracing::info!(port = listen_port, "listening for QUIC connections");
+    let udp_motion_port = kvm_protocol::udp::udp_port(listen_port);
+    tracing::info!(port = udp_motion_port, "listening for UDP motion");
     spawn_discovery_responder(identity.clone(), listen_port, configured_node_name);
+    spawn_udp_motion_listener(udp_motion_port);
 
     #[cfg(target_os = "windows")]
     if std::env::args().any(|argument| argument == "--service") {
@@ -5824,6 +6025,7 @@ pub async fn run() -> Result<()> {
                 let revoked_peers = revoked_peers.clone();
                 let pairing_approvals = pairing_approvals.clone();
                 let active_sessions = active_sessions.clone();
+                let local_fingerprint = fingerprint.clone();
                 tokio::spawn(async move {
                     active_sessions.fetch_add(1, Ordering::Relaxed);
                     match incoming.await {
@@ -5837,6 +6039,7 @@ pub async fn run() -> Result<()> {
                                 input_session_slot,
                                 revoked_peers,
                                 pairing_approvals,
+                                local_fingerprint,
                             )
                             .await
                             {
@@ -5898,6 +6101,117 @@ fn spawn_discovery_responder(identity: Identity, listen_port: u16, node_name: St
     });
 }
 
+/// UDP fast-path motion listener: decrypts pointer motion sent by peers that
+/// negotiated `udp_motion` over the QUIC verify and injects it through a
+/// motion-only virtual device. Keys/buttons/clipboard stay on the reliable
+/// QUIC episode stream; motion is stateless relative deltas, so a dedicated
+/// injector here never splits held-key state. A bad packet is dropped, never
+/// fatal; a peer without a registered key (no verify, banned epoch, old
+/// version) simply has its motion ignored while its QUIC stream still works.
+fn spawn_udp_motion_listener(port: u16) {
+    tokio::spawn(async move {
+        let socket = match tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+            .await
+        {
+            Ok(socket) => std::sync::Arc::new(socket),
+            Err(error) => {
+                tracing::warn!(%error, port, "UDP motion listener unavailable; motion stays on QUIC");
+                return;
+            }
+        };
+        tracing::info!(port, "UDP motion listener ready");
+        // Motion-only injectors, one per privilege level, owned by this
+        // single task (no sharing, no locks on the hot path).
+        let mut injector_plain: Option<ReceiverInjector> = None;
+        let mut injector_privileged: Option<ReceiverInjector> = None;
+        let mut last_seq: std::collections::HashMap<[u8; 32], u64> =
+            std::collections::HashMap::new();
+        let mut buffer = [0u8; 2048];
+        loop {
+            let (length, _source) = tokio::select! {
+                _ = shutdown_notifier().notified() => return,
+                received = socket.recv_from(&mut buffer) => match received {
+                    Ok(result) => result,
+                    Err(error) => {
+                        tracing::warn!(%error, "UDP motion listener stopped");
+                        return;
+                    }
+                },
+            };
+            let datagram = &buffer[..length];
+            let keys = udp_motion_key_snapshot();
+            if keys.is_empty() {
+                continue;
+            }
+            let key_bytes: Vec<[u8; 32]> = keys.iter().map(|(key, _, _)| *key).collect();
+            let (key_index, seq, dx, dy) =
+                match kvm_protocol::udp::decode_motion_packet(&key_bytes, datagram) {
+                    Ok(decoded) => decoded,
+                    Err(_) => continue,
+                };
+            let (key, fingerprint_hex, lock_screen_enabled) = &keys[key_index];
+            // Sequence dedup: UDP is unordered; old or replayed motion is
+            // dropped while the next fresh delta still glides the cursor.
+            // Strictly newer, or a counter wrap (fresh epoch restarts).
+            let accept = match last_seq.get(key) {
+                None => true,
+                Some(last) => seq > *last || (*last > u64::MAX - 4096 && seq < 4096),
+            };
+            if !accept {
+                continue;
+            }
+            last_seq.insert(*key, seq);
+            if last_seq.len() > 128 {
+                // Bounded: drop an arbitrary stale entry.
+                if let Some(old) = last_seq.keys().next().copied() {
+                    last_seq.remove(&old);
+                }
+            }
+            let injector = if *lock_screen_enabled {
+                if injector_privileged.is_none() {
+                    match ReceiverInjector::create(true) {
+                        Ok(injector) => injector_privileged = Some(injector),
+                        Err(error) => {
+                            tracing::warn!(%error, "UDP motion injector unavailable");
+                            continue;
+                        }
+                    }
+                }
+                injector_privileged.as_mut().unwrap()
+            } else {
+                if injector_plain.is_none() {
+                    match ReceiverInjector::create(false) {
+                        Ok(injector) => injector_plain = Some(injector),
+                        Err(error) => {
+                            tracing::warn!(%error, "UDP motion injector unavailable");
+                            continue;
+                        }
+                    }
+                }
+                injector_plain.as_mut().unwrap()
+            };
+            if injector.ensure_session().is_err() {
+                continue;
+            }
+            if injector
+                .send(kvm_core::InputEvent::MouseMove { dx, dy })
+                .is_err()
+            {
+                continue;
+            }
+            // Same live-drive signal the QUIC datagram path emits so the
+            // station UI and the idle-dual arbitration see UDP motion too.
+            if let Ok(links) = inbound_link_registry().lock() {
+                if let Some((link, _)) = links.get(fingerprint_hex.as_str()) {
+                    link.input_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     conn: quinn::Connection,
     peers: Arc<tokio::sync::RwLock<PeerBook>>,
@@ -5906,6 +6220,7 @@ async fn handle_connection(
     input_session_slot: Arc<tokio::sync::Semaphore>,
     revoked_peers: tokio::sync::broadcast::Sender<String>,
     pairing_approvals: crate::control::PairingApprovals,
+    local_fingerprint: String,
 ) -> Result<()> {
     let peer_fingerprint = peer_fingerprint(&conn)?;
     // One association, many episodes (Deskflow persistent-socket parity):
@@ -6132,6 +6447,10 @@ async fn handle_connection(
                 // one (see open_episode_stream); keys, buttons, wheel and
                 // gestures stay ordered on this episode stream.
                 motion_lane: true,
+                // UDP fast-path motion when the sender asked for it on a
+                // link with an epoch to derive the key from. The key is
+                // registered below so the UDP listener can decrypt motion.
+                udp_motion: hello.udp_motion && hello.link_id.is_some(),
             },
             )
             .await?;
@@ -6177,6 +6496,21 @@ async fn handle_connection(
                 hello.link_id,
             );
             drop(peer_book);
+            // UDP fast-path motion: when both sides negotiated it on a link
+            // with an epoch, derive the session key from the authenticated
+            // verify (both fingerprints + epoch) so the UDP listener can
+            // decrypt motion without a second ceremony.
+            if hello.udp_motion {
+                if let Some(epoch) = hello.link_id {
+                    register_udp_motion_key(
+                        &local_fingerprint,
+                        &peer_fingerprint,
+                        epoch,
+                        lock_screen_enabled,
+                    );
+                    tracing::info!(peer = %peer_fingerprint, "udp motion key registered");
+                }
+            }
             // One face per machine: the verified live fingerprint retires
             // same-named ghosts (the service-cert vs user-cert split), so
             // the book converges instead of flapping.
@@ -7661,6 +7995,7 @@ async fn handle_pairing(
             pinch_zoom: true,
             // Pairing completion carries no input session; no lane.
             motion_lane: false,
+            udp_motion: false,
         },
     )
     .await?;
@@ -7705,6 +8040,10 @@ struct ConnectPolicy<'a> {
     /// Administrative link epoch both sides share (None for the fixed-peer
     /// diagnostic commands and older callers: no banning applies to them).
     link_id: Option<u64>,
+    /// Dialer wants pointer motion over the UDP fast path when the peer
+    /// agrees. Requires `link_id` (the UDP key derives from it); without a
+    /// link the handshake stays on the episode stream.
+    udp_motion: bool,
 }
 
 impl Clone for ConnectPolicy<'_> {
@@ -8093,8 +8432,12 @@ async fn open_episode_stream(
         clipboard_enabled,
         screen_geometry,
         link_id,
+        udp_motion,
     } = policy;
     let (mut send, mut recv) = conn.open_bi().await?;
+    // UDP fast-path motion needs a link epoch to derive its key from; without
+    // one the handshake stays on the episode stream even when requested.
+    let want_udp_motion = udp_motion && link_id.is_some();
     write_frame(
         &mut send,
         &WireMessage::Hello(Hello {
@@ -8112,6 +8455,7 @@ async fn open_episode_stream(
             // This side opens a motion lane when the receiver accepts one.
             motion_lane: true,
             link_id,
+            udp_motion: want_udp_motion,
         }),
     )
     .await?;
@@ -8125,6 +8469,7 @@ async fn open_episode_stream(
             smooth_scroll,
             pinch_zoom,
             motion_lane,
+            udp_motion: peer_udp_motion,
             ..
         } => {
             let capabilities = SessionCapabilities {
@@ -8132,6 +8477,7 @@ async fn open_episode_stream(
                 screen_geometry,
                 smooth_scroll,
                 pinch_zoom,
+                udp_motion: want_udp_motion && peer_udp_motion,
             };
             // The receiver agreed to a motion lane: open it now, before
             // any input flows, so stream-accept order on their side is
@@ -8164,6 +8510,8 @@ struct SessionCapabilities {
     screen_geometry: Option<ScreenGeometry>,
     smooth_scroll: bool,
     pinch_zoom: bool,
+    /// Peer accepted UDP fast-path pointer motion for this link.
+    udp_motion: bool,
 }
 
 fn local_screen_geometry(layout: &kvm_core::Layout) -> Option<ScreenGeometry> {

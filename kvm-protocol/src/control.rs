@@ -1,7 +1,7 @@
 //! Local daemon-control protocol shared by the daemon and the desktop UI.
 
 use crate::pairing::Peer;
-use kvm_core::{Config, EdgeMode, Layout, Mode};
+use kvm_core::{Config, EdgeMode, Layout, Mode, TransportProtocol};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -130,6 +130,10 @@ pub enum ControlRequest {
         /// partial CLI/UI updates are safe.
         #[serde(default)]
         edge_mode: Option<EdgeMode>,
+        /// Preferred outbound transport (Quic/Udp); omission preserves the
+        /// current value. The listener always serves both.
+        #[serde(default)]
+        transport: Option<TransportProtocol>,
     },
 }
 
@@ -155,6 +159,9 @@ pub struct DaemonStatus {
     /// for older daemons that predate the field.
     #[serde(default)]
     pub edge_mode: EdgeMode,
+    /// Preferred outbound transport. Defaults to Quic for older daemons.
+    #[serde(default)]
+    pub transport: TransportProtocol,
     pub peer_count: usize,
     pub active_session_count: usize,
     pub uptime_seconds: u64,
@@ -378,6 +385,7 @@ mod tests {
             clipboard_enabled: Some(true),
             clipboard_max_mb: Some(2),
             edge_mode: Some(EdgeMode::Double),
+            transport: Some(TransportProtocol::Udp),
         };
         let expected_address = "127.0.0.1:42110".to_owned();
         let sender = tokio::spawn(async move {
@@ -394,6 +402,7 @@ mod tests {
             clipboard_enabled,
             clipboard_max_mb,
             edge_mode,
+            transport,
         }) = read_request(&mut right).await.unwrap()
         else {
             panic!("expected SetConfig request");
@@ -411,6 +420,7 @@ mod tests {
         assert_eq!(clipboard_enabled, Some(true));
         assert_eq!(clipboard_max_mb, Some(2));
         assert_eq!(edge_mode, Some(EdgeMode::Double));
+        assert_eq!(transport, Some(TransportProtocol::Udp));
         sender.await.unwrap();
     }
 

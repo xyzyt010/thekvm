@@ -14,6 +14,7 @@ pub mod discovery;
 pub mod invite;
 pub mod pairing;
 pub mod transport;
+pub mod udp;
 pub mod wire;
 
 use thiserror::Error;

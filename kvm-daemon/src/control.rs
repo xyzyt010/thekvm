@@ -261,6 +261,7 @@ where
                 clipboard_enabled: current.clipboard_enabled,
                 clipboard_max_mb: current.clipboard_max_mb,
                 edge_mode: current.edge_mode,
+                transport: current.transport,
                 peer_count,
                 active_session_count: active_sessions.load(std::sync::atomic::Ordering::Relaxed),
                 sessions: crate::service::list_inbound_links(),
@@ -471,6 +472,7 @@ where
             clipboard_enabled,
             clipboard_max_mb,
             edge_mode,
+            transport,
         } => {
             if listen_port == Some(0) {
                 ControlResponse::Error {
@@ -536,6 +538,18 @@ where
                     }
                     if let Some(edge_mode) = edge_mode {
                         updated.edge_mode = edge_mode;
+                    }
+                    if let Some(transport) = transport {
+                        if updated.transport != transport {
+                            crate::service::audit_event(
+                                &data_dir,
+                                &format!(
+                                    "transport {:?} -> {transport:?} via local control",
+                                    current.transport
+                                ),
+                            );
+                            updated.transport = transport;
+                        }
                     }
                     if let Some(layout) = layout {
                         if let Err(error) = layout.validate() {

@@ -7,7 +7,7 @@ slint::include_modules!();
 mod tray;
 
 use anyhow::{Context, Result};
-use kvm_core::{EdgeMode, Mode};
+use kvm_core::{EdgeMode, Mode, TransportProtocol};
 use kvm_protocol::control::{
     read_response, write_request, ControlRequest, ControlResponse, DaemonStatus, PendingPairing,
 };
@@ -175,6 +175,10 @@ fn main() -> Result<()> {
         ui.set_edge_mode_index(match config.edge_mode {
             EdgeMode::Single => 0,
             EdgeMode::Double => 1,
+        });
+        ui.set_transport_index(match config.transport {
+            TransportProtocol::Quic => 0,
+            TransportProtocol::Udp => 1,
         });
         // Seed the green "Current role" text from the same file: until the
         // first successful poll it is the only source of truth on screen.
@@ -521,6 +525,7 @@ fn main() -> Result<()> {
                 clipboard_enabled: Some(current.clipboard_enabled),
                 clipboard_max_mb: None,
                 edge_mode: None,
+                transport: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -531,6 +536,7 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(current.edge_mode),
+                        None,
                     );
                     ui_log(&format!("role applied: {}", role_name(requested)));
                     // Update the green role text from the authoritative
@@ -648,6 +654,7 @@ fn main() -> Result<()> {
                 clipboard_enabled: Some(current.clipboard_enabled),
                 clipboard_max_mb: None,
                 edge_mode: Some(requested),
+                transport: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -658,6 +665,7 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(requested),
+                        None,
                     );
                     ui_log(&format!(
                         "edge crossing applied: {}",
@@ -700,6 +708,102 @@ fn main() -> Result<()> {
                 Err(error) => {
                     ui_log(&format!("edge change failed: {error}"));
                     set_status(&weak, format!("Cannot set edge crossing: {error}"))
+                }
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let transport_session = session_state.clone();
+    ui.on_set_transport(move |index| {
+        let weak = weak.clone();
+        let transport_session = transport_session.clone();
+        let requested = match index {
+            1 => TransportProtocol::Udp,
+            _ => TransportProtocol::Quic,
+        };
+        ui_log(&format!(
+            "transport selected: {}",
+            transport_name(requested)
+        ));
+        set_status(&weak, "Applying transport…".into());
+        std::thread::spawn(move || {
+            let current = match control_request(ControlRequest::GetConfig) {
+                Ok(ControlResponse::Config(config)) => config,
+                Ok(other) => {
+                    ui_log(&format!(
+                        "transport change: cannot read settings: {other:?}"
+                    ));
+                    set_status(&weak, format!("Cannot read settings: {other:?}"));
+                    return;
+                }
+                Err(error) => {
+                    ui_log(&format!("transport change: settings unreadable: {error:#}"));
+                    set_status(
+                        &weak,
+                        control_denied_status(&error, "Background service unreachable"),
+                    );
+                    return;
+                }
+            };
+            match control_request(ControlRequest::SetConfig {
+                device_name: Some(current.device_name.clone()),
+                mode: Some(current.mode),
+                allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                listen_port: None,
+                layout: None,
+                auto_connect_address: current.auto_connect_address.clone(),
+                clear_auto_connect: current.auto_connect_address.is_none(),
+                clipboard_enabled: Some(current.clipboard_enabled),
+                clipboard_max_mb: None,
+                edge_mode: None,
+                transport: Some(requested),
+            }) {
+                Ok(ControlResponse::Applied { .. }) => {
+                    mirror_user_config(
+                        &current.device_name,
+                        current.mode,
+                        current.allow_lock_screen_control,
+                        current.clipboard_enabled,
+                        None,
+                        None,
+                        None,
+                        Some(requested),
+                    );
+                    ui_log(&format!("transport applied: {}", transport_name(requested)));
+                    set_transport_display(&weak, requested);
+                    if transport_session
+                        .lock()
+                        .ok()
+                        .is_some_and(|slot| slot.as_ref().is_some())
+                    {
+                        ui_log("transport change: stopping the link; Connect again to re-link");
+                        stop_session(&weak, &transport_session, "Link stopped");
+                        set_status(
+                            &weak,
+                            format!(
+                                "Transport set: {}. Link stopped — Connect again to re-link.",
+                                transport_name(requested)
+                            ),
+                        );
+                    } else {
+                        set_status(
+                            &weak,
+                            format!("Transport set: {}.", transport_name(requested)),
+                        );
+                    }
+                }
+                Ok(ControlResponse::Error { message }) => {
+                    ui_log(&format!("transport change refused: {message}"));
+                    set_status(&weak, message)
+                }
+                Ok(other) => {
+                    ui_log(&format!("transport change unexpected: {other:?}"));
+                    set_status(&weak, format!("Unexpected daemon response: {other:?}"))
+                }
+                Err(error) => {
+                    ui_log(&format!("transport change failed: {error}"));
+                    set_status(&weak, format!("Cannot set transport: {error}"))
                 }
             }
         });
@@ -972,7 +1076,7 @@ fn main() -> Result<()> {
 
     let weak = ui.as_weak();
     ui.on_apply_config(
-        move |allow_lock_screen, mode_index, device_name, auto_address, clipboard_enabled, clipboard_max_mb| {
+        move |allow_lock_screen, mode_index, device_name, auto_address, clipboard_enabled, clipboard_max_mb, transport_index| {
             let weak = weak.clone();
             let device_name = device_name.to_string();
             let auto_address = auto_address.to_string();
@@ -983,6 +1087,10 @@ fn main() -> Result<()> {
                     1 => Mode::ServerClient,
                     2 => Mode::ClientOnly,
                     _ => Mode::Bidirectional,
+                };
+                let requested_transport = match transport_index {
+                    1 => TransportProtocol::Udp,
+                    _ => TransportProtocol::Quic,
                 };
                 // Clipboard cap from the MB field: refuse garbage instead
                 // of silently keeping the old limit.
@@ -1014,11 +1122,16 @@ fn main() -> Result<()> {
                     Some(max_mb),
                     None,
                     None,
+                    Some(requested_transport),
                 );
                 let mode = match mode_index {
                     1 => "server-client",
                     2 => "receiver-only",
                     _ => "bidirectional",
+                };
+                let transport_arg = match requested_transport {
+                    TransportProtocol::Udp => "udp",
+                    TransportProtocol::Quic => "quic",
                 };
                 let daemon =
                     std::env::var("THEKVM_DAEMON_PATH").unwrap_or_else(|_| "kvm-daemon".into());
@@ -1048,6 +1161,7 @@ fn main() -> Result<()> {
                     command.arg("--disable-clipboard");
                 }
                 command.arg("--clipboard-max-mb").arg(max_mb.to_string());
+                command.arg("--transport").arg(transport_arg);
                 match control_request(ControlRequest::SetConfig {
                     device_name: Some(device_name.clone()),
                     mode: Some(requested_mode),
@@ -1061,11 +1175,13 @@ fn main() -> Result<()> {
                     clipboard_max_mb: Some(max_mb),
                     // The Settings form has no edge control: preserve it.
                     edge_mode: None,
+                    transport: Some(requested_transport),
                 }) {
                     Ok(ControlResponse::Applied { restart_required }) => {
                         // Same truth rule as the role buttons: the green
                         // role text follows the Applied result at once.
                         set_role_display(&weak, requested_mode);
+                        set_transport_display(&weak, requested_transport);
                         // Settings (role included) can invalidate a running
                         // link contract: stop it rather than drive stale.
                         if config_session
@@ -1096,6 +1212,7 @@ fn main() -> Result<()> {
                     Err(control_error) => match command.output() {
                         Ok(output) if output.status.success() => {
                             set_role_display(&weak, requested_mode);
+                            set_transport_display(&weak, requested_transport);
                             set_status(&weak, "Configuration saved (CLI fallback)".into())
                         }
                         Ok(output) => set_status(
@@ -1139,6 +1256,7 @@ fn main() -> Result<()> {
                             clipboard_enabled: Some(current.clipboard_enabled),
                             clipboard_max_mb: None,
                             edge_mode: None,
+                            transport: None,
                         })? {
                             ControlResponse::Applied { .. } => Ok(()),
                             ControlResponse::Error { message } => anyhow::bail!(message),
@@ -1260,6 +1378,29 @@ fn edge_mode_name(mode: EdgeMode) -> &'static str {
         EdgeMode::Single => "Single edge",
         EdgeMode::Double => "Double edge",
     }
+}
+
+fn transport_name(transport: TransportProtocol) -> &'static str {
+    match transport {
+        TransportProtocol::Quic => "QUIC",
+        TransportProtocol::Udp => "UDP",
+    }
+}
+
+/// Show the authoritative transport immediately (same rule as role/edge:
+/// never wait for the next poll).
+fn set_transport_display(weak: &slint::Weak<AppWindow>, transport: TransportProtocol) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_transport_index(match transport {
+                    TransportProtocol::Quic => 0,
+                    TransportProtocol::Udp => 1,
+                });
+            }
+        }
+    });
 }
 
 /// Show the authoritative edge discipline immediately (same rule as the
@@ -1398,6 +1539,10 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                 ui.set_edge_mode_index(match status.edge_mode {
                     EdgeMode::Single => 0,
                     EdgeMode::Double => 1,
+                });
+                ui.set_transport_index(match status.transport {
+                    TransportProtocol::Quic => 0,
+                    TransportProtocol::Udp => 1,
                 });
                 ui.set_fingerprint(SharedString::from(status.fingerprint_hex));
                 ui.set_role_text(SharedString::from(role_name(status.mode)));
@@ -1999,6 +2144,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         clipboard_enabled: Some(current.clipboard_enabled),
         clipboard_max_mb: None,
         edge_mode: None,
+        transport: None,
     }) {
         Ok(ControlResponse::Applied { .. }) => {}
         Ok(ControlResponse::Error { message }) => anyhow::bail!("{message}"),
@@ -2012,6 +2158,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         current.clipboard_enabled,
         None,
         Some(layout.clone()),
+        None,
         None,
     );
     ui_log("arrange: screen arrangement saved");
@@ -3855,6 +4002,7 @@ fn pair_prepare(
 /// daemon state) dials with the right name, mode, and capabilities.
 /// Best effort: the daemon-side SetConfig result is authoritative for the
 /// user-visible status.
+#[allow(clippy::too_many_arguments)]
 fn mirror_user_config(
     device_name: &str,
     mode: Mode,
@@ -3863,6 +4011,7 @@ fn mirror_user_config(
     clipboard_max_mb: Option<u32>,
     layout: Option<kvm_core::Layout>,
     edge_mode: Option<EdgeMode>,
+    transport: Option<TransportProtocol>,
 ) {
     let path = data_dir().join("config.json");
     let mut config = kvm_core::Config::load(&path).unwrap_or_default();
@@ -3881,12 +4030,15 @@ fn mirror_user_config(
     // A supplied layout replaces the user's topology (arrangement UI,
     // auto-layout); omission preserves whatever is there so role presses
     // can never wipe the screen arrangement. Same rule for the edge
-    // discipline: only an explicit edge toggle writes it.
+    // discipline and transport: only an explicit toggle writes them.
     if let Some(layout) = layout {
         config.layout = layout;
     }
     if let Some(edge_mode) = edge_mode {
         config.edge_mode = edge_mode;
+    }
+    if let Some(transport) = transport {
+        config.transport = transport;
     }
     let _ = config.save(&path);
 }

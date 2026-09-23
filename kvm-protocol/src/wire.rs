@@ -195,6 +195,12 @@ pub struct Hello {
     /// older peers (no banning possible across versions).
     #[serde(default)]
     pub link_id: Option<u64>,
+    /// The sender can emit pointer motion over the low-latency UDP fast
+    /// path (same pairing trust, key derived from the QUIC verify). Absent/
+    /// false on older peers, which stay on the episode stream. The receiver
+    /// enables it by replying with `udp_motion` in Accepted.
+    #[serde(default)]
+    pub udp_motion: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +259,10 @@ pub enum WireMessage {
         /// peers, which read all input off the one stream.
         #[serde(default)]
         motion_lane: bool,
+        /// The receiver accepts UDP fast-path pointer motion for this link
+        /// (see Hello `udp_motion`). Absent/false on older peers.
+        #[serde(default)]
+        udp_motion: bool,
     },
     Input(InputPacket),
     /// Reliable sender state snapshot, sent before the first event on every
@@ -756,6 +766,7 @@ mod tests {
                 smooth_scroll: false,
                 pinch_zoom: false,
                 motion_lane: false,
+                udp_motion: false,
                 ..
             })
         ));
@@ -768,6 +779,7 @@ mod tests {
                 smooth_scroll: false,
                 pinch_zoom: false,
                 motion_lane: false,
+                udp_motion: false,
                 ..
             }
         ));
@@ -816,6 +828,7 @@ mod tests {
             pinch_zoom: false,
             motion_lane: false,
             link_id: None,
+            udp_motion: false,
         }))
         .is_err());
     }
@@ -832,6 +845,7 @@ mod tests {
             pinch_zoom: false,
             motion_lane: false,
             link_id: None,
+            udp_motion: false,
         }))
         .is_err());
         assert!(validate_message(&WireMessage::PairRequest {

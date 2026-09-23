@@ -5,21 +5,31 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::time::Duration;
 
 const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
-const DATAGRAM_RECEIVE_BUFFER: usize = 64 * 1024;
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
+const DATAGRAM_RECEIVE_BUFFER: usize = 256 * 1024;
+const DATAGRAM_SEND_BUFFER: usize = 256 * 1024;
 
 fn input_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     // Input sessions must notice a dead peer quickly, while keep-alives keep
     // NAT/firewall state warm during idle periods such as a password prompt.
-    // The idle budget is generous (60s): on Wi-Fi a transient stall must
+    // The idle budget stays generous (60s): on Wi-Fi a transient stall must
     // never tear down a healthy link — the app-level lease and the
     // keep-alive watchdogs already reap truly dead peers much faster.
+    // Keep-alive is aggressive (2s) so dead peers are noticed fast and NAT
+    // bindings stay warm; pointer motion itself usually keeps the path hot.
     transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
         MAX_IDLE_TIMEOUT.as_millis() as u32,
     ))));
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
     transport.datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER));
+    transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
+    // Throughput windows sized for bursty input, not bulk transfer: motion
+    // floods must never queue behind a clipboard chunk.
+    transport.send_window(8 * 1024 * 1024);
+    transport.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(32));
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(32));
     transport
 }
 

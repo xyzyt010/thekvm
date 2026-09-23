@@ -111,6 +111,10 @@ enum Command {
         /// `receiver-only` (client/receiver only).
         #[arg(long)]
         mode: Option<String>,
+        /// Preferred outbound transport: `quic` (default) or `udp`.
+        /// The daemon always listens on both; this selects dial order.
+        #[arg(long)]
+        transport: Option<String>,
         /// Allow paired peers to request lock-screen-capable injection.
         #[arg(long, conflicts_with = "disable_lock_screen_control")]
         allow_lock_screen_control: bool,
@@ -364,6 +368,7 @@ async fn async_main() -> Result<()> {
         Command::Configure {
             device_name,
             mode,
+            transport,
             allow_lock_screen_control,
             disable_lock_screen_control,
             listen_port,
@@ -374,9 +379,20 @@ async fn async_main() -> Result<()> {
             disable_clipboard,
             clipboard_max_mb,
         } => {
+            let requested_transport = transport
+                .as_deref()
+                .map(|value| match value.to_ascii_lowercase().as_str() {
+                    "quic" => Ok(kvm_core::TransportProtocol::Quic),
+                    "udp" => Ok(kvm_core::TransportProtocol::Udp),
+                    _ => Err(anyhow::anyhow!(
+                        "invalid transport {value}; use quic or udp"
+                    )),
+                })
+                .transpose()?;
             service::configure(service::ConfigureOptions {
                 device_name: device_name.as_deref(),
                 mode: mode.as_deref(),
+                transport: requested_transport,
                 allow_lock_screen_control: if allow_lock_screen_control {
                     Some(true)
                 } else if disable_lock_screen_control {

@@ -16,6 +16,13 @@ pub struct Config {
     pub device_name: String,
     pub listen_port: u16,
     pub mode: Mode,
+    /// Preferred dial transport. The daemon always listens on both QUIC and
+    /// UDP so either side can reach it regardless of this setting; this only
+    /// selects which transport outbound `connect`/`capture` sessions try
+    /// first (with automatic fallback to the other on failure).
+    /// Old config files without this field load as Quic.
+    #[serde(default)]
+    pub transport: TransportProtocol,
     /// Which screen edges may open a crossing. Single (default) crosses
     /// only the arranged facing edge; Double additionally opens the other
     /// horizontal outer edge to the lone peer on a two-machine link
@@ -42,6 +49,18 @@ pub struct Config {
     /// files without this field load as the default.
     #[serde(default = "default_clipboard_max_mb")]
     pub clipboard_max_mb: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TransportProtocol {
+    /// Authenticated QUIC (default). Best compatibility, reliable streams
+    /// plus unreliable datagrams for pointer motion.
+    #[default]
+    Quic,
+    /// Low-latency UDP. Key is derived from the authenticated QUIC verify
+    /// handshake, so UDP sessions carry the same pairing trust without a
+    /// second ceremony. Falls back to QUIC automatically when blocked.
+    Udp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +90,7 @@ impl Default for Config {
             device_name: hostname().unwrap_or_else(|| "unknown".into()),
             listen_port: 42110,
             mode: Mode::Bidirectional,
+            transport: TransportProtocol::Quic,
             edge_mode: EdgeMode::Single,
             layout: Default::default(),
             allow_lock_screen_control: false,
@@ -328,6 +348,7 @@ mod tests {
             DEFAULT_CLIPBOARD_MAX_MB as usize * 1024 * 1024
         );
         assert_eq!(config.edge_mode, EdgeMode::Single);
+        assert_eq!(config.transport, TransportProtocol::Quic);
         assert!(config.validate().is_ok());
     }
 
@@ -363,5 +384,19 @@ mod tests {
         assert!(raw.contains("\"Double\""));
         let back: Config = serde_json::from_str(&raw).unwrap();
         assert_eq!(back.edge_mode, EdgeMode::Double);
+    }
+
+    #[test]
+    fn transport_defaults_quic_and_roundtrips() {
+        assert_eq!(Config::default().transport, TransportProtocol::Quic);
+        let udp = Config {
+            transport: TransportProtocol::Udp,
+            ..Config::default()
+        };
+        assert!(udp.validate().is_ok());
+        let raw = serde_json::to_string(&udp).unwrap();
+        assert!(raw.contains("\"Udp\""));
+        let back: Config = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.transport, TransportProtocol::Udp);
     }
 }
