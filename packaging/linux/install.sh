@@ -183,7 +183,12 @@ if [ ! -e /dev/uinput ]; then
     exit 1
 fi
 systemctl daemon-reload
-systemctl enable --now thekvmd.service
+if systemctl is-active --quiet thekvmd.service 2>/dev/null; then
+    # Upgrade: the running daemon still executes the replaced binary.
+    systemctl restart thekvmd.service
+else
+    systemctl enable --now thekvmd.service
+fi
 
 cat <<EOF
 TheKVM receiver installed.

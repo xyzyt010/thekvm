@@ -45,14 +45,15 @@ pub const MAX_RELIABLE_MESSAGE: usize = 64 * 1024;
 /// Maximum fragments per reliable message.
 pub const MAX_FRAGMENTS: usize = 128;
 
-/// UDP listen port derived from the QUIC listen port. Discovery stays on
-/// 42111, so UDP takes `listen_port + 1` (wrapping 65535 to the discovery
-/// successor range is avoided by mapping 65535 to 42112).
+/// UDP listen port derived from the QUIC listen port: `listen_port + 1`,
+/// except it must never collide with LAN discovery (42111) and never land
+/// on a privileged port, so those cases map to 42112.
 pub fn udp_port(listen_port: u16) -> u16 {
-    if listen_port == u16::MAX {
+    let candidate = listen_port.wrapping_add(1);
+    if candidate == crate::discovery::DISCOVERY_PORT || candidate < 1024 {
         42112
     } else {
-        listen_port.wrapping_add(1)
+        candidate
     }
 }
 
@@ -322,9 +323,12 @@ mod tests {
 
     #[test]
     fn udp_port_derives_without_colliding_discovery() {
-        assert_eq!(udp_port(42110), 42111);
+        // Default QUIC port: +1 would hit discovery (42111), so 42112.
+        assert_eq!(udp_port(42110), 42112);
         assert_eq!(udp_port(42111), 42112);
-        assert_ne!(udp_port(u16::MAX), 0);
+        assert_eq!(udp_port(5000), 5001);
+        assert_eq!(udp_port(u16::MAX), 42112);
+        assert_ne!(udp_port(42110), crate::discovery::DISCOVERY_PORT);
     }
 
     #[test]

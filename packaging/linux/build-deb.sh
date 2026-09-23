@@ -3,7 +3,7 @@
 # Layout: ./in holds the release binaries; metadata is generated here.
 set -eu
 cd ~/thekvm-build
-VER=0.9.50
+VER=0.9.51
 PKG=thekvm
 ROOT=debroot
 rm -rf "$ROOT" "${PKG}_${VER}_amd64.deb"
@@ -191,7 +191,12 @@ case "$1" in
     fi
 
     systemctl daemon-reload
-    systemctl enable --now thekvmd.service
+    if systemctl is-active --quiet thekvmd.service 2>/dev/null; then
+        # Upgrade: the running daemon still executes the replaced binary.
+        systemctl restart thekvmd.service
+    else
+        systemctl enable --now thekvmd.service
+    fi
     echo "TheKVM receiver service installed and running."
     echo "Log out and back in so the 'thekvm' group applies to your desktop session, then launch TheKVM from the start menu."
     ;;
