@@ -12,6 +12,10 @@ jobs:
   linux:
     name: Linux x86_64
     runs-on: ubuntu-24.04
+    env:
+      # Release linking (Skia/static) is memory-hungry; stay well clear of
+      # the runner's RAM ceiling instead of failing fast on a cold cache.
+      CARGO_BUILD_JOBS: 2
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -25,8 +29,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - name: Build release binaries
-        run: cargo build --release -p kvm-daemon -p kvm-ui
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-x86_64-release
+      - name: Build daemon (release)
+        run: cargo build --release -p kvm-daemon
+      - name: Build UI (release)
+        run: cargo build --release -p kvm-ui
       - name: Build .deb
         run: |
           VER="${GITHUB_REF_NAME#v}"
@@ -64,6 +74,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x86_64-release
       - name: Build release binaries
         run: cargo build --release -p kvm-daemon -p kvm-ui
       - name: Zip portable build
