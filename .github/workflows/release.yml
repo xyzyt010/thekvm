@@ -1,0 +1,98 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libdbus-1-dev libfontconfig1-dev libinput-dev libwayland-dev libx11-xcb-dev \
+            libxi-dev libxkbcommon-dev libxtst-dev pkg-config
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Build release binaries
+        run: cargo build --release -p kvm-daemon -p kvm-ui
+      - name: Build .deb
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          sed -i "s/^VER=.*/VER=$VER/" packaging/linux/build-deb.sh
+          grep "^VER=" packaging/linux/build-deb.sh
+          mkdir -p ~/thekvm-build/in
+          cp target/release/kvm-daemon target/release/kvm-ui ~/thekvm-build/in/
+          sudo bash packaging/linux/build-deb.sh
+          ls -la ~/thekvm-build/*.deb
+      - name: Build portable tarball
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          STAGE="thekvm-$VER-linux-x86_64"
+          mkdir -p "$STAGE"
+          cp target/release/kvm-daemon target/release/kvm-ui "$STAGE/"
+          cp packaging/linux/install.sh packaging/linux/99-thekvm-uinput.rules \
+             packaging/linux/thekvm.conf packaging/linux/thekvmd.service \
+             packaging/linux/thekvm-agent.service packaging/linux/thekvm-agent-user.service "$STAGE/"
+          tar czf "$STAGE.tar.gz" "$STAGE"
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            ~/thekvm-build/*.deb
+            thekvm-*-linux-x86_64.tar.gz
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Build release binaries
+        run: cargo build --release -p kvm-daemon -p kvm-ui
+      - name: Zip portable build
+        shell: pwsh
+        run: |
+          $Ver = "${{ github.ref_name }}".TrimStart("v")
+          $Stage = "thekvm-$Ver-windows-x86_64"
+          New-Item -ItemType Directory -Path $Stage | Out-Null
+          Copy-Item target/release/kvm-daemon.exe, target/release/kvm-ui.exe $Stage/
+          Copy-Item packaging/windows/install-service.ps1 $Stage/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$Stage/*" -DestinationPath "$Stage.zip"
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: thekvm-*-windows-x86_64.zip
+
+  publish:
+    name: Publish GitHub Release
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
