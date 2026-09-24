@@ -33,6 +33,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux-x86_64-release
+      - name: Add swap for the Skia link
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
       - name: Build daemon (release)
         run: cargo build --release -p kvm-daemon
       - name: Build UI (release)
