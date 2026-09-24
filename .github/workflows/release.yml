@@ -16,6 +16,15 @@ jobs:
       # Release linking (Skia/static) is memory-hungry; stay well clear of
       # the runner's RAM ceiling instead of failing fast on a cold cache.
       CARGO_BUILD_JOBS: 2
+      # Cap native build parallelism too (Skia build scripts otherwise use
+      # every core regardless of cargo's -j).
+      NUM_JOBS: 2
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      # Trade a little binary size/speed for link-time memory: the default
+      # workspace profile (thin LTO, single codegen unit) peaks far above
+      # what the hosted runner reliably provides.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -35,10 +44,12 @@ jobs:
           shared-key: linux-x86_64-release
       - name: Add swap for the Skia link
         run: |
-          sudo fallocate -l 8G /swapfile
+          df -h /
+          sudo rm -f /swapfile
+          sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo swapon /swapfile || echo "swapon unavailable; continuing with profile caps only"
           free -h
       - name: Build daemon (release)
         run: cargo build --release -p kvm-daemon
