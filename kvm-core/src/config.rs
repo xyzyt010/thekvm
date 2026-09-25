@@ -40,9 +40,10 @@ pub struct Config {
     #[serde(default)]
     pub auto_connect_address: Option<String>,
     /// Synchronize plain text clipboard contents for ordinary logged-in
-    /// sessions. It is opt-in because clipboard data is user content and is
-    /// never required for privileged pre-login input.
-    #[serde(default)]
+    /// sessions. Default on: both machines sync while linked. Clipboard
+    /// data is user content, so either side can still switch it off in
+    /// Settings; privileged pre-login input never needs it.
+    #[serde(default = "default_clipboard_enabled")]
     pub clipboard_enabled: bool,
     /// Largest single clipboard update synchronized, in MiB (default 2,
     /// adjustable in Settings). Anything larger stays local. Old config
@@ -95,10 +96,17 @@ impl Default for Config {
             layout: Default::default(),
             allow_lock_screen_control: false,
             auto_connect_address: None,
-            clipboard_enabled: false,
+            clipboard_enabled: true,
             clipboard_max_mb: DEFAULT_CLIPBOARD_MAX_MB,
         }
     }
+}
+
+/// Fresh installs sync clipboard by default. Config files that already
+/// carry an explicit value keep it; only files predating the field
+/// (which never opted out) pick up the new default.
+fn default_clipboard_enabled() -> bool {
+    true
 }
 
 /// Default clipboard update limit for configs that predate the field.
@@ -341,7 +349,9 @@ mod tests {
         assert!(config.layout.screens.is_empty());
         assert!(!config.allow_lock_screen_control);
         assert!(config.auto_connect_address.is_none());
-        assert!(!config.clipboard_enabled);
+        // Files predating the clipboard field never opted out, so they
+        // pick up the current default-on.
+        assert!(config.clipboard_enabled);
         assert_eq!(config.clipboard_max_mb, DEFAULT_CLIPBOARD_MAX_MB);
         assert_eq!(
             config.clipboard_max_bytes(),

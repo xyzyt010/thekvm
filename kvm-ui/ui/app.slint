@@ -1,4 +1,4 @@
-import { Button, LineEdit, Switch, TabWidget } from "std-widgets.slint";
+import { Button, LineEdit, Palette, Switch, TabWidget } from "std-widgets.slint";
 
 // TheKVM: Deskflow-simple. The Connect tab is the whole product for most
 // users: pick what this computer does, type the other computer's address,
@@ -8,6 +8,26 @@ export component AppWindow inherits Window {
     min-width: 720px;
     min-height: 560px;
     background: #0a0a0a;
+
+    // This UI is designed dark. Slint's fluent widgets follow the OS color
+    // scheme, so on a light desktop (e.g. stock Linux Mint) every Switch,
+    // LineEdit and Button rendered light-on-dark and the contrast fell
+    // apart, while dark-mode Windows looked perfect. Pin the scheme to
+    // dark: set once at startup and re-assert on a slow guard timer, since
+    // the backend re-applies the OS theme on ThemeChanged/xdg-portal
+    // events and would otherwise flip light desktops back.
+    init => {
+        Palette.color-scheme = ColorScheme.dark;
+        scheme-guard.start();
+    }
+    scheme-guard := Timer {
+        interval: 3s;
+        triggered => {
+            if (Palette.color-scheme != ColorScheme.dark) {
+                Palette.color-scheme = ColorScheme.dark;
+            }
+        }
+    }
 
     in property <string> status-text: "Not connected";
     in property <bool> connected: false;
@@ -28,7 +48,7 @@ export component AppWindow inherits Window {
     in-out property <string> incoming-pairing-fingerprint: "";
     in-out property <string> incoming-verification-code: "";
     in-out property <bool> lock-screen-control: false;
-    in-out property <bool> clipboard-enabled: false;
+    in-out property <bool> clipboard-enabled: true;
     in-out property <string> clipboard-max-mb: "2";
     in-out property <int> mode-index: 0;
     in-out property <int> edge-mode-index: 0;
