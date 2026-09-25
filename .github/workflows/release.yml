@@ -106,10 +106,10 @@ jobs:
           VER="${GITHUB_REF_NAME#v}"
           sed -i "s/^VER=.*/VER=$VER/" packaging/linux/build-deb.sh
           grep "^VER=" packaging/linux/build-deb.sh
-          mkdir -p ~/thekvm-build/in
-          cp target/release/kvm-daemon target/release/kvm-ui ~/thekvm-build/in/
-          sudo bash packaging/linux/build-deb.sh
-          ls -la ~/thekvm-build/*.deb
+          mkdir -p "$HOME/thekvm-build/in"
+          cp target/release/kvm-daemon target/release/kvm-ui "$HOME/thekvm-build/in/"
+          sudo THEKVM_BUILD_DIR="$HOME/thekvm-build" bash packaging/linux/build-deb.sh
+          ls -la "$HOME/thekvm-build/"*.deb
       - name: Build portable tarball
         run: |
           VER="${GITHUB_REF_NAME#v}"

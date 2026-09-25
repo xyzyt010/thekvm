@@ -2,7 +2,11 @@
 # Build thekvm .deb on the target Linux machine. Run from ~/thekvm-build.
 # Layout: ./in holds the release binaries; metadata is generated here.
 set -eu
-cd ~/thekvm-build
+# THEKVM_BUILD_DIR overrides the work dir (CI runs the script under sudo,
+# where ~ is /root while the binaries were staged in $HOME as the runner
+# user). Default keeps the documented ~/thekvm-build layout for Mint builds.
+BUILD_DIR="${THEKVM_BUILD_DIR:-$HOME/thekvm-build}"
+cd "$BUILD_DIR"
 VER=0.9.51
 PKG=thekvm
 ROOT=debroot
@@ -227,4 +231,4 @@ chmod 0755 "$ROOT/DEBIAN/preinst" "$ROOT/DEBIAN/postinst" "$ROOT/DEBIAN/prerm" "
 # guaranteed, and we run this under sudo on the target anyway.
 sudo chown -R root:root "$ROOT"
 sudo dpkg-deb --build --root-owner-group "$ROOT" "${PKG}_${VER}_amd64.deb"
-echo "BUILT: ~/thekvm-build/${PKG}_${VER}_amd64.deb"
+echo "BUILT: $BUILD_DIR/${PKG}_${VER}_amd64.deb"
