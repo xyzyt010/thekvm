@@ -172,5 +172,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          # Recursive: artifacts from outside $GITHUB_WORKSPACE (the .deb)
+          # download into subdirectories; `*` would only match top level.
+          files: artifacts/**/*
           generate_release_notes: true
