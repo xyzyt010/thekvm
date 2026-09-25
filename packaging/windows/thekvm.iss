@@ -13,7 +13,9 @@
 ; Build: iscc packaging\windows\thekvm.iss   (output: dist\thekvm-<ver>-setup.exe)
 
 #define MyAppName "TheKVM"
-#define MyAppVersion "0.9.49"
+#ifndef MyAppVersion
+#define MyAppVersion "0.9.51"
+#endif
 #define MyAppPublisher "TheKVM project"
 #define MyAppURL "https://github.com/xyzyt010/thekvm"
 #define ServiceName "TheKVM"
@@ -270,7 +272,7 @@ begin
     AddQuotes('Remove-NetFirewallRule -DisplayName ' +
     AddQuotes(AddQuotes('{#FirewallRule}')) + ' -ErrorAction SilentlyContinue; ' +
     'New-NetFirewallRule -DisplayName ' + AddQuotes(AddQuotes('{#FirewallRule}')) +
-    ' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 42110,42111 ' +
+    ' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 42110,42111,42112 ' +
     '-Program ' + AddQuotes(AddQuotes(DaemonPath())) +
     ' -Profile Domain,Private,Public -ErrorAction Stop ' +
     '> ' + AddQuotes(LogFile) + ' 2>&1'));
@@ -281,7 +283,7 @@ begin
     show-rule check below decides success, not this call. }
   SoftRun('cmd.exe', '/c ' + AddQuotes('netsh.exe advfirewall firewall add rule name=' +
     AddQuotes('{#FirewallRule}') + ' dir=in action=allow protocol=UDP ' +
-    'localport=42110,42111 program=' + AddQuotes(DaemonPath()) +
+    'localport=42110,42111,42112 program=' + AddQuotes(DaemonPath()) +
     ' enable=yes > ' + AddQuotes(LogFile) + ' 2>&1'));
   if RuleVerified() then
     Exit;
@@ -300,7 +302,7 @@ begin
   Output := '';
   LoadStringFromFile(LogFile, Output);
   MsgBox('The firewall rule could not be added automatically. ' +
-    'Pairing needs UDP ports 42110-42111 inbound for kvm-daemon.exe. ' +
+    'Pairing needs UDP ports 42110-42112 inbound for kvm-daemon.exe. ' +
     'Details were saved to ' + LogFile + ' :' + #13#10 + Output,
     mbError, MB_OK);
 end;
