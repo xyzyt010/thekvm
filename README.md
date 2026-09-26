@@ -48,16 +48,18 @@ Two binaries per machine:
 
 ## Transport
 
-- **QUIC** (default) — all input on the authenticated stream. Tuned for
-  input: 2s keep-alive, 256KB datagram buffers, 8MB send window.
-- **UDP** (Settings → Transport) — pointer motion takes an encrypted
-  low-latency fast path (ChaCha20Poly1305, key derived from the QUIC
-  verify: both fingerprints + link epoch, no second pairing). Keys,
+- **UDP** (default, Settings → Transport) — pointer motion takes an
+  encrypted low-latency fast path (ChaCha20Poly1305, key derived from
+  the QUIC verify: both fingerprints + link epoch, no second pairing).
+  No stream head-of-line blocking, so motion stays smooth even while
+  keys, buttons, wheel, clipboard, and handoff share the link. Keys,
   buttons, wheel, clipboard, and handoff stay on QUIC. Every motion
   packet falls back to QUIC automatically, so a blocked UDP port never
   breaks the link. The daemon always listens on both (`listen_port` for
   QUIC, `listen_port + 1` for UDP motion); the setting only selects the
   dial order. Switch with `kvm-daemon configure --transport quic|udp`.
+- **QUIC** — all input on the authenticated stream. Tuned for
+  input: 2s keep-alive, 256KB datagram buffers, 8MB send window.
 
 ## Crates
 

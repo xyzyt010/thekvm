@@ -111,7 +111,7 @@ enum Command {
         /// `receiver-only` (client/receiver only).
         #[arg(long)]
         mode: Option<String>,
-        /// Preferred outbound transport: `quic` (default) or `udp`.
+        /// Preferred outbound transport: `udp` (default) or `quic`.
         /// The daemon always listens on both; this selects dial order.
         #[arg(long)]
         transport: Option<String>,

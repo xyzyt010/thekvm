@@ -1182,6 +1182,33 @@ mod win32_hooks {
         }
     }
 
+    /// Repark the guard pixel under the LIVE cursor after a scroll the hook
+    /// never saw (raw HID wheel, PTP pan). The hook paths above repark on
+    /// every swallowed tick with the event's own coordinates; raw/PTP
+    /// events carry none, so without this the pixel sits at the last hook
+    /// position while the cursor drifted — and the PTP stack translates
+    /// into the app under the drifted cursor (dual scroll) for pure-trackpad
+    /// scrollers who generate no hook ticks at all. Throttled to one
+    /// reposition per 50 ms; no-op when no drive parked a pixel.
+    fn repark_guard_pixel_at_cursor() {
+        static LAST_MS: AtomicU64 = AtomicU64::new(0);
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
+        if GUARD_PIXEL.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let t0 = T0.get_or_init(std::time::Instant::now);
+        let now_ms = t0.elapsed().as_millis() as u64;
+        if now_ms.wrapping_sub(LAST_MS.load(Ordering::Relaxed)) < 50 {
+            return;
+        }
+        LAST_MS.store(now_ms, Ordering::Relaxed);
+        let mut point = POINT::default();
+        if unsafe { GetCursorPos(&mut point) }.is_err() {
+            return;
+        }
+        repark_guard_pixel(point);
+    }
+
     /// Glue the local cursor back onto the park point while driving.
     /// Swallowing a motion event stops its DELIVERY, but absolute-position
     /// devices (and any reposition the hook never sees) still move the OS
@@ -1361,6 +1388,10 @@ mod win32_hooks {
             if x != 0 || y != 0 {
                 RAW_WHEEL.fetch_add(1, Ordering::Relaxed);
                 send(InputEvent::SmoothWheel { x, y });
+                // The hook never saw this scroll, so no hook tick reparked
+                // the guard pixel: keep it under the live cursor or the OS
+                // delivers the same gesture locally too (dual scroll).
+                repark_guard_pixel_at_cursor();
             }
         }
     }
@@ -1738,6 +1769,8 @@ mod win32_hooks {
     /// scroll owned a pinch, muted pan, and zoomed the peer instead of
     /// scrolling it. The common-mode guard below is the real
     /// scroll/pinch discriminator; this gate is only the second net.
+    /// (Kept at 128 while zoom gain was calmed separately: moving both
+    /// at once would double-desensitize real pinches.)
     const PINCH_ENGAGE_UNITS: i64 = 128;
     /// Common-mode dominance ratio: a frame whose midpoint step exceeds
     /// the spread step by more than this factor is scrolling fingers,
@@ -1782,9 +1815,10 @@ mod win32_hooks {
                 prev: None,
                 prev_mid: None,
                 acc: 0,
-                // Matches the live axis scale (LogicalMax/16): a fresh tap
-                // before subscribe is already calm, not 3x eager.
-                units_per_detent: 192,
+                // Matches the live axis scale (LogicalMax/16), then calmed
+                // a further step: at 192 small spreads still stepped zoom
+                // too eagerly once engaged, so zoom ran hot on real hands.
+                units_per_detent: 240,
                 engaged: false,
                 scroll_streak: 0,
             }
@@ -2492,6 +2526,10 @@ mod win32_hooks {
                 if fx != 0 || fy != 0 {
                     PTP_SCROLL.fetch_add(1, Ordering::Relaxed);
                     send(InputEvent::SmoothWheel { x: fx, y: fy });
+                    // Same guard-pixel upkeep as the raw wheel path above:
+                    // PTP scroll bypasses the hook, so without this the
+                    // pixel goes stale for pure-trackpad scrollers.
+                    repark_guard_pixel_at_cursor();
                 }
             }
         }

@@ -2818,6 +2818,12 @@ struct TopologySession {
     wheel_captured: u64,
     smooth_captured: u64,
     wheel_forwarded: u64,
+    /// Signed wheel VALUE sums (120ths) per axis. Counts prove flow; only
+    /// values prove an axis CAN move: a drive whose vertical scrolls cross
+    /// while every forwarded delta has x == 0 pins horizontal pans as a
+    /// capture/inject gap instead of a mystery. Logged at teardown.
+    wheel_sum_x: i64,
+    wheel_sum_y: i64,
     /// Sender-side motion census: captured vs forwarded MouseMove events.
     /// Logged at teardown next to the scroll census, so a silent motion
     /// drop (entry warp lands, cursor never tracks) is diagnosable from
@@ -2906,6 +2912,8 @@ impl TopologySession {
                 wheel_captured = self.wheel_captured,
                 smooth_captured = self.smooth_captured,
                 wheel_forwarded = self.wheel_forwarded,
+                wheel_sum_x = self.wheel_sum_x,
+                wheel_sum_y = self.wheel_sum_y,
                 motion_captured = self.motion_captured,
                 motion_forwarded = self.motion_forwarded,
                 motion_coalesced = self.motion_coalesced,
@@ -3774,7 +3782,11 @@ async fn handle_topology_event(
                 // forwarded counts wire sends).
                 match event {
                     InputEvent::Wheel(_) => session.wheel_captured += 1,
-                    InputEvent::SmoothWheel { .. } => session.smooth_captured += 1,
+                    InputEvent::SmoothWheel { x, y } => {
+                        session.smooth_captured += 1;
+                        session.wheel_sum_x += i64::from(x);
+                        session.wheel_sum_y += i64::from(y);
+                    }
                     InputEvent::MouseMove { dx, dy } => {
                         session.motion_captured += 1;
                         if session.motion_first.is_none() {
@@ -4722,6 +4734,8 @@ fn spawn_episode_driver(
         wheel_captured: 0,
         smooth_captured: 0,
         wheel_forwarded: 0,
+        wheel_sum_x: 0,
+        wheel_sum_y: 0,
         motion_captured: 0,
         motion_forwarded: 0,
         motion_coalesced: 0,
