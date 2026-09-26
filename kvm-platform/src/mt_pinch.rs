@@ -29,10 +29,11 @@ const ABS_MT_TRACKING_ID: u16 = 0x39;
 const ABS_BITS_LEN: usize = 8;
 /// Same engage gate as the PTP tap: spread must move this far before the
 /// fingers own a pinch (a steady two-finger scroll stays pan). Raised
-/// 48 -> 96 -> 128: finger wobble during a real scroll moves the spread
-/// more than the old gates assumed. The common-mode guard in feed is the
-/// real scroll/pinch discriminator; this gate is only the second net.
-const PINCH_ENGAGE_UNITS: i64 = 128;
+/// 48 -> 96 -> 128 -> 192: finger wobble during a real scroll (horizontal
+/// pans wobble most) moves the spread more than the old gates assumed.
+/// The common-mode guard in feed is the real scroll/pinch discriminator;
+/// this gate is only the second net.
+const PINCH_ENGAGE_UNITS: i64 = 192;
 /// Common-mode dominance ratio (PTP parity): a frame whose midpoint step
 /// exceeds the spread step by more than this factor is scrolling fingers.
 const SCROLL_DOMINANCE: i64 = 2;
@@ -40,10 +41,13 @@ const SCROLL_DOMINANCE: i64 = 2;
 const SCROLL_NOISE_FLOOR: i64 = 4;
 /// Sustained scroll-dominated frames while engaged hand the gesture back
 /// to pan instead of holding zoom hostage until the fingers lift.
-const TAKEOVER_FRAMES: u32 = 8;
+/// Five, not eight (PTP parity): a mis-engaged pinch must release a
+/// wobbly horizontal scroll mid-gesture.
+const TAKEOVER_FRAMES: u32 = 5;
 /// Full sensor span earns this many detents (PTP parity). Lowered from 48
-/// to 16 (~3x calmer) so a slight slide is a slight zoom.
-const DETENTS_PER_SPAN: i64 = 16;
+/// to 16, then 20 (~4x calmer than the original) so a slight slide is a
+/// slight zoom and real hands stop running hot.
+const DETENTS_PER_SPAN: i64 = 20;
 
 type IoctlRequest = libc::c_ulong;
 
@@ -391,14 +395,14 @@ mod tests {
         let mut pinch = state();
         assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
         assert!(!pinch.engaged);
-        // Below the engage gate (128): still scrolling fingers.
+        // Below the engage gate (192): still scrolling fingers.
         assert_eq!(pinch.feed(&[(0, 0), (120, 0)]), (0, false));
         assert!(!pinch.engaged);
         // Past the gate: engaged, spread change emits zoom-in (+).
-        // Anchor 100, prev 120, spread 230: acc 110 => 11 detents.
-        assert_eq!(pinch.feed(&[(0, 0), (230, 0)]), (1320, false));
+        // Anchor 100, prev 120, spread 300: acc 180 => 18 detents.
+        assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2160, false));
         assert!(pinch.engaged);
-        assert_eq!(pinch.feed(&[(0, 0), (210, 0)]), (-240, false));
+        assert_eq!(pinch.feed(&[(0, 0), (210, 0)]), (-1080, false));
     }
 
     #[test]
@@ -413,8 +417,8 @@ mod tests {
     #[test]
     fn scroll_with_spread_wobble_never_pinches() {
         // Brisk scroll with jitter and slow spread drift: common-mode
-        // dominates every frame, so the anchor slides and the 128 gate
-        // never trips (the drift alone would pass it by frame ~60).
+        // dominates every frame, so the anchor slides and the 192 gate
+        // never trips (the drift alone would pass it).
         let mut pinch = state();
         assert_eq!(pinch.feed(&[(0, 200), (100, 205)]), (0, false));
         for step in 1..70 {
@@ -432,15 +436,15 @@ mod tests {
     fn scroll_takeover_ends_an_engaged_pinch() {
         let mut pinch = state();
         assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
-        // Net +140 past the gate with a near-still midpoint: 14 detents.
-        assert_eq!(pinch.feed(&[(0, 0), (240, 0)]), (1680, false));
+        // Net +200 past the gate with a near-still midpoint: 20 detents.
+        assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2400, false));
         assert!(pinch.engaged);
-        for step in 1..8 {
+        for step in 1..5 {
             let y = -step * 20;
-            assert_eq!(pinch.feed(&[(0, y), (240, y)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, y), (300, y)]), (0, false));
             assert!(pinch.engaged);
         }
-        assert_eq!(pinch.feed(&[(0, -160), (240, -160)]), (0, true));
+        assert_eq!(pinch.feed(&[(0, -100), (300, -100)]), (0, true));
         assert!(!pinch.engaged);
         assert_eq!(pinch.feed(&[]), (0, false));
     }
@@ -449,7 +453,7 @@ mod tests {
     fn lift_after_pinch_ends_once_then_reanchors() {
         let mut pinch = state();
         assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
-        assert_eq!(pinch.feed(&[(0, 0), (240, 0)]), (1680, false));
+        assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2400, false));
         assert_eq!(pinch.feed(&[]), (0, true));
         assert_eq!(pinch.feed(&[]), (0, false));
         assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
@@ -485,11 +489,11 @@ mod tests {
         device.ingest(ev(EV_ABS, ABS_MT_POSITION_Y, 0));
         device.ingest(ev(EV_SYN, SYN_REPORT, 0));
         assert_eq!(device.pending, None);
-        // Spread 100 -> 240: net +140 past the gate, 14 detents.
+        // Spread 100 -> 300: net +200 past the gate, 20 detents.
         device.ingest(ev(EV_ABS, ABS_MT_SLOT, 1));
-        device.ingest(ev(EV_ABS, ABS_MT_POSITION_X, 240));
+        device.ingest(ev(EV_ABS, ABS_MT_POSITION_X, 300));
         device.ingest(ev(EV_SYN, SYN_REPORT, 0));
-        assert_eq!(device.pending, Some(InputEvent::Pinch { delta: 1680 }));
+        assert_eq!(device.pending, Some(InputEvent::Pinch { delta: 2400 }));
         device.pending = None;
         // Lift slot 1: single contact left, gesture ends.
         device.ingest(ev(EV_ABS, ABS_MT_SLOT, 1));

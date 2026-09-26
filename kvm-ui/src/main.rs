@@ -176,10 +176,6 @@ fn main() -> Result<()> {
             EdgeMode::Single => 0,
             EdgeMode::Double => 1,
         });
-        ui.set_transport_index(match config.transport {
-            TransportProtocol::Quic => 0,
-            TransportProtocol::Udp => 1,
-        });
         // Seed the green "Current role" text from the same file: until the
         // first successful poll it is the only source of truth on screen.
         ui.set_role_text(SharedString::from(role_name(config.mode)));
@@ -713,101 +709,9 @@ fn main() -> Result<()> {
         });
     });
 
-    let weak = ui.as_weak();
-    let transport_session = session_state.clone();
-    ui.on_set_transport(move |index| {
-        let weak = weak.clone();
-        let transport_session = transport_session.clone();
-        let requested = match index {
-            1 => TransportProtocol::Udp,
-            _ => TransportProtocol::Quic,
-        };
-        ui_log(&format!(
-            "transport selected: {}",
-            transport_name(requested)
-        ));
-        set_status(&weak, "Applying transport…".into());
-        std::thread::spawn(move || {
-            let current = match control_request(ControlRequest::GetConfig) {
-                Ok(ControlResponse::Config(config)) => config,
-                Ok(other) => {
-                    ui_log(&format!(
-                        "transport change: cannot read settings: {other:?}"
-                    ));
-                    set_status(&weak, format!("Cannot read settings: {other:?}"));
-                    return;
-                }
-                Err(error) => {
-                    ui_log(&format!("transport change: settings unreadable: {error:#}"));
-                    set_status(
-                        &weak,
-                        control_denied_status(&error, "Background service unreachable"),
-                    );
-                    return;
-                }
-            };
-            match control_request(ControlRequest::SetConfig {
-                device_name: Some(current.device_name.clone()),
-                mode: Some(current.mode),
-                allow_lock_screen_control: Some(current.allow_lock_screen_control),
-                listen_port: None,
-                layout: None,
-                auto_connect_address: current.auto_connect_address.clone(),
-                clear_auto_connect: current.auto_connect_address.is_none(),
-                clipboard_enabled: Some(current.clipboard_enabled),
-                clipboard_max_mb: None,
-                edge_mode: None,
-                transport: Some(requested),
-            }) {
-                Ok(ControlResponse::Applied { .. }) => {
-                    mirror_user_config(
-                        &current.device_name,
-                        current.mode,
-                        current.allow_lock_screen_control,
-                        current.clipboard_enabled,
-                        None,
-                        None,
-                        None,
-                        Some(requested),
-                    );
-                    ui_log(&format!("transport applied: {}", transport_name(requested)));
-                    set_transport_display(&weak, requested);
-                    if transport_session
-                        .lock()
-                        .ok()
-                        .is_some_and(|slot| slot.as_ref().is_some())
-                    {
-                        ui_log("transport change: stopping the link; Connect again to re-link");
-                        stop_session(&weak, &transport_session, "Link stopped");
-                        set_status(
-                            &weak,
-                            format!(
-                                "Transport set: {}. Link stopped — Connect again to re-link.",
-                                transport_name(requested)
-                            ),
-                        );
-                    } else {
-                        set_status(
-                            &weak,
-                            format!("Transport set: {}.", transport_name(requested)),
-                        );
-                    }
-                }
-                Ok(ControlResponse::Error { message }) => {
-                    ui_log(&format!("transport change refused: {message}"));
-                    set_status(&weak, message)
-                }
-                Ok(other) => {
-                    ui_log(&format!("transport change unexpected: {other:?}"));
-                    set_status(&weak, format!("Unexpected daemon response: {other:?}"))
-                }
-                Err(error) => {
-                    ui_log(&format!("transport change failed: {error}"));
-                    set_status(&weak, format!("Cannot set transport: {error}"))
-                }
-            }
-        });
-    });
+    // Transport is cemented to UDP: no selector, no per-link choice. The
+    // supervised child and the daemon always dial UDP motion with automatic
+    // QUIC fallback per packet; nothing here can select QUIC anymore.
 
     let _weak = ui.as_weak();
     ui.on_open_log_folder(move || {
@@ -1076,7 +980,7 @@ fn main() -> Result<()> {
 
     let weak = ui.as_weak();
     ui.on_apply_config(
-        move |allow_lock_screen, mode_index, device_name, auto_address, clipboard_enabled, clipboard_max_mb, transport_index| {
+        move |allow_lock_screen, mode_index, device_name, auto_address, clipboard_enabled, clipboard_max_mb| {
             let weak = weak.clone();
             let device_name = device_name.to_string();
             let auto_address = auto_address.to_string();
@@ -1088,10 +992,9 @@ fn main() -> Result<()> {
                     2 => Mode::ClientOnly,
                     _ => Mode::Bidirectional,
                 };
-                let requested_transport = match transport_index {
-                    1 => TransportProtocol::Udp,
-                    _ => TransportProtocol::Quic,
-                };
+                // Transport is cemented to UDP: the form carries no
+                // selector, so every save pins UDP on both configs.
+                let requested_transport = TransportProtocol::Udp;
                 // Clipboard cap from the MB field: refuse garbage instead
                 // of silently keeping the old limit.
                 let max_mb: u32 = match clipboard_max_mb.trim().parse() {
@@ -1129,10 +1032,7 @@ fn main() -> Result<()> {
                     2 => "receiver-only",
                     _ => "bidirectional",
                 };
-                let transport_arg = match requested_transport {
-                    TransportProtocol::Udp => "udp",
-                    TransportProtocol::Quic => "quic",
-                };
+                let transport_arg = "udp";
                 let daemon =
                     std::env::var("THEKVM_DAEMON_PATH").unwrap_or_else(|_| "kvm-daemon".into());
                 let mut command = std::process::Command::new(daemon);
@@ -1181,7 +1081,6 @@ fn main() -> Result<()> {
                         // Same truth rule as the role buttons: the green
                         // role text follows the Applied result at once.
                         set_role_display(&weak, requested_mode);
-                        set_transport_display(&weak, requested_transport);
                         // Settings (role included) can invalidate a running
                         // link contract: stop it rather than drive stale.
                         if config_session
@@ -1212,7 +1111,6 @@ fn main() -> Result<()> {
                     Err(control_error) => match command.output() {
                         Ok(output) if output.status.success() => {
                             set_role_display(&weak, requested_mode);
-                            set_transport_display(&weak, requested_transport);
                             set_status(&weak, "Configuration saved (CLI fallback)".into())
                         }
                         Ok(output) => set_status(
@@ -1380,29 +1278,6 @@ fn edge_mode_name(mode: EdgeMode) -> &'static str {
     }
 }
 
-fn transport_name(transport: TransportProtocol) -> &'static str {
-    match transport {
-        TransportProtocol::Quic => "QUIC",
-        TransportProtocol::Udp => "UDP",
-    }
-}
-
-/// Show the authoritative transport immediately (same rule as role/edge:
-/// never wait for the next poll).
-fn set_transport_display(weak: &slint::Weak<AppWindow>, transport: TransportProtocol) {
-    let _ = slint::invoke_from_event_loop({
-        let weak = weak.clone();
-        move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.set_transport_index(match transport {
-                    TransportProtocol::Quic => 0,
-                    TransportProtocol::Udp => 1,
-                });
-            }
-        }
-    });
-}
-
 /// Show the authoritative edge discipline immediately (same rule as the
 /// role display: never wait for the next poll).
 fn set_edge_mode_display(weak: &slint::Weak<AppWindow>, mode: EdgeMode) {
@@ -1539,10 +1414,6 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                 ui.set_edge_mode_index(match status.edge_mode {
                     EdgeMode::Single => 0,
                     EdgeMode::Double => 1,
-                });
-                ui.set_transport_index(match status.transport {
-                    TransportProtocol::Quic => 0,
-                    TransportProtocol::Udp => 1,
                 });
                 ui.set_fingerprint(SharedString::from(status.fingerprint_hex));
                 ui.set_role_text(SharedString::from(role_name(status.mode)));

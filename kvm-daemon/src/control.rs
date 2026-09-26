@@ -539,17 +539,10 @@ where
                     if let Some(edge_mode) = edge_mode {
                         updated.edge_mode = edge_mode;
                     }
-                    if let Some(transport) = transport {
-                        if updated.transport != transport {
-                            crate::service::audit_event(
-                                &data_dir,
-                                &format!(
-                                    "transport {:?} -> {transport:?} via local control",
-                                    current.transport
-                                ),
-                            );
-                            updated.transport = transport;
-                        }
+                    if transport.is_some() {
+                        // Transport is cemented to UDP: a stale client asking
+                        // for QUIC is acknowledged but never honored.
+                        updated.transport = kvm_core::TransportProtocol::Udp;
                     }
                     if let Some(layout) = layout {
                         if let Err(error) = layout.validate() {

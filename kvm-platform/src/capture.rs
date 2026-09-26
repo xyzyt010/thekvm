@@ -1764,14 +1764,13 @@ mod win32_hooks {
     /// Spread changes past this many sensor units own the gesture: below
     /// it two fingers are scrolling (pan keeps them), above it they are
     /// pinching (zoom takes over, pan stays silent for the gesture).
-    /// Raised 48 -> 96 -> 128: finger wobble during a real scroll moves
-    /// the spread more than the old gates assumed, so a steady vertical
-    /// scroll owned a pinch, muted pan, and zoomed the peer instead of
-    /// scrolling it. The common-mode guard below is the real
-    /// scroll/pinch discriminator; this gate is only the second net.
-    /// (Kept at 128 while zoom gain was calmed separately: moving both
-    /// at once would double-desensitize real pinches.)
-    const PINCH_ENGAGE_UNITS: i64 = 128;
+    /// Raised 48 -> 96 -> 128 -> 192: finger wobble during a real scroll
+    /// (horizontal pans wobble most) moves the spread more than the old
+    /// gates assumed, so a steady scroll owned a pinch, muted pan, and
+    /// zoomed the peer instead of scrolling it — the "horizontal works a
+    /// few times then stops" shape. The common-mode guard below is the
+    /// real scroll/pinch discriminator; this gate is only the second net.
+    const PINCH_ENGAGE_UNITS: i64 = 192;
     /// Common-mode dominance ratio: a frame whose midpoint step exceeds
     /// the spread step by more than this factor is scrolling fingers,
     /// not pinching ones (a one-finger-anchored asymmetric pinch moves
@@ -1781,7 +1780,10 @@ mod win32_hooks {
     const SCROLL_NOISE_FLOOR: i64 = 4;
     /// Sustained scroll-dominated frames while engaged hand the gesture
     /// back to pan (the fingers went back to scrolling mid-pinch).
-    const TAKEOVER_FRAMES: u32 = 8;
+    /// Five, not eight: a mis-engaged pinch must release a wobbly
+    /// horizontal scroll mid-gesture instead of holding pan hostage
+    /// until the fingers lift.
+    const TAKEOVER_FRAMES: u32 = 5;
 
     /// Two-finger pinch → zoom accumulator. Pure apart from construction,
     /// so the gesture math is unit-tested without HID hardware. Fed the
@@ -1816,9 +1818,10 @@ mod win32_hooks {
                 prev_mid: None,
                 acc: 0,
                 // Matches the live axis scale (LogicalMax/16), then calmed
-                // a further step: at 192 small spreads still stepped zoom
-                // too eagerly once engaged, so zoom ran hot on real hands.
-                units_per_detent: 240,
+                // two steps: at 192 small spreads still stepped zoom too
+                // eagerly once engaged, and at 240 real hands still ran
+                // hot — zoom must move deliberately, never jump.
+                units_per_detent: 320,
                 engaged: false,
                 scroll_streak: 0,
             }
@@ -1873,7 +1876,7 @@ mod win32_hooks {
             // drift (a close trends away from the anchor and engages)
             // while a traveling scroll still vetoes and slides (its
             // midpoint runs away from the anchor). While ENGAGED the
-            // veto stays per-frame: the 8-frame scroll takeover must
+            // veto stays per-frame: the 5-frame scroll takeover must
             // hand a resumed scroll back to pan fast, and excursions
             // would delay it by the already-banked spread.
             let vetoed = if self.engaged {
@@ -2281,9 +2284,13 @@ mod win32_hooks {
                     pan.units_per_detent_x = found.units_per_detent_x;
                     pan.units_per_detent_y = found.units_per_detent_y;
                     // Pinch spread moves in the same sensor units: share
-                    // the axis scale (mean of both axes).
+                    // the axis scale (mean of both axes), calmed a further
+                    // quarter — the constructor default only covers taps
+                    // without a live digitizer; real hardware lands here.
                     ptp_pinch_slot().units_per_detent =
-                        (found.units_per_detent_x + found.units_per_detent_y + 1) / 2;
+                        ((found.units_per_detent_x + found.units_per_detent_y + 1) / 2)
+                            .saturating_mul(5)
+                            / 4;
                 }
                 *ptp_device_slot() = Some(found);
                 tracing::info!(
@@ -2616,15 +2623,15 @@ mod win32_hooks {
             // Anchor: spread 100.
             assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
             assert!(!pinch.engaged());
-            // Below the engage gate (128): still scrolling fingers.
+            // Below the engage gate (192): still scrolling fingers.
             assert_eq!(pinch.feed(&[(0, 0), (120, 0)]), (0, false));
             assert!(!pinch.engaged());
             // Past the gate: engaged, spread change emits zoom-in (+).
-            // Anchor 100, prev 120, spread 230: acc 110 => 11 detents.
-            assert_eq!(pinch.feed(&[(0, 0), (230, 0)]), (1320, false));
+            // Anchor 100, prev 120, spread 300: acc 180 => 18 detents.
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2160, false));
             assert!(pinch.engaged());
             // Fingers close: zoom-out (−).
-            assert_eq!(pinch.feed(&[(0, 0), (210, 0)]), (-240, false));
+            assert_eq!(pinch.feed(&[(0, 0), (210, 0)]), (-1080, false));
         }
 
         #[test]
@@ -2647,7 +2654,7 @@ mod win32_hooks {
             // never stay perfectly parallel). Common-mode dominates
             // every frame, so the anchor slides and the gate never
             // trips — without arbitration the drift alone would pass
-            // 128 units by frame ~60, own a pinch, mute pan, and zoom
+            // 192 units, own a pinch, mute pan, and zoom
             // the peer instead of scrolling it.
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
@@ -2674,20 +2681,25 @@ mod win32_hooks {
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
             assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (0, false));
-            for step in 1..=12 {
+            for step in 1..=19 {
                 let s = step as i32;
                 // Spread shrinks 10/frame; midpoint wanders 4/frame.
                 let (zoom, ended) = pinch.feed(&[(s, 0), (300 - 9 * s, 0)]);
                 assert_eq!((zoom, ended), (0, false));
                 assert!(!pinch.engaged());
             }
-            // Spread 300 -> 170: excursion 130 past the 128 gate.
-            let (zoom, ended) = pinch.feed(&[(13, 0), (300 - 9 * 13, 0)]);
+            // Spread 300 -> 100: excursion 200 past the 192 gate.
+            let (zoom, ended) = pinch.feed(&[(20, 0), (300 - 9 * 20, 0)]);
             assert_eq!(ended, false);
             assert!(pinch.engaged());
             assert!(zoom < 0);
             // Further closing keeps emitting zoom-out.
-            let (zoom, ended) = pinch.feed(&[(14, 0), (300 - 9 * 14, 0)]);
+            let (zoom, ended) = pinch.feed(&[(21, 0), (300 - 9 * 21, 0)]);
+            assert_eq!(ended, false);
+            assert!(pinch.engaged());
+            assert!(zoom < 0);
+            // And further still.
+            let (zoom, ended) = pinch.feed(&[(22, 0), (300 - 9 * 22, 0)]);
             assert_eq!(ended, false);
             assert!(zoom < 0);
             // Lift ends exactly once.
@@ -2702,13 +2714,13 @@ mod win32_hooks {
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
             assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (0, false));
-            for step in 1..=12 {
+            for step in 1..=19 {
                 let s = step as i32;
                 let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * s, 0)]);
                 assert_eq!((zoom, ended), (0, false));
                 assert!(!pinch.engaged());
             }
-            let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * 13, 0)]);
+            let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * 20, 0)]);
             assert_eq!(ended, false);
             assert!(pinch.engaged());
             assert!(zoom < 0);
@@ -2721,17 +2733,17 @@ mod win32_hooks {
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
             assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
-            assert_eq!(pinch.feed(&[(0, 0), (240, 0)]), (1680, false));
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2400, false));
             assert!(pinch.engaged());
-            // Then the fingers go back to scrolling together: after 8
+            // Then the fingers go back to scrolling together: after 5
             // sustained scroll-dominated frames the pinch ends (pan kept
             // feeding underneath, so it resumes without a jump).
-            for step in 1..8 {
+            for step in 1..5 {
                 let y = -step * 20;
-                assert_eq!(pinch.feed(&[(0, y), (240, y)]), (0, false));
+                assert_eq!(pinch.feed(&[(0, y), (300, y)]), (0, false));
                 assert!(pinch.engaged());
             }
-            assert_eq!(pinch.feed(&[(0, -160), (240, -160)]), (0, true));
+            assert_eq!(pinch.feed(&[(0, -100), (300, -100)]), (0, true));
             assert!(!pinch.engaged());
             // A later lift is silent: nothing held downstream anymore.
             assert_eq!(pinch.feed(&[]), (0, false));
@@ -2742,9 +2754,9 @@ mod win32_hooks {
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
             assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
-            // Spread 100 -> 240: net +140 past the 128 gate with a
-            // near-still midpoint, so 14 detents of zoom-in.
-            assert_eq!(pinch.feed(&[(0, 0), (240, 0)]), (1680, false));
+            // Spread 100 -> 300: net +200 past the 192 gate with a
+            // near-still midpoint, so 20 detents of zoom-in.
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2400, false));
             // Lift: End exactly once, then silence.
             assert_eq!(pinch.feed(&[]), (0, true));
             assert_eq!(pinch.feed(&[]), (0, false));

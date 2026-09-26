@@ -159,7 +159,7 @@ pub struct DaemonStatus {
     /// for older daemons that predate the field.
     #[serde(default)]
     pub edge_mode: EdgeMode,
-    /// Preferred outbound transport. Defaults to Quic for older daemons.
+    /// Cemented transport. Always Udp; defaults to Udp for older daemons.
     #[serde(default)]
     pub transport: TransportProtocol,
     pub peer_count: usize,

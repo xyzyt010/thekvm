@@ -16,11 +16,12 @@ pub struct Config {
     pub device_name: String,
     pub listen_port: u16,
     pub mode: Mode,
-    /// Preferred dial transport. The daemon always listens on both QUIC and
-    /// UDP so either side can reach it regardless of this setting; this only
-    /// selects which transport outbound `connect`/`capture` sessions try
-    /// first (with automatic fallback to the other on failure).
-    /// Old config files without this field load as Udp.
+    /// Preferred dial transport. Cemented to UDP: the daemon always
+    /// listens on both QUIC and UDP, and outbound sessions always offer
+    /// the UDP motion fast path (with automatic per-packet QUIC fallback).
+    /// There is no QUIC option anywhere — no UI selector, no CLI switch.
+    /// Old config files without this field load as Udp; files that still
+    /// carry `"transport":"Quic"` are migrated to Udp on load.
     #[serde(default)]
     pub transport: TransportProtocol,
     /// Which screen edges may open a crossing. Single (default) crosses
@@ -54,14 +55,15 @@ pub struct Config {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TransportProtocol {
-    /// Authenticated QUIC. Best compatibility, reliable streams
-    /// plus unreliable datagrams for pointer motion.
+    /// Legacy QUIC-only marker. Kept deserializable so old config files
+    /// still load — never takes effect (load migrates to Udp, and every
+    /// dial offers UDP motion). There is no way to select this.
     Quic,
-    /// Low-latency UDP (default). Pointer motion rides encrypted datagrams
-    /// with no stream head-of-line blocking, so it is the lowest-lag dial;
-    /// the key is derived from the authenticated QUIC verify handshake, so
-    /// UDP sessions carry the same pairing trust without a second ceremony.
-    /// Falls back to QUIC automatically when blocked.
+    /// The only transport. Pointer motion rides encrypted UDP datagrams
+    /// with no stream head-of-line blocking; the key is derived from the
+    /// authenticated QUIC verify handshake, so UDP sessions carry the same
+    /// pairing trust without a second ceremony. Falls back to QUIC
+    /// per packet automatically when blocked.
     #[default]
     Udp,
 }
@@ -123,7 +125,11 @@ impl Config {
 
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
-        let config: Self = serde_json::from_str(&raw)?;
+        let mut config: Self = serde_json::from_str(&raw)?;
+        // Transport is cemented to UDP (no QUIC option anywhere): old
+        // config files may still carry `"transport":"Quic"` — the variant
+        // stays deserializable for that reason, but it never takes effect.
+        config.transport = TransportProtocol::Udp;
         config.validate().map_err(std::io::Error::other)?;
         Ok(config)
     }

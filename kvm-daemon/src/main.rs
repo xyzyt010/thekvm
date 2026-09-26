@@ -111,8 +111,8 @@ enum Command {
         /// `receiver-only` (client/receiver only).
         #[arg(long)]
         mode: Option<String>,
-        /// Preferred outbound transport: `udp` (default) or `quic`.
-        /// The daemon always listens on both; this selects dial order.
+        /// Retired: the link is always UDP. Accepted so old scripts keep
+        /// working; any value is ignored with a warning.
         #[arg(long)]
         transport: Option<String>,
         /// Allow paired peers to request lock-screen-capable injection.
@@ -379,20 +379,15 @@ async fn async_main() -> Result<()> {
             disable_clipboard,
             clipboard_max_mb,
         } => {
-            let requested_transport = transport
-                .as_deref()
-                .map(|value| match value.to_ascii_lowercase().as_str() {
-                    "quic" => Ok(kvm_core::TransportProtocol::Quic),
-                    "udp" => Ok(kvm_core::TransportProtocol::Udp),
-                    _ => Err(anyhow::anyhow!(
-                        "invalid transport {value}; use quic or udp"
-                    )),
-                })
-                .transpose()?;
+            if transport.is_some() {
+                // Transport is cemented to UDP: the flag is accepted so old
+                // scripts keep working, but QUIC can no longer be selected.
+                tracing::warn!("--transport is retired: the link is always UDP; ignoring");
+            }
             service::configure(service::ConfigureOptions {
                 device_name: device_name.as_deref(),
                 mode: mode.as_deref(),
-                transport: requested_transport,
+                transport: None,
                 allow_lock_screen_control: if allow_lock_screen_control {
                     Some(true)
                 } else if disable_lock_screen_control {

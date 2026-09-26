@@ -190,6 +190,30 @@ fn send_motion_udp(seq: u64, dx: i32, dy: i32) -> bool {
     socket.try_send_to(&packet, peer_addr).is_ok()
 }
 
+/// Arm the process-global UDP motion sender for this peer and link epoch.
+/// Every episode open (fresh topology open, pre-warm, fixed-peer link)
+/// calls this after the Hello negotiates `udp_motion`: without it the
+/// sender slot stays empty and ALL motion silently falls back to the QUIC
+/// stream — the lag. Re-arming per episode is required, not once per
+/// link: the key derives from the link epoch, so a re-linked peer needs
+/// a fresh sender or its packets die on a stale key.
+async fn arm_udp_motion_sender(
+    local_fingerprint: &str,
+    peer_fingerprint: &str,
+    epoch: u64,
+    remote: std::net::SocketAddr,
+) {
+    let key = kvm_protocol::udp::derive_udp_key(local_fingerprint, peer_fingerprint, epoch);
+    let address = remote.to_string();
+    match setup_udp_sender(&address, key).await {
+        Some(sender) => {
+            set_udp_sender(Some(sender));
+            tracing::info!(%address, "udp motion fast path armed");
+        }
+        None => tracing::warn!(%address, "udp motion sender unavailable; motion stays on QUIC"),
+    }
+}
+
 pub(crate) fn inbound_link_registry() -> LinkRegistry {
     INBOUND_LINKS
         .get_or_init(|| Arc::new(std::sync::Mutex::new(HashMap::new())))
@@ -1060,8 +1084,10 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
         }
         config.clipboard_max_mb = max_mb;
     }
-    if let Some(transport) = transport {
-        config.transport = transport;
+    if transport.is_some() {
+        // Transport is cemented to UDP: a stale CLI/UI asking for QUIC is
+        // accepted for compatibility but never honored.
+        config.transport = kvm_core::TransportProtocol::Udp;
     }
     config.save(&path).context("saving config")?;
     if config.mode != previous_mode {
@@ -1471,7 +1497,7 @@ pub async fn connect(
                 clipboard_enabled: config.clipboard_enabled,
                 screen_geometry: truthful_local_geometry(&config.layout),
                 link_id,
-                udp_motion: config.transport == kvm_core::TransportProtocol::Udp,
+                udp_motion: true, // UDP cemented: every dial offers motion fast path
             },
             None,
             &data_dir(),
@@ -2156,8 +2182,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                 clipboard_max_bytes: config.clipboard_max_bytes() as u64,
                                 dir: &dir,
                                 link_id: link.as_ref().and_then(|link| link.link_id),
-                                want_udp_motion: config.transport
-                                    == kvm_core::TransportProtocol::Udp,
+                                want_udp_motion: true, // UDP cemented
                             }).await {
                                 Ok(opened) => session = Some(opened),
                                 Err(error) => {
@@ -2362,7 +2387,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     inbound_baselines_fresh: &mut inbound_baselines_fresh,
                     last_yield: &mut last_yield,
                     last_outbound_input: &mut last_outbound_input,
-                    want_udp_motion: config.transport == kvm_core::TransportProtocol::Udp,
+                    want_udp_motion: true, // UDP cemented: every dial offers motion fast path
                 })
                 .await?;
             }
@@ -2490,7 +2515,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     inbound_baselines_fresh: &mut inbound_baselines_fresh,
                     last_yield: &mut last_yield,
                     last_outbound_input: &mut last_outbound_input,
-                    want_udp_motion: config.transport == kvm_core::TransportProtocol::Udp,
+                    want_udp_motion: true, // UDP cemented: every dial offers motion fast path
                 })
                 .await?;
             }
@@ -4347,6 +4372,25 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
             }
         }
     }
+    // UDP fast-path motion: the Hello above negotiated it, so arm the
+    // outbound sender from the live association's peer address. Without
+    // this every topology episode falls back to the QUIC stream (the
+    // lag): only the fixed-peer path used to arm it.
+    if capabilities.udp_motion {
+        if let Some(epoch) = link_id {
+            arm_udp_motion_sender(
+                &identity.fingerprint_hex(),
+                fingerprint,
+                epoch,
+                conn.remote_address(),
+            )
+            .await;
+        } else {
+            tracing::debug!("udp motion negotiated without a link epoch; motion stays on QUIC");
+        }
+    } else {
+        tracing::info!("peer did not accept udp motion; motion stays on QUIC");
+    }
     let mut session = spawn_episode_driver(
         conn,
         send,
@@ -4396,7 +4440,7 @@ fn episode_policy<'a>(
         clipboard_enabled: config.clipboard_enabled,
         screen_geometry: local_geometry,
         link_id: link.and_then(|link| link.link_id),
-        udp_motion: config.transport == kvm_core::TransportProtocol::Udp,
+        udp_motion: true, // UDP cemented: every dial offers motion fast path
     }
 }
 
@@ -4618,6 +4662,20 @@ async fn prewarm_link_stream(
         ?target,
         "link drive stream pre-warmed; first crossing needs no dial"
     );
+    // Same arming as a fresh open (see above): a pre-warmed episode that
+    // gets resumed directly must already have its sender, or its motion
+    // falls back to QUIC until the next fresh open.
+    if capabilities.udp_motion {
+        if let Some(epoch) = link.link_id {
+            arm_udp_motion_sender(
+                &identity.fingerprint_hex(),
+                &link.fingerprint,
+                epoch,
+                conn.remote_address(),
+            )
+            .await;
+        }
+    }
     Ok(Some(spawn_episode_driver(
         conn,
         send,
@@ -5097,11 +5155,36 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                         return;
                     }
                 };
+                // Best-effort OS change feed (see the loop below): a dead
+                // feed only costs the old poll latency, never the sync.
+                let watcher = match kvm_platform::clipboard::ClipboardWatcher::create() {
+                    Ok(watcher) => {
+                        tracing::debug!("clipboard change events armed");
+                        Some(watcher)
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "clipboard change events unavailable; using timed poll");
+                        None
+                    }
+                };
                 while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
                     while let Ok(text) = command_rx.try_recv() {
                         if let Err(error) = clipboard.set_text(text) {
                             tracing::debug!(%error, "cannot apply remote clipboard text");
                         }
+                    }
+                    // Deep-OS change events: the OS wakes this loop the
+                    // moment the user copies (XFixes on X11,
+                    // WM_CLIPBOARDUPDATE on Windows), so a copy races the
+                    // next drive handoff by milliseconds, not a 250ms poll
+                    // quantum. Absent (headless session, unsupported
+                    // compositor) the timed poll below still carries it —
+                    // events are a latency fast path, never a dependency.
+                    match &watcher {
+                        Some(watch) => {
+                            watch.wait_notice(Duration::from_millis(500));
+                        }
+                        None => std::thread::sleep(Duration::from_millis(250)),
                     }
                     match clipboard.poll_changed() {
                         Ok(Some(text)) => {
@@ -5112,7 +5195,6 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                             tracing::debug!(%error, "cannot poll system clipboard");
                         }
                     }
-                    std::thread::sleep(Duration::from_millis(250));
                 }
             })
             .ok()?;

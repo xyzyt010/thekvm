@@ -52,7 +52,6 @@ export component AppWindow inherits Window {
     in-out property <string> clipboard-max-mb: "2";
     in-out property <int> mode-index: 0;
     in-out property <int> edge-mode-index: 0;
-    in-out property <int> transport-index: 1;
     in property <string> role-text: "Both ways";
     in property <string> app-version: "";
     // Taskbar/dock alert: set while an incoming pairing waits, so a
@@ -75,7 +74,6 @@ export component AppWindow inherits Window {
     callback disconnect();
     callback set-role(int /* 0 both, 1 controller, 2 receiver */);
     callback set-edge-mode(int /* 0 single facing edge, 1 double horizontal edges */);
-    callback set-transport(int /* 0 QUIC, 1 UDP */);
     callback pair-from-invite(string /* invite */);
     callback discover-lan();
     callback start-daemon();
@@ -87,7 +85,7 @@ export component AppWindow inherits Window {
     callback place-peer-left();
     callback place-peer-right();
     callback open-log-folder();
-    callback apply-config(bool, int, string, string, bool, string, int);
+    callback apply-config(bool, int, string, string, bool, string);
     callback import-layout(string);
 
 
@@ -609,7 +607,7 @@ export component AppWindow inherits Window {
                         Button {
                             text: "Save";
                             enabled: name.text != "";
-                            clicked => { apply-config(lock-screen-control, mode-index, name.text, auto-connect-address, clipboard-enabled, root.clipboard-max-mb, transport-index); }
+                            clicked => { apply-config(lock-screen-control, mode-index, name.text, auto-connect-address, clipboard-enabled, root.clipboard-max-mb); }
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }
@@ -622,7 +620,7 @@ export component AppWindow inherits Window {
                         }
                         Switch {
                             checked <=> root.lock-screen-control;
-                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb, root.transport-index); }
+                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb); }
                         }
                     }
                     HorizontalLayout {
@@ -634,7 +632,7 @@ export component AppWindow inherits Window {
                         }
                         Switch {
                             checked <=> root.clipboard-enabled;
-                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text, root.transport-index); }
+                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
                         }
                     }
                     HorizontalLayout {
@@ -650,26 +648,7 @@ export component AppWindow inherits Window {
                         }
                         Button {
                             text: "Save";
-                            clicked => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text, root.transport-index); }
-                        }
-                    }
-                    Rectangle { height: 1px; background: #262626; }
-                    Text { text: "Transport"; color: white; font-size: 16px; font-weight: 700; }
-                    Text {
-                        text: transport-index == 1 ? "UDP: pointer motion takes the low-latency fast path (falls back to QUIC per packet)." : "QUIC: all input on the encrypted stream.";
-                        color: #9ca3af;
-                        font-size: 12px;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Button {
-                            text: "QUIC";
-                            clicked => { set-transport(0); }
-                        }
-                        Button {
-                            text: "UDP";
-                            clicked => { set-transport(1); }
+                            clicked => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }
@@ -687,7 +666,7 @@ export component AppWindow inherits Window {
                         }
                         Button {
                             text: "Save";
-                            clicked => { apply-config(lock-screen-control, mode-index, device-name, startup.text, clipboard-enabled, root.clipboard-max-mb, root.transport-index); }
+                            clicked => { apply-config(lock-screen-control, mode-index, device-name, startup.text, clipboard-enabled, root.clipboard-max-mb); }
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }
