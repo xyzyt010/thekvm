@@ -360,13 +360,24 @@ fn derive_scroll_wheel(
     if intent_x == 0.0 && intent_y == 0.0 {
         return None;
     }
+    // N.B. entry first, clock second: Instant is not Copy, so the
+    // construction clock must not be the same binding the verdict
+    // below moves around.
+    if !phases.contains_key(&sourceid) {
+        phases.insert(
+            sourceid,
+            ScrollPhase {
+                gest_x: 0.0,
+                gest_y: 0.0,
+                lock: None,
+                last: std::time::Instant::now(),
+            },
+        );
+    }
     let now = std::time::Instant::now();
-    let phase = phases.entry(sourceid).or_insert_with(|| ScrollPhase {
-        gest_x: 0.0,
-        gest_y: 0.0,
-        lock: None,
-        last: now,
-    });
+    let Some(phase) = phases.get_mut(&sourceid) else {
+        return None;
+    };
     if now.duration_since(phase.last).as_millis() > 300 {
         phase.gest_x = 0.0;
         phase.gest_y = 0.0;
