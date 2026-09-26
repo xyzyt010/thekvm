@@ -339,12 +339,7 @@ impl Layout {
             Edge::Top | Edge::Bottom => target_screen.width,
         };
         let mapped = map_coordinate(along, source_span, target_span);
-        let (target_x, target_y) = match edge {
-            Edge::Left => (target_screen.width - 1, mapped),
-            Edge::Right => (0, mapped),
-            Edge::Top => (mapped, target_screen.height - 1),
-            Edge::Bottom => (mapped, 0),
-        };
+        let (target_x, target_y) = entry_target_coords(edge, target_screen, mapped);
         Some(EdgeHandoff {
             from: screen_id,
             target,
@@ -999,12 +994,7 @@ impl EdgeRouter {
             Edge::Top | Edge::Bottom => target_screen.width,
         };
         let mapped = map_coordinate(along, source_span, target_span);
-        let (target_x, target_y) = match edge {
-            Edge::Left => (target_screen.width.saturating_sub(1), mapped),
-            Edge::Right => (0, mapped),
-            Edge::Top => (mapped, target_screen.height.saturating_sub(1)),
-            Edge::Bottom => (mapped, 0),
-        };
+        let (target_x, target_y) = entry_target_coords(edge, target_screen, mapped);
         let from = self.current_screen;
         if from == self.local_screen {
             self.local_cursor_x = self.cursor_x;
@@ -1206,7 +1196,43 @@ const SETTLE_PX: u32 = 48;
 /// The streak resets the moment motion comes back inside or changes
 /// edge, so drift can never save up for a phantom crossing.
 pub const EDGE_PUSH_PX: i64 = 24;
+/// Handoff landing inset (px inside the peer edge): entries land here
+/// instead of exactly on the edge. A cursor placed exactly on the facing
+/// edge re-fires the peer's own push budget from resting noise, so two
+/// linked machines drive each other in turns (the ping-pong: yield, park,
+/// re-push, slow fresh open, repeat). Past EDGE_PUSH_PX, only deliberate
+/// motion toward the edge can push back — resting jitter can never
+/// accumulate a budget. Invisible in practice.
+pub const ENTRY_INSET_PX: u32 = 32;
 
+/// Handoff landing coords for a crossing edge: the along-axis maps
+/// proportionally, the crossing axis insets inside (see ENTRY_INSET_PX).
+fn entry_target_coords(edge: Edge, target_screen: &Screen, mapped: u32) -> (u32, u32) {
+    match edge {
+        Edge::Left => (
+            target_screen
+                .width
+                .saturating_sub(1)
+                .saturating_sub(ENTRY_INSET_PX),
+            mapped,
+        ),
+        Edge::Right => (
+            ENTRY_INSET_PX.min(target_screen.width.saturating_sub(1)),
+            mapped,
+        ),
+        Edge::Top => (
+            mapped,
+            target_screen
+                .height
+                .saturating_sub(1)
+                .saturating_sub(ENTRY_INSET_PX),
+        ),
+        Edge::Bottom => (
+            mapped,
+            ENTRY_INSET_PX.min(target_screen.height.saturating_sub(1)),
+        ),
+    }
+}
 /// Sustained home-ward pressure (px of net edge overflow) that returns an
 /// UNARMED drive. Entry parks disarmed so post-entry jitter and fling
 /// tails pin instead of snapping back — but a parked cursor whose owner
@@ -1221,13 +1247,13 @@ pub const RETURN_PUSH_PX: i64 = 64;
 
 /// Armed-return brush guard (px of same-edge overflow streak): an ARMED
 /// drive returns only once outward pressure on the home-facing edge
-/// accumulates to this depth. Entries land ON the edge, so all early
-/// roaming happens right beside it — a 1px rule turns every roam into a
-/// snap-back cycle (push, cross, brush, die, re-push: the sticky-entry
-/// feel). Brushes pin at the border and keep driving; one deliberate
-/// shove (or a slow sustained push, which saves up across events)
-/// comes home. Inside movement or an edge switch restarts the streak,
-/// so oscillation can never save up for a phantom return. Unarmed
+/// accumulates to this depth. Entries land 32px inside the edge, so
+/// early roaming happens beside it — a 1px rule would turn every roam
+/// into a snap-back cycle (push, cross, brush, die, re-push: the
+/// sticky-entry feel). Brushes pin at the border and keep driving; one
+/// deliberate shove (or a slow sustained push, which saves up across
+/// events) comes home. Inside movement or an edge switch restarts the
+/// streak, so oscillation can never save up for a phantom return. Unarmed
 /// drives keep the deeper RETURN_PUSH_PX escape hatch instead.
 const RETURN_EDGE_PX: i64 = 12;
 
@@ -1358,7 +1384,7 @@ mod tests {
                 from: ScreenId(1),
                 target: ScreenId(2),
                 edge: Edge::Right,
-                target_x: 0,
+                target_x: 32,
                 ..
             }
         ));
@@ -1452,8 +1478,14 @@ mod tests {
         let mut router = EdgeRouter::new(layout).unwrap();
         let handoff = router.route(InputEvent::MouseMove { dx: 1000, dy: 0 });
         assert!(matches!(handoff, RoutedEvent::Handoff { .. }));
-        // Parked unarmed at the entry boundary: small shoves clamp...
+        // Parked unarmed 32px inside the entry edge: shoves walk to the
+        // boundary first, then the sustained escape run earns the return.
         for _ in 0..6 {
+            let result = router.route(InputEvent::MouseMove { dx: -10, dy: 0 });
+            assert!(!matches!(result, RoutedEvent::ReturnHome { .. }));
+        }
+        // Still walking out the inset + escape run: no return yet.
+        for _ in 0..3 {
             let result = router.route(InputEvent::MouseMove { dx: -10, dy: 0 });
             assert!(!matches!(result, RoutedEvent::ReturnHome { .. }));
         }
@@ -1872,13 +1904,15 @@ mod tests {
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
         let _ = router.route(InputEvent::MouseMove { dx: 200, dy: 0 });
-        // Exit right into the peer: entry at the peer's left edge.
+        // Exit right into the peer: entry lands 32px inside the peer's
+        // left edge (never exactly on it, so resting noise cannot
+        // re-fire the peer's own push budget).
         let handoff = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert!(matches!(
             handoff,
             RoutedEvent::Handoff {
                 target,
-                target_x: 0,
+                target_x: 32,
                 ..
             } if target == FIRST_PEER_SCREEN_ID
         ));
@@ -1886,13 +1920,13 @@ mod tests {
         let jitter = router.route(InputEvent::MouseMove { dx: -3, dy: 0 });
         assert!(matches!(jitter, RoutedEvent::Forward { .. }));
         assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
-        assert_eq!(router.cursor_position(), (0, 540));
+        assert_eq!(router.cursor_position(), (29, 540));
         // Small motion while driving forwards and tracks the remote cursor.
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: 100, dy: 50 }),
             RoutedEvent::Forward { .. }
         ));
-        assert_eq!(router.cursor_position(), (100, 590));
+        assert_eq!(router.cursor_position(), (129, 590));
         // Pushing back past the facing edge returns: x stays the saved
         // edge pixel (never mid-screen), y maps the roamed remote height
         // back (100,590 roamed -> same spans -> (1160,590) home) — with
@@ -1937,7 +1971,8 @@ mod tests {
     #[test]
     fn entry_edge_jitter_never_returns_before_settling() {
         // The live desk: Mint on Windows' left; Windows exits left and
-        // enters Mint at its right edge (x=1919, 1px from overflow).
+        // enters Mint 32px inside its right edge (x=1887, never exactly
+        // on it, so resting noise cannot re-fire Mint's own push).
         let peer_fp = "ab".repeat(32);
         let layout = Layout {
             screens: vec![
@@ -1970,7 +2005,7 @@ mod tests {
                 from,
                 target,
                 edge: Edge::Left,
-                target_x: 1919,
+                target_x: 1887,
                 ..
             } if from == ScreenId(2) && target == ScreenId(1)
         ));
@@ -1984,7 +2019,7 @@ mod tests {
             );
             assert_eq!(router.active_remote(), Some(ScreenId(1)));
         }
-        assert_eq!(router.cursor_position(), (1919, 540));
+        assert_eq!(router.cursor_position(), (1892, 540));
         // Non-facing edges clamp too, armed or not: Mint exits to Windows
         // only through its right edge.
         for motion in [
@@ -2025,11 +2060,11 @@ mod tests {
     fn return_arms_exactly_at_the_settle_threshold() {
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
-        // Peer on the right: enter at its left edge (x=0), entry edge Left.
+        // Peer on the right: enter 32px inside its left edge.
         let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
-        // 47px inside: still disarmed — facing overflow clamps.
+        // 15px more (47px inside): still disarmed — facing overflow clamps.
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 47, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: 15, dy: 0 }),
             RoutedEvent::Forward { .. }
         ));
         let clamped = router.route(InputEvent::MouseMove { dx: -100, dy: 0 });
@@ -2053,17 +2088,17 @@ mod tests {
 
     #[test]
     fn armed_boundary_brushes_clamp_until_a_sustained_shove() {
-        // Entries land ON the edge, so early roaming happens right
+        // Entries land 32px inside the edge, so early roaming happens
         // beside it: a small brush after settling must not end the drive
         // (the push/cross/brush/die/re-push sticky-entry cycle), while a
         // sustained shove still comes home.
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
-        // Peer on the right: enter at its left edge (x=0), entry edge Left.
+        // Peer on the right: enter 32px inside its left edge.
         let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
-        // Settle 48px inside: armed.
+        // Settle at 48px inside: armed.
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 48, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: 16, dy: 0 }),
             RoutedEvent::Forward { .. }
         ));
         // Brush the boundary (3px overflow) with inside resets between:
@@ -2209,7 +2244,7 @@ mod tests {
             RoutedEvent::Handoff {
                 target,
                 edge: Edge::Left,
-                target_x: 1919,
+                target_x: 1887,
                 ..
             } if target == FIRST_PEER_SCREEN_ID
         ));
@@ -2222,7 +2257,7 @@ mod tests {
             .handoff_for_motion(SELF_SCREEN_ID, 0, 540, -50, 0, EdgeMode::Double)
             .expect("double mode must hand off the outer edge");
         assert_eq!(hop.target, FIRST_PEER_SCREEN_ID);
-        assert_eq!(hop.target_x, 1919);
+        assert_eq!(hop.target_x, 1887);
         // Top and bottom never cross implicitly, even doubled.
         assert!(layout2
             .handoff_for_motion(SELF_SCREEN_ID, 960, 0, 0, -50, EdgeMode::Double)
@@ -2307,7 +2342,7 @@ mod tests {
             .handoff_for_motion(SELF_SCREEN_ID, 1919, 540, 50, 0, EdgeMode::Single)
             .expect("right edge must hand off");
         assert_eq!(handoff.target, FIRST_PEER_SCREEN_ID);
-        assert_eq!(handoff.target_x, 0);
+        assert_eq!(handoff.target_x, 32);
         // No grid neighbour on the outer edge — and a single-peer link no
         // longer crosses there either (strict facing edges only).
         assert_eq!(layout.neighbor_for_edge(SELF_SCREEN_ID, Edge::Left), None);

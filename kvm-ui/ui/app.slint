@@ -8,6 +8,12 @@ export component AppWindow inherits Window {
     min-width: 720px;
     min-height: 560px;
     background: #0a0a0a;
+    // Crisp native-feeling text: resolve the desktop's own UI family
+    // (Ubuntu on Mint, Segoe UI on Windows) instead of Slint's embedded
+    // fallback. Small unhinted fallback glyphs read blurry next to
+    // native apps; the system family is drawn for exactly these sizes.
+    // Missing families fall back gracefully per platform, never blank.
+    default-font-family: "Ubuntu, Segoe UI, Noto Sans, DejaVu Sans, Sans-Serif";
 
     // This UI is designed dark. Slint's fluent widgets follow the OS color
     // scheme, so on a light desktop (e.g. stock Linux Mint) every Switch,
@@ -482,7 +488,7 @@ export component AppWindow inherits Window {
                             VerticalLayout {
                                 padding: 6px;
                                 spacing: 2px;
-                                Text { text: "THIS PC"; color: #bbf7d0; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
+                                Text { text: "THIS PC"; color: #bbf7d0; font-size: 11px; font-weight: 700; horizontal-alignment: center; }
                                 Text { text: device-name == "" ? "…" : device-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
                             }
                         }
@@ -497,7 +503,7 @@ export component AppWindow inherits Window {
                             VerticalLayout {
                                 padding: 6px;
                                 spacing: 2px;
-                                Text { text: "LINKED"; color: #d6d3d1; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
+                                Text { text: "LINKED"; color: #d6d3d1; font-size: 11px; font-weight: 700; horizontal-alignment: center; }
                                 Text { text: linked-peer-name == "" ? "…" : linked-peer-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
                             }
                         }
@@ -515,7 +521,7 @@ export component AppWindow inherits Window {
                             VerticalLayout {
                                 padding: 6px;
                                 spacing: 2px;
-                                Text { text: "LINKED"; color: #d6d3d1; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
+                                Text { text: "LINKED"; color: #d6d3d1; font-size: 11px; font-weight: 700; horizontal-alignment: center; }
                                 Text { text: linked-peer-name == "" ? "…" : linked-peer-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
                             }
                         }
@@ -530,7 +536,7 @@ export component AppWindow inherits Window {
                             VerticalLayout {
                                 padding: 6px;
                                 spacing: 2px;
-                                Text { text: "THIS PC"; color: #bbf7d0; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
+                                Text { text: "THIS PC"; color: #bbf7d0; font-size: 11px; font-weight: 700; horizontal-alignment: center; }
                                 Text { text: device-name == "" ? "…" : device-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
                             }
                         }

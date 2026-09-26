@@ -45,9 +45,9 @@ const SCROLL_NOISE_FLOOR: i64 = 4;
 /// wobbly horizontal scroll mid-gesture.
 const TAKEOVER_FRAMES: u32 = 5;
 /// Full sensor span earns this many detents (PTP parity). Lowered from 48
-/// to 16, then 20 (~4x calmer than the original) so a slight slide is a
-/// slight zoom and real hands stop running hot.
-const DETENTS_PER_SPAN: i64 = 20;
+/// to 16, then 20, then 24 (~5x calmer than the original) so a slight
+/// slide is a slight zoom and real hands stop running hot.
+const DETENTS_PER_SPAN: i64 = 24;
 
 type IoctlRequest = libc::c_ulong;
 

@@ -3561,6 +3561,13 @@ async fn yield_drive_to_inbound(
     let _ = router.restore_local(target);
     let (x, y) = router.cursor_position();
     let _ = capture_control.warp_cursor(x, y);
+    // Retreat latch: the local cursor is back at the facing edge with the
+    // peer actively driving — an instant re-push would re-open into their
+    // drive and ping-pong (yield, park, re-push, slow fresh open, repeat).
+    // Re-seed through the fresh-entry gate so the next crossing needs a
+    // deliberate retreat inside first; parked-resume re-crossings stay
+    // instant for the user who genuinely pulls back and pushes again.
+    let _ = router.set_local_cursor_position(x, y);
     tracing::info!(?target, diverted, x, y, "peer is driving us while we drive them; yielding to the inbound drive (ours parked for resume)");
     eprintln!("THEKVM_STATUS local");
 }
@@ -6564,6 +6571,8 @@ async fn handle_connection(
             tracing::info!(
                 peer = %peer_fingerprint,
                 remote = %conn.remote_address(),
+                clipboard_offer = hello.clipboard_enabled,
+                clipboard_agent = clipboard.is_some(),
                 "input session accepted",
             );
             // Publish the live inbound link FIRST, before the motion-lane
@@ -8213,11 +8222,15 @@ pub(crate) async fn notify_peer_ended(
     let endpoint = transport::make_client_endpoint(&identity)?;
     let addr = normalize_addr(&address)?;
     let connecting = endpoint.connect(addr, "thekvm").context("notify connect")?;
-    let conn = tokio::time::timeout(Duration::from_secs(8), connecting)
+    // Best-effort Disconnect courtesy: 3s bounds, never the old 8s. A
+    // gone peer must not stall local teardown (the UI blocks on this
+    // reply) — slow notifies compound ban/re-epoch storms while the user
+    // mashes Connect waiting for the UI to come back.
+    let conn = tokio::time::timeout(Duration::from_secs(3), connecting)
         .await
         .context("notify handshake timed out")?
         .context("notify handshake")?;
-    let (mut send, _recv) = tokio::time::timeout(Duration::from_secs(8), conn.open_bi())
+    let (mut send, _recv) = tokio::time::timeout(Duration::from_secs(3), conn.open_bi())
         .await
         .context("notify stream open timed out")?
         .context("notify stream open")?;
@@ -8533,6 +8546,9 @@ async fn open_episode_stream(
     let (mut send, mut recv) = conn.open_bi().await?;
     // UDP fast-path motion needs a link epoch to derive its key from; without
     // one the handshake stays on the episode stream even when requested.
+    // (The clipboard offer is captured before the Accept shadows it, for
+    // the per-episode caps line below.)
+    let offer_clipboard = clipboard_enabled;
     let want_udp_motion = udp_motion && link_id.is_some();
     write_frame(
         &mut send,
@@ -8575,21 +8591,43 @@ async fn open_episode_stream(
                 pinch_zoom,
                 udp_motion: want_udp_motion && peer_udp_motion,
             };
+            // One line per episode naming the negotiated caps: the journal
+            // proves what each crossing offered/accepted instead of
+            // guessing (UDP fallback? clipboard poisoned by a headless
+            // receiver?) after the fact.
+            tracing::info!(
+                offer_udp_motion = want_udp_motion,
+                peer_udp_motion,
+                udp_motion = capabilities.udp_motion,
+                offer_clipboard,
+                peer_clipboard = clipboard_enabled,
+                clipboard = capabilities.clipboard_enabled,
+                "episode caps negotiated"
+            );
             // The receiver agreed to a motion lane: open it now, before
             // any input flows, so stream-accept order on their side is
             // deterministic (episode stream first, motion lane second —
             // episodes are served sequentially per association).
-            // BOUNDED (5s): open_uni waits for stream quota, and a
-            // saturated association must fail THIS episode (teardown +
-            // redial, suppression released) instead of parking the drive
-            // task forever with a hold requested.
+            // BOUNDED (800ms): open_uni waits for stream quota, and a slow
+            // lane must NOT hold the whole crossing hostage — the episode
+            // proceeds laneless (motion rides the bidi stream) and the
+            // next episode retries the lane. A 5s wait here was the
+            // slow-first-entry shape on a fresh association.
             let motion_send = if motion_lane {
-                let lane = tokio::time::timeout(Duration::from_secs(5), conn.open_uni())
-                    .await
-                    .map_err(|_| anyhow::anyhow!("motion lane open timed out after 5s"))?
-                    .map_err(|error| anyhow::anyhow!("motion lane open failed: {error}"))?;
-                tracing::debug!(stream = ?lane.id(), "episode motion lane opened");
-                Some(lane)
+                match tokio::time::timeout(Duration::from_millis(800), conn.open_uni()).await {
+                    Ok(Ok(lane)) => {
+                        tracing::debug!(stream = ?lane.id(), "episode motion lane opened");
+                        Some(lane)
+                    }
+                    Ok(Err(error)) => {
+                        tracing::info!(%error, "motion lane open failed; episode proceeds laneless");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::info!("motion lane open timed out after 800ms; episode proceeds laneless");
+                        None
+                    }
+                }
             } else {
                 None
             };

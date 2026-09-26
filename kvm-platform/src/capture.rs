@@ -1700,8 +1700,9 @@ mod win32_hooks {
             && tip != 0
     }
 
-    /// Two-finger pan → scroll accumulator. Pure apart from construction,
-    /// so the gesture math is unit-tested without HID hardware.
+    /// Two-finger pan → scroll accumulator. Pure apart from construction
+    /// and the wall clock (used ONLY to segment gestures on idle: unit
+    /// tests never idle, so they stay deterministic).
     #[derive(Debug)]
     struct PtpPan {
         prev: Option<(i64, i64)>,
@@ -1709,6 +1710,22 @@ mod win32_hooks {
         acc_y: i64,
         units_per_detent_x: i64,
         units_per_detent_y: i64,
+        /// Dominant-axis lock (see feed): once a gesture proves
+        /// horizontal, vertical cross-talk emits nothing until the
+        /// gesture ends (lift) or pauses (idle) — and vice versa.
+        lock: Option<PanAxis>,
+        /// |Sensor| motion banked since the gesture (or lock) started:
+        /// the lock verdict reads these, never a single frame.
+        gest_x: i64,
+        gest_y: i64,
+        last_feed: Option<std::time::Instant>,
+    }
+
+    /// Scroll axis owned by a locked pan gesture.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PanAxis {
+        X,
+        Y,
     }
 
     impl PtpPan {
@@ -1719,6 +1736,10 @@ mod win32_hooks {
                 acc_y: 0,
                 units_per_detent_x: 64,
                 units_per_detent_y: 64,
+                lock: None,
+                gest_x: 0,
+                gest_y: 0,
+                last_feed: None,
             }
         }
 
@@ -1726,11 +1747,26 @@ mod win32_hooks {
         /// units). Returns scroll in WHEEL_DELTA 120ths. Only a steady
         /// two-contact pan scrolls; contact-count changes reset the
         /// anchor and the remainder so lifts never jump.
+        ///
+        /// Axis lock (the native feel): real two-finger gestures wobble
+        /// — a horizontal pan carries vertical jitter that, forwarded
+        /// raw, scrolls the peer diagonally (horizontal "leads to"
+        /// vertical). Once one axis proves dominance (LOCK_MIN units at
+        /// a 2:1 ratio) the gesture locks to it and the other axis emits
+        /// nothing (its remainder is dropped, never banked: no backlog
+        /// jump on unlock). Genuine diagonals (no dominance) pass both
+        /// axes through untouched. The lock holds to gesture end; a
+        /// 300ms pause starts a fresh verdict so a later direction
+        /// change re-locks instead of staying stuck.
         fn feed(&mut self, contacts: &[(i32, i32)]) -> (i32, i32) {
             if contacts.len() != 2 {
                 self.prev = None;
                 self.acc_x = 0;
                 self.acc_y = 0;
+                self.lock = None;
+                self.gest_x = 0;
+                self.gest_y = 0;
+                self.last_feed = None;
                 return (0, 0);
             }
             let avg = (
@@ -1742,21 +1778,78 @@ mod win32_hooks {
                 return (0, 0);
             };
             self.prev = Some(avg);
+            // Gesture segmentation on idle: a pause ends the phase, so a
+            // resumed scroll re-proves its axis instead of inheriting a
+            // stale lock. Position carries over (silence is no motion),
+            // only the verdict resets.
+            let now = std::time::Instant::now();
+            if self
+                .last_feed
+                .is_some_and(|last| now.duration_since(last).as_millis() > 300)
+            {
+                self.lock = None;
+                self.gest_x = 0;
+                self.gest_y = 0;
+            }
+            self.last_feed = Some(now);
             // Fingers up (sensor y falls) scrolls up (+120ths);
             // fingers right scrolls right (+120ths).
-            self.acc_x += avg.0 - prev.0;
-            self.acc_y += prev.1 - avg.1;
+            let dx = avg.0 - prev.0;
+            let dy = prev.1 - avg.1;
+            self.acc_x += dx;
+            self.acc_y += dy;
+            self.gest_x = self.gest_x.saturating_add(dx.abs());
+            self.gest_y = self.gest_y.saturating_add(dy.abs());
+            // Lock verdict: enough intent at a clear ratio owns the
+            // gesture from here on.
+            const LOCK_MIN_UNITS: i64 = 120;
+            const LOCK_RATIO: i64 = 2;
+            if self.lock.is_none() {
+                if self.gest_x >= LOCK_MIN_UNITS
+                    && self.gest_x >= self.gest_y.saturating_mul(LOCK_RATIO)
+                {
+                    self.lock = Some(PanAxis::X);
+                } else if self.gest_y >= LOCK_MIN_UNITS
+                    && self.gest_y >= self.gest_x.saturating_mul(LOCK_RATIO)
+                {
+                    self.lock = Some(PanAxis::Y);
+                }
+            }
             // Smooth 120ths, not detent-quantized: one sensor unit earns
             // 120/units 120ths, so slow sub-detent motion still emits small
             // smooth steps instead of waiting for a whole detent (the steppy
             // shape). Truncation toward zero keeps both directions symmetric;
             // the sensor remainder is preserved for the next report.
+            // A locked-out axis emits nothing and banks nothing: finger
+            // wobble is discarded, so it can never surface later as a
+            // jump in the "wrong" direction.
             let units_x = self.units_per_detent_x.max(1);
             let units_y = self.units_per_detent_y.max(1);
-            let out_x = (self.acc_x.saturating_mul(120) / units_x).clamp(-120_000, 120_000);
-            let out_y = (self.acc_y.saturating_mul(120) / units_y).clamp(-120_000, 120_000);
-            self.acc_x -= out_x.saturating_mul(units_x) / 120;
-            self.acc_y -= out_y.saturating_mul(units_y) / 120;
+            let (out_x, out_y) = match self.lock {
+                Some(PanAxis::X) => {
+                    self.acc_y = 0;
+                    let out_x =
+                        (self.acc_x.saturating_mul(120) / units_x).clamp(-120_000, 120_000);
+                    self.acc_x -= out_x.saturating_mul(units_x) / 120;
+                    (out_x, 0)
+                }
+                Some(PanAxis::Y) => {
+                    self.acc_x = 0;
+                    let out_y =
+                        (self.acc_y.saturating_mul(120) / units_y).clamp(-120_000, 120_000);
+                    self.acc_y -= out_y.saturating_mul(units_y) / 120;
+                    (0, out_y)
+                }
+                None => {
+                    let out_x =
+                        (self.acc_x.saturating_mul(120) / units_x).clamp(-120_000, 120_000);
+                    let out_y =
+                        (self.acc_y.saturating_mul(120) / units_y).clamp(-120_000, 120_000);
+                    self.acc_x -= out_x.saturating_mul(units_x) / 120;
+                    self.acc_y -= out_y.saturating_mul(units_y) / 120;
+                    (out_x, out_y)
+                }
+            };
             (out_x as i32, out_y as i32)
         }
     }
@@ -1818,10 +1911,10 @@ mod win32_hooks {
                 prev_mid: None,
                 acc: 0,
                 // Matches the live axis scale (LogicalMax/16), then calmed
-                // two steps: at 192 small spreads still stepped zoom too
-                // eagerly once engaged, and at 240 real hands still ran
-                // hot — zoom must move deliberately, never jump.
-                units_per_detent: 320,
+                // further: zoom must move deliberately, never jump. Small
+                // spreads step small; only a real spreading gesture earns
+                // large zoom.
+                units_per_detent: 400,
                 engaged: false,
                 scroll_streak: 0,
             }
@@ -2284,13 +2377,13 @@ mod win32_hooks {
                     pan.units_per_detent_x = found.units_per_detent_x;
                     pan.units_per_detent_y = found.units_per_detent_y;
                     // Pinch spread moves in the same sensor units: share
-                    // the axis scale (mean of both axes), calmed a further
-                    // quarter — the constructor default only covers taps
-                    // without a live digitizer; real hardware lands here.
+                    // the axis scale (mean of both axes), calmed by half —
+                    // the constructor default only covers taps without a
+                    // live digitizer; real hardware lands here.
                     ptp_pinch_slot().units_per_detent =
                         ((found.units_per_detent_x + found.units_per_detent_y + 1) / 2)
-                            .saturating_mul(5)
-                            / 4;
+                            .saturating_mul(3)
+                            / 2;
                 }
                 *ptp_device_slot() = Some(found);
                 tracing::info!(
@@ -2614,6 +2707,53 @@ mod win32_hooks {
             assert_eq!(pan.feed(&[(0, 96), (0, 96)]), (0, 48));
             assert_eq!(pan.feed(&[(0, 92), (0, 92)]), (0, 48));
             assert_eq!(pan.feed(&[(0, 88), (0, 88)]), (0, 48));
+        }
+
+        #[test]
+        fn ptp_horizontal_pan_locks_out_vertical_wobble() {
+            // The native feel: a horizontal pan with vertical finger
+            // wobble must not scroll the peer diagonally. Before the
+            // verdict both axes emit; past 120 x-units at 2:1 the
+            // gesture locks horizontal and the wobble is eaten.
+            let mut pan = PtpPan::new();
+            pan.units_per_detent_x = 10;
+            pan.units_per_detent_y = 10;
+            assert_eq!(pan.feed(&[(100, 100), (100, 100)]), (0, 0));
+            for step in 1..12 {
+                let p = 100 + 10 * step;
+                let q = 100 + 2 * step;
+                assert_eq!(pan.feed(&[(p, q), (p, q)]), (120, -24));
+            }
+            for step in 12..16 {
+                let p = 100 + 10 * step;
+                let q = 100 + 2 * step;
+                assert_eq!(pan.feed(&[(p, q), (p, q)]), (120, 0));
+            }
+            // Lift ends the lock: a fresh vertical pan with x wobble
+            // locks vertical instead, eating the x.
+            assert_eq!(pan.feed(&[]), (0, 0));
+            assert_eq!(pan.feed(&[(0, 100), (0, 100)]), (0, 0));
+            for step in 1..12 {
+                let q = 100 - 10 * step;
+                assert_eq!(pan.feed(&[(step, q), (step, q)]), (12, 120));
+            }
+            for step in 12..15 {
+                let q = 100 - 10 * step;
+                assert_eq!(pan.feed(&[(step, q), (step, q)]), (0, 120));
+            }
+        }
+
+        #[test]
+        fn ptp_true_diagonal_never_locks() {
+            // 1:1 motion proves no dominance: both axes keep flowing.
+            let mut pan = PtpPan::new();
+            pan.units_per_detent_x = 10;
+            pan.units_per_detent_y = 10;
+            assert_eq!(pan.feed(&[(0, 0), (0, 0)]), (0, 0));
+            for step in 1..16 {
+                let p = 10 * step;
+                assert_eq!(pan.feed(&[(p, -p), (p, -p)]), (120, 120));
+            }
         }
 
         #[test]

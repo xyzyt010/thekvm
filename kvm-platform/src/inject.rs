@@ -506,8 +506,8 @@ mod linux_uinput {
     /// renderer's `pinch_separation` (same gain, same clamps): one wire
     /// protocol, one feel, both directions. Pure for tests.
     fn touch_separation(current_px: f64, delta_120ths: i32) -> f64 {
-        const PX_PER_UNIT: f64 = 0.018;
-        const MAX_STEP_PX: f64 = 8.0;
+        const PX_PER_UNIT: f64 = 0.014;
+        const MAX_STEP_PX: f64 = 6.0;
         const MIN_SEPARATION_PX: f64 = 40.0;
         const MAX_SEPARATION_PX: f64 = 700.0;
         let step = (f64::from(delta_120ths) * PX_PER_UNIT).clamp(-MAX_STEP_PX, MAX_STEP_PX);
@@ -1023,8 +1023,8 @@ mod linux_uinput {
         fn touch_separation_mirrors_the_windows_gain() {
             // Same contract as the Windows touch renderer: one 120 detent
             // earns 3px, spikes clamp at 10px, hard clamps at 40/700.
-            assert!((touch_separation(120.0, 120) - 122.16).abs() < 1e-9);
-            assert!((touch_separation(120.0, 10_000) - 128.0).abs() < 1e-9);
+            assert!((touch_separation(120.0, 120) - 121.68).abs() < 1e-9);
+            assert!((touch_separation(120.0, 10_000) - 126.0).abs() < 1e-9);
             assert_eq!(touch_separation(41.0, -10_000), 40.0);
             assert_eq!(touch_separation(699.0, 10_000), 700.0);
             assert_eq!(touch_separation(200.0, 0), 200.0);
@@ -1298,12 +1298,12 @@ mod win32_inject {
     /// 120ths of finger spread; a gentle gain plus a per-event clamp keeps
     /// a slight two-finger slide a slight zoom (not a full-page leap):
     /// small deltas track proportionally, pathological single-event spikes
-    /// clamp instead of teleporting the contacts. Calmed again (0.025->0.018,
-    /// 10->8px) alongside the capture-side engage/gain cut: the old gain
+    /// clamp instead of teleporting the contacts. Calmed again (0.018->0.014,
+    /// 8->6px) alongside the capture-side engage/gain cut: the old gain
     /// turned a slight slide into a full-page leap.
     fn pinch_separation(current_px: f64, delta_120ths: i32) -> f64 {
-        const PX_PER_UNIT: f64 = 0.018;
-        const MAX_STEP_PX: f64 = 8.0;
+        const PX_PER_UNIT: f64 = 0.014;
+        const MAX_STEP_PX: f64 = 6.0;
         const MIN_SEPARATION_PX: f64 = 40.0;
         const MAX_SEPARATION_PX: f64 = 700.0;
         let step = (f64::from(delta_120ths) * PX_PER_UNIT).clamp(-MAX_STEP_PX, MAX_STEP_PX);
@@ -2102,14 +2102,14 @@ mod win32_inject {
             // running away on a pathological flood. Calmed gain: 120 units
             // earn 3px (not 9.6), spikes clamp to 10px (not 30).
             assert_eq!(super::pinch_contacts(960, 120.0), (900, 1020));
-            assert!((super::pinch_separation(120.0, 120) - 122.16).abs() < 1e-9);
-            assert!((super::pinch_separation(120.0, -120) - 117.84).abs() < 1e-9);
+            assert!((super::pinch_separation(120.0, 120) - 121.68).abs() < 1e-9);
+            assert!((super::pinch_separation(120.0, -120) - 118.32).abs() < 1e-9);
             assert!((super::pinch_separation(120.0, 0) - 120.0).abs() < 1e-9);
             // Single-event spikes clamp to a 10px step instead of leaping.
-            assert!((super::pinch_separation(120.0, 10_000) - 128.0).abs() < 1e-9);
-            assert!((super::pinch_separation(120.0, -10_000) - 112.0).abs() < 1e-9);
-            assert!((super::pinch_separation(690.0, 10_000) - 698.0).abs() < 1e-9);
-            assert!((super::pinch_separation(50.0, -10_000) - 42.0).abs() < 1e-9);
+            assert!((super::pinch_separation(120.0, 10_000) - 126.0).abs() < 1e-9);
+            assert!((super::pinch_separation(120.0, -10_000) - 114.0).abs() < 1e-9);
+            assert!((super::pinch_separation(690.0, 10_000) - 696.0).abs() < 1e-9);
+            assert!((super::pinch_separation(50.0, -10_000) - 44.0).abs() < 1e-9);
         }
 
         #[test]

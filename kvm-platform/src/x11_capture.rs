@@ -99,6 +99,10 @@ pub struct X11Capture {
     /// valuator deltas arrive fractional, and truncating each event
     /// would eat slow scrolls whole.
     scroll_bank: HashMap<(xinput::DeviceId, usize), f64>,
+    /// Per-device scroll-phase axis lock (see ScrollPhase): horizontal
+    /// pans stop leaking vertical cross-talk into the peer (and vice
+    /// versa), matching the Windows PTP tap's lock gesture-for-gesture.
+    scroll_phase: HashMap<xinput::DeviceId, ScrollPhase>,
     /// Inbound-diverted arrivals already warned about (see
     /// INBOUND_DIVERTED): the journal line fires at most once per
     /// window while the shape persists, never per event.
@@ -253,6 +257,25 @@ struct ScrollAxis {
     units_120ths: f64,
 }
 
+/// Dominant axis owned by a locked XI scroll phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollLock {
+    X,
+    Y,
+}
+
+/// Per-device scroll-phase verdict (the axis lock): two-finger gestures
+/// wobble, and forwarding the wobble raw scrolls the peer diagonally.
+/// Once one axis proves dominance the phase locks to it and the other
+/// axis is dropped until the gesture pauses (300ms idle starts a fresh
+/// verdict). Genuine diagonals never prove dominance and pass through.
+struct ScrollPhase {
+    gest_x: f64,
+    gest_y: f64,
+    lock: Option<ScrollLock>,
+    last: std::time::Instant,
+}
+
 /// Resolve smooth-scroll valuators via XIQueryDevice (0 = all devices).
 /// Devices without scroll classes simply contribute nothing; a failed
 /// query keeps the previous map (same contract as query_own_sources).
@@ -298,21 +321,81 @@ fn query_scroll_axes(connection: &RustConnection) -> HashMap<xinput::DeviceId, V
 }
 
 /// Derive SmoothWheel 120ths from one raw motion's scroll valuators.
-/// Pure apart from the bank map: fractional deltas accumulate across
+/// Pure apart from the bank/lock maps: fractional deltas accumulate across
 /// events (slow scrolls survive), whole 120ths emit. Sign convention:
 /// XI positive scroll = fingers down/right = legacy buttons 5/7 =
 /// negative 120ths (buttons 4/6 are +120). Returns None when no scroll
 /// valuator on this device moved a whole unit yet.
+///
+/// Axis lock first: the verdict reads banked gesture intent per device
+/// (see ScrollPhase), so a horizontal pan's vertical wobble is dropped
+/// instead of emitted — the peer scrolls where the fingers meant, not
+/// diagonally. A locked-out axis neither banks nor emits: wobble can
+/// never surface later as a jump.
 fn derive_scroll_wheel(
     sourceid: xinput::DeviceId,
     mask: &[u32],
     values: &[xinput::Fp3232],
     axes: &[ScrollAxis],
     banks: &mut HashMap<(xinput::DeviceId, usize), f64>,
+    phases: &mut HashMap<xinput::DeviceId, ScrollPhase>,
 ) -> Option<InputEvent> {
+    // Intent totals: the lock reads the gesture, never one frame.
+    let mut intent_x = 0.0f64;
+    let mut intent_y = 0.0f64;
+    for axis in axes {
+        let Some(delta) = axis_value(mask, values, axis.axis) else {
+            continue;
+        };
+        if delta == 0.0 {
+            continue;
+        }
+        let scaled = delta * axis.units_120ths;
+        if axis.horizontal {
+            intent_x += scaled;
+        } else {
+            intent_y += scaled;
+        }
+    }
+    if intent_x == 0.0 && intent_y == 0.0 {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    let phase = phases.entry(sourceid).or_insert_with(|| ScrollPhase {
+        gest_x: 0.0,
+        gest_y: 0.0,
+        lock: None,
+        last: now,
+    });
+    if now.duration_since(phase.last).as_millis() > 300 {
+        phase.gest_x = 0.0;
+        phase.gest_y = 0.0;
+        phase.lock = None;
+    }
+    phase.last = now;
+    phase.gest_x += intent_x.abs();
+    phase.gest_y += intent_y.abs();
+    const LOCK_MIN_120THS: f64 = 240.0;
+    const LOCK_RATIO: f64 = 2.0;
+    if phase.lock.is_none() {
+        if phase.gest_x >= LOCK_MIN_120THS && phase.gest_x >= phase.gest_y * LOCK_RATIO {
+            phase.lock = Some(ScrollLock::X);
+        } else if phase.gest_y >= LOCK_MIN_120THS && phase.gest_y >= phase.gest_x * LOCK_RATIO {
+            phase.lock = Some(ScrollLock::Y);
+        }
+    }
+    let allow_x = matches!(phase.lock, None | Some(ScrollLock::X));
+    let allow_y = matches!(phase.lock, None | Some(ScrollLock::Y));
     let mut wheel_x = 0i32;
     let mut wheel_y = 0i32;
     for axis in axes {
+        let allowed = if axis.horizontal { allow_x } else { allow_y };
+        if !allowed {
+            // Locked out: drop the wobble AND its banked remainder so
+            // it can never flush as a jump on unlock.
+            banks.remove(&(sourceid, axis.axis));
+            continue;
+        }
         let Some(delta) = axis_value(mask, values, axis.axis) else {
             continue;
         };
@@ -487,6 +570,7 @@ impl X11Capture {
             last_source_refresh: std::time::Instant::now(),
             scroll_axes,
             scroll_bank: HashMap::new(),
+            scroll_phase: HashMap::new(),
             diverted_seen: 0,
             last_divert_warn: None,
             screen_dims,
@@ -753,6 +837,7 @@ impl X11Capture {
                         &event.axisvalues_raw,
                         axes,
                         &mut self.scroll_bank,
+                        &mut self.scroll_phase,
                     ) {
                         static FIRST_SMOOTH: std::sync::Once = std::sync::Once::new();
                         FIRST_SMOOTH.call_once(|| {
@@ -1413,13 +1498,14 @@ mod tests {
             units_120ths: 120.0,
         }];
         let mut banks = HashMap::new();
+        let mut phases = HashMap::new();
         let mask = [0b100u32];
         let one = xinput::Fp3232 {
             integral: 1,
             frac: 0,
         };
         assert_eq!(
-            derive_scroll_wheel(13, &mask, &[one], &vertical, &mut banks),
+            derive_scroll_wheel(13, &mask, &[one], &vertical, &mut banks, &mut phases),
             Some(InputEvent::SmoothWheel { x: 0, y: -120 })
         );
         // Sub-detent fractions bank across events (1/256-unit ticks =
@@ -1429,16 +1515,17 @@ mod tests {
             frac: 16_777_216,
         };
         let mut banks = HashMap::new();
+        let mut phases = HashMap::new();
         assert_eq!(
-            derive_scroll_wheel(13, &mask, &[tick], &vertical, &mut banks),
+            derive_scroll_wheel(13, &mask, &[tick], &vertical, &mut banks, &mut phases),
             None
         );
         assert_eq!(
-            derive_scroll_wheel(13, &mask, &[tick], &vertical, &mut banks),
+            derive_scroll_wheel(13, &mask, &[tick], &vertical, &mut banks, &mut phases),
             None
         );
         assert_eq!(
-            derive_scroll_wheel(13, &mask, &[tick], &vertical, &mut banks),
+            derive_scroll_wheel(13, &mask, &[tick], &vertical, &mut banks, &mut phases),
             Some(InputEvent::SmoothWheel { x: 0, y: -1 })
         );
         // Horizontal valuators drive x with the same right-negative sign.
@@ -1448,16 +1535,85 @@ mod tests {
             units_120ths: 120.0,
         }];
         let mut banks = HashMap::new();
+        let mut phases = HashMap::new();
         let hmask = [0b1000u32];
         assert_eq!(
-            derive_scroll_wheel(13, &hmask, &[one], &horizontal, &mut banks),
+            derive_scroll_wheel(13, &hmask, &[one], &horizontal, &mut banks, &mut phases),
             Some(InputEvent::SmoothWheel { x: -120, y: 0 })
         );
         // Axes the device never advertised contribute nothing.
         assert_eq!(
-            derive_scroll_wheel(13, &hmask, &[one], &vertical, &mut banks),
+            derive_scroll_wheel(13, &hmask, &[one], &vertical, &mut banks, &mut phases),
             None
         );
+    }
+
+    #[test]
+    fn horizontal_scroll_phase_locks_out_vertical_wobble() {
+        // Same native axis lock as the Windows tap, per device: a
+        // horizontal pan with vertical wobble emits both axes only until
+        // the verdict (240 x-120ths at 2:1), then pure horizontal.
+        use super::{derive_scroll_wheel, ScrollAxis};
+        use std::collections::HashMap;
+        let axes = vec![
+            ScrollAxis {
+                axis: 2,
+                horizontal: false,
+                units_120ths: 120.0,
+            },
+            ScrollAxis {
+                axis: 3,
+                horizontal: true,
+                units_120ths: 120.0,
+            },
+        ];
+        let mut banks = HashMap::new();
+        let mut phases = HashMap::new();
+        // Valuator bits 2 and 3 set: values arrive in ascending axis
+        // order (x first, then y).
+        let mask = [0b1100u32];
+        let x_one = xinput::Fp3232 {
+            integral: 1,
+            frac: 0,
+        };
+        // 0.25 units vertical wobble per event (30 120ths, exactly
+        // representable so the banking pins deterministically).
+        let y_wobble = xinput::Fp3232 {
+            integral: 0,
+            frac: 1_073_741_824,
+        };
+        // Pre-verdict: both axes flow.
+        assert_eq!(
+            derive_scroll_wheel(13, &mask, &[x_one, y_wobble], &axes, &mut banks, &mut phases),
+            Some(InputEvent::SmoothWheel { x: -120, y: -30 })
+        );
+        // Verdict reached (240 x at 2:1): the wobble is eaten, and its
+        // banked remainder is dropped with it — no later jump.
+        for _ in 0..3 {
+            assert_eq!(
+                derive_scroll_wheel(
+                    13,
+                    &mask,
+                    &[x_one, y_wobble],
+                    &axes,
+                    &mut banks,
+                    &mut phases
+                ),
+                Some(InputEvent::SmoothWheel { x: -120, y: 0 })
+            );
+        }
+        // A true 1:1 diagonal on another device never locks.
+        let mut banks = HashMap::new();
+        let mut phases = HashMap::new();
+        for _ in 0..5 {
+            assert_eq!(
+                derive_scroll_wheel(14, &mask, &[x_one, x_one], &axes, &mut banks, &mut phases),
+                Some(InputEvent::SmoothWheel {
+                    x: -120,
+                    y: -120
+                })
+            );
+        }
     }
 
     #[test]
