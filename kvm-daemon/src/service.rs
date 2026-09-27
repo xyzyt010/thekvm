@@ -1798,7 +1798,7 @@ async fn run_windows_service_capture_stream(
                 .await
                 .map_err(|_| anyhow::anyhow!("keep-alive ping stalled"))?
                 {
-                    break Err(error);
+                    break Err(error.into());
                 }
             }
             _ = session_check.tick() => {
@@ -6045,7 +6045,7 @@ async fn run_capture_stream(
                 .await
                 .map_err(|_| anyhow::anyhow!("keep-alive ping stalled"))?
                 {
-                    break Err(error);
+                    break Err(error.into());
                 }
             }
             _ = &mut remote_closed_rx => {
