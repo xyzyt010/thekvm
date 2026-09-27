@@ -1744,19 +1744,22 @@ async fn run_windows_service_capture_stream(
                             continue;
                         };
                         sequence = sequence.wrapping_add(1);
+                        // Tiered sends (freeze-proofing, both OSes): motion
+                        // drops on a 300ms stall instead of wedging this
+                        // privileged loop with suppression held; keys and
+                        // wheel stay reliable below.
                         let send_result = match outgoing {
                             InputEvent::MouseMove { .. } => {
                                 // Motion lane when negotiated (see
                                 // open_episode_stream); everything else
                                 // stays ordered on the episode stream.
-                                match motion_send.as_mut() {
-                                    Some(motion) => {
-                                        send_input(&connection, motion, sequence, outgoing).await
-                                    }
-                                    None => {
-                                        send_input(&connection, &mut send, sequence, outgoing).await
-                                    }
-                                }
+                                let stream = match motion_send.as_mut() {
+                                    Some(motion) => motion,
+                                    None => &mut send,
+                                };
+                                send_motion_best_effort(stream, sequence, outgoing)
+                                    .await
+                                    .map(|_| ())
                             }
                             InputEvent::Wheel(_)
                             | InputEvent::SmoothWheel { .. } => {
@@ -1785,8 +1788,17 @@ async fn run_windows_service_capture_stream(
             _ = keep_alive.tick() => {
                 // Drive-task heartbeat (see TASK_HEARTBEAT_MS).
                 stamp_task_heartbeat();
-                if let Err(error) = write_frame(&mut send, &WireMessage::Ping { nonce: sequence }).await {
-                    break Err(error.into());
+                // Bounded (freeze-proofing): an unbounded Ping pends
+                // forever on a half-dead association and stalls this
+                // whole loop behind it.
+                if let Err(error) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    write_frame(&mut send, &WireMessage::Ping { nonce: sequence }),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("keep-alive ping stalled"))?
+                {
+                    break Err(error);
                 }
             }
             _ = session_check.tick() => {
@@ -1982,6 +1994,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut discarded_event_barrier = 0u64;
     let mut last_transfer: Option<std::time::Instant> = None;
     let mut last_failed_episode: Option<std::time::Instant> = None;
+    // Consecutive un-sent inputs on the live episode (see the stall
+    // breaker in the Forward arm): a dead network ends the episode in
+    // drops, never in per-event stalls with suppression held.
+    let mut send_strikes: u32 = 0;
     // Last OS-pointer truth resync (see handle_topology_event): throttles
     // the GetCursorPos/query_pointer read to 20Hz so motion stays cheap.
     let mut last_resync: Option<std::time::Instant> = None;
@@ -2060,7 +2076,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 match signal {
                     Some(RemoteSignal::Handoff(handoff)) => {
                         if let Some(session) = active.take() {
-                            session.finish().await;
+                            tokio::spawn(session.finish());
                             release_suppression(&capture_control, Some(&mut suppression_requested));
                             discarded_event_barrier = discarded_event_barrier
                                 .max(capture_control.snapshot().last_event_id);
@@ -2328,7 +2344,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     Some(RemoteSignal::Closed) | None => {
                         if let Some(session) = active.take() {
                             let target = session.target;
-                            session.finish().await;
+                            tokio::spawn(session.finish());
                             release_suppression(&capture_control, Some(&mut suppression_requested));
                             discarded_event_barrier = discarded_event_barrier
                                 .max(capture_control.snapshot().last_event_id);
@@ -2388,6 +2404,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     last_yield: &mut last_yield,
                     last_outbound_input: &mut last_outbound_input,
                     want_udp_motion: true, // UDP cemented: every dial offers motion fast path
+                    send_strikes: &mut send_strikes,
                 })
                 .await?;
             }
@@ -2516,6 +2533,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     last_yield: &mut last_yield,
                     last_outbound_input: &mut last_outbound_input,
                     want_udp_motion: true, // UDP cemented: every dial offers motion fast path
+                    send_strikes: &mut send_strikes,
                 })
                 .await?;
             }
@@ -2544,12 +2562,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         tracing::warn!(%error, "topology clipboard send failed; control is local");
                         let session = active.take().expect("active session exists");
                         let target = session.target;
-                        session.finish().await;
+                        tokio::spawn(session.finish());
                         // The association itself is suspect: drop the park
                         // too, so the next push redials instead of
                         // resuming a dead stream.
                         if let Some(stale) = parked.take() {
-                            stale.finish().await;
+                            tokio::spawn(stale.finish());
                         }
                         release_suppression(&capture_control, Some(&mut suppression_requested));
                         discarded_event_barrier = discarded_event_barrier
@@ -2713,12 +2731,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         release_suppression(&capture_control, Some(&mut suppression_requested));
                         let session = active.take().expect("active session exists");
                         let target = session.target;
-                        session.finish().await;
+                        tokio::spawn(session.finish());
                         // The association itself is suspect: drop the park
                         // too, so the next push redials instead of
                         // resuming a dead stream.
                         if let Some(stale) = parked.take() {
-                            stale.finish().await;
+                            tokio::spawn(stale.finish());
                         }
                         discarded_event_barrier = discarded_event_barrier
                             .max(capture_control.snapshot().last_event_id);
@@ -2741,7 +2759,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     if !matches!(parked_ping, Ok(Ok(()))) {
                         tracing::debug!("parked drive stream died; next push reopens");
                         if let Some(stale) = parked.take() {
-                            stale.finish().await;
+                            tokio::spawn(stale.finish());
                         }
                     }
                 }
@@ -2798,10 +2816,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
             _ = tokio::signal::ctrl_c() => {
                 release_suppression(&capture_control, Some(&mut suppression_requested));
                 if let Some(session) = active.take() {
-                    session.finish().await;
+                    tokio::spawn(session.finish());
                 }
                 if let Some(stale) = parked.take() {
-                    stale.finish().await;
+                    tokio::spawn(stale.finish());
                 }
                 eprintln!("THEKVM_STATUS ended stopped");
                 return Ok(());
@@ -2859,6 +2877,12 @@ struct TopologySession {
     /// packet by the motion arm instead of sent as their own QUIC frame.
     /// Logged at teardown: proves the coalescer engaged under flood.
     motion_coalesced: u64,
+    /// Best-effort motion drops: stream-bound deltas that hit the 300ms
+    /// stall bound and were dropped instead of awaited (the freeze fix).
+    /// A climbing count with low forwarded proves a struggling network,
+    /// not a dead capture; the breaker ends the episode when nothing
+    /// gets through at all. Logged at teardown.
+    motion_dropped_stall: u64,
     /// Motion VALUE probe: the first forwarded delta, how many forwarded
     /// deltas were exactly zero, and the signed sums. Counts prove flow;
     /// only values prove the cursor CAN track: a drive whose warp lands
@@ -2942,6 +2966,7 @@ impl TopologySession {
                 motion_captured = self.motion_captured,
                 motion_forwarded = self.motion_forwarded,
                 motion_coalesced = self.motion_coalesced,
+                motion_dropped_stall = self.motion_dropped_stall,
                 motion_first = ?self.motion_first,
                 motion_zero_deltas = self.motion_zero_deltas,
                 motion_sum_dx = self.motion_sum_dx,
@@ -3126,13 +3151,15 @@ fn task_heartbeat_stale_ms() -> Option<u64> {
 
 /// Independent suppression watchdog: a plain OS thread OUTSIDE tokio and
 /// outside the capture thread, so it keeps ticking when a wedged drive
-/// task stalls everything else. Past 10s without a stamp it fires (at
+/// task stalls everything else. Past 4s without a stamp it fires (at
 /// most one volley per 30s): on Windows it force-releases the process
 /// hook suppression directly (the helper has its own send-stall release,
 /// see run_capture_helper); elsewhere it logs loudly — the capture
 /// thread owns the real backend release there (see start_capture).
 /// A healthy task stamps every ≤5s (keep-alive), usually every event, so
-/// a firing watchdog is proof of a wedge, never a slow drive.
+/// a firing watchdog is proof of a wedge, never a slow drive. (4s, not
+/// 10: cold opens run ~1.5s, so 4s cannot false-fire on a slow cross
+/// while still freeing a frozen desktop fast.)
 fn spawn_suppression_watchdog() {
     static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     STARTED.get_or_init(|| {
@@ -3143,7 +3170,7 @@ fn spawn_suppression_watchdog() {
                 let Some(stale_ms) = task_heartbeat_stale_ms() else {
                     continue;
                 };
-                if stale_ms < 10_000 {
+                if stale_ms < 4_000 {
                     continue;
                 }
                 use std::sync::atomic::Ordering;
@@ -3173,9 +3200,12 @@ fn spawn_suppression_watchdog() {
 
 /// Capture-thread watchdog actuation, shared by every stall path in the
 /// capture thread (see TASK_HEARTBEAT_MS): when the drive task has not
-/// ticked for 8s while suppression is still desired, release the backend
+/// ticked for 4s while suppression is still desired, release the backend
 /// in hand and clear the desire, so local input never freezes
 /// permanently. A recovered task re-engages on its next transition.
+/// (4s, not 8: with tiered sends a healthy task stamps constantly, so 4s
+/// stale is proof of a wedge; the old 8s left the desktop frozen twice
+/// as long per network blip.)
 fn watchdog_release_if_task_wedged(
     backend: &mut Option<Box<dyn kvm_platform::capture::CaptureBackend>>,
     thread_exclusive: &std::sync::atomic::AtomicBool,
@@ -3187,7 +3217,7 @@ fn watchdog_release_if_task_wedged(
     let Some(stale_ms) = task_heartbeat_stale_ms() else {
         return;
     };
-    if stale_ms <= 8_000 {
+    if stale_ms <= 4_000 {
         return;
     }
     tracing::error!(
@@ -3552,7 +3582,7 @@ async fn yield_drive_to_inbound(
     // release_suppression).
     release_suppression(capture_control, Some(&mut *suppression_requested));
     if let Some(stale) = parked.replace(session) {
-        stale.finish().await;
+        tokio::spawn(stale.finish());
     }
     *discarded_event_barrier =
         (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
@@ -3630,6 +3660,26 @@ struct TopologyEventContext<'a> {
     last_outbound_input: &'a mut Option<std::time::Instant>,
     /// Dialer wants UDP fast-path motion for fresh episodes.
     want_udp_motion: bool,
+    /// Consecutive un-sent inputs on the live episode (motion stalls +
+    /// real failures, no success between). Trips the stall breaker:
+    /// a dead network ends the episode in drops, not in per-event
+    /// multi-second timeouts with suppression held (the freeze).
+    /// Reset on every sent input and every fresh handoff.
+    send_strikes: &'a mut u32,
+}
+
+/// Stall-breaker trip count: this many consecutive un-sent inputs (motion
+/// stalls + real failures, no success between) end the episode at once
+/// instead of grinding one multi-second timeout per event with
+/// suppression held. Motion-heavy stalls trip in a few hundred ms;
+/// anything getting through resets the count. Pure-adjacent const for
+/// the Forward arm below.
+const SEND_STALL_BREAKER: u32 = 10;
+
+/// Stall-breaker predicate: trip once strikes reach the bound. Pure for
+/// tests (the arm owns the counting).
+fn stall_breaker_tripped(strikes: u32) -> bool {
+    strikes >= SEND_STALL_BREAKER
 }
 
 async fn handle_topology_event(
@@ -3671,6 +3721,7 @@ async fn handle_topology_event(
         last_yield,
         last_outbound_input,
         want_udp_motion,
+        send_strikes,
     } = context;
     // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
     // Raw deltas keep flowing after the OS pointer has stopped at the edge,
@@ -3715,7 +3766,7 @@ async fn handle_topology_event(
                 // Suppression first (see yield_drive_to_inbound), stream
                 // teardown after: same freeze shape as every other path.
                 release_suppression(capture_control, Some(&mut *suppression_requested));
-                session.finish().await;
+                tokio::spawn(session.finish());
                 *discarded_event_barrier =
                     (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
                 let _ = router.restore_local(target);
@@ -3725,7 +3776,7 @@ async fn handle_topology_event(
             // A lock is total: the parked stream goes too, so nothing
             // resumes under the lock.
             if let Some(stale) = parked.take() {
-                stale.finish().await;
+                tokio::spawn(stale.finish());
             }
             router.set_locked(true);
             tracing::info!("edge control locked to this computer");
@@ -3872,20 +3923,59 @@ async fn handle_topology_event(
                         // fall through to the stream below.
                     }
                 }
+                // Tiered sends (freeze-proofing, both OSes): motion is
+                // loss-tolerant — 300ms bound, then the delta DROPS
+                // (superseded by the next; UDP carries it anyway). Awaiting
+                // a dead stream per event is what wedged the drive task
+                // with suppression held and froze the local desktop for
+                // seconds per network blip. Keys/buttons/wheel stay
+                // reliable (2s bound): they cannot drop silently.
                 let lane = match outgoing {
                     InputEvent::MouseMove { .. } => session.motion_send.as_mut(),
                     _ => None,
                 };
-                let send_result = match lane {
-                    Some(motion) => {
-                        send_input(&session.connection, motion, *sequence, outgoing).await
-                    }
-                    None => {
-                        send_input(&session.connection, &mut session.send, *sequence, outgoing)
-                            .await
-                    }
+                let send_outcome: Result<bool> = if outgoing_is_motion {
+                    let stream = match lane {
+                        Some(motion) => motion,
+                        None => &mut session.send,
+                    };
+                    send_motion_best_effort(stream, *sequence, outgoing).await
+                } else {
+                    send_input(&session.connection, &mut session.send, *sequence, outgoing)
+                        .await
+                        .map(|()| true)
                 };
-                if let Err(error) = send_result {
+                let teardown: Option<anyhow::Error> = match send_outcome {
+                    Ok(true) => {
+                        *send_strikes = 0;
+                        if outgoing_is_motion {
+                            session.motion_forwarded += 1;
+                        }
+                        if outgoing_is_datagram {
+                            session.datagrams_sent += 1;
+                        }
+                        None
+                    }
+                    Ok(false) => {
+                        // Best-effort motion stall: drop this delta, count
+                        // the strike, keep driving — the heartbeat keeps
+                        // stamping and the desktop stays alive. The breaker
+                        // ends the episode only when NOTHING gets through
+                        // anymore (dead network, not loss).
+                        session.motion_dropped_stall += 1;
+                        *send_strikes += 1;
+                        if stall_breaker_tripped(*send_strikes) {
+                            Some(anyhow::anyhow!(
+                                "motion stall breaker tripped after {} consecutive stalled sends",
+                                *send_strikes
+                            ))
+                        } else {
+                            continue;
+                        }
+                    }
+                    Err(error) => Some(error),
+                };
+                if let Some(error) = teardown {
                     // A dead episode ends the EPISODE, never the child: the
                     // link (and the next crossing) survives a wobbly network.
                     // This used to `return Err`, killing the whole child — one
@@ -3896,11 +3986,11 @@ async fn handle_topology_event(
                     release_suppression(capture_control, Some(&mut *suppression_requested));
                     let session = active.take().expect("active session exists");
                     let target = session.target;
-                    session.finish().await;
+                    tokio::spawn(session.finish());
                     // The association itself is suspect: drop the park too, so
                     // the next push redials instead of resuming a dead stream.
                     if let Some(stale) = parked.take() {
-                        stale.finish().await;
+                        tokio::spawn(stale.finish());
                     }
                     *discarded_event_barrier =
                         (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
@@ -3910,15 +4000,6 @@ async fn handle_topology_event(
                     *last_failed_episode = Some(std::time::Instant::now());
                     eprintln!("THEKVM_STATUS local");
                     return Ok(());
-                } else {
-                    // Success path (the Err branch above tore the episode
-                    // down instead): count what actually left on the wire.
-                    if outgoing_is_motion {
-                        session.motion_forwarded += 1;
-                    }
-                    if outgoing_is_datagram {
-                        session.datagrams_sent += 1;
-                    }
                 }
             }
         }
@@ -3941,7 +4022,7 @@ async fn handle_topology_event(
             release_suppression(capture_control, Some(&mut *suppression_requested));
             if let Some(session) = active.take() {
                 if let Some(stale) = parked.replace(session) {
-                    stale.finish().await;
+                    tokio::spawn(stale.finish());
                 }
             }
             *discarded_event_barrier =
@@ -4158,6 +4239,9 @@ async fn handle_topology_event(
                 *last_peer_progress = None;
                 *unacked_pings = 0;
                 *last_transfer = Some(std::time::Instant::now());
+                // Fresh drive, fresh stall count: a dead network rebuilds
+                // strikes in drops, never in per-event multi-second waits.
+                *send_strikes = 0;
                 adopt_peer_geometry(
                     router,
                     link.map(|link| link.fingerprint.as_str()),
@@ -4461,7 +4545,7 @@ async fn take_parked_for(
 ) -> Option<TopologySession> {
     let mut session = parked.take()?;
     if session.target != target || session.connection.close_reason().is_some() {
-        session.finish().await;
+        tokio::spawn(session.finish());
         return None;
     }
     // Liveness proof before reuse: a parked stream whose peer app end
@@ -4488,7 +4572,7 @@ async fn take_parked_for(
         Ok(Ok(())) => Some(session),
         Ok(Err(error)) => {
             tracing::debug!(%error, ?target, "parked drive stream failed liveness; dialling fresh");
-            session.finish().await;
+            tokio::spawn(session.finish());
             None
         }
         Err(_) => {
@@ -4496,7 +4580,7 @@ async fn take_parked_for(
                 ?target,
                 "parked drive stream liveness timed out; dialling fresh"
             );
-            session.finish().await;
+            tokio::spawn(session.finish());
             None
         }
     }
@@ -4804,6 +4888,7 @@ fn spawn_episode_driver(
         motion_captured: 0,
         motion_forwarded: 0,
         motion_coalesced: 0,
+        motion_dropped_stall: 0,
         motion_first: None,
         motion_zero_deltas: 0,
         motion_sum_dx: 0,
@@ -5333,6 +5418,24 @@ async fn send_clipboard_text(
     revision: u64,
     text: String,
 ) -> Result<()> {
+    // Bounded (2s, freeze-proofing): an unbounded paste write pends
+    // forever on a half-dead association and stalls the drive loop with
+    // suppression held. Callers already tear the episode down on Err,
+    // so a timeout just hurries that along instead of freezing input.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        send_clipboard_text_inner(send, revision, text),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("clipboard send stalled"))??;
+    Ok(())
+}
+
+async fn send_clipboard_text_inner(
+    send: &mut quinn::SendStream,
+    revision: u64,
+    text: String,
+) -> Result<()> {
     if text.len() <= kvm_protocol::wire::MAX_CLIPBOARD_TEXT_BYTES {
         write_frame(send, &WireMessage::ClipboardText { revision, text }).await?;
         return Ok(());
@@ -5812,17 +5915,29 @@ async fn run_capture_stream(
                     // (own flow-control window and loss domain — a stalled
                     // motion packet never head-of-line-blocks keys); wheel
                     // stays ordered with keys on the episode stream.
+                    // Best-effort motion (freeze-proofing): a 300ms stall
+                    // drops the delta instead of wedging this loop with
+                    // suppression held; the next delta supersedes it.
                     let lane = match outgoing {
                         InputEvent::MouseMove { .. } => motion_send.as_mut(),
                         _ => None,
                     };
                     let send_result = match lane {
                         Some(motion) => {
-                            send_input(&connection, motion, sequence, outgoing).await
+                            send_motion_best_effort(motion, sequence, outgoing)
+                                .await
+                                .map(|_| ())
                         }
-                        None => {
-                            send_input(&connection, &mut send, sequence, outgoing).await
-                        }
+                        None => match outgoing {
+                            InputEvent::MouseMove { .. } => {
+                                send_motion_best_effort(&mut send, sequence, outgoing)
+                                    .await
+                                    .map(|_| ())
+                            }
+                            _ => {
+                                send_input(&connection, &mut send, sequence, outgoing).await
+                            }
+                        },
                     };
                     if let Err(error) = send_result {
                         break Err(error);
@@ -5920,8 +6035,17 @@ async fn run_capture_stream(
             _ = keep_alive.tick() => {
                 // Drive-task heartbeat (see TASK_HEARTBEAT_MS).
                 stamp_task_heartbeat();
-                if let Err(error) = write_frame(&mut send, &WireMessage::Ping { nonce: sequence }).await {
-                    break Err(error.into());
+                // Bounded (freeze-proofing): an unbounded Ping pends
+                // forever on a half-dead association and stalls this
+                // whole loop behind it.
+                if let Err(error) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    write_frame(&mut send, &WireMessage::Ping { nonce: sequence }),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("keep-alive ping stalled"))?
+                {
+                    break Err(error);
                 }
             }
             _ = &mut remote_closed_rx => {
@@ -8974,15 +9098,16 @@ async fn send_input(
     // it. The receiver still accepts datagrams from older peers (shared
     // dedup sets cover both arms).
     //
-    // BOUNDED (3s): a peer that stops reading (wedged app, dead helper)
-    // would otherwise park this write — and the whole drive task —
-    // forever. That is the permanent-freeze class: local suppression
-    // stays engaged while every watchdog lives on the same stalled task
-    // and can never fire. A timed-out write ends the EPISODE instead
-    // (every call site tears down and releases suppression), so a dead
-    // peer costs a crossing, never the local desktop.
+    // BOUNDED (2s): a peer that stops reading (wedged app, dead helper,
+    // dropped network) would otherwise park this write — and the whole
+    // drive task — until the next watchdog. That is the freeze class:
+    // local suppression stays engaged while the stalled task cannot
+    // stamp liveness. A timed-out write ends the EPISODE instead (every
+    // call site tears down and releases suppression), so a dead peer
+    // costs a crossing, never the local desktop. Motion never comes
+    // here (see send_motion_best_effort): it drops, never waits.
     match tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(2),
         write_frame(
             &mut *send,
             &WireMessage::Input(InputPacket { sequence, event }),
@@ -8996,8 +9121,43 @@ async fn send_input(
     Ok(())
 }
 
+/// Best-effort motion send for loss-tolerant pointer deltas (both OSes,
+/// all drive paths): 300ms bound, then the delta is DROPPED — never
+/// awaited, never fatal. The next delta supersedes a dropped one
+/// (and UDP carries motion anyway when armed), while awaiting a dead
+/// stream is what wedges the drive task with suppression held and
+/// freezes the local desktop for seconds. Returns true when the delta
+/// left on the stream. Callers count drops toward the stall breaker
+/// (consecutive drops end the episode); a write ERROR still ends it
+/// at once — only the timeout is survivable.
+async fn send_motion_best_effort(
+    send: &mut quinn::SendStream,
+    sequence: u64,
+    event: InputEvent,
+) -> Result<bool> {
+    match tokio::time::timeout(
+        Duration::from_millis(300),
+        write_frame(
+            &mut *send,
+            &WireMessage::Input(InputPacket { sequence, event }),
+        ),
+    )
+    .await
+    {
+        Ok(result) => {
+            result?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
 async fn send_state_sync(send: &mut quinn::SendStream, state: InputState) -> Result<()> {
-    write_frame(send, &WireMessage::StateSync(state)).await?;
+    // Bounded like every other drive-loop write (see send_input): an
+    // unbounded sync pends forever on a half-dead association.
+    tokio::time::timeout(Duration::from_secs(2), write_frame(send, &WireMessage::StateSync(state)))
+        .await
+        .map_err(|_| anyhow::anyhow!("state sync stalled"))??;
     Ok(())
 }
 
@@ -9621,6 +9781,14 @@ mod tests {
         assert!(!episode_cooling_down(Some(
             std::time::Instant::now() - Duration::from_secs(2)
         )));
+    }
+
+    #[test]
+    fn stall_breaker_trips_at_ten_consecutive_strikes() {
+        assert!(!stall_breaker_tripped(0));
+        assert!(!stall_breaker_tripped(9));
+        assert!(stall_breaker_tripped(10));
+        assert!(stall_breaker_tripped(100));
     }
 
     #[test]
