@@ -9,7 +9,8 @@ mod tray;
 use anyhow::{Context, Result};
 use kvm_core::{EdgeMode, Mode, TransportProtocol};
 use kvm_protocol::control::{
-    read_response, write_request, ControlRequest, ControlResponse, DaemonStatus, PendingPairing,
+    read_response, write_request, ClipboardKind, ControlRequest, ControlResponse, DaemonStatus,
+    PendingPairing,
 };
 use kvm_protocol::pairing::Identity;
 use kvm_protocol::transport;
@@ -218,6 +219,11 @@ fn main() -> Result<()> {
     // effort — a missing xhost binary just keeps today's behavior.
     #[cfg(target_os = "linux")]
     grant_daemon_x_access();
+    // Clipboard relay: the headless service that serves inbound episodes
+    // has no user session, so peer pastes stash in its relay slot instead
+    // of landing. This thread takes them and applies them with the
+    // logged-in session's own clipboard — text and screenshots alike.
+    spawn_clipboard_relay();
     // Poll thread owns no UI handles (see NOTE inside the loop); everything
     // it needs is cloned here.
     let poll_weak = weak.clone();
@@ -469,6 +475,11 @@ fn main() -> Result<()> {
     let connect_session = session_state.clone();
     ui.on_connect_to(move |address, code| {
         let code = code.trim().to_owned();
+        // First-connect loading animation (see link-connecting): the
+        // spinner runs until the session display settles — and the
+        // daemon gates crossings until edge-ready, so the first push
+        // after it rides the warmed stream.
+        set_link_connecting(&weak, true);
         start_session_flow(
             &weak,
             &pending_for_connect,
@@ -3919,6 +3930,9 @@ fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
+                // The session display settled (live or cleared): the
+                // first-connect spinner has done its job either way.
+                ui.set_link_connecting(false);
                 match address {
                     Some(address) => {
                         ui.set_session_active(true);
@@ -3932,6 +3946,210 @@ fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
             }
         }
     });
+}
+
+/// Show or hide the first-connect link spinner (see link-connecting in
+/// app.slint). Set on Connect; cleared by set_session when the display
+/// settles.
+fn set_link_connecting(weak: &slint::Weak<AppWindow>, connecting: bool) {
+    if connecting {
+        // Start the spinner ticker (once): it steps spinner-tick every
+        // 90ms until set_session clears the flag. The Slint Timer stays
+        // out of it — a Rust ticker is version-proof and costs nothing
+        // once the flag drops.
+        if SPINNER_RUNNING.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ).is_ok() {
+            let weak = weak.clone();
+            std::thread::Builder::new()
+                .name("thekvm-link-spinner".into())
+                .spawn(move || {
+                    while SPINNER_RUNNING.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(90));
+                        let _ = slint::invoke_from_event_loop({
+                            let weak = weak.clone();
+                            move || {
+                                if let Some(ui) = weak.upgrade() {
+                                    ui.set_spinner_tick((ui.get_spinner_tick() + 1) % 8);
+                                }
+                            }
+                        });
+                    }
+                })
+                .ok();
+        }
+    } else {
+        SPINNER_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+    }
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_link_connecting(connecting);
+            }
+        }
+    });
+}
+
+static SPINNER_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Headless-receiver clipboard relay (see `ClipboardPoll`): the service
+/// that serves inbound episodes usually runs without a user session, so
+/// peer pastes stash in its relay slot instead of landing anywhere.
+/// This thread takes new pastes and applies them with the logged-in
+/// session's own clipboard — text first, PNG screenshots identical —
+/// then advances its revision so the poll goes quiet. Equality-checked
+/// before every OS write, so a paste the session agent already applied
+/// (user-session daemon) never touches the OS twice and never echoes.
+fn spawn_clipboard_relay() {
+    std::thread::Builder::new()
+        .name("thekvm-clipboard-relay".into())
+        .spawn(|| {
+            let mut clipboard = match kvm_platform::clipboard::SystemClipboard::create() {
+                Ok(clipboard) => clipboard,
+                Err(error) => {
+                    ui_log(&format!(
+                        "clipboard relay: no session clipboard ({error}); peer pastes will not land"
+                    ));
+                    return;
+                }
+            };
+            ui_log("clipboard relay: watching for peer pastes");
+            let mut last_seen_revision = 0u64;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                // Gate on the negotiated toggle: off means neither
+                // direction syncs, so the relay stays quiet too. A dead
+                // daemon just retries next tick (the 1s status poll owns
+                // the loud errors; this stays quiet).
+                let enabled = match control_request(ControlRequest::Status) {
+                    Ok(ControlResponse::Status(status)) => status.clipboard_enabled,
+                    _ => continue,
+                };
+                if !enabled {
+                    continue;
+                }
+                let first = match control_request(ControlRequest::ClipboardPoll {
+                    last_seen_revision,
+                    next_index: 0,
+                }) {
+                    Ok(ControlResponse::ClipboardUpdate(update)) => update,
+                    _ => continue,
+                };
+                if first.revision == 0
+                    || first.revision == last_seen_revision
+                    || first.total_chunks == 0
+                {
+                    continue;
+                }
+                // Take the remaining chunks back-to-back (local socket:
+                // milliseconds, no sleep between them).
+                let mut chunks = vec![first.data.clone()];
+                let mut complete = first.total_chunks == 1;
+                for index in 1..first.total_chunks {
+                    match control_request(ControlRequest::ClipboardPoll {
+                        last_seen_revision,
+                        next_index: index,
+                    }) {
+                        Ok(ControlResponse::ClipboardUpdate(update))
+                            if update.revision == first.revision
+                                && update.index == index =>
+                        {
+                            chunks.push(update.data);
+                        }
+                        _ => break,
+                    }
+                    if index + 1 == first.total_chunks {
+                        complete = true;
+                    }
+                }
+                if !complete {
+                    continue;
+                }
+                let payload = chunks.concat();
+                let flavor = match first.kind {
+                    ClipboardKind::Text => "text",
+                    ClipboardKind::ImagePng => "image",
+                };
+                match apply_relay_paste(&mut clipboard, first.kind, &payload) {
+                    Ok(true) => {
+                        last_seen_revision = first.revision;
+                        ui_log(&format!(
+                            "clipboard relay: applied peer {flavor} paste ({} bytes)",
+                            payload.len()
+                        ));
+                    }
+                    Ok(false) => {
+                        // Already current on this machine: advance anyway
+                        // so the poll goes quiet.
+                        last_seen_revision = first.revision;
+                    }
+                    Err(error) => {
+                        ui_log(&format!(
+                            "clipboard relay: cannot apply peer {flavor} paste: {error:#}"
+                        ));
+                        // Do not advance: a newer revision supersedes on
+                        // the next tick, and this one retries.
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
+/// Apply one assembled relay paste with equality check first. Returns
+/// true when the OS clipboard was actually written.
+fn apply_relay_paste(
+    clipboard: &mut kvm_platform::clipboard::SystemClipboard,
+    kind: ClipboardKind,
+    payload: &str,
+) -> Result<bool> {
+    match kind {
+        ClipboardKind::Text => {
+            // poll_changed reports the current text exactly when it
+            // differs from what this handle last saw; equality with the
+            // paste means another path already landed it.
+            match clipboard
+                .poll_changed()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+            {
+                Some(current) if current == payload => Ok(false),
+                _ => {
+                    clipboard
+                        .set_text(payload.to_owned())
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    Ok(true)
+                }
+            }
+        }
+        ClipboardKind::ImagePng => {
+            let (width, height, rgba) =
+                kvm_platform::clipboard::decode_base64_png(payload)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+            match clipboard
+                .poll_changed_image()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+            {
+                Some((current_w, current_h, current))
+                    if current_w == width
+                        && current_h == height
+                        && current == rgba =>
+                {
+                    Ok(false)
+                }
+                _ => {
+                    clipboard
+                        .set_image_data(width, height, rgba)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    Ok(true)
+                }
+            }
+        }
+    }
 }
 
 /// Plain-language edge direction for status text.

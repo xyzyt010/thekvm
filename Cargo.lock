@@ -302,9 +302,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0348a1c054491f4bfe6ab86a7b6ab1e44e45d899005de92f58b3df180b36ddaf"
 dependencies = [
  "clipboard-win",
+ "image",
  "log",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
@@ -3343,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-core"
-version = "0.9.56"
+version = "0.9.57"
 dependencies = [
  "serde",
  "serde_json",
@@ -3352,9 +3355,10 @@ dependencies = [
 
 [[package]]
 name = "kvm-daemon"
-version = "0.9.56"
+version = "0.9.57"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "getrandom 0.3.4",
  "kvm-core",
@@ -3376,14 +3380,16 @@ dependencies = [
 
 [[package]]
 name = "kvm-platform"
-version = "0.9.56"
+version = "0.9.57"
 dependencies = [
  "arboard",
+ "base64",
  "futures",
  "input-capture",
  "input-event",
  "kvm-core",
  "libc",
+ "png 0.17.16",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -3393,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-protocol"
-version = "0.9.56"
+version = "0.9.57"
 dependencies = [
  "chacha20poly1305",
  "kvm-core",
@@ -3411,11 +3417,12 @@ dependencies = [
 
 [[package]]
 name = "kvm-ui"
-version = "0.9.56"
+version = "0.9.57"
 dependencies = [
  "anyhow",
  "gtk",
  "kvm-core",
+ "kvm-platform",
  "kvm-protocol",
  "qrcode",
  "quinn",

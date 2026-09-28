@@ -7,7 +7,7 @@ edition.workspace = true
 libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-arboard = { version = "3.6.1", default-features = false }
+arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_Input",
@@ -27,7 +27,7 @@ windows = { version = "0.58", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control", "image-data"] }
 futures = "0.3"
 input-capture = { version = "0.4.0", default-features = false, features = ["libei"] }
 input-event = { version = "0.4.0", default-features = false }
@@ -35,9 +35,11 @@ tokio = { workspace = true }
 x11rb = { version = "0.13", default-features = false, features = ["xinput", "xfixes", "shape"] }
 
 [target.'cfg(target_os = "freebsd")'.dependencies]
-arboard = { version = "3.6.1", default-features = false }
+arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
 
 [dependencies]
 kvm-core = { path = "../kvm-core" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+base64 = "0.22"
+png = "0.17"

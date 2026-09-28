@@ -14,6 +14,7 @@ kvm-platform = { path = "../kvm-platform" }
 quinn = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+base64 = "0.22"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }

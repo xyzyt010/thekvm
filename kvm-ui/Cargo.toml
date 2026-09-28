@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 kvm-core = { path = "../kvm-core" }
 kvm-protocol = { path = "../kvm-protocol" }
+kvm-platform = { path = "../kvm-platform" }
 qrcode = "0.14"
 slint = "1.8"
 tray-icon = "0.2"

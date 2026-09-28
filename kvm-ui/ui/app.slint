@@ -76,6 +76,15 @@ export component AppWindow inherits Window {
     in-out property <bool> invite-ready: false;
     in-out property <string> invite-input: "";
 
+    // First-connect link warm-up: set when the user presses Connect (or
+    // the station dials back), cleared the moment the session display
+    // settles (see set_session). While set and no session is live, the
+    // Connect tab shows a small round loading spinner instead of a dead
+    // row — and crossings stay gated daemon-side until edge-ready, so
+    // the first push after the spinner is already warm and instant.
+    in property <bool> link-connecting: false;
+    in-out property <int> spinner-tick: 0;
+
     callback connect-to(string /* address */, string /* typed station code, may be empty */);
     callback disconnect();
     callback set-role(int /* 0 both, 1 controller, 2 receiver */);
@@ -241,6 +250,48 @@ export component AppWindow inherits Window {
                         color: session-active ? #22c55e : #9ca3af;
                         font-size: 13px;
                         wrap: word-wrap;
+                    }
+                    // First-connect loading animation: a small round
+                    // orbiting dot while the link warms up (pre-warm dial
+                    // + caps + UDP arming, daemon-side). Crossings stay
+                    // gated until edge-ready, so motion the moment this
+                    // disappears rides the warmed stream — super smooth
+                    // both directions from the very first push.
+                    HorizontalLayout {
+                        visible: link-connecting && !session-active;
+                        spacing: 10px;
+                        Rectangle {
+                            width: 26px;
+                            height: 26px;
+                            // Static gradient ring: the round shape reads
+                            // even between ticks.
+                            Rectangle { x: 21px; y: 11px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
+                            Rectangle { x: 18px; y: 18px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
+                            Rectangle { x: 11px; y: 21px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
+                            Rectangle { x: 4px; y: 18px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
+                            Rectangle { x: 1px; y: 11px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
+                            Rectangle { x: 4px; y: 4px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
+                            Rectangle { x: 11px; y: 1px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
+                            Rectangle { x: 18px; y: 4px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
+                            // The orbiting bright dot: 8 positions stepping
+                            // with the timer (~0.7s per orbit).
+                            Rectangle {
+                                width: 4px;
+                                height: 4px;
+                                border-radius: 2px;
+                                background: #22c55e;
+                                x: spinner-tick == 0 ? 21px : spinner-tick == 1 ? 18px : spinner-tick == 2 ? 11px : spinner-tick == 3 ? 4px : spinner-tick == 4 ? 1px : spinner-tick == 5 ? 4px : spinner-tick == 6 ? 11px : 18px;
+                                y: spinner-tick == 0 ? 11px : spinner-tick == 1 ? 18px : spinner-tick == 2 ? 21px : spinner-tick == 3 ? 18px : spinner-tick == 4 ? 11px : spinner-tick == 5 ? 4px : spinner-tick == 6 ? 1px : 4px;
+                            }
+                        }
+                        Text {
+                            text: "Warming up the link — crossings unlock when ready…";
+                            color: #22c55e;
+                            font-size: 13px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
                     }
                     Rectangle { height: 1px; background: #262626; }
                     Text {

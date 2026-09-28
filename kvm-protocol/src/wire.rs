@@ -275,6 +275,17 @@ pub enum WireMessage {
         revision: u64,
         text: String,
     },
+    /// Single-shot image paste (PNG bytes as base64 — JSON carries only
+    /// UTF-8, so binary rides base64; the receiver decodes and enforces
+    /// the caps on the DECODED bytes). Larger screenshots use the
+    /// ImageStart/Chunk/End stream below (same revision throughout).
+    ClipboardImage {
+        revision: u64,
+        width: u32,
+        height: u32,
+        /// PNG-encoded image bytes, base64.
+        png_base64: String,
+    },
     /// Large-paste header: total UTF-8 bytes and chunk count. The receiver
     /// buffers only up to its configured cap and drops anything larger
     /// before the first chunk arrives.
@@ -282,6 +293,16 @@ pub enum WireMessage {
         revision: u64,
         total_bytes: u64,
         chunks: u32,
+    },
+    /// Large image-paste header: total base64 bytes and chunk count, plus
+    /// the decoded dimensions for the UI to size the paste. Same
+    /// buffering caps as the text header below.
+    ClipboardImageStart {
+        revision: u64,
+        total_bytes: u64,
+        chunks: u32,
+        width: u32,
+        height: u32,
     },
     /// One chunk of a large paste (UTF-8, split on char boundaries,
     /// `index` from 0). Ordered with everything else on the episode
@@ -291,11 +312,27 @@ pub enum WireMessage {
         index: u32,
         data: String,
     },
+    /// One chunk of a large image paste (base64 slice, `index` from 0).
+    /// Base64 is ASCII, so any split point is safe — unlike text, no
+    /// char-boundary walk is needed. Ordered with everything else on
+    /// the episode stream; the receiver concatenates in arrival order
+    /// and decodes once at End.
+    ClipboardImageChunk {
+        revision: u64,
+        index: u32,
+        data: String,
+    },
     /// End of a large paste: the receiver applies the buffer only when
     /// the revision matches an open assembly and the received bytes equal
     /// the declared total (truncation fails closed, like Deskflow's
     /// DataEnd).
     ClipboardEnd {
+        revision: u64,
+    },
+    /// End of a large image paste: same byte-exactness rule as the text
+    /// End above, then base64-decode, PNG-decode, and cap-check before
+    /// the paste lands anywhere.
+    ClipboardImageEnd {
         revision: u64,
     },
     ReleaseAll,
@@ -479,7 +516,26 @@ pub fn validate_message(message: &WireMessage) -> std::io::Result<()> {
             ));
         }
     }
-    if let WireMessage::ClipboardChunk { data, .. } = message {
+    if let WireMessage::ClipboardImage {
+        width,
+        height,
+        png_base64,
+        ..
+    } = message
+    {
+        if png_base64.len() > MAX_CLIPBOARD_TEXT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "clipboard image exceeds maximum single-shot size",
+            ));
+        }
+        if let Err(error) = validate_image_dims(*width, *height) {
+            return Err(error);
+        }
+    }
+    if let WireMessage::ClipboardChunk { data, .. }
+    | WireMessage::ClipboardImageChunk { data, .. } = message
+    {
         if data.len() > MAX_CLIPBOARD_TEXT_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -508,6 +564,45 @@ pub fn validate_message(message: &WireMessage) -> std::io::Result<()> {
                 "clipboard transfer header undercounts its chunks",
             ));
         }
+    }
+    if let WireMessage::ClipboardImageStart {
+        total_bytes,
+        chunks,
+        width,
+        height,
+        ..
+    } = message
+    {
+        if *total_bytes > MAX_CLIPBOARD_UPDATE_BYTES || *chunks == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "clipboard image transfer header is empty or exceeds maximum size",
+            ));
+        }
+        if let Err(error) = validate_image_dims(*width, *height) {
+            return Err(error);
+        }
+        let min_chunks = total_bytes.div_ceil(MAX_CLIPBOARD_TEXT_BYTES as u64);
+        if u64::from(*chunks) < min_chunks {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "clipboard image transfer header undercounts its chunks",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Pasted-image dimensions must be positive and sane: they size the
+/// receiver's decode buffer, so a hostile peer must not promise
+/// gigapixel geometry. 16384px per side caps the worst case well under
+/// the byte ceilings enforced elsewhere.
+fn validate_image_dims(width: u32, height: u32) -> std::io::Result<()> {
+    if width == 0 || height == 0 || width > 16384 || height > 16384 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "clipboard image dimensions are empty or exceed maximum size",
+        ));
     }
     Ok(())
 }
@@ -684,6 +779,75 @@ mod tests {
             chunks: 22,
         })
         .is_ok());
+    }
+
+    #[test]
+    fn clipboard_image_protocol_rejects_lies() {
+        // Oversized single-shot image.
+        assert!(validate_message(&WireMessage::ClipboardImage {
+            revision: 1,
+            width: 100,
+            height: 100,
+            png_base64: "x".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1),
+        })
+        .is_err());
+        // Degenerate or gigapixel dimensions.
+        for (width, height) in [(0, 100), (100, 0), (16385, 10), (10, 16385)] {
+            assert!(validate_message(&WireMessage::ClipboardImage {
+                revision: 1,
+                width,
+                height,
+                png_base64: "eA==".into(),
+            })
+            .is_err());
+            assert!(validate_message(&WireMessage::ClipboardImageStart {
+                revision: 1,
+                total_bytes: 48 * 1024,
+                chunks: 1,
+                width,
+                height,
+            })
+            .is_err());
+        }
+        // Oversized image chunk.
+        assert!(validate_message(&WireMessage::ClipboardImageChunk {
+            revision: 1,
+            index: 0,
+            data: "x".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1),
+        })
+        .is_err());
+        // Image header undercounting its chunks.
+        assert!(validate_message(&WireMessage::ClipboardImageStart {
+            revision: 1,
+            total_bytes: 1024 * 1024,
+            chunks: 2,
+            width: 800,
+            height: 600,
+        })
+        .is_err());
+        // Honest image frames pass (single-shot and streamed).
+        assert!(validate_message(&WireMessage::ClipboardImage {
+            revision: 1,
+            width: 800,
+            height: 600,
+            png_base64: "eA==".into(),
+        })
+        .is_ok());
+        assert!(validate_message(&WireMessage::ClipboardImageStart {
+            revision: 1,
+            total_bytes: 1024 * 1024,
+            chunks: 22,
+            width: 800,
+            height: 600,
+        })
+        .is_ok());
+        assert!(validate_message(&WireMessage::ClipboardImageChunk {
+            revision: 1,
+            index: 3,
+            data: "eA==".into(),
+        })
+        .is_ok());
+        assert!(validate_message(&WireMessage::ClipboardImageEnd { revision: 1 }).is_ok());
     }
 
     #[tokio::test]

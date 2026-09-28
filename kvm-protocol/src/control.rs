@@ -135,6 +135,46 @@ pub enum ControlRequest {
         #[serde(default)]
         transport: Option<TransportProtocol>,
     },
+    /// Take one chunk of the latest peer paste stashed for this
+    /// logged-in session (see [`ClipboardUpdate`]): the headless
+    /// service cannot touch the OS clipboard, so the UI takes the
+    /// relay and applies it with its own session clipboard. Chunked
+    /// because screenshots exceed the control frame ceiling.
+    ClipboardPoll {
+        /// Newest revision the UI already applied; the daemon answers
+        /// empty when the slot holds nothing newer.
+        last_seen_revision: u64,
+        /// Chunk index to take (the UI walks 0..total_chunks).
+        next_index: u32,
+    },
+}
+
+/// Which flavor a relayed clipboard paste carries. Text travels as
+/// UTF-8; images travel PNG-encoded and base64-wrapped (JSON-safe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipboardKind {
+    Text,
+    ImagePng,
+}
+
+/// One chunk of a relayed peer paste for
+/// [`ControlRequest::ClipboardPoll`]. `revision == 0` means "nothing
+/// new" (the slot is empty or the UI already saw it); otherwise the UI
+/// collects `total_chunks` in order and applies the assembled paste,
+/// then advances `last_seen_revision` so the next poll goes quiet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardUpdate {
+    pub revision: u64,
+    pub kind: ClipboardKind,
+    /// Payload bytes (UTF-8 text, or base64 PNG for images).
+    pub total_bytes: u64,
+    pub total_chunks: u32,
+    pub index: u32,
+    pub data: String,
+    /// Decoded image dimensions (0 for text): lets the UI size the
+    /// paste without decoding first.
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Default clipboard cap for status frames from older daemons.
@@ -289,6 +329,10 @@ pub enum ControlResponse {
         cert_der_hex: String,
         key_der_hex: String,
     },
+    /// One chunk of the latest relayed peer paste (see [`ClipboardUpdate`]).
+    /// Older daemons answer `Error` for the unknown `ClipboardPoll`
+    /// request instead — the UI then simply skips clipboard relay.
+    ClipboardUpdate(ClipboardUpdate),
     Error {
         message: String,
     },

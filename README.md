@@ -159,9 +159,12 @@ when control returns; Wayland intentionally cannot provide arbitrary pointer
 warping through the portal, and runtime multi-monitor/DPI discovery is still
 future work. Topology startup seeds the router from the current Windows or X11
 pointer when the platform exposes that position, and restores the saved local
-coordinate after a failed remote handoff. Opt-in text-only clipboard synchronization is available for normal
-logged-in sessions when both peers enable it; rich clipboard formats,
-clipboard history, and file transfer remain future work.
+coordinate after a failed remote handoff. Opt-in clipboard synchronization covers text and
+screenshots/images for normal logged-in sessions when both peers enable it; rich clipboard formats,
+clipboard history, and file transfer remain future work. Pastes ride the authenticated episode
+stream (chunked past a link cap, default 2MB); a headless receiver stashes them for the logged-in
+UI, which applies them with its own session clipboard — so copy works even when the receiving
+service has no desktop session.
 
 On Windows, relative mouse motion is captured through a hidden message-only
 window registered with Raw Input (`RIDEV_INPUTSINK`), so movement continues to

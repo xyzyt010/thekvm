@@ -1987,10 +1987,15 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut clipboard_enabled = config.clipboard_enabled;
     let mut clipboard_revision = 0u64;
     let mut latest_clipboard: Option<String> = None;
+    // Last observed local image paste (see latest_clipboard): sent as
+    // the initial image when the next episode opens.
+    let mut latest_image: Option<ImagePaste> = None;
     let clipboard_max_bytes = config.clipboard_max_bytes() as u64;
     // Open chunked-paste assembly for this link (see ClipboardAssembly):
     // at most one transfer buffers at a time, bounded by the cap above.
     let mut clipboard_assembly = ClipboardAssembly::default();
+    // Open chunked-IMAGE assembly alongside (see ImageAssembly).
+    let mut image_assembly = ImageAssembly::default();
     let mut discarded_event_barrier = 0u64;
     let mut last_transfer: Option<std::time::Instant> = None;
     let mut last_failed_episode: Option<std::time::Instant> = None;
@@ -1998,6 +2003,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // breaker in the Forward arm): a dead network ends the episode in
     // drops, never in per-event stalls with suppression held.
     let mut send_strikes: u32 = 0;
+    // Wall clock of the first strike in the current run (see the stall
+    // breaker in the Forward arm): a dead network ends the episode in
+    // drops sustained over seconds, never in per-event stalls.
+    let mut send_stall_since: Option<std::time::Instant> = None;
     // Last OS-pointer truth resync (see handle_topology_event): throttles
     // the GetCursorPos/query_pointer read to 20Hz so motion stays cheap.
     let mut last_resync: Option<std::time::Instant> = None;
@@ -2159,7 +2168,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                     handoff_y,
                                     snapshot.state.clone(),
                                     first_event,
-                                    latest_clipboard.clone(),
+                                    ClipboardInitial {
+                                        text: latest_clipboard.clone(),
+                                        image: latest_image.clone(),
+                                    },
                                     &mut clipboard_revision,
                                     config.clipboard_max_bytes() as u64,
                                     &mut sequence,
@@ -2192,7 +2204,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                 mode: config.mode,
                                 local_geometry,
                                 clipboard_enabled,
-                                initial_clipboard: latest_clipboard.clone(),
+                                initial_clipboard: ClipboardInitial {
+                                    text: latest_clipboard.clone(),
+                                    image: latest_image.clone(),
+                                },
                                 sequence: &mut sequence,
                                 clipboard_revision: &mut clipboard_revision,
                                 clipboard_max_bytes: config.clipboard_max_bytes() as u64,
@@ -2341,6 +2356,110 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             ClipboardFeed::Pending => {}
                         }
                     }
+                    Some(RemoteSignal::ClipboardImage {
+                        revision,
+                        png_base64,
+                        width,
+                        height,
+                    }) => {
+                        let Some(session) = active.as_mut() else {
+                            continue;
+                        };
+                        if !session.clipboard_enabled || revision <= session.remote_clipboard_revision {
+                            continue;
+                        }
+                        if png_base64.len() as u64 > clipboard_max_bytes {
+                            tracing::warn!(bytes = png_base64.len(), "peer sent oversized clipboard image; dropped");
+                            continue;
+                        }
+                        tracing::info!(bytes = png_base64.len(), "peer clipboard image received");
+                        apply_inbound_clipboard_image(
+                            &clipboard,
+                            &mut latest_image,
+                            &mut session.remote_clipboard_revision,
+                            revision,
+                            ImagePaste {
+                                png_base64,
+                                width,
+                                height,
+                            },
+                        )?;
+                    }
+                    Some(RemoteSignal::ClipboardImageStart {
+                        revision,
+                        total_bytes,
+                        chunks,
+                        width,
+                        height,
+                    }) => {
+                        let Some(session) = active.as_mut() else {
+                            continue;
+                        };
+                        if !session.clipboard_enabled
+                            || revision <= session.remote_clipboard_revision
+                        {
+                            continue;
+                        }
+                        if matches!(
+                            image_assembly.feed_start(
+                                revision,
+                                total_bytes,
+                                chunks,
+                                width,
+                                height,
+                                clipboard_max_bytes
+                            ),
+                            ImageFeed::Dropped
+                        ) {
+                            tracing::warn!(revision, total_bytes, "peer clipboard image transfer refused (over cap or malformed header)");
+                        }
+                    }
+                    Some(RemoteSignal::ClipboardImageChunk {
+                        revision,
+                        index,
+                        data,
+                    }) => {
+                        let Some(session) = active.as_mut() else {
+                            continue;
+                        };
+                        if !session.clipboard_enabled
+                            || revision <= session.remote_clipboard_revision
+                        {
+                            continue;
+                        }
+                        if matches!(
+                            image_assembly.feed_chunk(revision, index, &data),
+                            ImageFeed::Dropped
+                        ) {
+                            tracing::warn!(revision, index, "peer clipboard image transfer aborted (chunk mismatch)");
+                        }
+                    }
+                    Some(RemoteSignal::ClipboardImageEnd { revision }) => {
+                        let Some(session) = active.as_mut() else {
+                            continue;
+                        };
+                        if !session.clipboard_enabled
+                            || revision <= session.remote_clipboard_revision
+                        {
+                            continue;
+                        }
+                        match image_assembly.feed_end(revision) {
+                            ImageFeed::Ready(paste) => {
+                                tracing::info!(bytes = paste.png_base64.len(), "peer clipboard image transfer complete");
+                                apply_inbound_clipboard_image(
+                                    &clipboard,
+                                    &mut latest_image,
+                                    &mut session.remote_clipboard_revision,
+                                    revision,
+                                    paste,
+                                )?;
+                            }
+                            ImageFeed::Dropped => {
+                                tracing::warn!(revision, "peer clipboard image transfer failed validation; dropped");
+                            }
+                            ImageFeed::Pending => {}
+                        }
+                    }
                     Some(RemoteSignal::Closed) | None => {
                         if let Some(session) = active.take() {
                             let target = session.target;
@@ -2389,7 +2508,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     mode: config.mode,
                     local_geometry,
                     clipboard_enabled,
-                    initial_clipboard: latest_clipboard.clone(),
+                    initial_clipboard: ClipboardInitial {
+                        text: latest_clipboard.clone(),
+                        image: latest_image.clone(),
+                    },
                     clipboard_revision: &mut clipboard_revision,
                     clipboard_max_bytes: config.clipboard_max_bytes() as u64,
                     dir: &dir,
@@ -2405,6 +2527,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     last_outbound_input: &mut last_outbound_input,
                     want_udp_motion: true, // UDP cemented: every dial offers motion fast path
                     send_strikes: &mut send_strikes,
+                    send_stall_since: &mut send_stall_since,
                 })
                 .await?;
             }
@@ -2518,7 +2641,10 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     mode: config.mode,
                     local_geometry,
                     clipboard_enabled,
-                    initial_clipboard: latest_clipboard.clone(),
+                    initial_clipboard: ClipboardInitial {
+                        text: latest_clipboard.clone(),
+                        image: latest_image.clone(),
+                    },
                     clipboard_revision: &mut clipboard_revision,
                     clipboard_max_bytes: config.clipboard_max_bytes() as u64,
                     dir: &dir,
@@ -2534,29 +2660,39 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     last_outbound_input: &mut last_outbound_input,
                     want_udp_motion: true, // UDP cemented: every dial offers motion fast path
                     send_strikes: &mut send_strikes,
+                    send_stall_since: &mut send_stall_since,
                 })
                 .await?;
             }
-            text = receive_clipboard(&mut clipboard, clipboard_enabled) => match text {
-                Some(text) => {
-                    latest_clipboard = Some(text.clone());
+            change = receive_clipboard(&mut clipboard, clipboard_enabled) => match change {
+                Some(change) => {
+                    // Stash for the next episode open (copy-then-cross):
+                    // the copy happened while nobody was driven, so no
+                    // live episode carries it — the open sends it as
+                    // initial instead. Both flavors tracked; the open
+                    // sends text first, then image (final OS state wins).
+                    match &change {
+                        ClipboardChanged::Text(text) => {
+                            latest_clipboard = Some(text.clone());
+                        }
+                        ClipboardChanged::Image(paste) => {
+                            latest_image = Some(paste.clone());
+                        }
+                    }
                     let Some(session) = active.as_mut().filter(|session| session.clipboard_enabled) else {
                         continue;
                     };
-                    // Per-link cap from Settings (default 2MB): anything
-                    // larger stays local, never half-sent.
-                    if text.len() as u64 > config.clipboard_max_bytes() as u64 {
-                        tracing::debug!(bytes = text.len(), "skipping oversized clipboard text");
-                        continue;
-                    }
-                    clipboard_revision = clipboard_revision.wrapping_add(1);
-                    if let Err(error) = send_clipboard_text(
+                    match send_clipboard_change(
                         &mut session.send,
                         clipboard_revision,
-                        text,
+                        change,
+                        config.clipboard_max_bytes() as u64,
                     )
                     .await
                     {
+                        Ok(Some((revision, _))) => clipboard_revision = revision,
+                        Ok(None) => {}
+                        Err(error) => {
                         // Like a failed input send: the episode ends, the
                         // child lives on for the next crossing.
                         tracing::warn!(%error, "topology clipboard send failed; control is local");
@@ -2577,6 +2713,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         let _ = capture_control.warp_cursor(x, y);
                         last_failed_episode = Some(std::time::Instant::now());
                         eprintln!("THEKVM_STATUS local");
+                        }
                     }
                 }
                 None => clipboard_enabled = false,
@@ -2596,9 +2733,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // and for motion-only Windows drives (raw motion carries
                 // no tag). Activity, never session existence: the
                 // two-way-edge dial-back stays open persistently.
+                // Desensitized (see INBOUND_YIELD_MIN_GROWTH): the divert
+                // fast path needs a run of fresh diverts, not one stray —
+                // a single echo/noise event must never yank control home
+                // mid-display. A peer truly driving back produces dozens
+                // per tick and still yields within 300ms.
                 if active.is_some() {
                     let diverted = kvm_platform::capture::inbound_while_driving_count();
-                    if diverted > divert_baseline {
+                    if diverted > divert_baseline.saturating_add(INBOUND_YIELD_MIN_GROWTH - 1) {
                         yield_drive_to_inbound(
                             &mut router,
                             &mut active,
@@ -2642,10 +2784,11 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // yields when the local mouse moves (the "must move the
                 // Mint mouse out first" shape). The fast yield_probe above
                 // already covers the common case; this remains as a backup
-                // for a missed probe tick.
+                // for a missed probe tick. Same desensitization as the fast
+                // probe above: a run of fresh diverts, never one stray.
                 if active.is_some() {
                     let diverted = kvm_platform::capture::inbound_while_driving_count();
-                    if diverted > divert_baseline {
+                    if diverted > divert_baseline.saturating_add(INBOUND_YIELD_MIN_GROWTH - 1) {
                         yield_drive_to_inbound(
                             &mut router,
                             &mut active,
@@ -2943,6 +3086,32 @@ enum RemoteSignal {
         data: String,
     },
     ClipboardEnd {
+        revision: u64,
+    },
+    /// Single-shot image paste (PNG as base64): applied like Clipboard
+    /// above, then stashed for the UI relay when no session agent can
+    /// touch the OS clipboard (see apply_inbound_clipboard).
+    ClipboardImage {
+        revision: u64,
+        png_base64: String,
+        width: u32,
+        height: u32,
+    },
+    /// Chunked image-paste frames (see ImageAssembly): forwarded like
+    /// ClipboardImage and assembled in the drive loop.
+    ClipboardImageStart {
+        revision: u64,
+        total_bytes: u64,
+        chunks: u32,
+        width: u32,
+        height: u32,
+    },
+    ClipboardImageChunk {
+        revision: u64,
+        index: u32,
+        data: String,
+    },
+    ClipboardImageEnd {
         revision: u64,
     },
     Closed,
@@ -3427,7 +3596,12 @@ async fn probe_inbound_yield(
         *inbound_baselines_fresh = true;
         0
     };
-    if growth > 0 {
+    // Desensitized (see inbound_yield_fires): a Handoff-less stray (one
+    // echo/noise event, growth=1, nobody driving) is absorbed into the
+    // baseline, never a yield — the sudden mid-display exit shape. A
+    // peer that truly takes the cursor sends a Handoff first (driving
+    // non-empty), so intent still pre-empts within one 300ms tick.
+    if inbound_yield_fires(growth, !driving.is_empty()) {
         *last_inbound_growth_at = Some(std::time::Instant::now());
         let observed = kvm_platform::capture::inbound_while_driving_count();
         tracing::info!(
@@ -3618,7 +3792,7 @@ struct TopologyEventContext<'a> {
     mode: Mode,
     local_geometry: Option<ScreenGeometry>,
     clipboard_enabled: bool,
-    initial_clipboard: Option<String>,
+    initial_clipboard: ClipboardInitial,
     clipboard_revision: &'a mut u64,
     /// Per-link clipboard cap (Settings, default 2MB), loop-local copy.
     clipboard_max_bytes: u64,
@@ -3666,20 +3840,43 @@ struct TopologyEventContext<'a> {
     /// multi-second timeouts with suppression held (the freeze).
     /// Reset on every sent input and every fresh handoff.
     send_strikes: &'a mut u32,
+    /// Wall clock of the first strike in the current run (None when the
+    /// count is zero). The breaker needs BOTH count and duration: a
+    /// burst of drops under momentary loss must never end the episode
+    /// (the mid-display sudden-exit shape) — only sustained silence
+    /// with nothing getting through for seconds means dead network.
+    send_stall_since: &'a mut Option<std::time::Instant>,
 }
 
-/// Stall-breaker trip count: this many consecutive un-sent inputs (motion
-/// stalls + real failures, no success between) end the episode at once
+/// Stall-breaker trip thresholds: this many consecutive un-sent inputs
+/// AND this long with nothing getting through end the episode at once
 /// instead of grinding one multi-second timeout per event with
-/// suppression held. Motion-heavy stalls trip in a few hundred ms;
-/// anything getting through resets the count. Pure-adjacent const for
-/// the Forward arm below.
-const SEND_STALL_BREAKER: u32 = 10;
+/// suppression held. Either signal alone stays driving: brief loss
+/// bursts (high count, short time) recover, and a slow trickle (long
+/// time, low count) is congestion, not death. Pure-adjacent consts
+/// for the Forward arm below.
+const SEND_STALL_BREAKER: u32 = 30;
+const SEND_STALL_BREAKER_MS: u64 = 2000;
 
-/// Stall-breaker predicate: trip once strikes reach the bound. Pure for
-/// tests (the arm owns the counting).
-fn stall_breaker_tripped(strikes: u32) -> bool {
-    strikes >= SEND_STALL_BREAKER
+/// Stall-breaker predicate: trip only on sustained silence (count AND
+/// duration). Pure for tests (the arm owns the counting and clock).
+fn stall_breaker_tripped(strikes: u32, stalled_ms: u64) -> bool {
+    strikes >= SEND_STALL_BREAKER && stalled_ms >= SEND_STALL_BREAKER_MS
+}
+
+/// Yield trigger thresholds (see probe_inbound_yield): a single stray
+/// inbound input (echo, resting noise, one redialed-event) must never
+/// yank control home mid-display. A peer that truly takes the cursor
+/// always sends a Handoff first (the `driving` flag), so intent-gated
+/// singles still yield instantly while Handoff-less noise needs a
+/// sustained run. Pure for tests.
+const INBOUND_YIELD_MIN_GROWTH: u64 = 5;
+
+/// Inbound-yield predicate: fire on a sustained run of fresh peer input,
+/// or on ANY fresh input once the peer has taken the cursor (Handoff).
+/// Pure for tests (the probe owns the snapshot and baseline).
+fn inbound_yield_fires(growth: u64, peer_driving: bool) -> bool {
+    growth >= INBOUND_YIELD_MIN_GROWTH || (growth > 0 && peer_driving)
 }
 
 async fn handle_topology_event(
@@ -3722,6 +3919,7 @@ async fn handle_topology_event(
         last_outbound_input,
         want_udp_motion,
         send_strikes,
+        send_stall_since,
     } = context;
     // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
     // Raw deltas keep flowing after the OS pointer has stopped at the edge,
@@ -3791,9 +3989,13 @@ async fn handle_topology_event(
     // invisible grab window. Park ours and release the grab so their
     // input lands; our parked stream resumes on the next push.
     // Baseline-gated, so stale counts from an older drive never fire.
+    // Desensitized (see INBOUND_YIELD_MIN_GROWTH): a single stray
+    // diverted event (echo, resting noise) must never yank control
+    // home mid-display — a peer truly driving back produces a run of
+    // them within one probe tick.
     if active.is_some() {
         let diverted = kvm_platform::capture::inbound_while_driving_count();
-        if diverted > *divert_baseline {
+        if diverted > (*divert_baseline).saturating_add(INBOUND_YIELD_MIN_GROWTH - 1) {
             yield_drive_to_inbound(
                 router,
                 active,
@@ -3917,6 +4119,12 @@ async fn handle_topology_event(
                             if outgoing_is_motion {
                                 session.motion_forwarded += 1;
                             }
+                            // A delivered delta proves the path alive: clear
+                            // any stream-stall strikes so UDP success can
+                            // never trip the breaker below (the mid-display
+                            // exit shape on lossy links).
+                            *send_strikes = 0;
+                            *send_stall_since = None;
                             continue;
                         }
                         // Fast path missed (no sender, buffer full):
@@ -3948,6 +4156,7 @@ async fn handle_topology_event(
                 let teardown: Option<anyhow::Error> = match send_outcome {
                     Ok(true) => {
                         *send_strikes = 0;
+                        *send_stall_since = None;
                         if outgoing_is_motion {
                             session.motion_forwarded += 1;
                         }
@@ -3960,14 +4169,18 @@ async fn handle_topology_event(
                         // Best-effort motion stall: drop this delta, count
                         // the strike, keep driving — the heartbeat keeps
                         // stamping and the desktop stays alive. The breaker
-                        // ends the episode only when NOTHING gets through
-                        // anymore (dead network, not loss).
+                        // needs sustained silence (count AND seconds with
+                        // nothing getting through): a loss burst drops and
+                        // recovers, only a dead network ends the episode.
                         session.motion_dropped_stall += 1;
                         *send_strikes += 1;
-                        if stall_breaker_tripped(*send_strikes) {
+                        let since = send_stall_since.get_or_insert(std::time::Instant::now());
+                        let stalled_ms = since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        if stall_breaker_tripped(*send_strikes, stalled_ms) {
                             Some(anyhow::anyhow!(
-                                "motion stall breaker tripped after {} consecutive stalled sends",
-                                *send_strikes
+                                "motion stall breaker tripped after {} consecutive stalled sends over {}ms",
+                                *send_strikes,
+                                stalled_ms
                             ))
                         } else {
                             continue;
@@ -4240,8 +4453,10 @@ async fn handle_topology_event(
                 *unacked_pings = 0;
                 *last_transfer = Some(std::time::Instant::now());
                 // Fresh drive, fresh stall count: a dead network rebuilds
-                // strikes in drops, never in per-event multi-second waits.
+                // strikes in drops sustained over seconds, never in
+                // per-event multi-second waits.
                 *send_strikes = 0;
+                *send_stall_since = None;
                 adopt_peer_geometry(
                     router,
                     link.map(|link| link.fingerprint.as_str()),
@@ -4318,7 +4533,7 @@ struct TopologyOpen<'a> {
     mode: Mode,
     local_geometry: Option<ScreenGeometry>,
     clipboard_enabled: bool,
-    initial_clipboard: Option<String>,
+    initial_clipboard: ClipboardInitial,
     clipboard_revision: &'a mut u64,
     /// Per-link clipboard cap (Settings, default 2MB): the initial sync
     /// sends chunked up to this, never more.
@@ -4451,17 +4666,13 @@ async fn open_topology_session(request: TopologyOpen<'_>) -> Result<TopologySess
     .await?;
     send_state_sync(&mut send, state).await?;
     if clipboard_enabled {
-        if let Some(text) = initial_clipboard {
-            if text.len() as u64 <= clipboard_max_bytes {
-                *clipboard_revision = clipboard_revision.wrapping_add(1);
-                send_clipboard_text(&mut send, *clipboard_revision, text).await?;
-            } else {
-                tracing::debug!(
-                    bytes = text.len(),
-                    "skipping oversized initial clipboard text"
-                );
-            }
-        }
+        send_initial_clipboard(
+            &mut send,
+            &initial_clipboard,
+            clipboard_revision,
+            clipboard_max_bytes,
+        )
+        .await?;
     }
     // UDP fast-path motion: the Hello above negotiated it, so arm the
     // outbound sender from the live association's peer address. Without
@@ -4555,9 +4766,12 @@ async fn take_parked_for(
     // the walk-back. One bounded Ping/Pong round trip proves the peer
     // still reads this stream; on timeout the park is finished and the
     // caller dials fresh instead. Stale backlog drains first so an
-    // ancient Pong cannot pose as fresh proof.
+    // ancient Pong cannot pose as fresh proof. 250ms, not 1s: on LAN
+    // the Pong lands in milliseconds, and every extra 100ms here adds
+    // directly to the next crossing's open_ms (the slow re-entry
+    // shape: 1s liveness wait + cold dial on every re-cross).
     while session.signals.try_recv().is_ok() {}
-    let verified = tokio::time::timeout(Duration::from_secs(1), async {
+    let verified = tokio::time::timeout(Duration::from_millis(250), async {
         write_frame(&mut session.send, &WireMessage::Ping { nonce: 0 }).await?;
         loop {
             match session.signals.recv().await {
@@ -4599,7 +4813,7 @@ async fn resume_parked_session(
     target_y: u32,
     state: InputState,
     first_event: Option<InputEvent>,
-    initial_clipboard: Option<String>,
+    initial_clipboard: ClipboardInitial,
     clipboard_revision: &mut u64,
     clipboard_max_bytes: u64,
     sequence: &mut u64,
@@ -4626,17 +4840,13 @@ async fn resume_parked_session(
     .await?;
     send_state_sync(&mut session.send, state).await?;
     if session.clipboard_enabled {
-        if let Some(text) = initial_clipboard {
-            if text.len() as u64 <= clipboard_max_bytes {
-                *clipboard_revision = clipboard_revision.wrapping_add(1);
-                send_clipboard_text(&mut session.send, *clipboard_revision, text).await?;
-            } else {
-                tracing::debug!(
-                    bytes = text.len(),
-                    "skipping oversized resumed clipboard text"
-                );
-            }
-        }
+        send_initial_clipboard(
+            &mut session.send,
+            &initial_clipboard,
+            clipboard_revision,
+            clipboard_max_bytes,
+        )
+        .await?;
     }
     let first_event = first_event.and_then(|event| {
         outgoing_wheel_event(event, session.peer_smooth, &mut session.wheel_debt)
@@ -4969,6 +5179,19 @@ async fn drain_peer_responses(
             WireMessage::ClipboardText { revision, text } => {
                 let _ = signal.send(RemoteSignal::Clipboard { revision, text });
             }
+            WireMessage::ClipboardImage {
+                revision,
+                png_base64,
+                width,
+                height,
+            } => {
+                let _ = signal.send(RemoteSignal::ClipboardImage {
+                    revision,
+                    png_base64,
+                    width,
+                    height,
+                });
+            }
             WireMessage::ClipboardStart {
                 revision,
                 total_bytes,
@@ -4990,6 +5213,35 @@ async fn drain_peer_responses(
                     index,
                     data,
                 });
+            }
+            WireMessage::ClipboardImageStart {
+                revision,
+                total_bytes,
+                chunks,
+                width,
+                height,
+            } => {
+                let _ = signal.send(RemoteSignal::ClipboardImageStart {
+                    revision,
+                    total_bytes,
+                    chunks,
+                    width,
+                    height,
+                });
+            }
+            WireMessage::ClipboardImageChunk {
+                revision,
+                index,
+                data,
+            } => {
+                let _ = signal.send(RemoteSignal::ClipboardImageChunk {
+                    revision,
+                    index,
+                    data,
+                });
+            }
+            WireMessage::ClipboardImageEnd { revision } => {
+                let _ = signal.send(RemoteSignal::ClipboardImageEnd { revision });
             }
             WireMessage::ClipboardEnd { revision } => {
                 let _ = signal.send(RemoteSignal::ClipboardEnd { revision });
@@ -5211,8 +5463,8 @@ fn start_capture(
 
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 struct ClipboardAgent {
-    changes: tokio::sync::watch::Receiver<Option<String>>,
-    commands: std::sync::mpsc::Sender<String>,
+    changes: tokio::sync::watch::Receiver<Option<ClipboardChanged>>,
+    commands: std::sync::mpsc::Sender<ClipboardChanged>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -5227,8 +5479,8 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
 
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
     {
-        let (change_tx, changes) = tokio::sync::watch::channel(None::<String>);
-        let (command_tx, command_rx) = std::sync::mpsc::channel::<String>();
+        let (change_tx, changes) = tokio::sync::watch::channel(None::<ClipboardChanged>);
+        let (command_tx, command_rx) = std::sync::mpsc::channel::<ClipboardChanged>();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_stop = stop.clone();
@@ -5259,10 +5511,36 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                         None
                     }
                 };
+                // Image polls copy megabytes per call: gated to ownership
+                // changes or a 2s cadence (see the loop), never per tick.
+                let mut last_image_poll: Option<std::time::Instant> = None;
                 while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
-                    while let Ok(text) = command_rx.try_recv() {
-                        if let Err(error) = clipboard.set_text(text) {
-                            tracing::debug!(%error, "cannot apply remote clipboard text");
+                    while let Ok(change) = command_rx.try_recv() {
+                        match change {
+                            ClipboardChanged::Text(text) => {
+                                if let Err(error) = clipboard.set_text(text) {
+                                    tracing::debug!(%error, "cannot apply remote clipboard text");
+                                }
+                            }
+                            ClipboardChanged::Image(paste) => {
+                                use base64::Engine as _;
+                                let applied = base64::engine::general_purpose::STANDARD
+                                    .decode(paste.png_base64.as_bytes())
+                                    .map_err(|error| {
+                                        kvm_platform::PlatformError::Clipboard(format!(
+                                            "decode peer clipboard image: {error}"
+                                        ))
+                                    })
+                                    .and_then(|png| {
+                                        kvm_platform::clipboard::decode_image_png(&png)
+                                    })
+                                    .and_then(|(width, height, rgba)| {
+                                        clipboard.set_image_data(width, height, rgba)
+                                    });
+                                if let Err(error) = applied {
+                                    tracing::debug!(%error, "cannot apply remote clipboard image");
+                                }
+                            }
                         }
                     }
                     // Deep-OS change events: the OS wakes this loop the
@@ -5272,19 +5550,61 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                     // quantum. Absent (headless session, unsupported
                     // compositor) the timed poll below still carries it —
                     // events are a latency fast path, never a dependency.
-                    match &watcher {
+                    let notice = match &watcher {
                         Some(watch) => {
-                            watch.wait_notice(Duration::from_millis(500));
+                            watch.wait_notice(Duration::from_millis(500))
                         }
-                        None => std::thread::sleep(Duration::from_millis(250)),
-                    }
+                        None => {
+                            std::thread::sleep(Duration::from_millis(250));
+                            false
+                        }
+                    };
                     match clipboard.poll_changed() {
                         Ok(Some(text)) => {
-                            let _ = change_tx.send(Some(text));
+                            let _ = change_tx.send(Some(ClipboardChanged::Text(text)));
                         }
                         Ok(None) => {}
                         Err(error) => {
                             tracing::debug!(%error, "cannot poll system clipboard");
+                        }
+                    }
+                    // Image polling is gated, not per-tick: reading pixels
+                    // copies megabytes per call, so it runs on an ownership
+                    // change or every 2s — never in the hot text path.
+                    let image_due = last_image_poll
+                        .map_or(true, |when: std::time::Instant| {
+                            when.elapsed() >= Duration::from_secs(2)
+                        });
+                    if notice || image_due {
+                        last_image_poll = Some(std::time::Instant::now());
+                        match clipboard.poll_changed_image() {
+                            Ok(Some((width, height, rgba))) => {
+                                let encoded = kvm_platform::clipboard::encode_image_png(
+                                    width, height, &rgba,
+                                )
+                                .map(|png| {
+                                    use base64::Engine as _;
+                                    base64::engine::general_purpose::STANDARD.encode(&png)
+                                });
+                                match encoded {
+                                    Ok(png_base64) => {
+                                        let _ = change_tx.send(Some(ClipboardChanged::Image(
+                                            ImagePaste {
+                                                png_base64,
+                                                width: width as u32,
+                                                height: height as u32,
+                                            },
+                                        )));
+                                    }
+                                    Err(error) => {
+                                        tracing::debug!(%error, "cannot encode clipboard image");
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::debug!(%error, "cannot poll system clipboard image");
+                            }
                         }
                     }
                 }
@@ -5318,27 +5638,37 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
 }
 
 impl ClipboardAgent {
-    async fn recv(&mut self) -> Option<String> {
+    async fn recv(&mut self) -> Option<ClipboardChanged> {
         if self.changes.changed().await.is_err() {
             return None;
         }
         self.changes.borrow().clone()
     }
 
-    fn apply_remote(&self, text: String) -> Result<()> {
+    fn apply_text(&self, text: String) -> Result<()> {
         self.commands
-            .send(text)
+            .send(ClipboardChanged::Text(text))
+            .map_err(|error| anyhow::anyhow!("clipboard agent stopped: {error}"))
+    }
+
+    fn apply_image(&self, paste: ImagePaste) -> Result<()> {
+        self.commands
+            .send(ClipboardChanged::Image(paste))
             .map_err(|error| anyhow::anyhow!("clipboard agent stopped: {error}"))
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "windows")))]
 impl ClipboardAgent {
-    async fn recv(&mut self) -> Option<String> {
+    async fn recv(&mut self) -> Option<ClipboardChanged> {
         std::future::pending().await
     }
 
-    fn apply_remote(&self, _text: String) -> Result<()> {
+    fn apply_text(&self, _text: String) -> Result<()> {
+        Ok(())
+    }
+
+    fn apply_image(&self, _paste: ImagePaste) -> Result<()> {
         Ok(())
     }
 }
@@ -5358,7 +5688,7 @@ impl Drop for ClipboardAgent {
 async fn receive_clipboard(
     clipboard: &mut Option<ClipboardAgent>,
     enabled: bool,
-) -> Option<String> {
+) -> Option<ClipboardChanged> {
     if !enabled {
         return std::future::pending().await;
     }
@@ -5368,7 +5698,10 @@ async fn receive_clipboard(
 
 /// Apply one fully-received paste (single-shot or assembled) to the
 /// local clipboard. Shared by the connect drive loop and the serve loop
-/// so both directions behave identically.
+/// so both directions behave identically. Always stashes to the UI
+/// relay too: a session agent applies it directly where one exists,
+/// and the logged-in UI takes it where headless (the service case) —
+/// the UI's equality check makes a double landing a no-op.
 fn apply_inbound_clipboard(
     clipboard: &Option<ClipboardAgent>,
     latest_clipboard: &mut Option<String>,
@@ -5378,9 +5711,45 @@ fn apply_inbound_clipboard(
 ) -> Result<()> {
     *session_remote_revision = revision;
     if let Some(agent) = clipboard.as_ref() {
-        agent.apply_remote(text.clone())?;
+        if let Err(error) = agent.apply_text(text.clone()) {
+            tracing::debug!(%error, "clipboard agent apply failed; UI relay carries the paste");
+        }
     }
+    stash_inbound_clipboard(
+        revision,
+        kvm_protocol::control::ClipboardKind::Text,
+        &text,
+        0,
+        0,
+    );
     *latest_clipboard = Some(text);
+    Ok(())
+}
+
+/// Image half of [`apply_inbound_clipboard`]: same agent-then-relay
+/// rule, same revision bookkeeping, plus the latest-image slot that
+/// seeds the next episode open (copy-then-cross for screenshots).
+fn apply_inbound_clipboard_image(
+    clipboard: &Option<ClipboardAgent>,
+    latest_image: &mut Option<ImagePaste>,
+    session_remote_revision: &mut u64,
+    revision: u64,
+    paste: ImagePaste,
+) -> Result<()> {
+    *session_remote_revision = revision;
+    if let Some(agent) = clipboard.as_ref() {
+        if let Err(error) = agent.apply_image(paste.clone()) {
+            tracing::debug!(%error, "clipboard image agent apply failed; UI relay carries the paste");
+        }
+    }
+    stash_inbound_clipboard(
+        revision,
+        kvm_protocol::control::ClipboardKind::ImagePng,
+        &paste.png_base64,
+        paste.width,
+        paste.height,
+    );
+    *latest_image = Some(paste);
     Ok(())
 }
 
@@ -5406,6 +5775,41 @@ fn split_clipboard_chunks(text: &str) -> Vec<&str> {
         start = end;
     }
     chunks
+}
+
+/// Send one locally-observed clipboard change on the live episode
+/// stream (text or image), enforcing the per-link cap.
+///
+/// Ok(None): over the cap — stays local, never half-sent. Ok(Some):
+/// sent, carrying the adopted revision and the change back for the
+/// caller to stash as latest. Err: the caller tears its own loop down
+/// (every loop tears down differently — drive parks, serve breaks),
+/// so this only sends.
+async fn send_clipboard_change(
+    send: &mut quinn::SendStream,
+    revision: u64,
+    change: ClipboardChanged,
+    max_bytes: u64,
+) -> Result<Option<(u64, ClipboardChanged)>> {
+    let bytes = match &change {
+        ClipboardChanged::Text(text) => text.len() as u64,
+        ClipboardChanged::Image(paste) => paste.png_base64.len() as u64,
+    };
+    if bytes > max_bytes {
+        tracing::debug!(bytes, "skipping oversized clipboard paste");
+        return Ok(None);
+    }
+    let revision = revision.wrapping_add(1);
+    match change {
+        ClipboardChanged::Text(text) => {
+            send_clipboard_text(send, revision, text.clone()).await?;
+            Ok(Some((revision, ClipboardChanged::Text(text))))
+        }
+        ClipboardChanged::Image(paste) => {
+            send_clipboard_image(send, revision, paste.clone()).await?;
+            Ok(Some((revision, ClipboardChanged::Image(paste))))
+        }
+    }
 }
 
 /// Send one clipboard update: single-shot for small pastes, a
@@ -5462,6 +5866,126 @@ async fn send_clipboard_text_inner(
         .await?;
     }
     write_frame(send, &WireMessage::ClipboardEnd { revision }).await?;
+    Ok(())
+}
+
+/// Split base64 into wire-sized chunks. Base64 is ASCII, so any split
+/// point is safe — no char-boundary walk like the text path. Pure for
+/// tests.
+fn split_base64_chunks(encoded: &str) -> Vec<&str> {
+    if encoded.len() <= CLIPBOARD_CHUNK_BYTES {
+        return vec![encoded];
+    }
+    let bytes = encoded.as_bytes();
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < bytes.len() {
+        let end = (start + CLIPBOARD_CHUNK_BYTES).min(bytes.len());
+        chunks.push(&encoded[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+/// Send the last known clipboard state when a fresh episode opens
+/// (copy-then-cross: the copy happened while nobody was driven).
+/// Text first, then image, so the final OS state on the peer matches
+/// the final local state. Over-cap pastes stay local, never half-sent.
+async fn send_initial_clipboard(
+    send: &mut quinn::SendStream,
+    initial: &ClipboardInitial,
+    clipboard_revision: &mut u64,
+    clipboard_max_bytes: u64,
+) -> Result<()> {
+    if let Some(text) = initial.text.as_ref() {
+        if (text.len() as u64) <= clipboard_max_bytes {
+            *clipboard_revision = clipboard_revision.wrapping_add(1);
+            send_clipboard_text(send, *clipboard_revision, text.clone()).await?;
+        } else {
+            tracing::debug!(
+                bytes = text.len(),
+                "skipping oversized initial clipboard text"
+            );
+        }
+    }
+    if let Some(paste) = initial.image.as_ref() {
+        if (paste.png_base64.len() as u64) <= clipboard_max_bytes {
+            *clipboard_revision = clipboard_revision.wrapping_add(1);
+            send_clipboard_image(send, *clipboard_revision, paste.clone()).await?;
+        } else {
+            tracing::debug!(
+                bytes = paste.png_base64.len(),
+                "skipping oversized initial clipboard image"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Send one image paste: single-shot for small screenshots, an
+/// ImageStart/Chunk/End stream for large ones (same revision
+/// throughout). Same 2s freeze-proof bound as the text path.
+async fn send_clipboard_image(
+    send: &mut quinn::SendStream,
+    revision: u64,
+    paste: ImagePaste,
+) -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        send_clipboard_image_inner(send, revision, paste),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("clipboard image send stalled"))??;
+    Ok(())
+}
+
+async fn send_clipboard_image_inner(
+    send: &mut quinn::SendStream,
+    revision: u64,
+    paste: ImagePaste,
+) -> Result<()> {
+    let ImagePaste {
+        png_base64,
+        width,
+        height,
+    } = paste;
+    if png_base64.len() <= kvm_protocol::wire::MAX_CLIPBOARD_TEXT_BYTES {
+        write_frame(
+            send,
+            &WireMessage::ClipboardImage {
+                revision,
+                width,
+                height,
+                png_base64,
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    let chunks = split_base64_chunks(&png_base64);
+    write_frame(
+        send,
+        &WireMessage::ClipboardImageStart {
+            revision,
+            total_bytes: png_base64.len() as u64,
+            chunks: chunks.len() as u32,
+            width,
+            height,
+        },
+    )
+    .await?;
+    for (index, data) in chunks.into_iter().enumerate() {
+        write_frame(
+            send,
+            &WireMessage::ClipboardImageChunk {
+                revision,
+                index: index as u32,
+                data: data.to_owned(),
+            },
+        )
+        .await?;
+    }
+    write_frame(send, &WireMessage::ClipboardImageEnd { revision }).await?;
     Ok(())
 }
 
@@ -5543,6 +6067,262 @@ impl ClipboardAssembly {
         *self = Self::default();
         ClipboardFeed::Ready(text)
     }
+}
+
+/// One fully-observed local image paste: PNG bytes as base64 plus the
+/// decoded dimensions (the UI sizes the paste from these without
+/// decoding first).
+#[derive(Debug, Clone)]
+struct ImagePaste {
+    png_base64: String,
+    width: u32,
+    height: u32,
+}
+
+/// One locally-observed clipboard change, text or image. The agent
+/// thread owns OS touch and reports these; the drive loop forwards
+/// them on the live episode (or stashes them for the next open).
+#[derive(Debug, Clone)]
+enum ClipboardChanged {
+    Text(String),
+    Image(ImagePaste),
+}
+
+/// The last known clipboard state in both flavors, sent as the initial
+/// paste when a fresh episode opens (copy-then-cross: the copy happened
+/// while nobody was driven, so no live episode carried it).
+#[derive(Debug, Clone, Default)]
+struct ClipboardInitial {
+    text: Option<String>,
+    image: Option<ImagePaste>,
+}
+
+/// Receiver-side assembly of one chunked IMAGE paste. Mirrors
+/// ClipboardAssembly exactly (same caps, same fail-closed rules); the
+/// buffer holds base64 (ASCII, so any split point is safe) and decodes
+/// once, at End, in the applier.
+#[derive(Default)]
+struct ImageAssembly {
+    revision: u64,
+    total_bytes: u64,
+    expected_chunks: u32,
+    next_index: u32,
+    received_bytes: u64,
+    buffer: String,
+    width: u32,
+    height: u32,
+}
+
+enum ImageFeed {
+    /// Not part of a transfer, over cap, or a mismatch (assembly reset):
+    /// nothing buffered.
+    Dropped,
+    /// Chunk buffered, transfer still open.
+    Pending,
+    /// Transfer complete and byte-exact: apply this base64 image.
+    Ready(ImagePaste),
+}
+
+impl ImageAssembly {
+    /// Open a chunked image paste. Same refusal rules as the text
+    /// header, plus sane dimensions (they size the UI-side decode).
+    fn feed_start(
+        &mut self,
+        revision: u64,
+        total_bytes: u64,
+        chunks: u32,
+        width: u32,
+        height: u32,
+        max_bytes: u64,
+    ) -> ImageFeed {
+        *self = Self::default();
+        if total_bytes == 0
+            || total_bytes > max_bytes
+            || chunks == 0
+            || width == 0
+            || height == 0
+            || width > 16384
+            || height > 16384
+        {
+            return ImageFeed::Dropped;
+        }
+        self.revision = revision;
+        self.total_bytes = total_bytes;
+        self.expected_chunks = chunks;
+        self.width = width;
+        self.height = height;
+        ImageFeed::Pending
+    }
+
+    /// Append one base64 chunk. Same abort rules as the text path.
+    fn feed_chunk(&mut self, revision: u64, index: u32, data: &str) -> ImageFeed {
+        if revision != self.revision
+            || self.expected_chunks == 0
+            || index != self.next_index
+            || self.received_bytes + data.len() as u64 > self.total_bytes
+        {
+            *self = Self::default();
+            return ImageFeed::Dropped;
+        }
+        self.buffer.push_str(data);
+        self.received_bytes += data.len() as u64;
+        self.next_index += 1;
+        ImageFeed::Pending
+    }
+
+    /// Close a chunked image paste. Same byte-exactness rule as text.
+    fn feed_end(&mut self, revision: u64) -> ImageFeed {
+        if revision != self.revision
+            || self.expected_chunks == 0
+            || self.next_index != self.expected_chunks
+            || self.received_bytes != self.total_bytes
+        {
+            *self = Self::default();
+            return ImageFeed::Dropped;
+        }
+        let png_base64 = std::mem::take(&mut self.buffer);
+        let paste = ImagePaste {
+            png_base64,
+            width: self.width,
+            height: self.height,
+        };
+        *self = Self::default();
+        ImageFeed::Ready(paste)
+    }
+}
+
+/// Headless-receiver clipboard relay: the serve loop usually runs as a
+/// system service with no user session, so no in-process agent can
+/// touch the OS clipboard there. Fully-received peer pastes land in
+/// this single latest slot, and the logged-in UI takes them chunk by
+/// chunk via ClipboardPoll and applies them with its own session
+/// clipboard. Revisions order it; the UI tracks what it already
+/// applied, so a re-poll never double-pastes.
+#[derive(Debug, Clone)]
+struct RelayPaste {
+    revision: u64,
+    kind: kvm_protocol::control::ClipboardKind,
+    /// Pre-sliced payload chunks (char-boundary safe for text, plain
+    /// slices for base64): the UI takes one per poll call.
+    chunks: Vec<String>,
+    total_bytes: u64,
+    width: u32,
+    height: u32,
+}
+
+static CLIPBOARD_RELAY: std::sync::OnceLock<std::sync::Mutex<Option<RelayPaste>>> =
+    std::sync::OnceLock::new();
+
+fn clipboard_relay() -> &'static std::sync::Mutex<Option<RelayPaste>> {
+    CLIPBOARD_RELAY.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Slice a relay payload into poll-sized pieces: char-boundary safe
+/// for text (never splits a UTF-8 sequence), plain slices for base64
+/// (ASCII, any split point is safe). Pure for tests.
+fn split_relay_payload(payload: &str, is_text: bool) -> Vec<String> {
+    if payload.len() <= CLIPBOARD_CHUNK_BYTES {
+        return vec![payload.to_owned()];
+    }
+    if !is_text {
+        return payload
+            .as_bytes()
+            .chunks(CLIPBOARD_CHUNK_BYTES)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < payload.len() {
+        let mut end = (start + CLIPBOARD_CHUNK_BYTES).min(payload.len());
+        while !payload.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(payload[start..end].to_owned());
+        start = end;
+    }
+    chunks
+}
+
+/// Stash one fully-received peer paste for UI take. Called for every
+/// paste (agent or not): when a session agent applied it directly the
+/// UI's equality check makes the take a no-op, and when headless the
+/// take is the only path that lands the paste.
+pub(crate) fn stash_inbound_clipboard(
+    revision: u64,
+    kind: kvm_protocol::control::ClipboardKind,
+    payload: &str,
+    width: u32,
+    height: u32,
+) {
+    let chunks = split_relay_payload(
+        payload,
+        matches!(
+            kind,
+            kvm_protocol::control::ClipboardKind::Text
+        ),
+    );
+    let total_bytes = payload.len() as u64;
+    tracing::info!(
+        revision,
+        total_bytes,
+        chunks = chunks.len(),
+        "peer clipboard stashed for UI take"
+    );
+    if let Ok(mut slot) = clipboard_relay().lock() {
+        *slot = Some(RelayPaste {
+            revision,
+            kind,
+            chunks,
+            total_bytes,
+            width,
+            height,
+        });
+    }
+}
+
+/// Serve one UI take: the chunk at `next_index` when the slot holds a
+/// paste newer than `last_seen_revision`, else an empty update
+/// (revision 0) meaning "nothing new".
+pub(crate) fn poll_inbound_clipboard(
+    last_seen_revision: u64,
+    next_index: u32,
+) -> kvm_protocol::control::ControlResponse {
+    use kvm_protocol::control::{ClipboardUpdate, ControlResponse};
+    let empty = || {
+        ControlResponse::ClipboardUpdate(ClipboardUpdate {
+            revision: 0,
+            kind: kvm_protocol::control::ClipboardKind::Text,
+            total_bytes: 0,
+            total_chunks: 0,
+            index: 0,
+            data: String::new(),
+            width: 0,
+            height: 0,
+        })
+    };
+    let Ok(slot) = clipboard_relay().lock() else {
+        return empty();
+    };
+    let Some(paste) = slot.as_ref() else {
+        return empty();
+    };
+    if paste.revision == 0 || paste.revision == last_seen_revision {
+        return empty();
+    }
+    let Some(data) = paste.chunks.get(next_index as usize) else {
+        return empty();
+    };
+    ControlResponse::ClipboardUpdate(ClipboardUpdate {
+        revision: paste.revision,
+        kind: paste.kind,
+        total_bytes: paste.total_bytes,
+        total_chunks: paste.chunks.len() as u32,
+        index: next_index,
+        data: data.clone(),
+        width: paste.width,
+        height: paste.height,
+    })
 }
 
 struct CaptureGuard {
@@ -5824,7 +6604,11 @@ async fn run_capture_stream(
                 WireMessage::ClipboardText { .. }
                 | WireMessage::ClipboardStart { .. }
                 | WireMessage::ClipboardChunk { .. }
-                | WireMessage::ClipboardEnd { .. } => {
+                | WireMessage::ClipboardEnd { .. }
+                | WireMessage::ClipboardImage { .. }
+                | WireMessage::ClipboardImageStart { .. }
+                | WireMessage::ClipboardImageChunk { .. }
+                | WireMessage::ClipboardImageEnd { .. } => {
                     if remote_message_tx.send(message).is_err() {
                         break;
                     }
@@ -5841,9 +6625,14 @@ async fn run_capture_stream(
     let mut clipboard_enabled = clipboard_enabled;
     let mut remote_clipboard_revision = 0u64;
     let mut latest_clipboard: Option<String> = None;
+    // Last image paste applied from the peer (mirrors the text slot;
+    // feeds the shared apply helper).
+    let mut latest_image: Option<ImagePaste> = None;
     // Open chunked-paste assembly for this stream (see
     // ClipboardAssembly): bounded by the configured cap.
     let mut clipboard_assembly = ClipboardAssembly::default();
+    // Open chunked-IMAGE assembly (see ImageAssembly): same cap.
+    let mut image_assembly = ImageAssembly::default();
     let mut wheel_debt = WheelDowngrade::default();
     // Legacy pinch-expansion state for old peers (see pinch_for_send),
     // plus a shadow of the physical Ctrl hold: this stream sees every
@@ -5945,21 +6734,21 @@ async fn run_capture_stream(
                 }
                 None => break Err(anyhow::anyhow!("input capture stopped")),
             },
-            text = receive_clipboard(clipboard, clipboard_enabled) => match text {
-                Some(text) => {
-                    if text.len() as u64 > clipboard_max_bytes {
-                        tracing::debug!(bytes = text.len(), "skipping oversized clipboard text");
-                        continue;
-                    }
-                    *clipboard_revision = clipboard_revision.wrapping_add(1);
-                    if let Err(error) = send_clipboard_text(
+            change = receive_clipboard(clipboard, clipboard_enabled) => match change {
+                Some(change) => {
+                    match send_clipboard_change(
                         &mut send,
                         *clipboard_revision,
-                        text,
+                        change,
+                        clipboard_max_bytes,
                     )
                     .await
                     {
-                        break Err(error.into());
+                        Ok(Some((revision, _))) => *clipboard_revision = revision,
+                        Ok(None) => {}
+                        Err(error) => {
+                            break Err(error.into());
+                        }
                     }
                 }
                 None => clipboard_enabled = false,
@@ -6027,6 +6816,82 @@ async fn run_capture_stream(
                             tracing::warn!(revision, "peer clipboard transfer failed validation; dropped");
                         }
                         ClipboardFeed::Pending => {}
+                    }
+                }
+                Some(WireMessage::ClipboardImage {
+                    revision,
+                    png_base64,
+                    width,
+                    height,
+                }) if clipboard_enabled && revision > remote_clipboard_revision => {
+                    if png_base64.len() as u64 > clipboard_max_bytes {
+                        tracing::warn!(bytes = png_base64.len(), "peer sent oversized clipboard image; dropped");
+                    } else {
+                        tracing::info!(bytes = png_base64.len(), "peer clipboard image received");
+                        apply_inbound_clipboard_image(
+                            clipboard,
+                            &mut latest_image,
+                            &mut remote_clipboard_revision,
+                            revision,
+                            ImagePaste {
+                                png_base64,
+                                width,
+                                height,
+                            },
+                        )?;
+                    }
+                }
+                Some(WireMessage::ClipboardImageStart {
+                    revision,
+                    total_bytes,
+                    chunks,
+                    width,
+                    height,
+                }) if clipboard_enabled && revision > remote_clipboard_revision => {
+                    if matches!(
+                        image_assembly.feed_start(
+                            revision,
+                            total_bytes,
+                            chunks,
+                            width,
+                            height,
+                            clipboard_max_bytes
+                        ),
+                        ImageFeed::Dropped
+                    ) {
+                        tracing::warn!(revision, total_bytes, "peer clipboard image transfer refused (over cap or malformed header)");
+                    }
+                }
+                Some(WireMessage::ClipboardImageChunk {
+                    revision,
+                    index,
+                    data,
+                }) if clipboard_enabled && revision > remote_clipboard_revision => {
+                    if matches!(
+                        image_assembly.feed_chunk(revision, index, &data),
+                        ImageFeed::Dropped
+                    ) {
+                        tracing::warn!(revision, index, "peer clipboard image transfer aborted (chunk mismatch)");
+                    }
+                }
+                Some(WireMessage::ClipboardImageEnd { revision })
+                    if clipboard_enabled && revision > remote_clipboard_revision =>
+                {
+                    match image_assembly.feed_end(revision) {
+                        ImageFeed::Ready(paste) => {
+                            tracing::info!(bytes = paste.png_base64.len(), "peer clipboard image transfer complete");
+                            apply_inbound_clipboard_image(
+                                clipboard,
+                                &mut latest_image,
+                                &mut remote_clipboard_revision,
+                                revision,
+                                paste,
+                            )?;
+                        }
+                        ImageFeed::Dropped => {
+                            tracing::warn!(revision, "peer clipboard image transfer failed validation; dropped");
+                        }
+                        ImageFeed::Pending => {}
                     }
                 }
                 Some(_) => {}
@@ -6629,6 +7494,10 @@ async fn handle_connection(
             // Last paste applied from the peer (mirrors the connect
             // loop's copy; feeds the shared apply helper).
             let mut latest_clipboard: Option<String> = None;
+            // Last image paste applied from the peer (mirrors text).
+            let mut latest_image: Option<ImagePaste> = None;
+            // Open chunked-IMAGE assembly alongside the text one.
+            let mut image_assembly = ImageAssembly::default();
             // Provision the native receiver before advertising an accepted
             // session. Otherwise a missing /dev/uinput device or unavailable
             // Windows interactive helper can make the sender believe input is
@@ -7155,6 +8024,89 @@ async fn handle_connection(
                                     ClipboardFeed::Pending => {}
                                 }
                             }
+                            WireMessage::ClipboardImage {
+                                revision,
+                                png_base64,
+                                width,
+                                height,
+                            } if clipboard_enabled
+                                && revision > remote_clipboard_revision =>
+                            {
+                                if png_base64.len() as u64 > clipboard_max_bytes {
+                                    tracing::warn!(bytes = png_base64.len(), "peer sent oversized clipboard image; dropped");
+                                    continue;
+                                }
+                                tracing::info!(bytes = png_base64.len(), "peer clipboard image received");
+                                apply_inbound_clipboard_image(
+                                    &clipboard,
+                                    &mut latest_image,
+                                    &mut remote_clipboard_revision,
+                                    revision,
+                                    ImagePaste {
+                                        png_base64,
+                                        width,
+                                        height,
+                                    },
+                                )?;
+                            }
+                            WireMessage::ClipboardImageStart {
+                                revision,
+                                total_bytes,
+                                chunks,
+                                width,
+                                height,
+                            } if clipboard_enabled
+                                && revision > remote_clipboard_revision =>
+                            {
+                                if matches!(
+                                    image_assembly.feed_start(
+                                        revision,
+                                        total_bytes,
+                                        chunks,
+                                        width,
+                                        height,
+                                        clipboard_max_bytes
+                                    ),
+                                    ImageFeed::Dropped
+                                ) {
+                                    tracing::warn!(revision, total_bytes, "peer clipboard image transfer refused (over cap or malformed header)");
+                                }
+                            }
+                            WireMessage::ClipboardImageChunk {
+                                revision,
+                                index,
+                                data,
+                            } if clipboard_enabled
+                                && revision > remote_clipboard_revision =>
+                            {
+                                if matches!(
+                                    image_assembly.feed_chunk(revision, index, &data),
+                                    ImageFeed::Dropped
+                                ) {
+                                    tracing::warn!(revision, index, "peer clipboard image transfer aborted (chunk mismatch)");
+                                }
+                            }
+                            WireMessage::ClipboardImageEnd { revision }
+                                if clipboard_enabled
+                                    && revision > remote_clipboard_revision =>
+                            {
+                                match image_assembly.feed_end(revision) {
+                                    ImageFeed::Ready(paste) => {
+                                        tracing::info!(bytes = paste.png_base64.len(), "peer clipboard image transfer complete");
+                                        apply_inbound_clipboard_image(
+                                            &clipboard,
+                                            &mut latest_image,
+                                            &mut remote_clipboard_revision,
+                                            revision,
+                                            paste,
+                                        )?;
+                                    }
+                                    ImageFeed::Dropped => {
+                                        tracing::warn!(revision, "peer clipboard image transfer failed validation; dropped");
+                                    }
+                                    ImageFeed::Pending => {}
+                                }
+                            }
                             WireMessage::Pong { .. } => {}
                             _ => {}
                         }
@@ -7218,19 +8170,18 @@ async fn handle_connection(
                             break Ok(());
                         }
                     }
-                    text = receive_clipboard(&mut clipboard, clipboard_enabled) => match text {
-                        Some(text) => {
-                            if text.len() as u64 > clipboard_max_bytes {
-                                tracing::debug!(bytes = text.len(), "skipping oversized clipboard text");
-                                continue;
-                            }
-                            clipboard_revision = clipboard_revision.wrapping_add(1);
-                            send_clipboard_text(
+                    change = receive_clipboard(&mut clipboard, clipboard_enabled) => match change {
+                        Some(change) => {
+                            if let Some((revision, _)) = send_clipboard_change(
                                 &mut send,
                                 clipboard_revision,
-                                text,
+                                change,
+                                clipboard_max_bytes,
                             )
-                            .await?;
+                            .await?
+                            {
+                                clipboard_revision = revision;
+                            }
                         }
                         None => clipboard_enabled = false,
                     },
@@ -9784,11 +10735,107 @@ mod tests {
     }
 
     #[test]
-    fn stall_breaker_trips_at_ten_consecutive_strikes() {
-        assert!(!stall_breaker_tripped(0));
-        assert!(!stall_breaker_tripped(9));
-        assert!(stall_breaker_tripped(10));
-        assert!(stall_breaker_tripped(100));
+    fn stall_breaker_trips_on_sustained_silence_only() {
+        // Brief loss bursts never trip, however deep: the episode rides
+        // them out in drops and recovers.
+        assert!(!stall_breaker_tripped(0, 0));
+        assert!(!stall_breaker_tripped(29, 10_000));
+        assert!(!stall_breaker_tripped(1_000, 0));
+        // Sustained silence trips: nothing getting through for seconds
+        // means dead network, and the episode ends at once instead of
+        // grinding one timeout per event with suppression held.
+        assert!(!stall_breaker_tripped(30, 1_999));
+        assert!(stall_breaker_tripped(30, 2_000));
+        assert!(stall_breaker_tripped(100, 5_000));
+    }
+
+    #[test]
+    fn inbound_yield_ignores_strays_but_honors_takeover() {        // Handoff-less strays (echo, resting noise, single redialed
+        // events) never yank control home mid-display.
+        assert!(!inbound_yield_fires(0, false));
+        assert!(!inbound_yield_fires(1, false));
+        assert!(!inbound_yield_fires(4, false));
+        // A sustained Handoff-less run still yields (a peer driving
+        // without a Handoff flag, e.g. older peers, still pre-empts).
+        assert!(inbound_yield_fires(5, false));
+        assert!(inbound_yield_fires(50, false));
+        // A peer that took the cursor (Handoff seen) pre-empts on any
+        // fresh input within one probe tick.
+        assert!(inbound_yield_fires(1, true));
+        assert!(inbound_yield_fires(3, true));
+    }
+
+    #[test]
+    fn base64_chunks_split_anywhere_but_reassemble() {
+        let payload = "eA==".repeat(30_000);
+        let chunks = split_base64_chunks(&payload);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 48 * 1024));
+        assert_eq!(chunks.concat(), payload);
+        let tiny = "eA==";
+        assert_eq!(split_base64_chunks(tiny), vec![tiny]);
+    }
+
+    #[test]
+    fn relay_payload_never_splits_utf8() {
+        let payload = "héllo—world—".repeat(8_000);
+        let chunks = split_relay_payload(&payload, true);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.len() <= 48 * 1024);
+        }
+        assert_eq!(chunks.concat(), payload);
+        // Base64 takes the plain path with identical reassembly.
+        let b64 = "eA==".repeat(30_000);
+        assert_eq!(split_relay_payload(&b64, false).concat(), b64);
+    }
+
+    #[test]
+    fn image_assembly_is_byte_exact_and_fail_closed() {
+        let mut assembly = ImageAssembly::default();
+        // Over-cap header refused before the first chunk.
+        assert!(matches!(
+            assembly.feed_start(7, u64::MAX, 99, 800, 600, 1024),
+            ImageFeed::Dropped
+        ));
+        // Degenerate dims refused.
+        assert!(matches!(
+            assembly.feed_start(7, 100, 1, 0, 600, 1024),
+            ImageFeed::Dropped
+        ));
+        // Honest transfer assembles byte-exact.
+        assert!(matches!(
+            assembly.feed_start(7, 8, 2, 800, 600, 1024),
+            ImageFeed::Pending
+        ));
+        assert!(matches!(
+            assembly.feed_chunk(7, 0, "eA=="),
+            ImageFeed::Pending
+        ));
+        // Wrong index aborts the whole transfer.
+        assert!(matches!(
+            assembly.feed_chunk(7, 2, "eA=="),
+            ImageFeed::Dropped
+        ));
+        assert!(matches!(
+            assembly.feed_start(7, 8, 2, 800, 600, 1024),
+            ImageFeed::Pending
+        ));
+        assert!(matches!(
+            assembly.feed_chunk(7, 0, "eA=="),
+            ImageFeed::Pending
+        ));
+        assert!(matches!(
+            assembly.feed_chunk(7, 1, "eA=="),
+            ImageFeed::Pending
+        ));
+        match assembly.feed_end(7) {
+            ImageFeed::Ready(paste) => {
+                assert_eq!(paste.png_base64, "eA==eA==");
+                assert_eq!((paste.width, paste.height), (800, 600));
+            }
+            _ => panic!("honest image transfer must complete"),
+        }
     }
 
     #[test]

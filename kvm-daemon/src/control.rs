@@ -271,6 +271,10 @@ where
             })
         }
         ControlRequest::GetConfig => ControlResponse::Config(config.read().await.clone()),
+        ControlRequest::ClipboardPoll {
+            last_seen_revision,
+            next_index,
+        } => crate::service::poll_inbound_clipboard(last_seen_revision, next_index),
         ControlRequest::Pair {
             address,
             expected_fingerprint_hex,
