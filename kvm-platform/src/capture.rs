@@ -724,6 +724,17 @@ mod win32_hooks {
             // Same tag rule as the keyboard hook: skip our own echo, keep
             // everything else including vendor-synthesized scroll.
             if info.dwExtraInfo != crate::ECHO_TAG {
+                // The 1x1 park window only answers WM_SETCURSOR while the
+                // pointer sits on that pixel. Anywhere else a busy app's
+                // hourglass shows through the drive. Force an arrow for
+                // every local event we swallow.
+                if BLOCK_LOCAL.load(Ordering::Acquire) {
+                    if let Ok(arrow) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+                        unsafe {
+                            SetCursor(arrow);
+                        }
+                    }
+                }
                 let message = wparam.0 as u32;
                 match message {
                     WM_MOUSEMOVE => {

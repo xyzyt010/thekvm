@@ -101,7 +101,7 @@ pub fn enabled() -> Result<bool, PlatformError> {
             // No user entry of our own: a system-wide install still
             // starts us, so that decides. A source install has neither
             // and honestly reports "off" until the user turns it on.
-            return Ok(!system_autostart_entry().exists());
+            return Ok(system_autostart_entry().exists());
         }
         let text = std::fs::read_to_string(&entry).unwrap_or_default();
         return Ok(!masked(&text));

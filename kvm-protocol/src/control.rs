@@ -147,6 +147,21 @@ pub enum ControlRequest {
         /// Chunk index to take (the UI walks 0..total_chunks).
         next_index: u32,
     },
+    /// One chunk of a local copy the logged-in UI is offering to the
+    /// daemon. The headless service cannot read the OS clipboard, so
+    /// this is how a copy on the machine being driven still reaches the
+    /// peer. `generation` is monotonic per UI process; a new generation
+    /// starts a new paste, and the daemon publishes it once every chunk
+    /// has arrived. Chunked for the same reason as [`ClipboardPoll`].
+    ClipboardOffer {
+        generation: u64,
+        kind: ClipboardKind,
+        total_chunks: u32,
+        index: u32,
+        data: String,
+        width: u32,
+        height: u32,
+    },
 }
 
 /// Which flavor a relayed clipboard paste carries. Text travels as

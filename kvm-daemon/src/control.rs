@@ -275,6 +275,23 @@ where
             last_seen_revision,
             next_index,
         } => crate::service::poll_inbound_clipboard(last_seen_revision, next_index),
+        ControlRequest::ClipboardOffer {
+            generation,
+            kind,
+            total_chunks,
+            index,
+            data,
+            width,
+            height,
+        } => crate::service::submit_local_clipboard_chunk(
+            generation,
+            kind,
+            total_chunks,
+            index,
+            data,
+            width,
+            height,
+        ),
         ControlRequest::Pair {
             address,
             expected_fingerprint_hex,

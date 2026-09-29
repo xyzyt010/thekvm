@@ -117,6 +117,10 @@ pub struct X11Capture {
     /// so a failed show retries on the next release instead of leaking
     /// an invisible cursor.
     cursor_hidden: bool,
+    /// Left-pointer cursor passed to a core grab. Cursor 0 tells the
+    /// server to leave the shape alone, which inherits a watch/hourglass
+    /// from whatever was busy at engage. Allocated once, freed on drop.
+    grab_cursor: u32,
     /// Read-only multitouch gesture tap (see mt_pinch): X11 hides
     /// trackpad touches behind relative motion, so pinch spread arrives
     /// from the evdev tap, never from the X stream. Empty when no MT
@@ -581,6 +585,7 @@ impl X11Capture {
             cage_quiet: 0,
             xfixes_cursor,
             cursor_hidden: false,
+            grab_cursor: 0,
             // Best-effort by construction (see MtPinchTap::open): an
             // empty tap only disables pinch, never capture startup.
             mt_pinch: crate::mt_pinch::MtPinchTap::open(),
@@ -634,6 +639,53 @@ impl X11Capture {
                 tracing::debug!(%error, "core capture cage warp failed; retrying next poll");
             }
         }
+    }
+
+    /// XC_left_ptr from the cursor font. Failure leaves 0, and the core
+    /// grab then keeps today's "don't change the cursor" behavior.
+    fn ensure_left_ptr(&mut self) -> u32 {
+        if self.grab_cursor != 0 {
+            return self.grab_cursor;
+        }
+        const XC_LEFT_PTR: u16 = 68;
+        let Ok(cursor) = self.connection.generate_id() else {
+            return 0;
+        };
+        let Ok(font) = self.connection.generate_id() else {
+            return 0;
+        };
+        let opened = self
+            .connection
+            .open_font(font, b"cursor")
+            .and_then(|cookie| cookie.check());
+        if opened.is_err() {
+            return 0;
+        }
+        let created = self
+            .connection
+            .create_glyph_cursor(
+                cursor,
+                font,
+                font,
+                XC_LEFT_PTR,
+                XC_LEFT_PTR + 1,
+                0,
+                0,
+                0,
+                0xffff,
+                0xffff,
+                0xffff,
+            )
+            .and_then(|cookie| cookie.check());
+        let _ = self
+            .connection
+            .close_font(font)
+            .map(|cookie| cookie.check());
+        if created.is_err() {
+            return 0;
+        }
+        self.grab_cursor = cursor;
+        cursor
     }
 
     /// Hide the local pointer for the drive (see the engage path).
@@ -1036,7 +1088,8 @@ impl CaptureBackend for X11Capture {
                     // so a later kind-matched release cannot skip a real
                     // hold (or chase a phantom one).
                     self.grab_kind = GrabKind::None;
-                    core_grab(&self.connection, self.grab_window)?;
+                    let cursor = self.ensure_left_ptr();
+                    core_grab(&self.connection, self.grab_window, cursor)?;
                     self.grab_kind = GrabKind::Core;
                 }
             }
@@ -1119,6 +1172,13 @@ impl CaptureBackend for X11Capture {
 impl Drop for X11Capture {
     fn drop(&mut self) {
         let _ = self.set_exclusive(false);
+        if self.grab_cursor != 0 {
+            let _ = self
+                .connection
+                .free_cursor(self.grab_cursor)
+                .map(|cookie| cookie.check());
+            self.grab_cursor = 0;
+        }
     }
 }
 
@@ -1288,6 +1348,7 @@ fn xi_ungrab_selectors(connection: &RustConnection, held: &[u16]) -> Result<(), 
 fn core_grab(
     connection: &RustConnection,
     grab_window: xproto::Window,
+    cursor: u32,
 ) -> Result<(), PlatformError> {
     let pointer = connection
         .grab_pointer(
@@ -1299,7 +1360,7 @@ fn core_grab(
             xproto::GrabMode::ASYNC,
             xproto::GrabMode::ASYNC,
             0u32,
-            0u32,
+            cursor,
             0u32,
         )
         .map_err(|error| PlatformError::Capture(format!("grab core pointer: {error}")))?

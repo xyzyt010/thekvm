@@ -14,6 +14,11 @@ pub struct SystemClipboard {
     clipboard: arboard::Clipboard,
     last_text: Option<String>,
     last_image_hash: Option<(usize, usize, u64)>,
+    /// Owner-change events still owed to our own `set_text` /
+    /// `set_image_data`. Those writes wake the OS watcher; absorbing
+    /// them here is what stops a peer paste from being offered back.
+    /// A later real copy, even of the same bytes, still emits.
+    ignore_owner_events: u8,
 }
 
 impl SystemClipboard {
@@ -24,7 +29,86 @@ impl SystemClipboard {
             clipboard,
             last_text: None,
             last_image_hash: None,
+            ignore_owner_events: 0,
         })
+    }
+
+    /// True when this handle already remembers `text` (no OS read).
+    pub fn same_text(&self, text: &str) -> bool {
+        self.last_text.as_deref() == Some(text)
+    }
+
+    /// True when this handle already remembers these pixels (no OS read).
+    pub fn same_image(&self, width: usize, height: usize, rgba: &[u8]) -> bool {
+        self.last_image_hash == Some(Self::image_fingerprint(width, height, rgba))
+    }
+
+    /// Consume one owner-change that our own write is about to generate.
+    fn absorb_own_owner_event(&mut self, ownership_changed: bool) -> bool {
+        if ownership_changed && self.ignore_owner_events > 0 {
+            self.ignore_owner_events -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Like [`poll_changed`], but a real ownership change emits the
+    /// current text even when it equals the last paste. That is a user
+    /// re-copy; equality suppression would swallow it. `ownership_changed`
+    /// is the OS watcher's notice. Our own `set_text` arms a short ignore
+    /// so the notice it generates is not offered back to the peer.
+    pub fn poll_user_text(
+        &mut self,
+        ownership_changed: bool,
+    ) -> Result<Option<String>, PlatformError> {
+        if self.absorb_own_owner_event(ownership_changed) {
+            if let Ok(text) = self.clipboard.get_text() {
+                self.last_text = Some(text);
+                self.last_image_hash = None;
+            }
+            return Ok(None);
+        }
+        let text = match self.clipboard.get_text() {
+            Ok(text) => text,
+            Err(_) => return Ok(None),
+        };
+        let same = self.last_text.as_deref() == Some(text.as_str());
+        if same && !ownership_changed {
+            return Ok(None);
+        }
+        self.last_text = Some(text.clone());
+        self.last_image_hash = None;
+        Ok(Some(text))
+    }
+
+    /// Image half of [`poll_user_text`].
+    pub fn poll_user_image(
+        &mut self,
+        ownership_changed: bool,
+    ) -> Result<Option<(usize, usize, Vec<u8>)>, PlatformError> {
+        if self.absorb_own_owner_event(ownership_changed) {
+            if let Ok(image) = self.clipboard.get_image() {
+                let rgba = image.bytes.to_vec();
+                self.last_image_hash =
+                    Some(Self::image_fingerprint(image.width, image.height, &rgba));
+                self.last_text = None;
+            }
+            return Ok(None);
+        }
+        let image = match self.clipboard.get_image() {
+            Ok(image) => image,
+            Err(_) => return Ok(None),
+        };
+        let rgba = image.bytes.to_vec();
+        let fingerprint = Self::image_fingerprint(image.width, image.height, &rgba);
+        let same = self.last_image_hash == Some(fingerprint);
+        if same && !ownership_changed {
+            return Ok(None);
+        }
+        self.last_image_hash = Some(fingerprint);
+        self.last_text = None;
+        Ok(Some((image.width, image.height, rgba)))
     }
 
     /// Cheap fingerprint for image dedup: dimensions plus a hash of the
@@ -85,6 +169,8 @@ impl SystemClipboard {
             .map_err(|error| PlatformError::Clipboard(format!("set system clipboard: {error}")))?;
         self.last_text = Some(text);
         self.last_image_hash = None;
+        // Text poll and image poll can each observe the owner change.
+        self.ignore_owner_events = 2;
         Ok(())
     }
 
@@ -104,6 +190,7 @@ impl SystemClipboard {
         }
         self.last_image_hash = Some(Self::image_fingerprint(width, height, &rgba));
         self.last_text = None;
+        self.ignore_owner_events = 2;
         self.clipboard
             .set_image(arboard::ImageData {
                 width,
@@ -156,6 +243,17 @@ pub fn encode_image_png(
         .map_err(|error| PlatformError::Clipboard(format!("encode clipboard PNG: {error}")))?;
     drop(writer);
     Ok(encoded)
+}
+
+/// PNG bytes, base64-encoded, ready for a clipboard offer or wire frame.
+pub fn encode_image_png_base64(
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+) -> Result<String, PlatformError> {
+    let png = encode_image_png(width, height, rgba)?;
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png))
 }
 
 /// Decode a wire image paste (base64 PNG, exactly what the agent's

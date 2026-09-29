@@ -4256,14 +4256,13 @@ fn set_link_connecting(weak: &slint::Weak<AppWindow>, connecting: bool) {
 
 static SPINNER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Headless-receiver clipboard relay (see `ClipboardPoll`): the service
-/// that serves inbound episodes usually runs without a user session, so
-/// peer pastes stash in its relay slot instead of landing anywhere.
-/// This thread takes new pastes and applies them with the logged-in
-/// session's own clipboard — text first, PNG screenshots identical —
-/// then advances its revision so the poll goes quiet. Equality-checked
-/// before every OS write, so a paste the session agent already applied
-/// (user-session daemon) never touches the OS twice and never echoes.
+/// Clipboard relay for the logged-in session.
+///
+/// The headless service cannot read the OS clipboard, so this thread does
+/// both directions: it offers each new local copy (`ClipboardOffer`) and
+/// it applies peer pastes (`ClipboardPoll`). Local changes are offered
+/// before inbound pastes are applied, and the clipboard that was already
+/// present at startup is remembered but not offered.
 fn spawn_clipboard_relay() {
     std::thread::Builder::new()
         .name("thekvm-clipboard-relay".into())
@@ -4277,19 +4276,106 @@ fn spawn_clipboard_relay() {
                     return;
                 }
             };
-            ui_log("clipboard relay: watching for peer pastes");
+            // Seed without offering whatever was already on the clipboard.
+            let _ = clipboard.poll_changed();
+            let _ = clipboard.poll_changed_image();
+            let watcher = kvm_platform::clipboard::ClipboardWatcher::create().ok();
+            ui_log("clipboard relay: watching local copies and peer pastes");
             let mut last_seen_revision = 0u64;
+            let mut generation = 0u64;
+            let mut last_image_poll = std::time::Instant::now();
+            let mut last_offer_error = String::new();
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                // Gate on the negotiated toggle: off means neither
-                // direction syncs, so the relay stays quiet too. A dead
-                // daemon just retries next tick (the 1s status poll owns
-                // the loud errors; this stays quiet).
+                let notice = match &watcher {
+                    Some(watch) => watch.wait_notice(std::time::Duration::from_millis(100)),
+                    None => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        false
+                    }
+                };
                 let enabled = match control_request(ControlRequest::Status) {
                     Ok(ControlResponse::Status(status)) => status.clipboard_enabled,
                     _ => continue,
                 };
                 if !enabled {
+                    continue;
+                }
+                let mut offered = false;
+                if let Ok(Some(text)) = clipboard.poll_user_text(notice) {
+                    generation = generation.wrapping_add(1);
+                    match offer_local_clipboard(ClipboardKind::Text, generation, &text, 0, 0) {
+                        Ok(()) => {
+                            offered = true;
+                            last_offer_error.clear();
+                            ui_log(&format!(
+                                "clipboard relay: offered local text ({} bytes)",
+                                text.len()
+                            ));
+                        }
+                        Err(error) => {
+                            if error != last_offer_error {
+                                ui_log(&format!("clipboard relay: offer failed: {error}"));
+                                last_offer_error = error;
+                            }
+                        }
+                    }
+                }
+                let image_due = last_image_poll.elapsed() >= std::time::Duration::from_secs(2);
+                if notice || image_due {
+                    last_image_poll = std::time::Instant::now();
+                    if let Ok(Some((width, height, rgba))) = clipboard.poll_user_image(notice) {
+                        match kvm_platform::clipboard::encode_image_png_base64(width, height, &rgba)
+                        {
+                            Ok(payload) => {
+                                generation = generation.wrapping_add(1);
+                                match offer_local_clipboard(
+                                    ClipboardKind::ImagePng,
+                                    generation,
+                                    &payload,
+                                    width as u32,
+                                    height as u32,
+                                ) {
+                                    Ok(()) => {
+                                        offered = true;
+                                        last_offer_error.clear();
+                                        ui_log(&format!(
+                                            "clipboard relay: offered local image ({} bytes)",
+                                            payload.len()
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        if error != last_offer_error {
+                                            ui_log(&format!(
+                                                "clipboard relay: offer failed: {error}"
+                                            ));
+                                            last_offer_error = error;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                ui_log(&format!(
+                                    "clipboard relay: cannot encode local image: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                if offered {
+                    // This local copy is newer than any peer paste already
+                    // sitting in the slot. Drop that slot without applying
+                    // it, or the next tick would clobber the copy we just
+                    // offered.
+                    if let Ok(ControlResponse::ClipboardUpdate(update)) =
+                        control_request(ControlRequest::ClipboardPoll {
+                            last_seen_revision,
+                            next_index: 0,
+                        })
+                    {
+                        if update.revision > last_seen_revision {
+                            last_seen_revision = update.revision;
+                        }
+                    }
                     continue;
                 }
                 let first = match control_request(ControlRequest::ClipboardPoll {
@@ -4305,8 +4391,6 @@ fn spawn_clipboard_relay() {
                 {
                     continue;
                 }
-                // Take the remaining chunks back-to-back (local socket:
-                // milliseconds, no sleep between them).
                 let mut chunks = vec![first.data.clone()];
                 let mut complete = first.total_chunks == 1;
                 for index in 1..first.total_chunks {
@@ -4342,16 +4426,12 @@ fn spawn_clipboard_relay() {
                         ));
                     }
                     Ok(false) => {
-                        // Already current on this machine: advance anyway
-                        // so the poll goes quiet.
                         last_seen_revision = first.revision;
                     }
                     Err(error) => {
                         ui_log(&format!(
                             "clipboard relay: cannot apply peer {flavor} paste: {error:#}"
                         ));
-                        // Do not advance: a newer revision supersedes on
-                        // the next tick, and this one retries.
                     }
                 }
             }
@@ -4359,8 +4439,71 @@ fn spawn_clipboard_relay() {
         .ok();
 }
 
-/// Apply one assembled relay paste with equality check first. Returns
-/// true when the OS clipboard was actually written.
+/// Control-frame chunk size. Matches the daemon's clipboard chunks so an
+/// offer stays under the 64KiB control frame.
+const OFFER_CHUNK_BYTES: usize = 48 * 1024;
+
+fn split_offer_payload(payload: &str, text: bool) -> Vec<String> {
+    if payload.len() <= OFFER_CHUNK_BYTES {
+        return vec![payload.to_owned()];
+    }
+    if !text {
+        return payload
+            .as_bytes()
+            .chunks(OFFER_CHUNK_BYTES)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < payload.len() {
+        let mut end = (start + OFFER_CHUNK_BYTES).min(payload.len());
+        while end > start && !payload.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            break;
+        }
+        chunks.push(payload[start..end].to_owned());
+        start = end;
+    }
+    chunks
+}
+
+fn offer_local_clipboard(
+    kind: ClipboardKind,
+    generation: u64,
+    payload: &str,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    let chunks = split_offer_payload(payload, matches!(kind, ClipboardKind::Text));
+    if chunks.is_empty() {
+        return Err("clipboard offer was empty".into());
+    }
+    let total_chunks = chunks.len() as u32;
+    for (index, data) in chunks.into_iter().enumerate() {
+        match control_request(ControlRequest::ClipboardOffer {
+            generation,
+            kind,
+            total_chunks,
+            index: index as u32,
+            data,
+            width,
+            height,
+        }) {
+            Ok(ControlResponse::Applied { .. }) => {}
+            Ok(ControlResponse::Error { message }) => return Err(message),
+            Ok(_) => return Err("daemon refused the clipboard offer".into()),
+            Err(error) => return Err(format!("{error:#}")),
+        }
+    }
+    Ok(())
+}
+
+/// Apply one assembled relay paste. Compares against what this handle
+/// already remembers, without reading the OS clipboard first: a read
+/// would swallow a newer local copy into `last_text` and then overwrite it.
 fn apply_relay_paste(
     clipboard: &mut kvm_platform::clipboard::SystemClipboard,
     kind: ClipboardKind,
@@ -4368,41 +4511,24 @@ fn apply_relay_paste(
 ) -> Result<bool> {
     match kind {
         ClipboardKind::Text => {
-            // poll_changed reports the current text exactly when it
-            // differs from what this handle last saw; equality with the
-            // paste means another path already landed it.
-            match clipboard
-                .poll_changed()
-                .map_err(|error| anyhow::anyhow!("{error}"))?
-            {
-                Some(current) if current == payload => Ok(false),
-                _ => {
-                    clipboard
-                        .set_text(payload.to_owned())
-                        .map_err(|error| anyhow::anyhow!("{error}"))?;
-                    Ok(true)
-                }
+            if clipboard.same_text(payload) {
+                return Ok(false);
             }
+            clipboard
+                .set_text(payload.to_owned())
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(true)
         }
         ClipboardKind::ImagePng => {
             let (width, height, rgba) = kvm_platform::clipboard::decode_base64_png(payload)
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
-            match clipboard
-                .poll_changed_image()
-                .map_err(|error| anyhow::anyhow!("{error}"))?
-            {
-                Some((current_w, current_h, current))
-                    if current_w == width && current_h == height && current == rgba =>
-                {
-                    Ok(false)
-                }
-                _ => {
-                    clipboard
-                        .set_image_data(width, height, rgba)
-                        .map_err(|error| anyhow::anyhow!("{error}"))?;
-                    Ok(true)
-                }
+            if clipboard.same_image(width, height, &rgba) {
+                return Ok(false);
             }
+            clipboard
+                .set_image_data(width, height, rgba)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(true)
         }
     }
 }

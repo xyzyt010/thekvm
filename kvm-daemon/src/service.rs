@@ -2155,13 +2155,22 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
             biased;
             signal = async {
                 if let Some(session) = active.as_mut() {
-                    session.signals.recv().await
-                } else {
-                    std::future::pending::<Option<RemoteSignal>>().await
+                    if let Some(queued) = session.deferred.pop_front() {
+                        return (true, Some(queued));
+                    }
+                    return (true, session.signals.recv().await);
                 }
+                if let Some(session) = parked.as_mut() {
+                    if let Some(queued) = session.deferred.pop_front() {
+                        return (false, Some(queued));
+                    }
+                    return (false, session.signals.recv().await);
+                }
+                std::future::pending().await
             } => {
+                let (from_active, signal) = signal;
                 match signal {
-                    Some(RemoteSignal::Handoff(handoff)) => {
+                    Some(RemoteSignal::Handoff(handoff)) if from_active => {
                         if let Some(session) = active.take() {
                             tokio::spawn(session.finish());
                             release_suppression(&capture_control, Some(&mut suppression_requested));
@@ -2337,18 +2346,34 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                 eprintln!("THEKVM_STATUS driving {name}");
                             }
                         }
+                    Some(RemoteSignal::Handoff(_)) => {
+                        tracing::debug!("ignoring handoff on a parked drive stream");
+                    }
                     Some(RemoteSignal::Progress) => {
                         // Peer-app heartbeat: the episode stream is alive
                         // end-to-end. The only signal separating a healthy
                         // idle drive from a wedged peer app (transport ACKs
-                        // either way).
-                        last_peer_progress = Some(Instant::now());
-                        unacked_pings = 0;
+                        // either way). A Pong on the parked stream is also
+                        // what lets the next crossing skip a liveness wait.
+                        let now = Instant::now();
+                        if let Some(session) =
+                            signal_session(from_active, &mut active, &mut parked)
+                        {
+                            session.last_progress = Some(now);
+                        }
+                        if from_active {
+                            last_peer_progress = Some(now);
+                            unacked_pings = 0;
+                        }
                     }
-                    Some(RemoteSignal::Clipboard { revision, text }) => {                        let Some(session) = active.as_mut() else {
+                    Some(RemoteSignal::Clipboard { revision, text }) => {                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
                             continue;
                         };
-                        if !session.clipboard_enabled || revision <= session.remote_clipboard_revision {
+                        if !clipboard_frame_current(
+                            session.clipboard_enabled,
+                            revision,
+                            session.remote_clipboard_revision,
+                        ) {
                             continue;
                         }
                         if text.len() as u64 > clipboard_max_bytes {
@@ -2368,12 +2393,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         total_bytes,
                         chunks,
                     }) => {
-                        let Some(session) = active.as_mut() else {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
                             continue;
                         };
-                        if !session.clipboard_enabled
-                            || revision <= session.remote_clipboard_revision
-                        {
+                        if !clipboard_frame_current(
+                            session.clipboard_enabled,
+                            revision,
+                            session.remote_clipboard_revision,
+                        ) {
                             continue;
                         }
                         if matches!(
@@ -2393,12 +2420,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         index,
                         data,
                     }) => {
-                        let Some(session) = active.as_mut() else {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
                             continue;
                         };
-                        if !session.clipboard_enabled
-                            || revision <= session.remote_clipboard_revision
-                        {
+                        if !clipboard_frame_current(
+                            session.clipboard_enabled,
+                            revision,
+                            session.remote_clipboard_revision,
+                        ) {
                             continue;
                         }
                         if matches!(
@@ -2409,12 +2438,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         }
                     }
                     Some(RemoteSignal::ClipboardEnd { revision }) => {
-                        let Some(session) = active.as_mut() else {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
                             continue;
                         };
-                        if !session.clipboard_enabled
-                            || revision <= session.remote_clipboard_revision
-                        {
+                        if !clipboard_frame_current(
+                            session.clipboard_enabled,
+                            revision,
+                            session.remote_clipboard_revision,
+                        ) {
                             continue;
                         }
                         match clipboard_assembly.feed_end(revision) {
@@ -2440,10 +2471,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         width,
                         height,
                     }) => {
-                        let Some(session) = active.as_mut() else {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
                             continue;
                         };
-                        if !session.clipboard_enabled || revision <= session.remote_clipboard_revision {
+                        if !clipboard_frame_current(
+                            session.clipboard_enabled,
+                            revision,
+                            session.remote_clipboard_revision,
+                        ) {
                             continue;
                         }
                         if png_base64.len() as u64 > clipboard_max_bytes {
@@ -2470,12 +2505,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         width,
                         height,
                     }) => {
-                        let Some(session) = active.as_mut() else {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
                             continue;
                         };
-                        if !session.clipboard_enabled
-                            || revision <= session.remote_clipboard_revision
-                        {
+                        if !clipboard_frame_current(
+                            session.clipboard_enabled,
+                            revision,
+                            session.remote_clipboard_revision,
+                        ) {
                             continue;
                         }
                         if matches!(
@@ -2497,12 +2534,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         index,
                         data,
                     }) => {
-                        let Some(session) = active.as_mut() else {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
                             continue;
                         };
-                        if !session.clipboard_enabled
-                            || revision <= session.remote_clipboard_revision
-                        {
+                        if !clipboard_frame_current(
+                            session.clipboard_enabled,
+                            revision,
+                            session.remote_clipboard_revision,
+                        ) {
                             continue;
                         }
                         if matches!(
@@ -2513,12 +2552,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         }
                     }
                     Some(RemoteSignal::ClipboardImageEnd { revision }) => {
-                        let Some(session) = active.as_mut() else {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
                             continue;
                         };
-                        if !session.clipboard_enabled
-                            || revision <= session.remote_clipboard_revision
-                        {
+                        if !clipboard_frame_current(
+                            session.clipboard_enabled,
+                            revision,
+                            session.remote_clipboard_revision,
+                        ) {
                             continue;
                         }
                         match image_assembly.feed_end(revision) {
@@ -2539,6 +2580,16 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         }
                     }
                     Some(RemoteSignal::Closed) | None => {
+                        if !from_active {
+                            if let Some(session) = parked.take() {
+                                tracing::info!(
+                                    target = ?session.target,
+                                    "parked drive stream closed"
+                                );
+                                tokio::spawn(session.finish());
+                            }
+                            continue;
+                        }
                         if let Some(session) = active.take() {
                             let target = session.target;
                             tokio::spawn(session.finish());
@@ -2562,12 +2613,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // runaway. Releasing an unheld control is a no-op
                 // everywhere, so a stale release is harmless while a
                 // dropped one is a stuck key.
-                if !captured.event.is_release()
-                    && (captured.event_id <= discarded_event_barrier
-                        || active
-                            .as_ref()
-                            .is_some_and(|session| captured.event_id <= session.event_barrier))
-                {
+                if !event_passes_barrier(
+                    captured.event_id,
+                    discarded_event_barrier,
+                    active.as_ref().map(|session| session.event_barrier),
+                    captured.event.is_release(),
+                ) {
                     continue;
                 }
                 handle_topology_event(captured, TopologyEventContext {
@@ -2695,12 +2746,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // Releases bypass teardown barriers (see the priority arm
                 // above): same stuck-hold reasoning, same harmless
                 // stale-release no-op.
-                if !captured.event.is_release()
-                    && (captured.event_id <= discarded_event_barrier
-                        || active
-                            .as_ref()
-                            .is_some_and(|session| captured.event_id <= session.event_barrier))
-                {
+                if !event_passes_barrier(
+                    captured.event_id,
+                    discarded_event_barrier,
+                    active.as_ref().map(|session| session.event_barrier),
+                    captured.event.is_release(),
+                ) {
                     continue;
                 }
                 handle_topology_event(captured, TopologyEventContext {
@@ -3138,6 +3189,13 @@ struct TopologySession {
     /// UDP motion packets emitted on the fast path. Logged at teardown
     /// next to `datagrams_sent`.
     udp_packets_sent: u64,
+    /// Frames that arrived while this stream was parked (clipboard, a
+    /// late hop). Popped before the live recv so a resume does not
+    /// discard a paste that landed during the rest.
+    deferred: std::collections::VecDeque<RemoteSignal>,
+    /// Last Pong on this stream. A park newer than [`PARKED_LIVENESS`]
+    /// resumes without another round trip.
+    last_progress: Option<std::time::Instant>,
     /// The peer's self-reported geometry (for re-mapping re-entry points
     /// when this stream is reused after parking).
     peer_geometry: Option<ScreenGeometry>,
@@ -3672,10 +3730,9 @@ fn inbound_inputs_growth(
 }
 
 /// Shared inbound-yield probe body (300ms fast probe + 5s keep-alive
-/// backup): fresh inbound INPUT ACTIVITY pre-empts our drive within one
-/// tick, and the idle-dual arbitration below breaks the both-suppressed
-/// standoff when neither side touches input. Pure routing except for the
-/// snapshot read and the yield itself.
+/// backup): fresh inbound input pre-empts our drive within one tick.
+/// Rest does not. A quiet drive holds until the cursor returns past the
+/// facing edge or [`inbound_yield_fires`] sees a real takeover.
 #[allow(clippy::too_many_arguments)]
 async fn probe_inbound_yield(
     router: &mut EdgeRouter,
@@ -3703,11 +3760,10 @@ async fn probe_inbound_yield(
         *inbound_baselines_fresh = true;
         0
     };
-    // Any inbound growth is INBOUND ACTIVITY, whether or not it is enough
-    // to yield: the idle-dual arbitration below asks "did the peer move in
-    // the last few seconds?", and it used to read that from a stamp that
-    // only a YIELD wrote — so "no inbound input for 5s" was true on every
-    // quiet drive and the arbitration fired 5s into healthy crossings.
+    // Any inbound growth is inbound activity. Rest itself is not a yield:
+    // a quiet drive holds until the cursor comes home or
+    // `inbound_yield_fires` sees a real takeover. The old 5s idle-dual
+    // timer treated that rest as a standoff and flapped suppression.
     if growth > 0 {
         *last_inbound_growth_at = Some(std::time::Instant::now());
     }
@@ -3735,52 +3791,17 @@ async fn probe_inbound_yield(
             observed,
         )
         .await;
-        return;
     }
-    if active.is_none() || driving.is_empty() {
-        return;
-    }
-    // Idle-dual arbitration: BOTH directions drive but nobody has touched
-    // input for a while — no outbound forwards here, no inbound growth
-    // there. Without this each side sits suppressed forever waiting for
-    // the other (the dual-drive freeze both users report after crossing).
-    // The peer-DRIVING signal (cursor taken, not mere link existence)
-    // gates it, so a solo idle drive — hands off, reading the peer's
-    // screen — NEVER yields. Either side's next input re-takes instantly
-    // (fresh baseline each drive), so the cost of a wrong yield is one
-    // re-push, not a freeze.
-    //
-    // `driving` is FRESH now (see snapshot_inbound_inputs) and
-    // `in_idle` is stamped on any inbound growth, not only on a yield, so
-    // all three conditions below mean what they say. Before that, the
-    // stale takeover flag plus a never-written idle stamp made this fire
-    // 5s into nearly every healthy crossing — the grab flap (and the
-    // hourglass it shows) rather than a real standoff.
-    let now = std::time::Instant::now();
-    let drive_old =
-        last_transfer.is_some_and(|when| now.duration_since(when) > Duration::from_secs(5));
-    let out_idle =
-        last_outbound_input.is_none_or(|when| now.duration_since(when) > Duration::from_secs(5));
-    let in_idle =
-        last_inbound_growth_at.is_none_or(|when| now.duration_since(when) > Duration::from_secs(5));
-    if drive_old && out_idle && in_idle {
-        let observed = kvm_platform::capture::inbound_while_driving_count();
-        tracing::info!(
-            "dual idle drive with the peer (no input either way for 5s); yielding to local"
-        );
-        yield_drive_to_inbound(
-            router,
-            active,
-            parked,
-            capture_control,
-            discarded_event_barrier,
-            last_transfer,
-            last_yield,
-            suppression_requested,
-            observed,
-        )
-        .await;
-    }
+    // Do not put a rest timer back. `idle_rest_yields` stays false.
+    let _ = idle_rest_yields();
+    let _ = last_outbound_input;
+}
+
+/// Resting on the peer screen is not abandonment. Real takeover is
+/// [`inbound_yield_fires`]. Kept as a named pin so a future edit cannot
+/// treat idle time as a yield without failing the test.
+fn idle_rest_yields() -> bool {
+    false
 }
 
 /// Step the router cursor a few pixels inside the screen after a refused
@@ -4009,6 +4030,20 @@ const PEER_DRIVE_FRESH_MS: u64 = 2_500;
 /// Pure for tests (the probe owns the snapshot and baseline).
 fn inbound_yield_fires(growth: u64, peer_driving: bool) -> bool {
     growth >= INBOUND_YIELD_MIN_GROWTH || (growth > 0 && peer_driving)
+}
+
+/// Drop a captured event that was already in flight when this drive
+/// opened. Releases always pass: a barrier-dropped release strands the
+/// hold on the receiver. `session_barrier` is the triggering event of
+/// the crossing, not a later snapshot, so a click queued just after
+/// that motion still crosses.
+fn event_passes_barrier(
+    event_id: u64,
+    discarded: u64,
+    session_barrier: Option<u64>,
+    is_release: bool,
+) -> bool {
+    is_release || (event_id > discarded && session_barrier.is_none_or(|barrier| event_id > barrier))
 }
 
 /// Divert/echo fast path: the counters are process-wide and cumulative,
@@ -4542,7 +4577,7 @@ async fn handle_topology_event(
                         &mut *clipboard_revision,
                         clipboard_max_bytes,
                         &mut *sequence,
-                        snapshot.last_event_id,
+                        captured.event_id,
                     )
                     .await
                     {
@@ -4584,7 +4619,7 @@ async fn handle_topology_event(
                     target_x,
                     target_y,
                     state: snapshot.state,
-                    event_barrier: snapshot.last_event_id,
+                    event_barrier: captured.event_id,
                     first_event: Some(event),
                     request_lock_screen,
                     mode,
@@ -4924,6 +4959,82 @@ fn episode_policy<'a>(
     }
 }
 
+/// The session a peer frame belongs to: the live drive, or the parked
+/// stream when this machine is local. Clipboard that arrives during a
+/// rest has to land on the park, or the next resume throws it away.
+fn signal_session<'a>(
+    from_active: bool,
+    active: &'a mut Option<TopologySession>,
+    parked: &'a mut Option<TopologySession>,
+) -> Option<&'a mut TopologySession> {
+    if from_active {
+        active.as_mut()
+    } else {
+        parked.as_mut()
+    }
+}
+
+/// Drop a clipboard frame whose revision is not newer than what this
+/// stream already applied. Disabled streams stay quiet; a stale revision
+/// is logged so a stuck counter is visible in the journal.
+fn clipboard_frame_current(enabled: bool, revision: u64, remote: u64) -> bool {
+    if !enabled {
+        return false;
+    }
+    if revision <= remote {
+        tracing::info!(
+            revision,
+            remote,
+            "dropping peer clipboard frame; revision is not newer"
+        );
+        return false;
+    }
+    true
+}
+
+/// How long a Pong still counts as proof that a parked stream is alive.
+/// Keep-alive pings every 5s, so one missed interval still resumes
+/// without a fresh round trip. Older than this, one 250ms Ping/Pong
+/// decides; a miss finishes the park and the caller dials cold.
+const PARKED_LIVENESS: Duration = Duration::from_secs(6);
+
+enum ParkDrain {
+    /// A Pong just arrived, or the last one is still inside
+    /// [`PARKED_LIVENESS`].
+    Fresh,
+    /// Nothing proved the peer app recently. The caller may ping.
+    Unknown,
+    /// The peer closed the stream.
+    Closed,
+}
+
+/// Move queued peer frames onto `session.deferred` instead of dropping
+/// them. A Progress in that queue (or a recent `last_progress`) is
+/// liveness. Clipboard that landed during the rest stays queued for the
+/// drive loop.
+fn drain_parked_signals(session: &mut TopologySession) -> ParkDrain {
+    let mut fresh = session
+        .last_progress
+        .is_some_and(|when| when.elapsed() < PARKED_LIVENESS);
+    loop {
+        match session.signals.try_recv() {
+            Ok(RemoteSignal::Progress) => {
+                fresh = true;
+                session.last_progress = Some(std::time::Instant::now());
+            }
+            Ok(RemoteSignal::Closed) => return ParkDrain::Closed,
+            Ok(other) => session.deferred.push_back(other),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return ParkDrain::Closed,
+        }
+    }
+    if fresh {
+        ParkDrain::Fresh
+    } else {
+        ParkDrain::Unknown
+    }
+}
+
 /// Take the parked drive stream when it already targets this screen and its
 /// association is still alive. A stale park (wrong target, dead
 /// association) is finished here — freeing the peer's input slot — so a
@@ -4937,25 +5048,30 @@ async fn take_parked_for(
         tokio::spawn(session.finish());
         return None;
     }
-    // Liveness proof before reuse: a parked stream whose peer app end
-    // died (wedged drain, reaped episode) can still ride a live QUIC
-    // association, and resuming it opens a silent drive — control
-    // leaves locally, nothing moves remotely, and the only way home is
-    // the walk-back. One bounded Ping/Pong round trip proves the peer
-    // still reads this stream; on timeout the park is finished and the
-    // caller dials fresh instead. Stale backlog drains first so an
-    // ancient Pong cannot pose as fresh proof. 250ms, not 1s: on LAN
-    // the Pong lands in milliseconds, and every extra 100ms here adds
-    // directly to the next crossing's open_ms (the slow re-entry
-    // shape: 1s liveness wait + cold dial on every re-cross).
-    while session.signals.try_recv().is_ok() {}
+    match drain_parked_signals(&mut session) {
+        ParkDrain::Closed => {
+            tokio::spawn(session.finish());
+            return None;
+        }
+        ParkDrain::Fresh => return Some(session),
+        ParkDrain::Unknown => {}
+    }
+    // No recent Pong. One bounded Ping/Pong proves the peer still reads
+    // this stream. Non-progress frames (clipboard) are kept, not dropped.
+    // 250ms: on LAN the Pong is milliseconds, and a miss dials fresh
+    // instead of opening a silent drive.
     let verified = tokio::time::timeout(Duration::from_millis(250), async {
         write_frame(&mut session.send, &WireMessage::Ping { nonce: 0 }).await?;
         loop {
             match session.signals.recv().await {
-                Some(RemoteSignal::Progress) => return Ok::<(), anyhow::Error>(()),
-                Some(_) => continue,
-                None => anyhow::bail!("parked drive stream closed"),
+                Some(RemoteSignal::Progress) => {
+                    session.last_progress = Some(std::time::Instant::now());
+                    return Ok::<(), anyhow::Error>(());
+                }
+                Some(RemoteSignal::Closed) | None => {
+                    anyhow::bail!("parked drive stream closed");
+                }
+                Some(other) => session.deferred.push_back(other),
             }
         }
     })
@@ -4998,7 +5114,9 @@ async fn resume_parked_session(
     event_barrier: u64,
 ) -> Result<TopologySession> {
     let mut session = session;
-    while session.signals.try_recv().is_ok() {}
+    if matches!(drain_parked_signals(&mut session), ParkDrain::Closed) {
+        anyhow::bail!("parked drive stream closed");
+    }
     session.event_barrier = event_barrier;
     // Same session-scoping as the fresh open above: the parked
     // session's capabilities are this peer's advertisement (see
@@ -5197,7 +5315,7 @@ fn adopt_peer_geometry(
             height,
             "topology peer geometry adopted"
         ),
-        None => tracing::debug!(
+        None => tracing::info!(
             peer = fingerprint,
             "peer geometry matches no linked screen; keeping configured peer dims"
         ),
@@ -5284,6 +5402,8 @@ fn spawn_episode_driver(
         datagrams_sent: 0,
         udp_motion: capabilities.udp_motion,
         udp_packets_sent: 0,
+        deferred: std::collections::VecDeque::new(),
+        last_progress: None,
     }
 }
 
@@ -5641,7 +5761,7 @@ fn start_capture(
 
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 struct ClipboardAgent {
-    changes: tokio::sync::watch::Receiver<Option<ClipboardChanged>>,
+    changes: tokio::sync::mpsc::UnboundedReceiver<ClipboardChanged>,
     commands: std::sync::mpsc::Sender<ClipboardChanged>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -5657,7 +5777,7 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
 
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
     {
-        let (change_tx, changes) = tokio::sync::watch::channel(None::<ClipboardChanged>);
+        let (change_tx, changes) = tokio::sync::mpsc::unbounded_channel();
         let (command_tx, command_rx) = std::sync::mpsc::channel::<ClipboardChanged>();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5737,9 +5857,9 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                             false
                         }
                     };
-                    match clipboard.poll_changed() {
+                    match clipboard.poll_user_text(notice) {
                         Ok(Some(text)) => {
-                            let _ = change_tx.send(Some(ClipboardChanged::Text(text)));
+                            let _ = change_tx.send(ClipboardChanged::Text(text));
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -5753,7 +5873,7 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                         .is_none_or(|when: std::time::Instant| when.elapsed() >= Duration::from_secs(2));
                     if notice || image_due {
                         last_image_poll = Some(std::time::Instant::now());
-                        match clipboard.poll_changed_image() {
+                        match clipboard.poll_user_image(notice) {
                             Ok(Some((width, height, rgba))) => {
                                 let encoded = kvm_platform::clipboard::encode_image_png(
                                     width, height, &rgba,
@@ -5764,13 +5884,13 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                                 });
                                 match encoded {
                                     Ok(png_base64) => {
-                                        let _ = change_tx.send(Some(ClipboardChanged::Image(
+                                        let _ = change_tx.send(ClipboardChanged::Image(
                                             ImagePaste {
                                                 png_base64,
                                                 width: width as u32,
                                                 height: height as u32,
                                             },
-                                        )));
+                                        ));
                                     }
                                     Err(error) => {
                                         tracing::debug!(%error, "cannot encode clipboard image");
@@ -5815,10 +5935,7 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
 
 impl ClipboardAgent {
     async fn recv(&mut self) -> Option<ClipboardChanged> {
-        if self.changes.changed().await.is_err() {
-            return None;
-        }
-        self.changes.borrow().clone()
+        self.changes.recv().await
     }
 
     fn apply_text(&self, text: String) -> Result<()> {
@@ -6454,6 +6571,183 @@ pub(crate) fn stash_inbound_clipboard(
     }
 }
 
+/// A local copy the logged-in UI offered. `generation` is the UI's
+/// counter, not a wire revision: the latest complete generation wins.
+#[derive(Debug, Clone)]
+struct LocalClipboardOffer {
+    generation: u64,
+    kind: kvm_protocol::control::ClipboardKind,
+    payload: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug)]
+struct OfferAssembly {
+    generation: u64,
+    kind: kvm_protocol::control::ClipboardKind,
+    total_chunks: u32,
+    chunks: Vec<Option<String>>,
+    width: u32,
+    height: u32,
+}
+
+impl Default for OfferAssembly {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            kind: kvm_protocol::control::ClipboardKind::Text,
+            total_chunks: 0,
+            chunks: Vec::new(),
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
+impl OfferAssembly {
+    /// Push one chunk. `Ok(Some)` is a finished paste. A new generation
+    /// throws away a partial older one. Malformed input is `Err`.
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        generation: u64,
+        kind: kvm_protocol::control::ClipboardKind,
+        total_chunks: u32,
+        index: u32,
+        data: String,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<LocalClipboardOffer>, &'static str> {
+        if generation == 0 || total_chunks == 0 || total_chunks > 512 || index >= total_chunks {
+            return Err("clipboard offer is malformed");
+        }
+        if data.len() > CLIPBOARD_CHUNK_BYTES {
+            return Err("clipboard offer chunk is too large");
+        }
+        if self.generation != generation || self.total_chunks != total_chunks {
+            self.generation = generation;
+            self.kind = kind;
+            self.total_chunks = total_chunks;
+            self.chunks = vec![None; total_chunks as usize];
+            self.width = width;
+            self.height = height;
+        }
+        let Some(slot) = self.chunks.get_mut(index as usize) else {
+            return Err("clipboard offer chunk does not match the transfer");
+        };
+        *slot = Some(data);
+        if self.chunks.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+        let payload = self
+            .chunks
+            .iter()
+            .map(|chunk| chunk.as_deref().unwrap_or(""))
+            .collect();
+        let offer = LocalClipboardOffer {
+            generation,
+            kind: self.kind,
+            payload,
+            width: self.width,
+            height: self.height,
+        };
+        *self = Self::default();
+        Ok(Some(offer))
+    }
+}
+
+static LOCAL_CLIPBOARD_OFFERS: std::sync::OnceLock<
+    tokio::sync::watch::Sender<Option<LocalClipboardOffer>>,
+> = std::sync::OnceLock::new();
+
+static OFFER_ASSEMBLY: std::sync::OnceLock<std::sync::Mutex<OfferAssembly>> =
+    std::sync::OnceLock::new();
+
+fn local_offer_sender() -> &'static tokio::sync::watch::Sender<Option<LocalClipboardOffer>> {
+    LOCAL_CLIPBOARD_OFFERS.get_or_init(|| {
+        let (sender, _receiver) = tokio::sync::watch::channel(None);
+        sender
+    })
+}
+
+fn subscribe_local_clipboard_offers() -> tokio::sync::watch::Receiver<Option<LocalClipboardOffer>> {
+    local_offer_sender().subscribe()
+}
+
+fn offer_assembly() -> &'static std::sync::Mutex<OfferAssembly> {
+    OFFER_ASSEMBLY.get_or_init(|| std::sync::Mutex::new(OfferAssembly::default()))
+}
+
+/// Accept one chunk of a UI-offered local copy. A finished generation is
+/// published for every live episode (serve and direct capture) to forward.
+pub(crate) fn submit_local_clipboard_chunk(
+    generation: u64,
+    kind: kvm_protocol::control::ClipboardKind,
+    total_chunks: u32,
+    index: u32,
+    data: String,
+    width: u32,
+    height: u32,
+) -> kvm_protocol::control::ControlResponse {
+    use kvm_protocol::control::ControlResponse;
+    let mut assembly = match offer_assembly().lock() {
+        Ok(assembly) => assembly,
+        Err(_) => {
+            return ControlResponse::Error {
+                message: "clipboard offer lock poisoned".into(),
+            };
+        }
+    };
+    match assembly.push(generation, kind, total_chunks, index, data, width, height) {
+        Ok(Some(offer)) => {
+            let generation = offer.generation;
+            let _ = local_offer_sender().send(Some(offer));
+            tracing::info!(generation, "local clipboard offer published");
+            ControlResponse::Applied {
+                restart_required: false,
+            }
+        }
+        Ok(None) => ControlResponse::Applied {
+            restart_required: false,
+        },
+        Err(message) => ControlResponse::Error {
+            message: message.into(),
+        },
+    }
+}
+
+/// Send one published local offer on an episode stream. Callers skip a
+/// generation they already sent. Content equality is not a reason to
+/// skip: a re-copy of the same text must still win.
+async fn forward_local_clipboard_offer(
+    send: &mut quinn::SendStream,
+    offer: &LocalClipboardOffer,
+    clipboard_revision: &mut u64,
+    max_bytes: u64,
+) -> Result<bool> {
+    let change = match offer.kind {
+        kvm_protocol::control::ClipboardKind::Text => ClipboardChanged::Text(offer.payload.clone()),
+        kvm_protocol::control::ClipboardKind::ImagePng => ClipboardChanged::Image(ImagePaste {
+            png_base64: offer.payload.clone(),
+            width: offer.width,
+            height: offer.height,
+        }),
+    };
+    match send_clipboard_change(send, *clipboard_revision, change, max_bytes).await? {
+        Some((revision, _)) => {
+            *clipboard_revision = revision;
+            tracing::info!(
+                generation = offer.generation,
+                revision,
+                "forwarded local clipboard offer to the peer"
+            );
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 /// Serve one UI take: the chunk at `next_index` when the slot holds a
 /// paste newer than `last_seen_revision`, else an empty update
 /// (revision 0) meaning "nothing new".
@@ -6583,7 +6877,6 @@ impl CapturedState {
                     // so the receiver re-taps them; Linux skips re-presses
                     // on held keys and repeats natively). Dropping them
                     // here is what made held keys emit one char remotely.
-                    // Buttons have no repeat and stay deduped below.
                     self.keys.insert(key.usage);
                     true
                 } else {
@@ -6600,11 +6893,14 @@ impl CapturedState {
                 }
             }
             InputEvent::MouseButton { button, pressed } => {
+                // Always forward. Deduping a press that is already held
+                // drops every later click once one release was lost.
                 if *pressed {
-                    self.buttons.insert(*button)
+                    self.buttons.insert(*button);
                 } else {
-                    self.buttons.remove(button)
+                    self.buttons.remove(button);
                 }
+                true
             }
             InputEvent::MouseMove { .. }
             | InputEvent::Wheel(_)
@@ -6795,7 +7091,6 @@ async fn run_capture_stream(
 
     tracing::info!("capturing input; press Ctrl+C to stop");
     let mut sequence = 0u64;
-    let mut clipboard_enabled = clipboard_enabled;
     let mut remote_clipboard_revision = 0u64;
     let mut latest_clipboard: Option<String> = None;
     // Last image paste applied from the peer (mirrors the text slot;
@@ -6817,6 +7112,24 @@ async fn run_capture_stream(
     let mut ctrl_shadow = false;
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut watch_local_agent = clipboard.is_some();
+    let mut local_offers = subscribe_local_clipboard_offers();
+    let mut last_sent_offer = 0u64;
+    if clipboard_enabled {
+        let pending = local_offers.borrow().clone();
+        if let Some(offer) = pending.filter(|offer| offer.generation > 0) {
+            if forward_local_clipboard_offer(
+                &mut send,
+                &offer,
+                clipboard_revision,
+                clipboard_max_bytes,
+            )
+            .await?
+            {
+                last_sent_offer = offer.generation;
+            }
+        }
+    }
     let result: Result<()> = loop {
         tokio::select! {
             biased;
@@ -6907,7 +7220,7 @@ async fn run_capture_stream(
                 }
                 None => break Err(anyhow::anyhow!("input capture stopped")),
             },
-            change = receive_clipboard(clipboard, clipboard_enabled) => match change {
+            change = receive_clipboard(clipboard, clipboard_enabled && watch_local_agent) => match change {
                 Some(change) => {
                     match send_clipboard_change(
                         &mut send,
@@ -6922,7 +7235,31 @@ async fn run_capture_stream(
                         Err(error) => break Err(error),
                     }
                 }
-                None => clipboard_enabled = false,
+                // The agent is gone. Stop watching it. Offers from the UI
+                // and inbound pastes keep flowing.
+                None => watch_local_agent = false,
+            },
+            offer_ready = local_offers.changed() => {
+                if offer_ready.is_err() {
+                    continue;
+                }
+                let offer = local_offers.borrow().clone();
+                if let Some(offer) = offer
+                    .filter(|offer| clipboard_enabled && offer.generation > last_sent_offer)
+                {
+                    match forward_local_clipboard_offer(
+                        &mut send,
+                        &offer,
+                        clipboard_revision,
+                        clipboard_max_bytes,
+                    )
+                    .await
+                    {
+                        Ok(true) => last_sent_offer = offer.generation,
+                        Ok(false) => {}
+                        Err(error) => break Err(error),
+                    }
+                }
             },
             remote = remote_message_rx.recv() => match remote {
                 Some(WireMessage::ClipboardText { revision, text })
@@ -7618,6 +7955,11 @@ async fn handle_connection(
             // heights, phantom mid-screen exits). Per-stream clone, so no
             // cross-stream races: each Hello re-teaches current truth.
             let mut config = config;
+            // Hop, clamp, and handoff_for_motion all read THIS layout.
+            // Entry remap already uses truthful dims; leaving the layout
+            // at session-0 or stale size hops the cursor while it is
+            // still mid-screen.
+            apply_truthful_self_geometry(&mut config.layout);
             if let Some(geometry) = peer_screen_geometry
                 .filter(|geometry| geometry.width >= 2 && geometry.height >= 2)
             {
@@ -7640,7 +7982,7 @@ async fn handle_connection(
                         height,
                         "receiver peer geometry adopted"
                     ),
-                    None => tracing::debug!(
+                    None => tracing::info!(
                         peer = %peer_fingerprint,
                         "hello geometry matches no linked screen; keeping configured peer dims"
                     ),
@@ -7924,6 +8266,23 @@ async fn handle_connection(
             let recv_display = receiver_display();
             let mut clipboard_revision = 0u64;
             let mut remote_clipboard_revision = 0u64;
+            let mut local_offers = subscribe_local_clipboard_offers();
+            let mut last_sent_offer = 0u64;
+            if clipboard_enabled {
+                let pending = local_offers.borrow().clone();
+                if let Some(offer) = pending.filter(|offer| offer.generation > 0) {
+                    if forward_local_clipboard_offer(
+                        &mut send,
+                        &offer,
+                        &mut clipboard_revision,
+                        clipboard_max_bytes,
+                    )
+                    .await?
+                    {
+                        last_sent_offer = offer.generation;
+                    }
+                }
+            }
             let mut lease_check = tokio::time::interval(Duration::from_secs(5));
             lease_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let session_result: Result<()> = loop {
@@ -8401,6 +8760,26 @@ async fn handle_connection(
                         // machine that has no agent.
                         None => clipboard_agent_present = false,
                     },
+                    offer_ready = local_offers.changed() => {
+                        if offer_ready.is_err() {
+                            continue;
+                        }
+                        let offer = local_offers.borrow().clone();
+                        if let Some(offer) = offer
+                            .filter(|offer| clipboard_enabled && offer.generation > last_sent_offer)
+                        {
+                            if forward_local_clipboard_offer(
+                                &mut send,
+                                &offer,
+                                &mut clipboard_revision,
+                                clipboard_max_bytes,
+                            )
+                            .await?
+                            {
+                                last_sent_offer = offer.generation;
+                            }
+                        }
+                    }
                     motion_message = async {
                         // Disabled arm when no lane was negotiated: pending
                         // forever so the select below never fires it.
@@ -10157,6 +10536,36 @@ fn remote_truth_for_announce(
     ((0, 0), "unknown")
 }
 
+/// Overwrite the self screen with interactive-desktop truth so the
+/// receiver hop uses the same space as the entry warp.
+fn apply_truthful_self_geometry(layout: &mut kvm_core::Layout) {
+    let Some(truth) = truthful_local_geometry(layout) else {
+        return;
+    };
+    if truth.width < 2 || truth.height < 2 {
+        return;
+    }
+    let Some(screen) = layout
+        .screens
+        .iter_mut()
+        .find(|screen| screen.id.0 == truth.screen_id)
+    else {
+        return;
+    };
+    if screen.width == truth.width && screen.height == truth.height {
+        return;
+    }
+    tracing::info!(
+        layout_width = screen.width,
+        layout_height = screen.height,
+        width = truth.width,
+        height = truth.height,
+        "receiver self geometry replaced with interactive desktop truth"
+    );
+    screen.width = truth.width;
+    screen.height = truth.height;
+}
+
 /// Truthful local geometry for advertisements (Deskflow getShape parity).
 /// The headless Mint daemon cannot query X11 itself, so without the
 /// child-published sidecar it advertises fallback dims and the peer maps
@@ -11493,7 +11902,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_state_tags_and_throttles_key_repeats_but_dedupes_buttons() {
+    fn capture_state_tags_and_throttles_key_repeats_and_always_forwards_buttons() {
         use kvm_core::KeyEvent;
         let mut captured = CapturedState::default();
         let press = || {
@@ -11558,8 +11967,58 @@ mod tests {
             button: MouseButton::Left,
             pressed: true,
         };
-        assert!(captured.record(button).is_some());
-        assert!(captured.record(button).is_none());
+        let first = captured.record(button).unwrap();
+        let second = captured
+            .record(button)
+            .expect("a repeated press still forwards");
+        assert!(second.event_id > first.event_id);
+        let up = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: false,
+        };
+        assert!(captured.record(up).is_some());
+        assert!(
+            captured.record(up).is_some(),
+            "a release of an already-up button still forwards"
+        );
+    }
+
+    #[test]
+    fn crossing_barrier_keeps_the_click_queued_after_the_motion() {
+        // The barrier is the triggering motion, not a later snapshot.
+        assert!(event_passes_barrier(101, 0, Some(100), false));
+        assert!(!event_passes_barrier(100, 0, Some(100), false));
+        assert!(!event_passes_barrier(50, 80, Some(100), false));
+        assert!(event_passes_barrier(50, 80, Some(100), true));
+        assert!(event_passes_barrier(1, 0, None, false));
+    }
+
+    #[test]
+    fn resting_on_the_peer_screen_does_not_yield() {
+        assert!(!idle_rest_yields());
+    }
+
+    #[test]
+    fn local_clipboard_offer_assembles_and_resets_on_a_new_generation() {
+        use kvm_protocol::control::ClipboardKind;
+        let mut assembly = OfferAssembly::default();
+        assert!(assembly
+            .push(1, ClipboardKind::Text, 2, 0, "hel".into(), 0, 0)
+            .unwrap()
+            .is_none());
+        let ready = assembly
+            .push(1, ClipboardKind::Text, 2, 1, "lo".into(), 0, 0)
+            .unwrap()
+            .expect("two chunks make one paste");
+        assert_eq!(ready.generation, 1);
+        assert_eq!(ready.payload, "hello");
+        assert!(assembly
+            .push(2, ClipboardKind::Text, 1, 0, "next".into(), 0, 0)
+            .unwrap()
+            .is_some());
+        assert!(assembly
+            .push(0, ClipboardKind::Text, 1, 0, "nope".into(), 0, 0)
+            .is_err());
     }
 
     #[test]
