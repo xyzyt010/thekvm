@@ -9170,7 +9170,8 @@ impl ReceiverInjector {
                         );
                         return Ok(());
                     };
-                    return kvm_platform::capture::warp_cursor_on(Some(&display), x, y);
+                    return kvm_platform::capture::warp_cursor_on(Some(&display), x, y)
+                        .map_err(anyhow::Error::from);
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
