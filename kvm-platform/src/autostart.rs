@@ -38,7 +38,9 @@ fn current_exe() -> Result<PathBuf, PlatformError> {
         .map_err(|error| PlatformError::Autostart(format!("locate own executable: {error}")))
 }
 
-#[cfg(target_os = "linux")]
+/// The user's home directory. Mirrors the rest of kvm-platform, which
+/// resolves data paths the same way on the XDG desktops we support.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn home_dir() -> Result<PathBuf, PlatformError> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -56,7 +58,7 @@ fn user_autostart_entry() -> Result<PathBuf, PlatformError> {
 
 /// The desktop entry a system-wide install provides (only consulted to
 /// decide whether a masking override is needed at all).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn system_autostart_entry() -> PathBuf {
     PathBuf::from("/etc/xdg/autostart").join(DESKTOP_BASENAME)
 }
