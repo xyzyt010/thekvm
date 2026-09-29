@@ -686,7 +686,7 @@ mod linux_uinput {
                     "touchscreen pinch gesture started"
                 );
             }
-            let mut frame = |touch: &mut Self| -> std::io::Result<()> {
+            let frame = |touch: &mut Self| -> std::io::Result<()> {
                 for (slot, ((x, y), id)) in contacts.iter().zip(ids.iter()).enumerate() {
                     touch.write_raw(EV_ABS, ABS_MT_SLOT, slot as i32)?;
                     touch.write_raw(EV_ABS, ABS_MT_TRACKING_ID, *id)?;

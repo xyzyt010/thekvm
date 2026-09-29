@@ -64,7 +64,7 @@ fn system_autostart_entry() -> PathBuf {
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-fn desktop_entry_text(executable: &PathBuf) -> String {
+fn desktop_entry_text(executable: &std::path::Path) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\

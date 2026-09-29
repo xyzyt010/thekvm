@@ -363,17 +363,12 @@ fn derive_scroll_wheel(
     // N.B. entry first, clock second: Instant is not Copy, so the
     // construction clock must not be the same binding the verdict
     // below moves around.
-    if !phases.contains_key(&sourceid) {
-        phases.insert(
-            sourceid,
-            ScrollPhase {
-                gest_x: 0.0,
-                gest_y: 0.0,
-                lock: None,
-                last: std::time::Instant::now(),
-            },
-        );
-    }
+    phases.entry(sourceid).or_insert_with(|| ScrollPhase {
+        gest_x: 0.0,
+        gest_y: 0.0,
+        lock: None,
+        last: std::time::Instant::now(),
+    });
     let now = std::time::Instant::now();
     let Some(phase) = phases.get_mut(&sourceid) else {
         return None;
@@ -891,9 +886,7 @@ impl X11Capture {
                     return None;
                 }
                 let anchor = self.core_last.replace((event.root_x, event.root_y));
-                let Some((last_x, last_y)) = anchor else {
-                    return None;
-                };
+                let (last_x, last_y) = anchor?;
                 let (dx, dy) = core_motion_step((last_x, last_y), (event.root_x, event.root_y));
                 let dx = take_integer(&mut self.motion_x, dx as f64);
                 let dy = take_integer(&mut self.motion_y, dy as f64);
@@ -1087,9 +1080,7 @@ impl CaptureBackend for X11Capture {
                 GrabKind::Core => core_ungrab(&self.connection),
                 GrabKind::None => Ok(()),
             };
-            if let Err(error) = released {
-                return Err(error);
-            }
+            released?;
             // Release the drive cursor hide (paired with the engage
             // above): runs on every release path, including Drop via
             // release(), so no path strands an invisible cursor. A
