@@ -1566,15 +1566,23 @@ mod tests {
         // the verdict (240 x-120ths at 2:1), then pure horizontal.
         use super::{derive_scroll_wheel, ScrollAxis};
         use std::collections::HashMap;
+        // XInput valuators 2 and 3 deliver X then Y in ascending axis
+        // order, so axis 2 IS the horizontal one here. The fixture used
+        // to declare them the other way round (2 vertical, 3
+        // horizontal) while feeding [x_one, y_wobble] and expecting an
+        // x-dominant result, which cannot hold: the values landed on the
+        // opposite axes and the assertion compared y against x. It only
+        // ever ran on Linux, and CI never reached it because the fmt
+        // gate failed first.
         let axes = vec![
             ScrollAxis {
                 axis: 2,
-                horizontal: false,
+                horizontal: true,
                 units_120ths: 120.0,
             },
             ScrollAxis {
                 axis: 3,
-                horizontal: true,
+                horizontal: false,
                 units_120ths: 120.0,
             },
         ];
