@@ -2147,6 +2147,11 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut yield_probe = tokio::time::interval(Duration::from_millis(300));
     yield_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let control_dirs = daemon_control_candidates(&dir);
+    // Inbound snapshot cache (see spawn_inbound_poller): the drive
+    // probes must never await control sockets on their hot path.
+    let inbound_cache: InboundCache =
+        std::sync::Arc::new(std::sync::Mutex::new(InboundSnapshot::default()));
+    spawn_inbound_poller(inbound_cache.clone(), control_dirs);
 
     tracing::info!(screen = ?router.current_screen(), version = env!("CARGO_PKG_VERSION"), "topology capture ready; move to a configured screen edge");
     eprintln!("THEKVM_STATUS edge-ready");
@@ -2906,7 +2911,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             &mut inbound_baselines_fresh,
                             &last_outbound_input,
                             &mut last_inbound_growth_at,
-                            &control_dirs,
+                            &inbound_cache,
                         )
                         .await;
                     }
@@ -2960,7 +2965,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             &mut inbound_baselines_fresh,
                             &last_outbound_input,
                             &mut last_inbound_growth_at,
-                            &control_dirs,
+                            &inbound_cache,
                         )
                         .await;
                     }
@@ -3038,10 +3043,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     // A parked stream still holds the peer's input slot and
                     // provisioned injector: ping it so the lease never
                     // reaps it and a silent death is noticed within seconds
-                    // instead of on the next push. Bounded like the active
-                    // Ping above: never stall the task on a half-dead peer.
+                    // instead of on the next push. 1.5s (tighter than the
+                    // active Ping: a parked death only drops the park, so
+                    // there is no reason to ever stall the drive task on
+                    // it with suppression held).
                     let parked_ping = tokio::time::timeout(
-                        Duration::from_secs(3),
+                        Duration::from_millis(1500),
                         write_frame(&mut session.send, &WireMessage::Ping { nonce: sequence }),
                     )
                     .await;
@@ -3055,10 +3062,18 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // Suppression-hold reaper: a held local-suppression with no
                 // active drive freezes ALL local input (and injected input
                 // too) while the cursor still moves. Any missed or resisted
-                // release heals here within seconds, loudly.
-                if stale_hold_needs_release(active.is_some(), suppression_requested) {
+                // release heals here within seconds, loudly. UNCONDITIONAL
+                // while nothing is driven: belief alone cannot prove the
+                // platform hold is free (a lost hook rendezvous or a dead
+                // capture thread keeps the OS hold with belief already
+                // cleared — the reaper would stay blind forever). The
+                // release is idempotent, so a free machine just no-ops.
+                if active.is_none() {
+                    let had_hold = stale_hold_needs_release(active.is_some(), suppression_requested);
                     release_suppression(&capture_control, Some(&mut suppression_requested));
-                    tracing::info!("suppression reaper: released stale hold with no active drive");
+                    if had_hold {
+                        tracing::info!("suppression reaper: released stale hold with no active drive");
+                    }
                 }
                 // Backend receipt census, once a minute: which OS channel
                 // speaks (hook vs raw HID vs precision touchpad).
@@ -3658,6 +3673,13 @@ fn daemon_control_candidates(primary: &std::path::Path) -> Vec<std::path::PathBu
 /// simply contributes nothing. Takes the MAX per fingerprint across
 /// candidates so overlapping dirs that reach the same daemon can never
 /// double-count.
+///
+/// WARNING (freeze class): every call awaits up to 3x200ms of socket
+/// timeouts. It must NEVER run on the drive hot path — a contended
+/// endpoint stalls routing with suppression held for most of every
+/// second, which reads exactly like a freeze (dead input, fresh
+/// heartbeat, blind watchdogs). Drive probes read [`InboundCache`]
+/// instead; this stays as the background poller's fetch.
 async fn snapshot_inbound_inputs(
     candidates: &[std::path::PathBuf],
 ) -> (
@@ -3701,6 +3723,37 @@ async fn snapshot_inbound_inputs(
         }
     }
     (totals, driving)
+}
+
+/// Background-polled inbound snapshot cache (see
+/// [`snapshot_inbound_inputs`]): the drive probes read the latest warm
+/// snapshot without awaiting any socket, so endpoint contention costs a
+/// stale read, never a stalled drive task.
+#[derive(Debug, Default, Clone)]
+struct InboundSnapshot {
+    totals: std::collections::HashMap<String, u64>,
+    driving: std::collections::HashSet<String>,
+}
+
+type InboundCache = std::sync::Arc<std::sync::Mutex<InboundSnapshot>>;
+
+/// Spawn the background poller for `control_dirs`, refreshing `cache`
+/// every 300ms until the process ends. Best-effort per candidate, as
+/// before — a missing socket simply contributes nothing, and a poisoned
+/// lock just skips one refresh.
+fn spawn_inbound_poller(cache: InboundCache, control_dirs: Vec<std::path::PathBuf>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(300));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let (totals, driving) = snapshot_inbound_inputs(&control_dirs).await;
+            if let Ok(mut slot) = cache.lock() {
+                slot.totals = totals;
+                slot.driving = driving;
+            }
+        }
+    });
 }
 
 /// Fresh inbound input since the baseline snapshot, and refresh the
@@ -3771,12 +3824,18 @@ async fn probe_inbound_yield(
     inbound_baselines_fresh: &mut bool,
     last_outbound_input: &Option<std::time::Instant>,
     last_inbound_growth_at: &mut Option<std::time::Instant>,
-    control_dirs: &[std::path::PathBuf],
+    inbound_cache: &InboundCache,
 ) {
     // Fresh-inbound-input path (see inbound_inputs_growth): the first
     // probe of a drive only records its baseline, so input the peer sent
-    // on an older drive can never fire a new crossing.
-    let (current, driving) = snapshot_inbound_inputs(control_dirs).await;
+    // on an older drive can never fire a new crossing. Reads the
+    // background-polled cache (see spawn_inbound_poller) — never a
+    // socket: a contended endpoint costs a stale read here, never a
+    // stalled drive task with suppression held (the freeze shape).
+    let (current, driving) = inbound_cache
+        .lock()
+        .map(|slot| (slot.totals.clone(), slot.driving.clone()))
+        .unwrap_or_default();
     let growth = if *inbound_baselines_fresh {
         inbound_inputs_growth(inbound_baseline, &current)
     } else {
@@ -5045,7 +5104,9 @@ enum ParkDrain {
 /// Move queued peer frames onto `session.deferred` instead of dropping
 /// them. A Progress in that queue (or a recent `last_progress`) is
 /// liveness. Clipboard that landed during the rest stays queued for the
-/// drive loop.
+/// drive loop. Bounded (see DEFERRED_CAP): an unresponsive drive loop
+/// plus a chatty peer must not grow memory without limit over
+/// hours-long links.
 fn drain_parked_signals(session: &mut TopologySession) -> ParkDrain {
     let mut fresh = session
         .last_progress
@@ -5057,7 +5118,7 @@ fn drain_parked_signals(session: &mut TopologySession) -> ParkDrain {
                 session.last_progress = Some(std::time::Instant::now());
             }
             Ok(RemoteSignal::Closed) => return ParkDrain::Closed,
-            Ok(other) => session.deferred.push_back(other),
+            Ok(other) => push_deferred_capped(session, other),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return ParkDrain::Closed,
         }
@@ -5067,6 +5128,29 @@ fn drain_parked_signals(session: &mut TopologySession) -> ParkDrain {
     } else {
         ParkDrain::Unknown
     }
+}
+
+/// Cap for queued peer frames on one session (see `deferred`): bounds
+/// memory over hours-long links. Oldest drops first with a loud line;
+/// Progress never queues (it folds into `last_progress`), so the cap
+/// only ever bites clipboard bursts.
+const DEFERRED_CAP: usize = 64;
+
+/// Queue one peer frame on the session, dropping the oldest when the
+/// cap is hit. Pure-ish for tests (the session owns the queue).
+fn push_deferred_capped(session: &mut TopologySession, signal: RemoteSignal) {
+    if deferred_overflowed(session.deferred.len()) {
+        session.deferred.pop_front();
+        tracing::warn!("parked session deferred queue full; dropping oldest peer frame");
+    }
+    session.deferred.push_back(signal);
+}
+
+/// Pure cap predicate for [`push_deferred_capped`]: the queue holds at
+/// most DEFERRED_CAP frames. Pinned by test so hours-long links can
+/// never grow it without limit.
+fn deferred_overflowed(len: usize) -> bool {
+    len >= DEFERRED_CAP
 }
 
 /// Take the parked drive stream when it already targets this screen and its
@@ -5079,11 +5163,18 @@ async fn take_parked_for(
 ) -> Option<TopologySession> {
     let mut session = parked.take()?;
     if session.target != target || session.connection.close_reason().is_some() {
+        // Reason-logged (not silent): every cold open pays a dial, so
+        // the journal must say WHY the warm park was skipped.
+        tracing::debug!(?target, parked_target = ?session.target, "parked drive stream skipped (wrong target or dead association); dialling fresh");
         tokio::spawn(session.finish());
         return None;
     }
     match drain_parked_signals(&mut session) {
         ParkDrain::Closed => {
+            tracing::debug!(
+                ?target,
+                "parked drive stream skipped (peer closed); dialling fresh"
+            );
             tokio::spawn(session.finish());
             return None;
         }
@@ -5105,7 +5196,7 @@ async fn take_parked_for(
                 Some(RemoteSignal::Closed) | None => {
                     anyhow::bail!("parked drive stream closed");
                 }
-                Some(other) => session.deferred.push_back(other),
+                Some(other) => push_deferred_capped(&mut session, other),
             }
         }
     })
@@ -11407,6 +11498,14 @@ mod tests {
         assert!(!episode_cooling_down(Some(
             std::time::Instant::now() - Duration::from_secs(2)
         )));
+    }
+
+    #[test]
+    fn deferred_queue_stays_bounded_over_long_links() {
+        assert!(!deferred_overflowed(0));
+        assert!(!deferred_overflowed(63));
+        assert!(deferred_overflowed(64));
+        assert!(deferred_overflowed(10_000));
     }
 
     #[test]

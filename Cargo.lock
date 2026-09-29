@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-core"
-version = "0.9.60"
+version = "0.9.61"
 dependencies = [
  "serde",
  "serde_json",
@@ -3355,7 +3355,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-daemon"
-version = "0.9.60"
+version = "0.9.61"
 dependencies = [
  "anyhow",
  "base64",
@@ -3380,7 +3380,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-platform"
-version = "0.9.60"
+version = "0.9.61"
 dependencies = [
  "arboard",
  "base64",
@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-protocol"
-version = "0.9.60"
+version = "0.9.61"
 dependencies = [
  "chacha20poly1305",
  "kvm-core",
@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-ui"
-version = "0.9.60"
+version = "0.9.61"
 dependencies = [
  "anyhow",
  "gtk",

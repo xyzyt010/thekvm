@@ -1331,8 +1331,14 @@ pub const RETURN_PUSH_PX: i64 = 64;
 /// deliberate shove (or a slow sustained push, which saves up across
 /// events) comes home. Inside movement or an edge switch restarts the
 /// streak, so oscillation can never save up for a phantom return. Unarmed
-/// drives keep the deeper RETURN_PUSH_PX escape hatch instead.
-const RETURN_EDGE_PX: i64 = 12;
+/// drives keep the deeper RETURN_PUSH_PX escape hatch instead. Raised
+/// past the old 12px: virtual-ahead drift (sensitivity, ballistics lag
+/// on the driven side) could hold 12px of phantom overflow for the
+/// whole hold window and return while the visible cursor was still a
+/// little short of the edge. A deliberate home shove is hundreds of px
+/// and trips 28px in the first events, so genuine returns feel
+/// identical — only phantom drift stops coming home.
+const RETURN_EDGE_PX: i64 = 28;
 
 /// A truth re-pin that moves the cursor further than this keeps the
 /// position but restarts the push run (the old position was phantom);
@@ -2279,8 +2285,8 @@ mod tests {
             ));
             assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
         }
-        // Fresh run from the boundary: 5px + 5px still clamps (10 < 12),
-        // the third shove (15 >= 12) comes home.
+        // Fresh run from the boundary: 15px still clamps (15 < 28),
+        // the next 15px (30 >= 28) comes home.
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: 30, dy: 0 }),
             RoutedEvent::Forward { .. }
@@ -2290,14 +2296,10 @@ mod tests {
             RoutedEvent::Forward { .. }
         ));
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: -5, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: -15, dy: 0 }),
             RoutedEvent::Forward { .. }
         ));
-        assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: -5, dy: 0 }),
-            RoutedEvent::Forward { .. }
-        ));
-        let home = router.route(InputEvent::MouseMove { dx: -5, dy: 0 });
+        let home = router.route(InputEvent::MouseMove { dx: -15, dy: 0 });
         assert!(matches!(
             home,
             RoutedEvent::ReturnHome {
