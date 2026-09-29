@@ -102,7 +102,7 @@ pub fn enabled() -> Result<bool, PlatformError> {
             return Ok(!system_autostart_entry().exists());
         }
         let text = std::fs::read_to_string(&entry).unwrap_or_default();
-        Ok(!masked(&text))
+        return Ok(!masked(&text));
     }
     #[allow(unreachable_code)]
     Err(PlatformError::Autostart(
@@ -138,7 +138,7 @@ pub fn set_enabled(enabled: bool) -> Result<(), PlatformError> {
                 PlatformError::Autostart(format!("write {}: {error}", entry.display()))
             });
         }
-        match std::fs::remove_file(&entry) {
+        return match std::fs::remove_file(&entry) {
             Ok(()) => Ok(()),
             // Already off: a system-wide install still starts us, so mask
             // it with the XDG override instead of doing nothing.
@@ -152,13 +152,13 @@ pub fn set_enabled(enabled: bool) -> Result<(), PlatformError> {
                         PlatformError::Autostart(format!("write {}: {error}", entry.display()))
                     });
                 }
-                Ok(())
+                return Ok(());
             }
             Err(error) => Err(PlatformError::Autostart(format!(
                 "remove {}: {error}",
                 entry.display()
             ))),
-        }
+        };
     }
     #[allow(unreachable_code)]
     Err(PlatformError::Autostart(
