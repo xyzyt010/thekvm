@@ -370,9 +370,7 @@ fn derive_scroll_wheel(
         last: std::time::Instant::now(),
     });
     let now = std::time::Instant::now();
-    let Some(phase) = phases.get_mut(&sourceid) else {
-        return None;
-    };
+    let phase = phases.get_mut(&sourceid)?;
     if now.duration_since(phase.last).as_millis() > 300 {
         phase.gest_x = 0.0;
         phase.gest_y = 0.0;

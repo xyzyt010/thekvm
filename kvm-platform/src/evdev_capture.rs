@@ -191,9 +191,7 @@ impl Device {
     }
 
     fn push_key(&mut self, code: u16, value: i32) -> Option<InputEvent> {
-        let Some(pressed) = key_pressed(value) else {
-            return None;
-        };
+        let pressed = key_pressed(value)?;
         let usage = hid_from_evdev(code)?;
         if pressed {
             // Kernel typematic repeat (value 2) for a key this device
