@@ -490,7 +490,7 @@ mod tests {
         // Not a PNG at all.
         assert!(super::decode_image_png(b"definitely not a png").is_err());
         // Truncated PNG.
-        let encoded = super::encode_image_png(3, 3, &vec![9u8; 3 * 3 * 4]).unwrap();
+        let encoded = super::encode_image_png(3, 3, &[9u8; 3 * 3 * 4]).unwrap();
         assert!(super::decode_image_png(&encoded[..20]).is_err());
     }
 }

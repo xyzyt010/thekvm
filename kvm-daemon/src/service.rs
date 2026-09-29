@@ -64,10 +64,11 @@ pub(crate) struct InboundLink {
     /// inbound_link_activity).
     pub driving: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Monotonic stamp (see `now_millis`) of the newest peer input or
-    /// cursor takeover on this session. `0` = nothing yet. This is the
-    /// heartbeat that makes `driving` decidable: a peer that took the
-    /// cursor minutes ago and whose user walked away must not read as
-    /// "driving us right now", or every later crossing is yanked home.
+    /// cursor takeover on this session. `NO_INPUT_YET` = nothing seen
+    /// yet. This is the heartbeat that makes `driving` decidable: a peer
+    /// that took the cursor minutes ago and whose user walked away must
+    /// not read as "driving us right now", or every later crossing is
+    /// yanked home.
     pub last_input: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -254,8 +255,10 @@ pub(crate) fn register_inbound_link(
     let driving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Freshness stamp for the driving claim (see the field): starts at
     // "nothing seen yet" so a fresh dial-back reads idle until the peer
-    // actually moves.
-    let last_input = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // actually moves. NOT a plain 0: now_millis() returns 0 during the
+    // process's first millisecond, which would make an immediately-active
+    // peer look like a silent one (see NO_INPUT_YET).
+    let last_input = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(NO_INPUT_YET));
     // Stamp last-seen BEFORE inserting: even a replaced stale entry
     // counts as proof this peer linked (the dial-back trigger).
     note_inbound_seen(fingerprint_hex, node_name, address, link_id);
@@ -290,6 +293,17 @@ fn now_millis() -> u64 {
     let base = BASE.get_or_init(std::time::Instant::now);
     base.elapsed().as_millis() as u64
 }
+
+/// Sentinel for "this session has seen no peer input yet" in
+/// `InboundLink::last_input`.
+///
+/// A plain `0` cannot express that: `now_millis()` legitimately returns
+/// `0` for the first millisecond of a process's life, so a peer whose
+/// first event lands immediately would be indistinguishable from a peer
+/// that never moved, and its freshness age would read as absent (the
+/// arbiter then refuses to trust its `driving` flag). `u64::MAX` is
+/// unreachable for a real millisecond count, so it is a safe sentinel.
+const NO_INPUT_YET: u64 = u64::MAX;
 
 /// Stamp "the peer just drove us" on one inbound session: the freshness
 /// half of the driving claim (see InboundLink::last_input). Called for
@@ -343,7 +357,8 @@ pub(crate) fn list_inbound_links() -> Vec<kvm_protocol::control::ActiveSession> 
                     driving: link.driving.load(std::sync::atomic::Ordering::Relaxed),
                     // Age, not stamp: the consumer may live in another
                     // process (and on another machine) with its own base.
-                    last_input_age_ms: (last_input > 0).then(|| now.saturating_sub(last_input)),
+                    last_input_age_ms: (last_input != NO_INPUT_YET)
+                        .then(|| now.saturating_sub(last_input)),
                 }
             })
             .collect()
@@ -10998,17 +11013,22 @@ mod tests {
         // qualifies as a standoff, and one where the peer is actively
         // pushing never looks idle.
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let stamp = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        // Nothing seen yet: no age at all, so no freshness claim.
+        let stamp = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(NO_INPUT_YET));
+        // Nothing seen yet: the sentinel, which never reads as a real age
+        // (see NO_INPUT_YET for why plain 0 cannot be used).
         assert_eq!(
             stamp.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "a fresh link must start with no activity stamp"
+            NO_INPUT_YET
         );
         note_inbound_activity(&counter, &stamp);
-        let age = now_millis().saturating_sub(stamp.load(std::sync::atomic::Ordering::Relaxed));
+        let stamped = stamp.load(std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(
+            stamped, NO_INPUT_YET,
+            "one event must produce a real timestamp"
+        );
+        let age = now_millis().saturating_sub(stamped);
         assert!(age < 1_000, "activity must stamp a fresh age, got {age}ms");
-        // Every event moves it, and the counter still tracks the listing.
+        // Every event moves the counter, and the listing sees the count.
         note_inbound_activity(&counter, &stamp);
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
@@ -11218,8 +11238,11 @@ mod tests {
         assert!(!listed[0].driving);
         // Serve-loop bumps surface through the listing (the yield
         // probe's activity signal), together with the freshness stamp
-        // that makes the sticky driving flag decidable.
-        note_inbound_activity(&inputs, &last_input);
+        // that makes the sticky driving flag decidable. One call per
+        // event, exactly as the serve loop does it.
+        for _ in 0..25 {
+            note_inbound_activity(&inputs, &last_input);
+        }
         driving.store(true, std::sync::atomic::Ordering::Relaxed);
         let relisted: Vec<_> = list_inbound_links()
             .into_iter()

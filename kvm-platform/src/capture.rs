@@ -2818,25 +2818,24 @@ mod win32_hooks {
             pinch.units_per_detent = 10;
             assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (0, false));
             for step in 1..=19 {
-                let s = step as i32;
                 // Spread shrinks 10/frame; midpoint wanders 4/frame.
-                let (zoom, ended) = pinch.feed(&[(s, 0), (300 - 9 * s, 0)]);
+                let (zoom, ended) = pinch.feed(&[(step, 0), (300 - 9 * step, 0)]);
                 assert_eq!((zoom, ended), (0, false));
                 assert!(!pinch.engaged());
             }
             // Spread 300 -> 100: excursion 200 past the 192 gate.
             let (zoom, ended) = pinch.feed(&[(20, 0), (300 - 9 * 20, 0)]);
-            assert_eq!(ended, false);
+            assert!(!ended);
             assert!(pinch.engaged());
             assert!(zoom < 0);
             // Further closing keeps emitting zoom-out.
             let (zoom, ended) = pinch.feed(&[(21, 0), (300 - 9 * 21, 0)]);
-            assert_eq!(ended, false);
+            assert!(!ended);
             assert!(pinch.engaged());
             assert!(zoom < 0);
             // And further still.
             let (zoom, ended) = pinch.feed(&[(22, 0), (300 - 9 * 22, 0)]);
-            assert_eq!(ended, false);
+            assert!(!ended);
             assert!(zoom < 0);
             // Lift ends exactly once.
             assert_eq!(pinch.feed(&[]), (0, true));
@@ -2851,13 +2850,12 @@ mod win32_hooks {
             pinch.units_per_detent = 10;
             assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (0, false));
             for step in 1..=19 {
-                let s = step as i32;
-                let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * s, 0)]);
+                let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * step, 0)]);
                 assert_eq!((zoom, ended), (0, false));
                 assert!(!pinch.engaged());
             }
             let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * 20, 0)]);
-            assert_eq!(ended, false);
+            assert!(!ended);
             assert!(pinch.engaged());
             assert!(zoom < 0);
             assert_eq!(pinch.feed(&[]), (0, true));

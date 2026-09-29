@@ -529,9 +529,7 @@ pub fn validate_message(message: &WireMessage) -> std::io::Result<()> {
                 "clipboard image exceeds maximum single-shot size",
             ));
         }
-        if let Err(error) = validate_image_dims(*width, *height) {
-            return Err(error);
-        }
+        validate_image_dims(*width, *height)?;
     }
     if let WireMessage::ClipboardChunk { data, .. }
     | WireMessage::ClipboardImageChunk { data, .. } = message
@@ -579,9 +577,7 @@ pub fn validate_message(message: &WireMessage) -> std::io::Result<()> {
                 "clipboard image transfer header is empty or exceeds maximum size",
             ));
         }
-        if let Err(error) = validate_image_dims(*width, *height) {
-            return Err(error);
-        }
+        validate_image_dims(*width, *height)?;
         let min_chunks = total_bytes.div_ceil(MAX_CLIPBOARD_TEXT_BYTES as u64);
         if u64::from(*chunks) < min_chunks {
             return Err(std::io::Error::new(
