@@ -3642,8 +3642,8 @@ async fn snapshot_inbound_inputs(
 /// - a counter that reset (current < baseline) refreshes the baseline
 ///   without firing.
 /// Callers absorb one snapshot per drive start (see
-/// inbound_baselines_fresh) so an older drive's input can never fire a
-/// later crossing. Pure for tests.
+///   `inbound_baselines_fresh`) so an older drive's input can never fire a
+///   later crossing. Pure for tests.
 fn inbound_inputs_growth(
     baseline: &mut std::collections::HashMap<String, u64>,
     current: &std::collections::HashMap<String, u64>,
@@ -3651,10 +3651,12 @@ fn inbound_inputs_growth(
     let mut growth = 0u64;
     for (fingerprint, count) in current {
         match baseline.get(fingerprint) {
-            Some(previous) => {
-                if *count > *previous {
-                    growth = growth.saturating_add(count - previous);
-                }
+            Some(previous) if *count > *previous => {
+                growth = growth.saturating_add(count - previous);
+            }
+            Some(_) => {
+                // Counted at or below the baseline (a counter that reset, or
+                // no new input): refresh only, never fire.
             }
             None => {
                 // First sighting mid-drive: record, never fire (a fresh
@@ -5514,7 +5516,7 @@ fn start_capture(
                                 break 'capture;
                             }
                             failures += 1;
-                            let due = last_warn.map_or(true, |when| {
+                            let due = last_warn.is_none_or(|when| {
                                 when.elapsed() > std::time::Duration::from_secs(30)
                             });
                             if due {
@@ -5747,9 +5749,7 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                     // copies megabytes per call, so it runs on an ownership
                     // change or every 2s — never in the hot text path.
                     let image_due = last_image_poll
-                        .map_or(true, |when: std::time::Instant| {
-                            when.elapsed() >= Duration::from_secs(2)
-                        });
+                        .is_none_or(|when: std::time::Instant| when.elapsed() >= Duration::from_secs(2));
                     if notice || image_due {
                         last_image_poll = Some(std::time::Instant::now());
                         match clipboard.poll_changed_image() {
@@ -6918,9 +6918,7 @@ async fn run_capture_stream(
                     {
                         Ok(Some((revision, _))) => *clipboard_revision = revision,
                         Ok(None) => {}
-                        Err(error) => {
-                            break Err(error.into());
-                        }
+                        Err(error) => break Err(error),
                     }
                 }
                 None => clipboard_enabled = false,
@@ -7168,16 +7166,14 @@ pub async fn run() -> Result<()> {
     // layout. Sessionful daemons measure directly; headless ones keep
     // fallback until a child publishes the sidecar (see
     // truthful_local_geometry).
-    if let Ok(size) = kvm_platform::capture::screen_size() {
-        if let Some((width, height)) = size {
-            let local = config
-                .layout
-                .self_screen
-                .or_else(|| config.layout.screens.first().map(|screen| screen.id));
-            if let Some(id) = local {
-                if config.layout.set_screen_size(id, width, height) {
-                    tracing::info!(width, height, "daemon measured local geometry");
-                }
+    if let Ok(Some((width, height))) = kvm_platform::capture::screen_size() {
+        let local = config
+            .layout
+            .self_screen
+            .or_else(|| config.layout.screens.first().map(|screen| screen.id));
+        if let Some(id) = local {
+            if config.layout.set_screen_size(id, width, height) {
+                tracing::info!(width, height, "daemon measured local geometry");
             }
         }
     }
@@ -7930,10 +7926,11 @@ async fn handle_connection(
             let session_result: Result<()> = loop {
                 tokio::select! {
                     message = read_frame(&mut recv) => {
-                        let Some(message) = message.map_err(|error| {
+                        let Some(message) = message.inspect_err(|error| {
                             end_reason = "stream read failed";
-                            error
-                        })? else {
+                            let _ = error;
+                        })?
+                        else {
                             end_reason = "peer finished the stream";
                             break Ok(());
                         };
@@ -8124,7 +8121,7 @@ async fn handle_connection(
                                     let (size, source) = remote_truth_for_announce(
                                         &config.layout,
                                         &peer_fingerprint,
-                                        peer_screen_geometry,
+                                        &peer_screen_geometry,
                                     );
                                     tracing::info!(
                                         width = size.0,
@@ -8320,9 +8317,9 @@ async fn handle_connection(
                         }
                     }
                     datagram = conn.read_datagram() => {
-                        let payload = datagram.map_err(|error| {
+                        let payload = datagram.inspect_err(|error| {
                             end_reason = "datagram read failed";
-                            error
+                            let _ = error;
                         })?;
                         last_activity = Instant::now();
                         injector.ensure_session()?;
@@ -8409,10 +8406,11 @@ async fn handle_connection(
                             None => std::future::pending().await,
                         }
                     } => {
-                        let Some(message) = motion_message.map_err(|error| {
+                        let Some(message) = motion_message.inspect_err(|error| {
                             end_reason = "motion lane read failed";
-                            error
-                        })? else {
+                            let _ = error;
+                        })?
+                        else {
                             // The sender finishes the lane at episode
                             // teardown: park the arm and let the episode
                             // stream close (ReleaseAll/FIN) end the
@@ -9169,8 +9167,7 @@ impl ReceiverInjector {
                         );
                         return Ok(());
                     };
-                    return kvm_platform::capture::warp_cursor_on(Some(&display), x, y)
-                        .map_err(anyhow::Error::from);
+                    return kvm_platform::capture::warp_cursor_on(Some(&display), x, y);
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
@@ -10129,7 +10126,7 @@ fn pick_geometry(
 fn remote_truth_for_announce(
     layout: &kvm_core::Layout,
     peer_fingerprint: &str,
-    peer_geometry: Option<ScreenGeometry>,
+    peer_geometry: &Option<ScreenGeometry>,
 ) -> ((u32, u32), &'static str) {
     if let Some(geometry) =
         peer_geometry.filter(|geometry| geometry.width >= 2 && geometry.height >= 2)
@@ -10774,18 +10771,18 @@ mod tests {
             height: 864,
         });
         assert_eq!(
-            remote_truth_for_announce(&layout, &fingerprint, hello),
+            remote_truth_for_announce(&layout, &fingerprint, &hello),
             ((1536, 864), "hello")
         );
         // No Hello: the adopted peer screen (same truth one handshake
         // later) — never the local screen.
         assert_eq!(
-            remote_truth_for_announce(&layout, &fingerprint, None),
+            remote_truth_for_announce(&layout, &fingerprint, &None),
             ((1920, 1080), "layout-peer")
         );
         // Unknown peer and no Hello: disabled, never fantasy.
         assert_eq!(
-            remote_truth_for_announce(&layout, "unknown", None),
+            remote_truth_for_announce(&layout, "unknown", &None),
             ((0, 0), "unknown")
         );
         // Degenerate Hello falls through to layout, not onto the wire.
@@ -10795,7 +10792,7 @@ mod tests {
             height: 864,
         });
         assert_eq!(
-            remote_truth_for_announce(&layout, &fingerprint, degenerate),
+            remote_truth_for_announce(&layout, &fingerprint, &degenerate),
             ((1920, 1080), "layout-peer")
         );
     }
