@@ -718,6 +718,26 @@ mod win32_hooks {
                     WM_MOUSEHWHEEL => {
                         wheel_dedup().note_hook((info.mouseData >> 16) as i16 as i32, 0, true, now)
                     }
+                    WM_MOUSEMOVE => {
+                        // Own-echo motion note for the tag-less raw
+                        // channel (see MotionEcho): our SendInput motion
+                        // always traverses this hook tagged, while raw
+                        // reports carry no tag. The guard still advances
+                        // past echo positions so later genuine deltas
+                        // stay exact — only forwarding is skipped.
+                        let point = info.pt;
+                        let last = LAST_POINT.get_or_init(|| Mutex::new(None));
+                        if let Ok(mut guard) = last.lock() {
+                            if let Some(previous) = *guard {
+                                let dx = point.x.saturating_sub(previous.x);
+                                let dy = point.y.saturating_sub(previous.y);
+                                if dx != 0 || dy != 0 {
+                                    motion_echo().note_own(dx, dy, now);
+                                }
+                            }
+                            *guard = Some(point);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1383,8 +1403,15 @@ mod win32_hooks {
             }
         }
         if let Some((dx, dy)) = decode_raw_mouse_motion(&buffer[..result as usize]) {
-            RAW_MOVE.fetch_add(1, Ordering::Relaxed);
-            send(InputEvent::MouseMove { dx, dy });
+            // Own-echo filter (see MotionEcho): injected deltas arrive
+            // here untagged and must die, or every drive re-drives its
+            // peer within a second. Genuine take-back motion passes.
+            let now = std::time::Instant::now();
+            let (dx, dy) = motion_echo().filter_raw(dx, dy, now);
+            if dx != 0 || dy != 0 {
+                RAW_MOVE.fetch_add(1, Ordering::Relaxed);
+                send(InputEvent::MouseMove { dx, dy });
+            }
         }
         // HID wheel channel (the trackpad fix): precision touchpads report
         // two-finger scroll in the raw HID report (RI_MOUSE_WHEEL), and some
@@ -1488,6 +1515,99 @@ mod win32_hooks {
         DEDUP
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Same single-thread ownership for the motion echo oracle below.
+    fn motion_echo() -> std::sync::MutexGuard<'static, MotionEcho> {
+        use std::sync::Mutex;
+
+        static ECHO: Mutex<MotionEcho> = Mutex::new(MotionEcho::new());
+        ECHO.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Own-echo window for motion (see MotionEcho): the raw channel
+    /// trails the tagged hook receipt by milliseconds, never more.
+    const MOTION_ECHO_WINDOW_MS: u128 = 40;
+
+    /// Cross-channel motion echo oracle. The raw mouse channel carries
+    /// no tag, so every SendInput-injected delta we drive into this
+    /// machine while being driven ALSO arrives as a raw report — and
+    /// forwarding it re-drives the peer, which yields to the phantom
+    /// takeover ~1s into every drive (the Mint-cannot-cross loop:
+    /// diverted/growth seconds after each handoff, both sides flapping
+    /// until a grab collides). The hook always observes our own echo
+    /// tagged first: notes here name it, and the raw arm drops what
+    /// they explain. Per-axis sign + magnitude matching (not bare
+    /// time): a deliberate local take-back swipe is larger than the
+    /// injected dribble it interrupts, so it always passes while the
+    /// echo dies. Pure apart from the clock the caller passes in, so
+    /// the windows are unit-tested like WheelDedup.
+    #[derive(Debug, Default)]
+    struct MotionEcho {
+        /// Recent own-echo notes (observed-at, dx, dy), oldest first.
+        /// Bounded and expiring: notes older than the window never
+        /// match, so a stale note can never eat later genuine motion.
+        notes: std::collections::VecDeque<(std::time::Instant, i32, i32)>,
+    }
+
+    impl MotionEcho {
+        const fn new() -> Self {
+            Self {
+                notes: std::collections::VecDeque::new(),
+            }
+        }
+
+        /// Record one tagged hook motion receipt: our own injector's
+        /// echo, observed pre-forwarding with its post-ballistics
+        /// displacement. Never forwards anything itself.
+        fn note_own(&mut self, dx: i32, dy: i32, now: std::time::Instant) {
+            self.notes.push_back((now, dx, dy));
+            while self.notes.len() > 32 {
+                self.notes.pop_front();
+            }
+        }
+
+        /// Filter one raw motion report: zero per axis the component
+        /// explained by a recent own echo — same sign, and no larger
+        /// than twice the noted displacement plus a 4px slack (the
+        /// hook observes post-ballistics cursor displacement while the
+        /// raw report carries the exact injected delta, so exact
+        /// equality can never be required). Genuine take-back motion
+        /// (uncorrelated in time, or deliberately larger than the
+        /// dribble) passes through untouched.
+        fn filter_raw(&mut self, dx: i32, dy: i32, now: std::time::Instant) -> (i32, i32) {
+            while let Some((at, _, _)) = self.notes.front() {
+                if now.duration_since(*at).as_millis() > MOTION_ECHO_WINDOW_MS {
+                    self.notes.pop_front();
+                } else {
+                    break;
+                }
+            }
+            let mut dx = dx;
+            let mut dy = dy;
+            for (_, note_dx, note_dy) in self.notes.iter() {
+                if dx != 0
+                    && *note_dx != 0
+                    && dx.signum() == note_dx.signum()
+                    && dx.unsigned_abs()
+                        <= note_dx.unsigned_abs().saturating_mul(2).saturating_add(4)
+                {
+                    dx = 0;
+                }
+                if dy != 0
+                    && *note_dy != 0
+                    && dy.signum() == note_dy.signum()
+                    && dy.unsigned_abs()
+                        <= note_dy.unsigned_abs().saturating_mul(2).saturating_add(4)
+                {
+                    dy = 0;
+                }
+                if dx == 0 && dy == 0 {
+                    break;
+                }
+            }
+            (dx, dy)
+        }
     }
 
     /// Our own SendInput echo stays suppressible for this long after the
@@ -2645,7 +2765,7 @@ mod win32_hooks {
     #[cfg(test)]
     mod raw_input_tests {
         use super::decode_raw_mouse_motion;
-        use super::{decode_raw_mouse_wheel, PtpPan, PtpPinch, WheelDedup};
+        use super::{decode_raw_mouse_wheel, MotionEcho, PtpPan, PtpPinch, WheelDedup};
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::UI::Input::{
             MOUSE_MOVE_ABSOLUTE, MOUSE_STATE, RAWINPUT, RAWINPUTHEADER, RAWINPUT_0, RAWMOUSE,
@@ -3040,6 +3160,37 @@ mod win32_hooks {
             // Genuine user scroll after the echo window passes through.
             let later = now + std::time::Duration::from_millis(100);
             assert_eq!(dedup.filter_raw(0, -45, later), (0, -45));
+        }
+
+        #[test]
+        fn motion_echo_oracle_drops_injected_raw_but_keeps_takeback() {
+            // Injected motion crosses the hook tagged and the raw channel
+            // untagged a few ms later: the raw copy dies per axis.
+            let now = std::time::Instant::now();
+            let mut echo = MotionEcho::new();
+            echo.note_own(6, -3, now);
+            assert_eq!(echo.filter_raw(6, -3, now), (0, 0));
+            // Partial match: the unexplained axis survives.
+            let mut echo = MotionEcho::new();
+            echo.note_own(6, 0, now);
+            assert_eq!(echo.filter_raw(6, 40, now), (0, 40));
+            // Opposite direction is a different gesture, never echo.
+            let mut echo = MotionEcho::new();
+            echo.note_own(6, 0, now);
+            assert_eq!(echo.filter_raw(-6, 0, now), (-6, 0));
+            // A deliberate take-back swipe dwarfs the injected dribble
+            // and always passes, even inside the window.
+            let mut echo = MotionEcho::new();
+            echo.note_own(3, 0, now);
+            assert_eq!(echo.filter_raw(60, 0, now), (60, 0));
+            // Outside the window the same delta is new information.
+            let mut echo = MotionEcho::new();
+            echo.note_own(6, -3, now);
+            let later = now + std::time::Duration::from_millis(100);
+            assert_eq!(echo.filter_raw(6, -3, later), (6, -3));
+            // No notes at all: everything passes.
+            let mut echo = MotionEcho::new();
+            assert_eq!(echo.filter_raw(6, -3, now), (6, -3));
         }
     }
 

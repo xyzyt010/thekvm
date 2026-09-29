@@ -121,6 +121,17 @@ pub struct X11Capture {
     /// server to leave the shape alone, which inherits a watch/hourglass
     /// from whatever was busy at engage. Allocated once, freed on drop.
     grab_cursor: u32,
+    /// First grab-engage failure of the current run (see next_event):
+    /// a transiently held pointer (compositor popup, racing release
+    /// flush) must NOT nuke the backend — capture keeps flowing
+    /// ungrabbed and the engage retries with backoff, failing only
+    /// after seconds of continuous refusal (a genuinely wedged
+    /// server), which is what earns a backend rebuild.
+    grab_retry_since: Option<std::time::Instant>,
+    /// Last engage-failure journal line: one loud warn per run, then
+    /// quiet retries — a contested grab must not flood the journal at
+    /// poll rate while it clears.
+    last_grab_warn: Option<std::time::Instant>,
     /// Read-only multitouch gesture tap (see mt_pinch): X11 hides
     /// trackpad touches behind relative motion, so pinch spread arrives
     /// from the evdev tap, never from the X stream. Empty when no MT
@@ -383,7 +394,7 @@ fn derive_scroll_wheel(
     phase.last = now;
     phase.gest_x += intent_x.abs();
     phase.gest_y += intent_y.abs();
-    const LOCK_MIN_120THS: f64 = 240.0;
+    const LOCK_MIN_120THS: f64 = 120.0;
     const LOCK_RATIO: f64 = 2.0;
     if phase.lock.is_none() {
         if phase.gest_x >= LOCK_MIN_120THS && phase.gest_x >= phase.gest_y * LOCK_RATIO {
@@ -586,6 +597,8 @@ impl X11Capture {
             xfixes_cursor,
             cursor_hidden: false,
             grab_cursor: 0,
+            grab_retry_since: None,
+            last_grab_warn: None,
             // Best-effort by construction (see MtPinchTap::open): an
             // empty tap only disables pinch, never capture startup.
             mt_pinch: crate::mt_pinch::MtPinchTap::open(),
@@ -642,16 +655,23 @@ impl X11Capture {
     }
 
     /// XC_left_ptr from the cursor font. Failure leaves 0, and the core
-    /// grab then keeps today's "don't change the cursor" behavior.
+    /// grab then keeps today's "don't change the cursor" behavior — which
+    /// inherits a watch/hourglass from whatever was busy at engage. Loud
+    /// on failure (warn, once per backend): a silent 0 is exactly how the
+    /// hourglass survives "fixed" grabs with nothing in the journal.
     fn ensure_left_ptr(&mut self) -> u32 {
         if self.grab_cursor != 0 {
             return self.grab_cursor;
         }
         const XC_LEFT_PTR: u16 = 68;
         let Ok(cursor) = self.connection.generate_id() else {
+            tracing::warn!("grab cursor id unavailable; core grab keeps the busy cursor shape");
             return 0;
         };
         let Ok(font) = self.connection.generate_id() else {
+            tracing::warn!(
+                "grab cursor font id unavailable; core grab keeps the busy cursor shape"
+            );
             return 0;
         };
         // `open_font` fails with a connection error; `check` fails with a
@@ -661,6 +681,7 @@ impl X11Capture {
             Err(_) => false,
         };
         if !opened {
+            tracing::warn!("X cursor font unavailable; core grab keeps the busy cursor shape");
             return 0;
         }
         let created = match self.connection.create_glyph_cursor(
@@ -683,6 +704,9 @@ impl X11Capture {
             let _ = cookie.check();
         }
         if !created {
+            tracing::warn!(
+                "left-pointer cursor creation failed; core grab keeps the busy cursor shape"
+            );
             return 0;
         }
         self.grab_cursor = cursor;
@@ -1024,7 +1048,44 @@ impl CaptureBackend for X11Capture {
             }
             let desired_exclusive = exclusive.load(Ordering::Acquire);
             if desired_exclusive != self.exclusive {
-                self.set_exclusive(desired_exclusive)?;
+                match self.set_exclusive(desired_exclusive) {
+                    Ok(()) => {
+                        self.grab_retry_since = None;
+                    }
+                    Err(error) => {
+                        // A refused grab is NOT a dead backend: the pointer
+                        // is often held transiently (compositor popup,
+                        // racing release flush, peer-driven cage), and
+                        // dropping the backend over it stops all capture —
+                        // the machine can never cross again until a
+                        // restart. Keep capturing ungrabbed and retry with
+                        // backoff; only seconds of continuous refusal earn
+                        // a backend rebuild (a genuinely wedged server).
+                        // Releasing never waits: a stuck release must not
+                        // hold local input hostage for seconds.
+                        if !desired_exclusive {
+                            return Err(error);
+                        }
+                        let now = std::time::Instant::now();
+                        let since = *self.grab_retry_since.get_or_insert(now);
+                        if now.duration_since(since) >= std::time::Duration::from_secs(2) {
+                            self.grab_retry_since = None;
+                            return Err(error);
+                        }
+                        let due = self
+                            .last_grab_warn
+                            .map(|when| {
+                                now.duration_since(when) > std::time::Duration::from_secs(5)
+                            })
+                            .unwrap_or(true);
+                        if due {
+                            self.last_grab_warn = Some(now);
+                            tracing::warn!(%error, "drive grab refused; capturing ungrabbed and retrying");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                }
             }
             // The cage runs on every poll while core-grabbed (see
             // maybe_recenter_cage): cheap integer compares mid-screen,
@@ -1090,8 +1151,30 @@ impl CaptureBackend for X11Capture {
                     // hold (or chase a phantom one).
                     self.grab_kind = GrabKind::None;
                     let cursor = self.ensure_left_ptr();
-                    core_grab(&self.connection, self.grab_window, cursor)?;
-                    self.grab_kind = GrabKind::Core;
+                    // Transient holders (compositor popups, a racing
+                    // release flush) clear in milliseconds; failing the
+                    // whole drive on the first refusal turned every such
+                    // blip into rebuild churn and, compounded, a capture
+                    // that can never cross again. Retry the core grab
+                    // briefly — the XI refusal above stays single-attempt
+                    // (Mint Xorg refuses it permanently, so retrying it
+                    // would tax every drive start for nothing).
+                    let mut attempts = 0;
+                    loop {
+                        match core_grab(&self.connection, self.grab_window, cursor) {
+                            Ok(()) => {
+                                self.grab_kind = GrabKind::Core;
+                                break;
+                            }
+                            Err(core_error) => {
+                                attempts += 1;
+                                if attempts >= 6 {
+                                    return Err(core_error);
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(80));
+                            }
+                        }
+                    }
                 }
             }
             // Fresh anchor for grabbed-core relative steps (see
@@ -1613,8 +1696,10 @@ mod tests {
     #[test]
     fn horizontal_scroll_phase_locks_out_vertical_wobble() {
         // Same native axis lock as the Windows tap, per device: a
-        // horizontal pan with vertical wobble emits both axes only until
-        // the verdict (240 x-120ths at 2:1), then pure horizontal.
+        // horizontal pan locks to x on the very first detent (120
+        // x-120ths at 2:1, exactly the PTP tap's verdict), so short
+        // horizontal pans never spend their whole gesture unlocked and
+        // diagonal — the "horizontal is harder than native" shape.
         use super::{derive_scroll_wheel, ScrollAxis};
         use std::collections::HashMap;
         // XInput valuators 2 and 3 deliver X then Y in ascending axis
@@ -1652,21 +1737,10 @@ mod tests {
             integral: 0,
             frac: 1_073_741_824,
         };
-        // Pre-verdict: both axes flow.
-        assert_eq!(
-            derive_scroll_wheel(
-                13,
-                &mask,
-                &[x_one, y_wobble],
-                &axes,
-                &mut banks,
-                &mut phases
-            ),
-            Some(InputEvent::SmoothWheel { x: -120, y: -30 })
-        );
-        // Verdict reached (240 x at 2:1): the wobble is eaten, and its
-        // banked remainder is dropped with it — no later jump.
-        for _ in 0..3 {
+        // First detent verdict (120 x at 2:1): the wobble is eaten from
+        // the very first frame, and its banked remainder is dropped
+        // with it — no later jump.
+        for _ in 0..4 {
             assert_eq!(
                 derive_scroll_wheel(
                     13,

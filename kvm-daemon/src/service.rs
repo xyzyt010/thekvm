@@ -2317,6 +2317,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                         return Err(error);
                                     }
                                     let _ = router.restore_local(target);
+                                    resync_home_to_truth(&mut router);
                                     let (x, y) = router.cursor_position();
                                     let _ = capture_control.warp_cursor(x, y);
                                     tracing::warn!(%error, ?target, "topology handoff target unavailable; returned control locally");
@@ -2597,6 +2598,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             discarded_event_barrier = discarded_event_barrier
                                 .max(capture_control.snapshot().last_event_id);
                             let _ = router.restore_local(target);
+                            resync_home_to_truth(&mut router);
                             let (x, y) = router.cursor_position();
                             let _ = capture_control.warp_cursor(x, y);
                             tracing::warn!(?target, "topology peer closed; returned control locally");
@@ -2838,6 +2840,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         discarded_event_barrier = discarded_event_barrier
                             .max(capture_control.snapshot().last_event_id);
                         let _ = router.restore_local(target);
+                        resync_home_to_truth(&mut router);
                         let (x, y) = router.cursor_position();
                         let _ = capture_control.warp_cursor(x, y);
                         last_failed_episode = Some(std::time::Instant::now());
@@ -3026,6 +3029,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         discarded_event_barrier = discarded_event_barrier
                             .max(capture_control.snapshot().last_event_id);
                         let _ = router.restore_local(target);
+                        resync_home_to_truth(&mut router);
                         let (x, y) = router.cursor_position();
                         let _ = capture_control.warp_cursor(x, y);
                         eprintln!("THEKVM_STATUS local");
@@ -3392,11 +3396,25 @@ fn peek_live_remote(fingerprint: &str) -> Option<String> {
     Some(warm.connection.remote_address().to_string())
 }
 
+/// Re-pin the virtual cursor to OS pointer truth synchronously on every
+/// homecoming (yield, edge return, refused/failed push, teardown).
+/// restore_local revives the SAVED edge pixel, but the OS truth may have
+/// drifted (cage warps, compositor moves, grab races) — and the 20Hz
+/// background resync can lag a full push burst behind, so the first
+/// pushes integrate from a phantom position and die in the flick veto:
+/// the "move away and into the edge a few times" ritual. Re-pinning
+/// here (best-effort; unqueryable platforms skip silently) makes the
+/// next push accumulate from truth, identically on both machines.
+fn resync_home_to_truth(router: &mut EdgeRouter) {
+    if let Ok(Some((x, y))) = kvm_platform::capture::current_cursor_position() {
+        router.resync_if_local(x, y);
+    }
+}
+
 /// MWB lastJump parity: ignore a new edge transfer within 100ms of the last
 /// completed one, so two facing edges can never ping-pong the cursor
 /// forever. Pure so the determinism is unit-tested.
-fn transfer_debounced(last_transfer: Option<std::time::Instant>) -> bool {
-    last_transfer.is_some_and(|when| when.elapsed() < Duration::from_millis(25))
+fn transfer_debounced(last_transfer: Option<std::time::Instant>) -> bool {    last_transfer.is_some_and(|when| when.elapsed() < Duration::from_millis(25))
 }
 
 /// Best-effort release of local-input suppression. A failed ungrab must
@@ -3596,9 +3614,15 @@ fn episode_cooling_down(last_failed_episode: Option<std::time::Instant>) -> bool
 /// Cooldown after yielding to an inbound drive: the local user may still
 /// be holding against the edge, and without a pause their next push
 /// would instantly re-take the peer — which yields back — ping-ponging
-/// the drive while both users hold opposite edges. Pure for tests.
+/// the drive while both users hold opposite edges. 350ms, not seconds:
+/// a re-push inside a third of a second is almost certainly the still-
+/// held edge (refuse it), while a deliberate push a beat later must
+/// cross at once — the old 2s wait is exactly the "wiggle away and back
+/// a few times" ritual. The fresh-entry retreat latch stays the
+/// structural anti-flap guard, so the shorter time loses no safety.
+/// Pure for tests.
 fn yield_cooling_down(last_yield: Option<std::time::Instant>) -> bool {
-    last_yield.is_some_and(|when| when.elapsed() < Duration::from_secs(2))
+    last_yield.is_some_and(|when| when.elapsed() < Duration::from_millis(350))
 }
 
 /// Candidate control endpoints that may know about a live inbound drive.
@@ -3906,6 +3930,7 @@ async fn yield_drive_to_inbound(
     *last_transfer = Some(std::time::Instant::now());
     *last_yield = Some(std::time::Instant::now());
     let _ = router.restore_local(target);
+    resync_home_to_truth(router);
     let (x, y) = router.cursor_position();
     let _ = capture_control.warp_cursor(x, y);
     // Retreat latch: the local cursor is back at the facing edge with the
@@ -4170,6 +4195,7 @@ async fn handle_topology_event(
                 *discarded_event_barrier =
                     (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
                 let _ = router.restore_local(target);
+                resync_home_to_truth(router);
                 let (x, y) = router.cursor_position();
                 let _ = capture_control.warp_cursor(x, y);
             }
@@ -4240,6 +4266,7 @@ async fn handle_topology_event(
         RoutedEvent::Forward { target, event } => {
             let Some(session) = active.as_mut() else {
                 let _ = router.restore_local(target);
+                resync_home_to_truth(router);
                 let (x, y) = router.cursor_position();
                 let _ = capture_control.warp_cursor(x, y);
                 return Ok(());
@@ -4421,6 +4448,7 @@ async fn handle_topology_event(
                     *discarded_event_barrier =
                         (*discarded_event_barrier).max(capture_control.snapshot().last_event_id);
                     let _ = router.restore_local(target);
+                    resync_home_to_truth(router);
                     let (x, y) = router.cursor_position();
                     let _ = capture_control.warp_cursor(x, y);
                     *last_failed_episode = Some(std::time::Instant::now());
@@ -4513,6 +4541,7 @@ async fn handle_topology_event(
                         "crossing_refused: edge faces an unlinked screen; staying local"
                     );
                     let _ = router.restore_local(target);
+                    resync_home_to_truth(router);
                     park_inside(router, edge);
                     return Ok(());
                 }
@@ -4525,6 +4554,7 @@ async fn handle_topology_event(
                     "crossing_refused: edge push debounced after a transfer"
                 );
                 let _ = router.restore_local(target);
+                resync_home_to_truth(router);
                 park_inside(router, edge);
                 return Ok(());
             }
@@ -4539,6 +4569,7 @@ async fn handle_topology_event(
                     "crossing_refused: edge push in yield cooldown after yielding to inbound"
                 );
                 let _ = router.restore_local(target);
+                resync_home_to_truth(router);
                 park_inside(router, edge);
                 return Ok(());
             }
@@ -4553,6 +4584,7 @@ async fn handle_topology_event(
             if let Some((truth_x, truth_y)) = phantom_handoff_veto(router, from, edge) {
                 tracing::info!(?target, ?edge, truth_x, truth_y, "crossing_refused: OS pointer truth is mid-screen, flick vetoed; keep pushing deliberately to cross");
                 let _ = router.restore_local(target);
+                resync_home_to_truth(router);
                 router.resync_if_local(truth_x, truth_y);
                 park_inside(router, edge);
                 return Ok(());
@@ -4607,6 +4639,7 @@ async fn handle_topology_event(
                         "crossing_refused: edge push in failed-episode cooldown"
                     );
                     let _ = router.restore_local(target);
+                    resync_home_to_truth(router);
                     park_inside(router, edge);
                     return Ok(());
                 }
@@ -4652,6 +4685,7 @@ async fn handle_topology_event(
                         // heals any hold that outlives this either way.
                         release_suppression(capture_control, Some(&mut *suppression_requested));
                         let _ = router.restore_local(target);
+                        resync_home_to_truth(router);
                         park_inside(router, edge);
                         tracing::warn!(%error, ?target, "topology target unavailable; control remains local");
                     }
@@ -11565,9 +11599,13 @@ mod tests {
         // Never yielded: drive.
         assert!(!yield_cooling_down(None));
         let just = std::time::Instant::now();
-        // Just yielded to an inbound drive: hold, so opposite-edge
-        // holding cannot ping-pong the drive back instantly.
+        // Just yielded to an inbound drive: hold briefly, so opposite-edge
+        // holding cannot ping-pong the drive back instantly — but only
+        // briefly, so a deliberate push a beat later crosses at once
+        // instead of demanding the wiggle ritual.
         assert!(yield_cooling_down(Some(just)));
+        assert!(yield_cooling_down(Some(just - Duration::from_millis(200))));
+        assert!(!yield_cooling_down(Some(just - Duration::from_millis(500))));
         // An old yield: drive again.
         let old = just - Duration::from_secs(3);
         assert!(!yield_cooling_down(Some(old)));
