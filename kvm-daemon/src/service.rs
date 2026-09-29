@@ -9170,8 +9170,8 @@ impl ReceiverInjector {
                         );
                         return Ok(());
                     };
-                    return kvm_platform::capture::warp_cursor_on(Some(&display), x, y)
-                        .map_err(anyhow::Error::from);
+                    kvm_platform::capture::warp_cursor_on(Some(&display), x, y)
+                        .map_err(anyhow::Error::from)
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
@@ -10132,6 +10132,10 @@ fn pick_geometry(
 /// "measured") is what silently disarmed — or mis-mapped — every
 /// drive, so this function can only name the peer's space. Pure for
 /// tests; the source tag rides the journal line beside the announce.
+/// Windows-only: the announcement path that calls it is the sender's
+/// `Accepted`, which only the Windows sender builds. Kept out of other
+/// targets (rather than left dead) so -D warnings stays clean everywhere.
+#[cfg(target_os = "windows")]
 fn remote_truth_for_announce(
     layout: &kvm_core::Layout,
     peer_fingerprint: &str,
@@ -10744,6 +10748,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn announce_names_the_sender_space() {
         // The helper tracks the REMOTE cursor: the announce must name
         // the sender's dims — a local-space announce is the whole
