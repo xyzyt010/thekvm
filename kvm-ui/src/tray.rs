@@ -48,9 +48,9 @@ fn build_tray() -> Option<Receiver<TrayCommand>> {
     let show = MenuItem::new("Show TheKVM", true, None);
     let logs = MenuItem::new("Open logs", true, None);
     let quit = MenuItem::new("Quit TheKVM", true, None);
-    let show_id = show.id().clone();
-    let logs_id = logs.id().clone();
-    let quit_id = quit.id().clone();
+    let show_id = show.id();
+    let logs_id = logs.id();
+    let quit_id = quit.id();
     menu.append_items(&[&show, &logs, &quit]);
     let icon = build_icon();
     let tray = TrayIconBuilder::new()

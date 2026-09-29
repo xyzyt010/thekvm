@@ -2517,7 +2517,7 @@ fn refresh_arrangement(weak: &slint::Weak<AppWindow>, edge_active: bool) {
             }
         }
     };
-    set_arrangement(&weak, peer_name, text, peer_on_right, edge_active);
+    set_arrangement(weak, peer_name, text, peer_on_right, edge_active);
 }
 
 fn set_arrangement(
@@ -2556,17 +2556,17 @@ fn resolve_peer(fingerprint: &str) -> Option<(String, Option<String>)> {
 /// arrangements survive restarts; this overwrites only the peer position.
 fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kvm_core::Edge) {
     let Some((name, address)) = resolve_peer(fingerprint) else {
-        set_status(&weak, "Linked computer not found — pair it first.".into());
+        set_status(weak, "Linked computer not found — pair it first.".into());
         return;
     };
     let current = match control_request(ControlRequest::GetConfig) {
         Ok(ControlResponse::Config(config)) => config,
         Ok(other) => {
-            set_status(&weak, format!("Cannot read settings: {other:?}"));
+            set_status(weak, format!("Cannot read settings: {other:?}"));
             return;
         }
         Err(error) => {
-            set_status(&weak, format!("Settings unreadable: {error:#}"));
+            set_status(weak, format!("Settings unreadable: {error:#}"));
             return;
         }
     };
@@ -2597,7 +2597,7 @@ fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kv
     // screen, else the first screen, so placement always has a "me".
     let self_missing = layout
         .self_screen
-        .map_or(true, |id| layout.screen(id).is_none());
+        .is_none_or(|id| layout.screen(id).is_none());
     if self_missing {
         layout.self_screen = layout
             .screens
@@ -2607,7 +2607,7 @@ fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kv
             .map(|screen| screen.id);
     }
     if let Err(error) = layout.place_peer(fingerprint, side) {
-        set_status(&weak, format!("Cannot place the screen there: {error}"));
+        set_status(weak, format!("Cannot place the screen there: {error}"));
         return;
     }
     match write_arrangement(layout) {
@@ -2618,9 +2618,9 @@ fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kv
                 "arrange: {name} placed on the {}",
                 edge_name(side)
             ));
-            refresh_arrangement(&weak, false);
+            refresh_arrangement(weak, false);
             set_status(
-                &weak,
+                weak,
                 format!(
                     "{} is on your {} — start edge control and push past the {} edge.",
                     name,
@@ -2629,7 +2629,7 @@ fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kv
                 ),
             );
         }
-        Err(error) => set_status(&weak, format!("Arrangement failed: {error:#}")),
+        Err(error) => set_status(weak, format!("Arrangement failed: {error:#}")),
     }
 }
 
@@ -2641,13 +2641,10 @@ fn arrange_place_peer(weak: &slint::Weak<AppWindow>, fingerprint: &str, side: kv
 fn arrange_place_first_peer(weak: &slint::Weak<AppWindow>, side: kvm_core::Edge) {
     let peers = linked_peers();
     let Some(peer) = peers.first() else {
-        set_status(
-            &weak,
-            "No linked computer to place — pair one first.".into(),
-        );
+        set_status(weak, "No linked computer to place — pair one first.".into());
         return;
     };
-    arrange_place_peer(&weak, &peer.fingerprint.clone(), side);
+    arrange_place_peer(weak, &peer.fingerprint.clone(), side);
 }
 
 /// Start the supervised `connect` session.
@@ -2674,11 +2671,8 @@ fn spawn_session(
 ) {
     // Every user Connect mints a FRESH epoch: a previous Disconnect banned
     // the old one, so reusing it would be rejected as a stale redial.
-    let link_id = Some(mint_link_id());
-    ui_log(&format!(
-        "link: minted fresh link epoch {}",
-        link_id.unwrap_or(0)
-    ));
+    let link_id = mint_link_id();
+    ui_log(&format!("link: minted fresh link epoch {link_id}"));
     launch_child(
         weak,
         session,
@@ -2687,7 +2681,7 @@ fn spawn_session(
         address.clone(),
         address,
         false,
-        link_id,
+        Some(link_id),
     );
 }
 
@@ -2719,6 +2713,7 @@ const RECENT_FALLBACK_MAX_SECS: u64 = 300;
 ///   the link after an outage. It ends on user Disconnect, on a banned
 ///   epoch (the peer disconnected on purpose), or when its process dies
 ///   (the reaper reports that).
+///
 /// Display is touched on transitions only, so the relay owns the status
 /// line the rest of the time. Dial-back attempts are throttled (30s) so a
 /// peer that accepts but never answers our dial cannot fork-bomb us.
@@ -2790,13 +2785,13 @@ fn follow_link(
             {
                 ensure_station_arrangement(&link.node_name, &link.fingerprint_hex);
                 adopt_layout_fingerprint(&link.node_name, &link.fingerprint_hex);
-                set_session(&weak, Some(link.node_name.clone()));
+                set_session(weak, Some(link.node_name.clone()));
                 // One-way honesty: a Be-controlled-only station never dials
                 // back, so the status must say one-way HERE (not just in
                 // ui.log) or the user pushes an edge that can never drive.
                 if status.mode == kvm_core::Mode::ClientOnly {
                     set_status(
-                        &weak,
+                        weak,
                         format!(
                             "{} is linked one-way (this computer is Be-controlled-only and cannot drive back). Set Both ways to cross either direction; Disconnect ends the link.",
                             link.node_name
@@ -2804,7 +2799,7 @@ fn follow_link(
                     );
                 } else {
                     set_status(
-                        &weak,
+                        weak,
                         format!(
                             "{} is linked — push past the arranged edge to take control. Both computers stay usable; Disconnect ends the link.",
                             link.node_name
@@ -2831,14 +2826,12 @@ fn follow_link(
             // idle, the dial-back respawns) — blank the display only after
             // 45s of true silence, never on a gap between sessions.
             (Some(_), None) if !child_running(session) => {
-                let stale = last_link_seen.lock().ok().map_or(true, |seen| {
-                    seen.map_or(true, |when| {
-                        when.elapsed() > std::time::Duration::from_secs(45)
-                    })
+                let stale = last_link_seen.lock().ok().is_none_or(|seen| {
+                    seen.is_none_or(|when| when.elapsed() > std::time::Duration::from_secs(45))
                 });
                 if stale {
-                    set_session(&weak, None);
-                    set_status(&weak, "Not connected".into());
+                    set_session(weak, None);
+                    set_status(weak, "Not connected".into());
                 }
             }
             _ => {}
@@ -2928,14 +2921,7 @@ fn follow_link(
                     "link: dialling back {} at {} for two-way edge",
                     link.node_name, link.address
                 ));
-                spawn_dial_back(
-                    &weak,
-                    session,
-                    pending,
-                    data_dir,
-                    link.address,
-                    link.link_id,
-                );
+                spawn_dial_back(weak, session, pending, data_dir, link.address, link.link_id);
             }
         }
     }
@@ -2977,6 +2963,11 @@ fn spawn_dial_back(
 /// turns it into truthful status. Exactly one supervised child runs at a
 /// time: starting one stops the other with a log line, so retries can never
 /// stack.
+// Eight parameters, deliberately: they mirror the two call sites
+// (user Connect and automatic dial-back) exactly, so neither has to
+// invent placeholder values to satisfy the other. Grouping them behind a
+// struct would only move the same data one level down.
+#[allow(clippy::too_many_arguments)]
 fn launch_child(
     weak: &slint::Weak<AppWindow>,
     session: &Arc<Mutex<Option<Session>>>,
@@ -3000,7 +2991,7 @@ fn launch_child(
     let binary = match daemon_binary() {
         Ok(binary) => binary,
         Err(error) => {
-            set_status(&weak, format!("Cannot start connection: {error}"));
+            set_status(weak, format!("Cannot start connection: {error}"));
             return;
         }
     };
@@ -3096,9 +3087,9 @@ fn launch_child(
                     link_id,
                 });
             }
-            set_session(&weak, Some(label.clone()));
+            set_session(weak, Some(label.clone()));
             set_status(
-                &weak,
+                weak,
                 format!(
                     "Connecting to {label}… verifying the other side (a few seconds). Press Disconnect to stop."
                 ),
@@ -3117,7 +3108,7 @@ fn launch_child(
                 ui_log("session: child stderr unavailable; connection cannot be verified");
             }
         }
-        Err(error) => set_status(&weak, format!("Cannot start connection: {error}")),
+        Err(error) => set_status(weak, format!("Cannot start connection: {error}")),
     }
 }
 
@@ -3180,6 +3171,10 @@ fn open_link_log(path: &std::path::Path) -> Option<std::fs::File> {
         .ok()
 }
 
+// Same shape as `launch_child`: one parameter per field the child's
+// progress relay needs to label what it is reporting on, rather than a
+// struct built solely to satisfy the argument limit.
+#[allow(clippy::too_many_arguments)]
 fn relay_session_progress(
     weak: &slint::Weak<AppWindow>,
     stderr: std::process::ChildStderr,
@@ -3406,9 +3401,9 @@ fn stop_session(
         }
         None => message.to_owned(),
     };
-    set_session(&weak, None);
-    set_driving(&weak, String::new());
-    set_status(&weak, message);
+    set_session(weak, None);
+    set_driving(weak, String::new());
+    set_status(weak, message);
 }
 
 fn set_peer_address_field(weak: &slint::Weak<AppWindow>, address: &str) {
@@ -4022,7 +4017,7 @@ fn pairing_identity(dir: &std::path::Path) -> Result<Identity> {
 /// Strict hex decode for exported identity material. None on any defect.
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
     let value = value.trim();
-    if value.is_empty() || value.len() % 2 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);

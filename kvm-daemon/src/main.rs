@@ -278,18 +278,14 @@ impl std::io::Write for ServiceFileWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.file
             .lock()
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "service log lock poisoned")
-            })?
+            .map_err(|_| std::io::Error::other("service log lock poisoned"))?
             .write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.file
             .lock()
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "service log lock poisoned")
-            })?
+            .map_err(|_| std::io::Error::other("service log lock poisoned"))?
             .flush()
     }
 }

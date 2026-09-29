@@ -3641,9 +3641,10 @@ async fn snapshot_inbound_inputs(
 ///   healthy drive the moment the peer redials);
 /// - a counter that reset (current < baseline) refreshes the baseline
 ///   without firing.
+///
 /// Callers absorb one snapshot per drive start (see
-///   `inbound_baselines_fresh`) so an older drive's input can never fire a
-///   later crossing. Pure for tests.
+/// `inbound_baselines_fresh`) so an older drive's input can never fire a
+/// later crossing. Pure for tests.
 fn inbound_inputs_growth(
     baseline: &mut std::collections::HashMap<String, u64>,
     current: &std::collections::HashMap<String, u64>,
@@ -7648,7 +7649,6 @@ async fn handle_connection(
             // Bound below at injector creation (after helper priming on
             // Windows): the Accepted advertisement must already carry
             // interactive-desktop truth, never session-0 fantasy.
-            let local_geometry: Option<ScreenGeometry>;
             // Clipboard capability, the two halves of it kept apart on
             // purpose:
             //  * `clipboard_agent` = THIS process can watch/apply the OS
@@ -7717,7 +7717,10 @@ async fn handle_connection(
             {
                 injector.prime_helper_dims();
             }
-            local_geometry = truthful_local_geometry(&config.layout);
+            // Bound here, after the Windows helper priming above: the
+            // Accepted advertisement must already carry interactive-desktop
+            // truth, never session-0 fantasy.
+            let local_geometry = truthful_local_geometry(&config.layout);
             write_frame(
                 &mut send,
             &WireMessage::Accepted {
@@ -7757,7 +7760,7 @@ async fn handle_connection(
                 remote = %conn.remote_address(),
                 clipboard_offer = hello.clipboard_enabled,
                 clipboard_agent = clipboard_agent.is_some(),
-                clipboard_relay = !clipboard_agent.is_some(),
+                clipboard_relay = clipboard_agent.is_none(),
                 "input session accepted",
             );
             // Publish the live inbound link FIRST, before the motion-lane
@@ -9183,7 +9186,7 @@ impl ReceiverInjector {
                 // warped; only the interactive-session Native path no-oped.
                 #[cfg(target_os = "windows")]
                 {
-                    return kvm_platform::capture::warp_cursor(x, y).map_err(anyhow::Error::from);
+                    kvm_platform::capture::warp_cursor(x, y).map_err(anyhow::Error::from)
                 }
             }
             #[cfg(target_os = "windows")]
@@ -10028,6 +10031,11 @@ fn parse_sidecar_display(text: &str) -> Option<String> {
 /// hard: this path is trusted for X authentication, so only absolute
 /// paths without NUL bytes pass. Existence is checked at use time, not
 /// here, to keep this pure for tests.
+///
+/// Linux only: its one caller is `seed_session_xauthority`, which has no
+/// X server to seed outside Linux. Gating the function itself (rather
+/// than letting it go dead) keeps the build warning-free everywhere.
+#[cfg(target_os = "linux")]
 fn parse_sidecar_xauthority(text: &str) -> Option<std::path::PathBuf> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let path = value.get("xauthority")?.as_str()?;
@@ -10710,19 +10718,19 @@ mod tests {
         });
         // Sidecar wins over everything.
         assert_eq!(
-            pick_geometry(2, Some((1536, 864)), Some((1280, 720)), configured.clone())
+            pick_geometry(2, Some((1536, 864)), Some((1280, 720)), configured)
                 .map(|geometry| (geometry.width, geometry.height)),
             Some((1536, 864))
         );
         // Live measure wins over fallback.
         assert_eq!(
-            pick_geometry(2, None, Some((1280, 720)), configured.clone())
+            pick_geometry(2, None, Some((1280, 720)), configured)
                 .map(|geometry| (geometry.width, geometry.height)),
             Some((1280, 720))
         );
         // Zero live measure falls through to fallback.
         assert_eq!(
-            pick_geometry(2, None, Some((0, 720)), configured.clone())
+            pick_geometry(2, None, Some((0, 720)), configured)
                 .map(|geometry| (geometry.width, geometry.height)),
             Some((1920, 1080))
         );
@@ -10819,6 +10827,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn sidecar_xauthority_parses_strictly() {
         // Absolute cookie paths pass; relative paths, traversal, NUL
         // bytes, and overlong values are rejected — this path is trusted
