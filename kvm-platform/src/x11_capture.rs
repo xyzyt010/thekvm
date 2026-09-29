@@ -654,34 +654,35 @@ impl X11Capture {
         let Ok(font) = self.connection.generate_id() else {
             return 0;
         };
-        let opened = self
-            .connection
-            .open_font(font, b"cursor")
-            .and_then(|cookie| cookie.check());
-        if opened.is_err() {
+        // `open_font` fails with a connection error; `check` fails with a
+        // reply error. Keep those apart so the fallback stays "no cursor".
+        let opened = match self.connection.open_font(font, b"cursor") {
+            Ok(cookie) => cookie.check().is_ok(),
+            Err(_) => false,
+        };
+        if !opened {
             return 0;
         }
-        let created = self
-            .connection
-            .create_glyph_cursor(
-                cursor,
-                font,
-                font,
-                XC_LEFT_PTR,
-                XC_LEFT_PTR + 1,
-                0,
-                0,
-                0,
-                0xffff,
-                0xffff,
-                0xffff,
-            )
-            .and_then(|cookie| cookie.check());
-        let _ = self
-            .connection
-            .close_font(font)
-            .map(|cookie| cookie.check());
-        if created.is_err() {
+        let created = match self.connection.create_glyph_cursor(
+            cursor,
+            font,
+            font,
+            XC_LEFT_PTR,
+            XC_LEFT_PTR + 1,
+            0,
+            0,
+            0,
+            0xffff,
+            0xffff,
+            0xffff,
+        ) {
+            Ok(cookie) => cookie.check().is_ok(),
+            Err(_) => false,
+        };
+        if let Ok(cookie) = self.connection.close_font(font) {
+            let _ = cookie.check();
+        }
+        if !created {
             return 0;
         }
         self.grab_cursor = cursor;
