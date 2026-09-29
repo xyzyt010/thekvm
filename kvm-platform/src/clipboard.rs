@@ -60,9 +60,7 @@ impl SystemClipboard {
     /// observed value: dimensions plus raw RGBA pixels. Text coexistence
     /// is OS-defined (most clipboards hold one flavor at a time); a
     /// text-only clipboard is ignored here, never an error.
-    pub fn poll_changed_image(
-        &mut self,
-    ) -> Result<Option<(usize, usize, Vec<u8>)>, PlatformError> {
+    pub fn poll_changed_image(&mut self) -> Result<Option<(usize, usize, Vec<u8>)>, PlatformError> {
         let image = match self.clipboard.get_image() {
             Ok(image) => image,
             Err(_) => return Ok(None),
@@ -150,12 +148,12 @@ pub fn encode_image_png(
     let mut encoder = png::Encoder::new(&mut encoded, width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header().map_err(|error| {
-        PlatformError::Clipboard(format!("encode clipboard PNG: {error}"))
-    })?;
-    writer.write_image_data(rgba).map_err(|error| {
-        PlatformError::Clipboard(format!("encode clipboard PNG: {error}"))
-    })?;
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| PlatformError::Clipboard(format!("encode clipboard PNG: {error}")))?;
+    writer
+        .write_image_data(rgba)
+        .map_err(|error| PlatformError::Clipboard(format!("encode clipboard PNG: {error}")))?;
     drop(writer);
     Ok(encoded)
 }
@@ -181,19 +179,14 @@ pub fn decode_base64_png(encoded: &str) -> Result<(usize, usize, Vec<u8>), Platf
 /// instead of expensively converted.
 pub fn decode_image_png(png_bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), PlatformError> {
     let decoder = png::Decoder::new(png_bytes);
-    let mut reader = decoder.read_info().map_err(|error| {
-        PlatformError::Clipboard(format!("decode clipboard PNG: {error}"))
-    })?;
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| PlatformError::Clipboard(format!("decode clipboard PNG: {error}")))?;
     // Copy the header out before the frame read: the reader borrows the
     // info, so the dims check must not hold it across next_frame.
     let (width, height, color_type, bit_depth) = {
         let info = reader.info();
-        (
-            info.width,
-            info.height,
-            info.color_type,
-            info.bit_depth,
-        )
+        (info.width, info.height, info.color_type, info.bit_depth)
     };
     if color_type != png::ColorType::Rgba || bit_depth != png::BitDepth::Eight {
         return Err(PlatformError::Clipboard(
@@ -210,9 +203,9 @@ pub fn decode_image_png(png_bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), Pla
         ));
     }
     let mut pixels = vec![0u8; reader.output_buffer_size()];
-    let frame = reader.next_frame(&mut pixels).map_err(|error| {
-        PlatformError::Clipboard(format!("decode clipboard PNG: {error}"))
-    })?;
+    let frame = reader
+        .next_frame(&mut pixels)
+        .map_err(|error| PlatformError::Clipboard(format!("decode clipboard PNG: {error}")))?;
     pixels.truncate(frame.buffer_size());
     Ok((width as usize, height as usize, pixels))
 }
@@ -262,11 +255,9 @@ impl ClipboardWatcher {
             .root;
         // Unmapped 1x1 input-only window: exists only to receive the
         // XFixes events, never visible, never focusable.
-        let window = connection
-            .generate_id()
-            .map_err(|error| {
-                PlatformError::Clipboard(format!("allocate clipboard event window: {error}"))
-            })?;
+        let window = connection.generate_id().map_err(|error| {
+            PlatformError::Clipboard(format!("allocate clipboard event window: {error}"))
+        })?;
         connection
             .create_window(
                 x11rb::COPY_DEPTH_FROM_PARENT,
@@ -362,13 +353,13 @@ unsafe extern "system" fn clipboard_watcher_proc(
 #[cfg(target_os = "windows")]
 impl ClipboardWatcher {
     pub fn create() -> Result<Self, PlatformError> {
+        use windows::core::PCWSTR;
         use windows::Win32::System::DataExchange::AddClipboardFormatListener;
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, RegisterClassW, HMENU, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
             WNDCLASSW,
         };
-        use windows::core::PCWSTR;
 
         unsafe {
             let instance = GetModuleHandleW(None).map_err(|error| {
@@ -499,8 +490,7 @@ mod tests {
         // Not a PNG at all.
         assert!(super::decode_image_png(b"definitely not a png").is_err());
         // Truncated PNG.
-        let encoded =
-            super::encode_image_png(3, 3, &vec![9u8; 3 * 3 * 4]).unwrap();
+        let encoded = super::encode_image_png(3, 3, &vec![9u8; 3 * 3 * 4]).unwrap();
         assert!(super::decode_image_png(&encoded[..20]).is_err());
     }
 }

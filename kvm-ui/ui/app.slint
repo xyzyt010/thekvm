@@ -56,6 +56,22 @@ export component AppWindow inherits Window {
     in-out property <bool> lock-screen-control: false;
     in-out property <bool> clipboard-enabled: true;
     in-out property <string> clipboard-max-mb: "2";
+    // Login auto-start (kvm-platform::autostart): the switch reflects
+    // what the OS will actually do at the next logon, not a config
+    // value, so it can never claim a state the machine does not have.
+    in-out property <bool> autostart-enabled: false;
+    in property <bool> autostart-supported: true;
+    in-out property <bool> autostart-busy: false;
+    in-out property <string> autostart-note: "";
+    // Auto-reconnect: true only for the last link this machine was
+    // actually linked to at shutdown. A Disconnect clears the remembered
+    // address, so a link the user ended is never resurrected; the
+    // epoch-ban system still refuses the re-dial if the peer also ended
+    // it on their side.
+    in-out property <bool> auto-connect-on-start: false;
+    in property <bool> auto-connect-known: false;
+    in-out property <bool> auto-connect-busy: false;
+    in-out property <string> auto-connect-note: "";
     in-out property <int> mode-index: 0;
     in-out property <int> edge-mode-index: 0;
     in property <string> role-text: "Both ways";
@@ -101,6 +117,11 @@ export component AppWindow inherits Window {
     callback place-peer-right();
     callback open-log-folder();
     callback apply-config(bool, int, string, string, bool, string);
+    // Login auto-start and auto-reconnect toggles (Problem 3). Both carry the
+    // requested state; the UI code re-reads the OS / the daemon afterwards so
+    // the switches always show what the machine will really do.
+    callback apply-autostart(bool /* wanted */);
+    callback apply-auto-connect(bool /* wanted */);
     callback import-layout(string);
 
 
@@ -691,6 +712,44 @@ export component AppWindow inherits Window {
                             checked <=> root.clipboard-enabled;
                             toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
                         }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Start TheKVM when I log in";
+                            color: #d1d5db;
+                            vertical-alignment: center;
+                        }
+                        Switch {
+                            enabled: root.autostart-supported && !root.autostart-busy;
+                            checked <=> root.autostart-enabled;
+                            toggled => { root.apply-autostart(root.autostart-enabled); }
+                        }
+                    }
+                    Text {
+                        text: root.autostart-note;
+                        color: #9ca3af;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Reconnect to the last computer at startup";
+                            color: #d1d5db;
+                            vertical-alignment: center;
+                        }
+                        Switch {
+                            enabled: root.auto-connect-known && !root.auto-connect-busy;
+                            checked <=> root.auto-connect-on-start;
+                            toggled => { root.apply-auto-connect(root.auto-connect-on-start); }
+                        }
+                    }
+                    Text {
+                        text: root.auto-connect-note;
+                        color: #9ca3af;
+                        font-size: 11px;
+                        wrap: word-wrap;
                     }
                     HorizontalLayout {
                         spacing: 12px;

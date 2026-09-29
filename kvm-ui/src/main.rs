@@ -166,8 +166,13 @@ fn main() -> Result<()> {
         ui.set_clipboard_max_mb(SharedString::from(config.clipboard_max_mb.to_string()));
         ui.set_device_name(SharedString::from(config.device_name.clone()));
         ui.set_auto_connect_address(SharedString::from(
-            config.auto_connect_address.unwrap_or_default(),
+            config.auto_connect_address.clone().unwrap_or_default(),
         ));
+        // Auto-reconnect: the remembered address IS the "last live link"
+        // (a Disconnect clears it), so the switch starts on exactly when
+        // this machine would re-link by itself after a reboot.
+        ui.set_auto_connect_on_start(config.auto_connect_address.is_some());
+        ui.set_auto_connect_known(config.auto_connect_address.is_some());
         ui.set_mode_index(match config.mode {
             kvm_core::Mode::Bidirectional => 0,
             kvm_core::Mode::ServerClient => 1,
@@ -219,11 +224,100 @@ fn main() -> Result<()> {
     // effort — a missing xhost binary just keeps today's behavior.
     #[cfg(target_os = "linux")]
     grant_daemon_x_access();
+    // Login auto-start: show what this machine will ACTUALLY do at the
+    // next logon (the OS owns that state — see kvm_platform::autostart).
+    ui.set_autostart_supported(kvm_platform::autostart::SUPPORTED);
+    match kvm_platform::autostart::enabled() {
+        Ok(on) => {
+            ui.set_autostart_enabled(on);
+            ui.set_autostart_note(
+                if on {
+                    "TheKVM starts when you log in."
+                } else {
+                    "TheKVM will not start at login."
+                }
+                .into(),
+            );
+        }
+        Err(error) => {
+            ui.set_autostart_note(format!("Login auto-start unavailable: {error}").into());
+            ui.set_autostart_supported(false);
+        }
+    }
     // Clipboard relay: the headless service that serves inbound episodes
     // has no user session, so peer pastes stash in its relay slot instead
     // of landing. This thread takes them and applies them with the
     // logged-in session's own clipboard — text and screenshots alike.
     spawn_clipboard_relay();
+    // Auto-reconnect at startup (Problem 3: "after a power cut the link
+    // comes back with zero clicks once both are logged in"). The
+    // remembered `auto_connect_address` IS the last live link: a user
+    // Disconnect clears it, so a retired link is never resurrected here,
+    // and the epoch-ban system still refuses the re-dial when the peer
+    // ended that link on their side.
+    //
+    // Deliberately OUTSIDE the poll thread's link-following logic and
+    // one-shot: that logic reacts to an INBOUND session (the other
+    // machine dialled us), which does not exist yet after a power cut on
+    // both sides. This dials the remembered peer once the daemon answers.
+    // The same first-connect spinner runs, so the window looks exactly
+    // like a manual Connect.
+    {
+        let weak = weak.clone();
+        let pending = pending_pair.clone();
+        let session = session_state.clone();
+        let data_dir = startup_dir.clone();
+        let address = ui.get_auto_connect_address().as_str().trim().to_owned();
+        if !address.is_empty() {
+            ui_log(&format!("autoconnect: startup, re-linking to {address}"));
+            std::thread::spawn(move || {
+                // Startup barrier: wait for the daemon, and bring one up if
+                // this machine has none. A plain poll would race the
+                // background daemon's own start on a source install and
+                // give up right before it appeared; `ensure_user_daemon`
+                // is the same path the Start button and the poll use, so
+                // the re-link cannot lose to a cold boot.
+                let mut endpoint_ready = false;
+                for _ in 0..30 {
+                    if control_request(ControlRequest::Status).is_ok() {
+                        endpoint_ready = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                if !endpoint_ready {
+                    match ensure_user_daemon() {
+                        Ok(()) => ui_log("autoconnect: started a user-session daemon"),
+                        // A packaged machine whose system service is still
+                        // coming up: give it a few more seconds rather than
+                        // declaring the re-link failed.
+                        Err(error) => {
+                            ui_log(&format!("autoconnect: daemon not ready ({error}); waiting"));
+                            for _ in 0..12 {
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                if control_request(ControlRequest::Status).is_ok() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if control_request(ControlRequest::Status).is_err() {
+                    ui_log("autoconnect: background service unreachable; not reconnecting");
+                    finish_auto_connect(
+                        &weak,
+                        true,
+                        "Background service unreachable — open TheKVM again once it starts."
+                            .to_owned(),
+                    );
+                    return;
+                }
+                set_link_connecting(&weak, true);
+                start_session_flow(&weak, &pending, &data_dir, &session, address, None);
+            });
+        }
+    }
+
     // Poll thread owns no UI handles (see NOTE inside the loop); everything
     // it needs is cloned here.
     let poll_weak = weak.clone();
@@ -469,6 +563,53 @@ fn main() -> Result<()> {
         }
     });
 
+    /// A `SetConfig` that changes ONLY the auto-connect fields: every other
+    /// setting is read back from the live daemon config first, so a
+    /// one-switch press can never silently reset the role, clipboard, or
+    /// transport behind the user's back.
+    fn only_auto_connect(
+        current: &kvm_core::Config,
+        address: Option<String>,
+        clear: bool,
+    ) -> ControlRequest {
+        ControlRequest::SetConfig {
+            device_name: Some(current.device_name.clone()),
+            mode: Some(current.mode),
+            allow_lock_screen_control: Some(current.allow_lock_screen_control),
+            listen_port: None,
+            layout: None,
+            auto_connect_address: address,
+            clear_auto_connect: clear,
+            clipboard_enabled: Some(current.clipboard_enabled),
+            clipboard_max_mb: None,
+            edge_mode: None,
+            transport: None,
+        }
+    }
+
+    /// One-line, user-shaped outcome of a control request, for the switch
+    /// note and the log.
+    fn describe_control_outcome(outcome: Result<ControlResponse>, action: &str) -> String {
+        match outcome {
+            Ok(ControlResponse::Error { message }) => {
+                format!("The daemon refused to {action} this: {message}")
+            }
+            Ok(other) => format!("Unexpected daemon response: {other:?}"),
+            Err(error) => format!("Could not {action} this: {error}"),
+        }
+    }
+
+    /// Settle the auto-connect switch after an attempt: the switch follows
+    /// the persisted state, the note says what happened.
+    fn finish_auto_connect(weak: &slint::Weak<AppWindow>, on: bool, note: String) {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_auto_connect_on_start(on);
+            ui.set_auto_connect_known(on);
+            ui.set_auto_connect_note(note.into());
+            ui.set_auto_connect_busy(false);
+        }
+    }
+
     let weak = ui.as_weak();
     let pending_for_connect = pending_pair.clone();
     let connect_data_dir = startup_dir.clone();
@@ -489,6 +630,123 @@ fn main() -> Result<()> {
             (!code.is_empty()).then_some(code),
         );
     });
+
+    // Login auto-start (Problem 3: "the app starts by itself when I log
+    // in"). The state lives in the OS (Startup-folder shortcut on
+    // Windows, XDG autostart entry / Hidden=true mask on desktops), so
+    // the switch is re-read after every change and a failure is SHOWN:
+    // the checkbox must never claim a state the machine does not have.
+    {
+        let weak = ui.as_weak();
+        ui.on_apply_autostart(move |requested| {
+            let weak = weak.clone();
+            if let Some(ui) = weak.upgrade() {
+                ui.set_autostart_busy(true);
+            }
+            let result = kvm_platform::autostart::set_enabled(requested);
+            let (now_enabled, note) = match (&result, kvm_platform::autostart::enabled()) {
+                (Ok(()), Ok(now)) => (
+                    now,
+                    if now {
+                        "TheKVM will start when you log in.".to_owned()
+                    } else {
+                        "TheKVM will not start at login.".to_owned()
+                    },
+                ),
+                (Ok(()), Err(error)) => (requested, format!("Cannot read login state: {error}")),
+                (Err(error), _) => (
+                    !requested,
+                    format!("Cannot change login auto-start: {error}"),
+                ),
+            };
+            match &result {
+                Ok(()) => ui_log(&format!(
+                    "autostart: login auto-start now {now_enabled} (requested {requested})"
+                )),
+                Err(error) => ui_log(&format!("autostart: {error}")),
+            }
+            if let Some(ui) = weak.upgrade() {
+                ui.set_autostart_enabled(now_enabled);
+                ui.set_autostart_note(note.into());
+                ui.set_autostart_busy(false);
+            }
+        });
+    }
+
+    // Auto-reconnect (Problem 3: "it automatically reconnects to the last
+    // linked computer without me pressing anything"). The remembered
+    // address is exactly the last live link: a Disconnect clears it
+    // (`auto_connect_address: None`), and a deliberately ended epoch is
+    // still refused by the epoch-ban system, so nothing the user ended
+    // comes back on its own.
+    {
+        let weak = ui.as_weak();
+        ui.on_apply_auto_connect(move |wanted| {
+            let weak = weak.clone();
+            if let Some(ui) = weak.upgrade() {
+                ui.set_auto_connect_busy(true);
+            }
+            let current = match control_request(ControlRequest::GetConfig) {
+                Ok(ControlResponse::Config(config)) => config,
+                Ok(other) => {
+                    finish_auto_connect(&weak, false, format!("Cannot read settings: {other:?}"));
+                    return;
+                }
+                Err(error) => {
+                    finish_auto_connect(&weak, false, format!("Settings unreachable: {error}"));
+                    return;
+                }
+            };
+            // Turning it OFF forgets the peer on purpose: a link the user
+            // retired must not be resurrected at the next boot.
+            if !wanted {
+                match control_request(only_auto_connect(&current, None, true)) {
+                    Ok(ControlResponse::Applied { .. }) => {
+                        ui_log("auto-connect: cleared; the next start stays local");
+                        finish_auto_connect(
+                            &weak,
+                            false,
+                            "TheKVM starts local and waits for you to connect.".to_owned(),
+                        );
+                    }
+                    other => {
+                        let message = describe_control_outcome(other, "clear");
+                        ui_log(&format!("auto-connect: {message}"));
+                        finish_auto_connect(&weak, current.auto_connect_address.is_some(), message);
+                    }
+                }
+                return;
+            }
+            // Turning it ON with nothing remembered says so instead of
+            // pretending the next boot will link up.
+            let Some(address) = current.auto_connect_address.clone() else {
+                ui_log("auto-connect: nothing to reconnect to yet; connect once first");
+                finish_auto_connect(
+                    &weak,
+                    false,
+                    "Connect to a computer once, then this switch re-links at startup.".to_owned(),
+                );
+                return;
+            };
+            match control_request(only_auto_connect(&current, Some(address.clone()), false)) {
+                Ok(ControlResponse::Applied { .. }) => {
+                    ui_log(&format!(
+                        "auto-connect: will re-link to {address} at startup"
+                    ));
+                    finish_auto_connect(
+                        &weak,
+                        true,
+                        format!("Reconnects to {address} at startup."),
+                    );
+                }
+                other => {
+                    let message = describe_control_outcome(other, "save");
+                    ui_log(&format!("auto-connect: {message}"));
+                    finish_auto_connect(&weak, false, message);
+                }
+            }
+        });
+    }
 
     let weak = ui.as_weak();
     let role_session = session_state.clone();
@@ -2493,6 +2751,10 @@ fn follow_link(
                 link_id: recent.link_id,
                 input_events: 0,
                 driving: false,
+                // The session is over, so there is no fresh input to
+                // vouch for a sticky `driving`; `None` makes the
+                // arbiter treat it as idle.
+                last_input_age_ms: None,
             })
     });
     let inbound_id = inbound
@@ -3957,12 +4219,15 @@ fn set_link_connecting(weak: &slint::Weak<AppWindow>, connecting: bool) {
         // 90ms until set_session clears the flag. The Slint Timer stays
         // out of it — a Rust ticker is version-proof and costs nothing
         // once the flag drops.
-        if SPINNER_RUNNING.compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Relaxed,
-        ).is_ok() {
+        if SPINNER_RUNNING
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
             let weak = weak.clone();
             std::thread::Builder::new()
                 .name("thekvm-link-spinner".into())
@@ -3994,8 +4259,7 @@ fn set_link_connecting(weak: &slint::Weak<AppWindow>, connecting: bool) {
     });
 }
 
-static SPINNER_RUNNING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SPINNER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Headless-receiver clipboard relay (see `ClipboardPoll`): the service
 /// that serves inbound episodes usually runs without a user session, so
@@ -4056,8 +4320,7 @@ fn spawn_clipboard_relay() {
                         next_index: index,
                     }) {
                         Ok(ControlResponse::ClipboardUpdate(update))
-                            if update.revision == first.revision
-                                && update.index == index =>
+                            if update.revision == first.revision && update.index == index =>
                         {
                             chunks.push(update.data);
                         }
@@ -4127,17 +4390,14 @@ fn apply_relay_paste(
             }
         }
         ClipboardKind::ImagePng => {
-            let (width, height, rgba) =
-                kvm_platform::clipboard::decode_base64_png(payload)
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let (width, height, rgba) = kvm_platform::clipboard::decode_base64_png(payload)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
             match clipboard
                 .poll_changed_image()
                 .map_err(|error| anyhow::anyhow!("{error}"))?
             {
                 Some((current_w, current_h, current))
-                    if current_w == width
-                        && current_h == height
-                        && current == rgba =>
+                    if current_w == width && current_h == height && current == rgba =>
                 {
                     Ok(false)
                 }

@@ -14,7 +14,7 @@
 
 #define MyAppName "TheKVM"
 #ifndef MyAppVersion
-#define MyAppVersion "0.9.57"
+#define MyAppVersion "0.9.58"
 #endif
 #define MyAppPublisher "TheKVM project"
 #define MyAppURL "https://github.com/xyzyt010/thekvm"
@@ -56,6 +56,13 @@ Source: "..\..\target\release\kvm-ui.exe"; DestDir: "{app}"; Flags: ignoreversio
 [Icons]
 Name: "{group}\TheKVM UI"; Filename: "{app}\kvm-ui.exe"
 Name: "{group}\Uninstall TheKVM"; Filename: "{uninstallexe}"
+; Startup-folder TEMPLATE for login auto-start (Problem 3). The shortcut
+; itself is created inside {app}, NOT dropped into the user's Startup
+; folder: the UI copies it there when the Settings switch is turned on
+; (kvm-platform::autostart), so the install stays per-user-optional, needs
+; no elevation at logon, and uninstall never has to guess whose profile
+; it touched.
+Name: "{app}\TheKVM.lnk"; Filename: "{app}\kvm-ui.exe"; WorkingDir: "{app}"
 
 [Run]
 Filename: "{app}\kvm-ui.exe"; Description: "Launch TheKVM"; Flags: nowait postinstall skipifsilent
@@ -327,5 +334,15 @@ begin
     SoftRun('sc.exe', 'delete {#ServiceName}');
     SoftRun('netsh.exe', 'advfirewall firewall delete rule name=' +
       AddQuotes('{#FirewallRule}'));
+    { Login auto-start lives in the CURRENT user's Startup folder, which
+      an elevated uninstall may not even be. Ask the shell to remove the
+      shortcut from every profile it can see; a machine where the UI was
+      never switched on simply has nothing to remove. }
+    SoftRun(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' +
+      AddQuotes('Get-ChildItem -Path (Join-Path $env:APPDATA ' +
+      '"Microsoft\Windows\Start Menu\Programs\Startup") -Filter TheKVM.lnk ' +
+      '-ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction ' +
+      'SilentlyContinue'));
   end;
 end;

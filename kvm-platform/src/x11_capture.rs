@@ -1595,7 +1595,14 @@ mod tests {
         };
         // Pre-verdict: both axes flow.
         assert_eq!(
-            derive_scroll_wheel(13, &mask, &[x_one, y_wobble], &axes, &mut banks, &mut phases),
+            derive_scroll_wheel(
+                13,
+                &mask,
+                &[x_one, y_wobble],
+                &axes,
+                &mut banks,
+                &mut phases
+            ),
             Some(InputEvent::SmoothWheel { x: -120, y: -30 })
         );
         // Verdict reached (240 x at 2:1): the wobble is eaten, and its
@@ -1619,10 +1626,7 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(
                 derive_scroll_wheel(14, &mask, &[x_one, x_one], &axes, &mut banks, &mut phases),
-                Some(InputEvent::SmoothWheel {
-                    x: -120,
-                    y: -120
-                })
+                Some(InputEvent::SmoothWheel { x: -120, y: -120 })
             );
         }
     }

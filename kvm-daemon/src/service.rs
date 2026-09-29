@@ -58,7 +58,17 @@ pub(crate) struct InboundLink {
     /// input_events so the Status snapshot (and the outbound drive
     /// loop's idle-dual arbitration) can tell an idle DRIVE from an idle
     /// LINK — the distinction that breaks the both-suppressed freeze.
+    ///
+    /// STICKY until the session ends, so it is a *claim*, not a
+    /// heartbeat: read it together with `last_input` (see
+    /// inbound_link_activity).
     pub driving: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic stamp (see `now_millis`) of the newest peer input or
+    /// cursor takeover on this session. `0` = nothing yet. This is the
+    /// heartbeat that makes `driving` decidable: a peer that took the
+    /// cursor minutes ago and whose user walked away must not read as
+    /// "driving us right now", or every later crossing is yanked home.
+    pub last_input: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 type LinkRegistry =
@@ -236,11 +246,16 @@ pub(crate) fn register_inbound_link(
     tokio::sync::watch::Receiver<bool>,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let id = LINK_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (drop_tx, drop_rx) = tokio::sync::watch::channel(false);
     let input_events = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let driving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Freshness stamp for the driving claim (see the field): starts at
+    // "nothing seen yet" so a fresh dial-back reads idle until the peer
+    // actually moves.
+    let last_input = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Stamp last-seen BEFORE inserting: even a replaced stale entry
     // counts as proof this peer linked (the dial-back trigger).
     note_inbound_seen(fingerprint_hex, node_name, address, link_id);
@@ -256,12 +271,35 @@ pub(crate) fn register_inbound_link(
                     link_id,
                     input_events: input_events.clone(),
                     driving: driving.clone(),
+                    last_input: last_input.clone(),
                 },
                 drop_tx,
             ),
         );
     }
-    (id, drop_rx, input_events, driving)
+    (id, drop_rx, input_events, driving, last_input)
+}
+
+/// Process-monotonic milliseconds since the first call. One base per
+/// process keeps the inbound-activity stamps lock-free and comparable
+/// inside a session; the Status snapshot converts them to an AGE before
+/// they cross a process or machine boundary, so no clock ever has to
+/// agree with anything.
+fn now_millis() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(std::time::Instant::now);
+    base.elapsed().as_millis() as u64
+}
+
+/// Stamp "the peer just drove us" on one inbound session: the freshness
+/// half of the driving claim (see InboundLink::last_input). Called for
+/// every received input event and for every cursor takeover.
+fn note_inbound_activity(
+    counter: &std::sync::atomic::AtomicU64,
+    stamp: &std::sync::atomic::AtomicU64,
+) {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    stamp.store(now_millis(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Remove a registration, but only when the id still matches — a redialed
@@ -291,15 +329,22 @@ pub(crate) fn drop_inbound_link(fingerprint_hex: &str) -> bool {
 
 pub(crate) fn list_inbound_links() -> Vec<kvm_protocol::control::ActiveSession> {
     if let Ok(links) = inbound_link_registry().lock() {
+        let now = now_millis();
         links
             .values()
-            .map(|(link, _)| kvm_protocol::control::ActiveSession {
-                fingerprint_hex: link.fingerprint_hex.clone(),
-                node_name: link.node_name.clone(),
-                address: link.address.clone(),
-                link_id: link.link_id,
-                input_events: link.input_events.load(std::sync::atomic::Ordering::Relaxed),
-                driving: link.driving.load(std::sync::atomic::Ordering::Relaxed),
+            .map(|(link, _)| {
+                let last_input = link.last_input.load(std::sync::atomic::Ordering::Relaxed);
+                kvm_protocol::control::ActiveSession {
+                    fingerprint_hex: link.fingerprint_hex.clone(),
+                    node_name: link.node_name.clone(),
+                    address: link.address.clone(),
+                    link_id: link.link_id,
+                    input_events: link.input_events.load(std::sync::atomic::Ordering::Relaxed),
+                    driving: link.driving.load(std::sync::atomic::Ordering::Relaxed),
+                    // Age, not stamp: the consumer may live in another
+                    // process (and on another machine) with its own base.
+                    last_input_age_ms: (last_input > 0).then(|| now.saturating_sub(last_input)),
+                }
             })
             .collect()
     } else {
@@ -1893,6 +1938,18 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // user sees as "far from any edge" — on either computer. Once per
     // process: the per-event truth feed below only re-pins the cursor,
     // never the dims.
+    // Return hysteresis (see EdgeRouter::set_return_hold /
+    // set_handoff_grace): the router's own rule stays the pure,
+    // event-only one for every unit test, and the live driver arms the
+    // wall-clock windows here. Without them a crossing dies to its own
+    // echo: the entry lands one inset inside the peer's facing edge, so
+    // the crossing's fling tail and the natural pull-back that brings
+    // the physical mouse back to the desk both overflow that edge
+    // within a few hundred ms — the "exits mid-screen" snap-back. A
+    // deliberate shove back out holds the boundary far longer than
+    // either window, so returning home still feels immediate.
+    router.set_return_hold(Duration::from_millis(180));
+    router.set_handoff_grace(Duration::from_millis(400));
     match kvm_platform::capture::screen_size() {
         Ok(Some((width, height))) => match router.adopt_local_screen_size(width, height) {
             Some((w, h)) => {
@@ -2031,6 +2088,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // divert/echo count when the current drive started. Growth while a
     // drive is active is the peer driving us back — auto-yield fires.
     let mut divert_baseline = 0u64;
+    // Per-probe watermark for the same counters: the probe ticks compare
+    // the growth SINCE THE LAST TICK (a rate), while the per-event path
+    // above compares growth since the drive started (it cannot see a rate
+    // because it runs per event). Seeded at the live count so nothing
+    // that happened before this loop is ever attributed to a drive.
+    let mut divert_seen = kvm_platform::capture::inbound_while_driving_count();
     // Inbound INPUT-ACTIVITY baselines for the yield probe (see
     // inbound_inputs_growth): per-peer input-event totals from the
     // last probe. `inbound_baselines_fresh` is cleared on every
@@ -2278,7 +2341,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             continue;
                         }
                         apply_inbound_clipboard(
-                            &clipboard,
+                                &clipboard,
                             &mut latest_clipboard,
                             &mut session.remote_clipboard_revision,
                             revision,
@@ -2343,7 +2406,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             ClipboardFeed::Ready(text) => {
                                 tracing::info!(bytes = text.len(), "peer clipboard transfer complete");
                                 apply_inbound_clipboard(
-                                    &clipboard,
+                                &clipboard,
                                     &mut latest_clipboard,
                                     &mut session.remote_clipboard_revision,
                                     revision,
@@ -2374,7 +2437,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         }
                         tracing::info!(bytes = png_base64.len(), "peer clipboard image received");
                         apply_inbound_clipboard_image(
-                            &clipboard,
+                                &clipboard,
                             &mut latest_image,
                             &mut session.remote_clipboard_revision,
                             revision,
@@ -2447,7 +2510,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             ImageFeed::Ready(paste) => {
                                 tracing::info!(bytes = paste.png_base64.len(), "peer clipboard image transfer complete");
                                 apply_inbound_clipboard_image(
-                                    &clipboard,
+                                &clipboard,
                                     &mut latest_image,
                                     &mut session.remote_clipboard_revision,
                                     revision,
@@ -2733,14 +2796,21 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // and for motion-only Windows drives (raw motion carries
                 // no tag). Activity, never session existence: the
                 // two-way-edge dial-back stays open persistently.
-                // Desensitized (see INBOUND_YIELD_MIN_GROWTH): the divert
-                // fast path needs a run of fresh diverts, not one stray —
-                // a single echo/noise event must never yank control home
-                // mid-display. A peer truly driving back produces dozens
-                // per tick and still yields within 300ms.
+                // Desensitized (see divert_burst_fires): the divert fast
+                // path needs a RUN of fresh diverts that keeps arriving
+                // while this drive is open, not one stray — a single
+                // echo/noise event, or the tail of the episode we just
+                // left, must never yank control home mid-display. A peer
+                // truly driving back produces dozens per tick and still
+                // yields within 300ms.
                 if active.is_some() {
                     let diverted = kvm_platform::capture::inbound_while_driving_count();
-                    if diverted > divert_baseline.saturating_add(INBOUND_YIELD_MIN_GROWTH - 1) {
+                    let delta = diverted.saturating_sub(divert_seen);
+                    divert_seen = diverted;
+                    let open_for = last_transfer
+                        .map(|when| std::time::Instant::now().saturating_duration_since(when))
+                        .unwrap_or_default();
+                    if divert_burst_fires(delta, open_for) {
                         yield_drive_to_inbound(
                             &mut router,
                             &mut active,
@@ -2784,11 +2854,17 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // yields when the local mouse moves (the "must move the
                 // Mint mouse out first" shape). The fast yield_probe above
                 // already covers the common case; this remains as a backup
-                // for a missed probe tick. Same desensitization as the fast
-                // probe above: a run of fresh diverts, never one stray.
+                // for a missed probe tick. Same rate-based desensitization
+                // as the fast probe above: a divert run that keeps
+                // arriving while this drive is open, never one stray.
                 if active.is_some() {
                     let diverted = kvm_platform::capture::inbound_while_driving_count();
-                    if diverted > divert_baseline.saturating_add(INBOUND_YIELD_MIN_GROWTH - 1) {
+                    let delta = diverted.saturating_sub(divert_seen);
+                    divert_seen = diverted;
+                    let open_for = last_transfer
+                        .map(|when| std::time::Instant::now().saturating_duration_since(when))
+                        .unwrap_or_default();
+                    if divert_burst_fires(delta, open_for) {
                         yield_drive_to_inbound(
                             &mut router,
                             &mut active,
@@ -3480,10 +3556,11 @@ fn daemon_control_candidates(primary: &std::path::Path) -> Vec<std::path::PathBu
 }
 
 /// Snapshot of per-peer inbound input activity: fingerprint hex ->
-/// input events received on the live session. Best effort with a short
-/// per-candidate timeout — a missing socket simply contributes nothing.
-/// Takes the MAX per fingerprint across candidates so overlapping dirs
-/// that reach the same daemon can never double-count.
+/// (input events received on the live session, age of the newest one).
+/// Best effort with a short per-candidate timeout — a missing socket
+/// simply contributes nothing. Takes the MAX per fingerprint across
+/// candidates so overlapping dirs that reach the same daemon can never
+/// double-count.
 async fn snapshot_inbound_inputs(
     candidates: &[std::path::PathBuf],
 ) -> (
@@ -3508,7 +3585,19 @@ async fn snapshot_inbound_inputs(
                 // idle-dual arbitration below reads it. Older daemons
                 // report false — their links keep the pre-arbitration
                 // behavior (growth-yield only).
-                if session.driving {
+                //
+                // The flag alone is a STALE claim: it is set once per
+                // session and cleared only when that session ends, and a
+                // two-way-edge dial-back keeps the session open for the
+                // whole session. Reading it raw made every later drive
+                // read as "the peer is driving us", so 0.9.5-0.9.57 hung
+                // up 5s into perfectly healthy crossings (the
+                // "dual idle drive" flap) and pre-empted them on a single
+                // stray inbound event. It is only evidence of an ACTIVE
+                // takeover when the peer also moved recently; without a
+                // freshness stamp (older daemon) we deliberately trust
+                // the counter signal alone and never pre-empt on the flag.
+                if peer_drive_is_active(session.driving, session.last_input_age_ms) {
                     driving.insert(session.fingerprint_hex.clone());
                 }
             }
@@ -3596,13 +3685,21 @@ async fn probe_inbound_yield(
         *inbound_baselines_fresh = true;
         0
     };
+    // Any inbound growth is INBOUND ACTIVITY, whether or not it is enough
+    // to yield: the idle-dual arbitration below asks "did the peer move in
+    // the last few seconds?", and it used to read that from a stamp that
+    // only a YIELD wrote — so "no inbound input for 5s" was true on every
+    // quiet drive and the arbitration fired 5s into healthy crossings.
+    if growth > 0 {
+        *last_inbound_growth_at = Some(std::time::Instant::now());
+    }
     // Desensitized (see inbound_yield_fires): a Handoff-less stray (one
     // echo/noise event, growth=1, nobody driving) is absorbed into the
     // baseline, never a yield — the sudden mid-display exit shape. A
     // peer that truly takes the cursor sends a Handoff first (driving
-    // non-empty), so intent still pre-empts within one 300ms tick.
+    // non-empty, and FRESH — see snapshot_inbound_inputs), so intent still
+    // pre-empts within one 300ms tick.
     if inbound_yield_fires(growth, !driving.is_empty()) {
-        *last_inbound_growth_at = Some(std::time::Instant::now());
         let observed = kvm_platform::capture::inbound_while_driving_count();
         tracing::info!(
             growth,
@@ -3634,6 +3731,13 @@ async fn probe_inbound_yield(
     // screen — NEVER yields. Either side's next input re-takes instantly
     // (fresh baseline each drive), so the cost of a wrong yield is one
     // re-push, not a freeze.
+    //
+    // `driving` is FRESH now (see snapshot_inbound_inputs) and
+    // `in_idle` is stamped on any inbound growth, not only on a yield, so
+    // all three conditions below mean what they say. Before that, the
+    // stale takeover flag plus a never-written idle stamp made this fire
+    // 5s into nearly every healthy crossing — the grab flap (and the
+    // hourglass it shows) rather than a real standoff.
     let now = std::time::Instant::now();
     let drive_old =
         last_transfer.is_some_and(|when| now.duration_since(when) > Duration::from_secs(5));
@@ -3872,11 +3976,56 @@ fn stall_breaker_tripped(strikes: u32, stalled_ms: u64) -> bool {
 /// sustained run. Pure for tests.
 const INBOUND_YIELD_MIN_GROWTH: u64 = 5;
 
+/// How recently the peer must have moved for its "I took the cursor"
+/// claim to count as an ACTIVE takeover (see snapshot_inbound_inputs).
+/// A genuine takeover is re-stamped by every inbound event plus the
+/// handoff itself, so it stays inside this window for as long as the
+/// peer's user is actually driving. Past it the claim is history: the
+/// dial-back session is still open, but nobody is at the other
+/// keyboard, and yielding on that history is what produced the
+/// "control is yanked home 5s into every crossing" flap.
+const PEER_DRIVE_FRESH_MS: u64 = 2_500;
+
 /// Inbound-yield predicate: fire on a sustained run of fresh peer input,
 /// or on ANY fresh input once the peer has taken the cursor (Handoff).
 /// Pure for tests (the probe owns the snapshot and baseline).
 fn inbound_yield_fires(growth: u64, peer_driving: bool) -> bool {
     growth >= INBOUND_YIELD_MIN_GROWTH || (growth > 0 && peer_driving)
+}
+
+/// Divert/echo fast path: the counters are process-wide and cumulative,
+/// so the OLD rule ("more than N since the drive started") is a
+/// one-shot trap — a short tail of the previous episode's injected
+/// events lands after the new baseline and trips it instantly, yanking
+/// a fresh crossing home ~200ms after it opened (observed on the Mint
+/// driver with a peer's parked episode still draining). Rate instead:
+/// fire only on a burst that keeps arriving *while this drive is open*.
+/// Pure for tests.
+fn divert_burst_fires(delta: u64, open_for: Duration) -> bool {
+    open_for >= DIVERT_SETTLE && delta >= INBOUND_YIELD_MIN_GROWTH
+}
+
+/// Settling window after a drive opens during which divert growth is
+/// ignored: the peer's in-flight tail from the episode we just left (or
+/// a hand-off storm while the injector devices appear) lands inside it
+/// and is absorbed, never mistaken for "the peer is driving us back".
+const DIVERT_SETTLE: Duration = Duration::from_millis(600);
+
+/// Whether a peer's "I took the cursor" claim is evidence of a takeover
+/// happening NOW (see snapshot_inbound_inputs, PEER_DRIVE_FRESH_MS).
+///
+/// The `driving` flag is sticky for the whole session, so on its own it
+/// only says "the peer took the cursor at some point since we linked".
+/// Requiring the freshness stamp to agree is what keeps a settled,
+/// quiet remote session from reading as an active counter-drive — the
+/// cause of the "control is yanked home ~5s into every crossing" flap.
+///
+/// A missing stamp means an older daemon that does not report input
+/// age. We then refuse to pre-empt on the flag at all and let the
+/// (unambiguous) input-growth probe decide, rather than guessing.
+/// Pure for tests.
+fn peer_drive_is_active(driving: bool, last_input_age_ms: Option<u64>) -> bool {
+    driving && last_input_age_ms.is_some_and(|age| age <= PEER_DRIVE_FRESH_MS)
 }
 
 async fn handle_topology_event(
@@ -3989,13 +4138,23 @@ async fn handle_topology_event(
     // invisible grab window. Park ours and release the grab so their
     // input lands; our parked stream resumes on the next push.
     // Baseline-gated, so stale counts from an older drive never fire.
-    // Desensitized (see INBOUND_YIELD_MIN_GROWTH): a single stray
-    // diverted event (echo, resting noise) must never yank control
-    // home mid-display — a peer truly driving back produces a run of
-    // them within one probe tick.
+    // Desensitized (see divert_burst_fires): a single stray diverted event
+    // (echo, resting noise, the tail of the episode we just left) must
+    // never yank control home mid-display — a peer truly driving back
+    // produces a run of them within one probe tick.
     if active.is_some() {
         let diverted = kvm_platform::capture::inbound_while_driving_count();
-        if diverted > (*divert_baseline).saturating_add(INBOUND_YIELD_MIN_GROWTH - 1) {
+        // Cumulative-since-drive-start here (the per-event path cannot
+        // measure a rate: it runs per event), so only the settle gate
+        // separates a real peer takeover from the in-flight tail of the
+        // episode we just left. The per-tick probes below carry the
+        // rate-based rule.
+        let open_for = last_transfer
+            .map(|when| std::time::Instant::now().saturating_duration_since(when))
+            .unwrap_or_default();
+        if diverted > (*divert_baseline).saturating_add(INBOUND_YIELD_MIN_GROWTH - 1)
+            && open_for >= DIVERT_SETTLE
+        {
             yield_drive_to_inbound(
                 router,
                 active,
@@ -4175,7 +4334,8 @@ async fn handle_topology_event(
                         session.motion_dropped_stall += 1;
                         *send_strikes += 1;
                         let since = send_stall_since.get_or_insert(std::time::Instant::now());
-                        let stalled_ms = since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        let stalled_ms =
+                            since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                         if stall_breaker_tripped(*send_strikes, stalled_ms) {
                             Some(anyhow::anyhow!(
                                 "motion stall breaker tripped after {} consecutive stalled sends over {}ms",
@@ -6257,10 +6417,7 @@ pub(crate) fn stash_inbound_clipboard(
 ) {
     let chunks = split_relay_payload(
         payload,
-        matches!(
-            kind,
-            kvm_protocol::control::ClipboardKind::Text
-        ),
+        matches!(kind, kvm_protocol::control::ClipboardKind::Text),
     );
     let total_bytes = payload.len() as u64;
     tracing::info!(
@@ -7481,12 +7638,35 @@ async fn handle_connection(
             // Windows): the Accepted advertisement must already carry
             // interactive-desktop truth, never session-0 fantasy.
             let local_geometry: Option<ScreenGeometry>;
-            let mut clipboard = if config.clipboard_enabled && hello.clipboard_enabled {
+            // Clipboard capability, the two halves of it kept apart on
+            // purpose:
+            //  * `clipboard_agent` = THIS process can watch/apply the OS
+            //    clipboard (true in every user session, false for the
+            //    headless system service);
+            //  * `clipboard_enabled` = THIS MACHINE can land a peer paste,
+            //    which the logged-in UI relay does for the service (see
+            //    spawn_clipboard_relay / stash_inbound_clipboard).
+            //
+            // Advertising the AGENT as the capability was the reason
+            // clipboard sync only ever worked one way: the headless
+            // service answered Accepted{clipboard_enabled:false}, the
+            // driver on the other machine negotiated clipboard=false and
+            // therefore never sent a single paste — live or initial — so
+            // the relay had nothing to take and the copy simply vanished.
+            // The relay is part of the product on every desktop, so the
+            // advertisement follows the MACHINE's capability and the
+            // agent stays a local apply optimization.
+            let mut clipboard_agent = if config.clipboard_enabled && hello.clipboard_enabled {
                 start_clipboard_agent(true)
             } else {
                 None
             };
-            let mut clipboard_enabled = clipboard.is_some();
+            let clipboard_enabled = config.clipboard_enabled && hello.clipboard_enabled;
+            // Read once, outside the select: the arm below borrows the
+            // agent mutably, so asking the same Option inside the arm
+            // would be a double borrow. Re-read by the arm's own `None`
+            // case (the watch simply stops there).
+            let mut clipboard_agent_present = clipboard_agent.is_some();
             let clipboard_max_bytes = config.clipboard_max_bytes() as u64;
             // Open chunked-paste assembly for this association (see
             // ClipboardAssembly): bounded by the cap above.
@@ -7565,7 +7745,8 @@ async fn handle_connection(
                 peer = %peer_fingerprint,
                 remote = %conn.remote_address(),
                 clipboard_offer = hello.clipboard_enabled,
-                clipboard_agent = clipboard.is_some(),
+                clipboard_agent = clipboard_agent.is_some(),
+                clipboard_relay = !clipboard_agent.is_some(),
                 "input session accepted",
             );
             // Publish the live inbound link FIRST, before the motion-lane
@@ -7582,7 +7763,13 @@ async fn handle_connection(
             // daemon address and otherwise the inbound IP on the standard
             // daemon port.
             let peer_book = peers.read().await;
-            let (link_id, mut link_drop, link_input_events, link_driving) = register_inbound_link(
+            let (
+                link_id,
+                mut link_drop,
+                link_input_events,
+                link_driving,
+                link_last_input,
+            ) = register_inbound_link(
                 &peer_fingerprint,
                 &hello.node_name,
                 &dialable_peer_address(
@@ -7762,8 +7949,7 @@ async fn handle_connection(
                                 // input message is peer-injected input by
                                 // construction (handshakes, pings, clipboard
                                 // and state sync never take this branch).
-                                link_input_events
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                note_inbound_activity(&link_input_events, &link_last_input);
                                 // Wire-native pinch (0.9.34+ peers): never
                                 // reaches process_remote_input — it is a
                                 // gesture, not pointer/key state, and the
@@ -7825,8 +8011,7 @@ async fn handle_connection(
                                 // (the dual-drive freeze). Baselines absorb
                                 // older handoffs, so only a handoff DURING
                                 // our drive fires.
-                                link_input_events
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                note_inbound_activity(&link_input_events, &link_last_input);
                                 // Lazy single-driver slot: the first handoff
                                 // on this stream claims it; a second live
                                 // driver is rejected on THIS stream (the
@@ -7897,6 +8082,14 @@ async fn handle_connection(
                                 // reads it. Removal at session end clears
                                 // it implicitly with the entry.
                                 link_driving.store(true, std::sync::atomic::Ordering::Relaxed);
+                                // The takeover is also FRESHNESS evidence
+                                // (see InboundLink::last_input): the stamp
+                                // above was set by the handoff itself, so a
+                                // peer that takes the cursor and stops
+                                // reading as "driving us" within
+                                // PEER_DRIVE_FRESH_MS instead of for the
+                                // rest of the (persistently open)
+                                // session.
                                 // Arm proportional absolute motion BEFORE
                                 // the warp (Windows-service bridge only):
                                 // the helper tracks the REMOTE cursor in
@@ -7963,7 +8156,7 @@ async fn handle_connection(
                                     continue;
                                 }
                                 apply_inbound_clipboard(
-                                    &clipboard,
+                                    &clipboard_agent,
                                     &mut latest_clipboard,
                                     &mut remote_clipboard_revision,
                                     revision,
@@ -8011,7 +8204,7 @@ async fn handle_connection(
                                     ClipboardFeed::Ready(text) => {
                                         tracing::info!(bytes = text.len(), "peer clipboard transfer complete");
                                         apply_inbound_clipboard(
-                                            &clipboard,
+                                            &clipboard_agent,
                                             &mut latest_clipboard,
                                             &mut remote_clipboard_revision,
                                             revision,
@@ -8038,7 +8231,7 @@ async fn handle_connection(
                                 }
                                 tracing::info!(bytes = png_base64.len(), "peer clipboard image received");
                                 apply_inbound_clipboard_image(
-                                    &clipboard,
+                                    &clipboard_agent,
                                     &mut latest_image,
                                     &mut remote_clipboard_revision,
                                     revision,
@@ -8094,7 +8287,7 @@ async fn handle_connection(
                                     ImageFeed::Ready(paste) => {
                                         tracing::info!(bytes = paste.png_base64.len(), "peer clipboard image transfer complete");
                                         apply_inbound_clipboard_image(
-                                            &clipboard,
+                                    &clipboard_agent,
                                             &mut latest_image,
                                             &mut remote_clipboard_revision,
                                             revision,
@@ -8134,8 +8327,7 @@ async fn handle_connection(
                         datagrams_received += 1;
                         // Same live-drive signal for the datagram path
                         // (motion usually arrives here, not on the stream).
-                        link_input_events
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        note_inbound_activity(&link_input_events, &link_last_input);
                         match packet.event {
                             InputEvent::MouseMove { .. } => motion_count += 1,
                             InputEvent::Wheel(_) => wheel_count += 1,
@@ -8170,7 +8362,10 @@ async fn handle_connection(
                             break Ok(());
                         }
                     }
-                    change = receive_clipboard(&mut clipboard, clipboard_enabled) => match change {
+                    change = receive_clipboard(
+                        &mut clipboard_agent,
+                        clipboard_enabled && clipboard_agent_present,
+                    ) => match change {
                         Some(change) => {
                             if let Some((revision, _)) = send_clipboard_change(
                                 &mut send,
@@ -8183,7 +8378,13 @@ async fn handle_connection(
                                 clipboard_revision = revision;
                             }
                         }
-                        None => clipboard_enabled = false,
+                        // The agent is gone (headless service, or a dead
+                        // session clipboard): stop watching for LOCAL
+                        // copies only. The advertised capability above is
+                        // untouched — inbound pastes still land through
+                        // the logged-in UI relay, which is exactly the
+                        // machine that has no agent.
+                        None => clipboard_agent_present = false,
                     },
                     motion_message = async {
                         // Disabled arm when no lane was negotiated: pending
@@ -8224,8 +8425,7 @@ async fn handle_connection(
                                         smooth_count += 1;
                                     }
                                 }
-                                link_input_events
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                note_inbound_activity(&link_input_events, &link_last_input);
                                 if matches!(
                                     packet.event,
                                     InputEvent::Pinch { .. } | InputEvent::PinchEnd
@@ -9699,7 +9899,9 @@ async fn open_episode_stream(
                         None
                     }
                     Err(_) => {
-                        tracing::info!("motion lane open timed out after 800ms; episode proceeds laneless");
+                        tracing::info!(
+                            "motion lane open timed out after 800ms; episode proceeds laneless"
+                        );
                         None
                     }
                 }
@@ -10106,9 +10308,12 @@ async fn send_motion_best_effort(
 async fn send_state_sync(send: &mut quinn::SendStream, state: InputState) -> Result<()> {
     // Bounded like every other drive-loop write (see send_input): an
     // unbounded sync pends forever on a half-dead association.
-    tokio::time::timeout(Duration::from_secs(2), write_frame(send, &WireMessage::StateSync(state)))
-        .await
-        .map_err(|_| anyhow::anyhow!("state sync stalled"))??;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        write_frame(send, &WireMessage::StateSync(state)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("state sync stalled"))??;
     Ok(())
 }
 
@@ -10750,7 +10955,8 @@ mod tests {
     }
 
     #[test]
-    fn inbound_yield_ignores_strays_but_honors_takeover() {        // Handoff-less strays (echo, resting noise, single redialed
+    fn inbound_yield_ignores_strays_but_honors_takeover() {
+        // Handoff-less strays (echo, resting noise, single redialed
         // events) never yank control home mid-display.
         assert!(!inbound_yield_fires(0, false));
         assert!(!inbound_yield_fires(1, false));
@@ -10763,6 +10969,69 @@ mod tests {
         // fresh input within one probe tick.
         assert!(inbound_yield_fires(1, true));
         assert!(inbound_yield_fires(3, true));
+    }
+
+    #[test]
+    fn divert_burst_needs_a_sustained_run_after_the_settle_window() {
+        // The tail of the episode we just left (in-flight injected
+        // events, a hand-off storm while the injector devices appear)
+        // lands inside the settle window: it must never fire, however
+        // many of them arrive.
+        assert!(!divert_burst_fires(50, Duration::from_millis(0)));
+        assert!(!divert_burst_fires(50, Duration::from_millis(300)));
+        // Inside the window a trickle is absorbed too...
+        assert!(!divert_burst_fires(1, Duration::from_millis(300)));
+        assert!(!divert_burst_fires(4, Duration::from_millis(300)));
+        // ...and past it only a real run fires: a peer actively driving
+        // us back produces dozens per probe tick.
+        assert!(divert_burst_fires(5, Duration::from_millis(900)));
+        assert!(divert_burst_fires(200, Duration::from_secs(30)));
+        // A quiet drive stays quiet forever.
+        assert!(!divert_burst_fires(0, Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn inbound_activity_stamp_moves_on_any_growth() {
+        // The idle-dual arbitration reads "did the peer move recently?"
+        // from this stamp, so it must track OBSERVED growth rather than
+        // only yields: a drive the peer is quietly reading never
+        // qualifies as a standoff, and one where the peer is actively
+        // pushing never looks idle.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stamp = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Nothing seen yet: no age at all, so no freshness claim.
+        assert_eq!(
+            stamp.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a fresh link must start with no activity stamp"
+        );
+        note_inbound_activity(&counter, &stamp);
+        let age = now_millis().saturating_sub(stamp.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(age < 1_000, "activity must stamp a fresh age, got {age}ms");
+        // Every event moves it, and the counter still tracks the listing.
+        note_inbound_activity(&counter, &stamp);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn sticky_driving_only_counts_while_the_peer_actually_moved() {
+        // The regression: `driving` is sticky for the whole session, so a
+        // peer that took the cursor once and then walked away used to read
+        // as an active counter-drive, hanging up every later crossing.
+        // Fresh input = a real takeover; stale = history.
+        assert!(peer_drive_is_active(true, Some(0)));
+        assert!(peer_drive_is_active(true, Some(PEER_DRIVE_FRESH_MS)));
+        // A takeover two seconds ago is still a takeover.
+        assert!(peer_drive_is_active(true, Some(2_000)));
+        // ...ten seconds ago it is history, whatever the flag says.
+        assert!(!peer_drive_is_active(true, Some(10_000)));
+        assert!(!peer_drive_is_active(true, Some(u64::MAX)));
+        // An older daemon reports no age at all: never pre-empt on the
+        // bare flag, let the input-growth probe decide instead.
+        assert!(!peer_drive_is_active(true, None));
+        // Not driving is not driving, freshness or not.
+        assert!(!peer_drive_is_active(false, Some(0)));
+        assert!(!peer_drive_is_active(false, None));
     }
 
     #[test]
@@ -10934,7 +11203,7 @@ mod tests {
         assert!(!drop_inbound_link(&fp));
         assert!(list_inbound_links().iter().all(|s| s.fingerprint_hex != fp));
         // Register: listed with name and address, droppable.
-        let (id, _rx, inputs, driving) =
+        let (id, _rx, inputs, driving, last_input) =
             register_inbound_link(&fp, "mint", "192.168.1.7:42110", Some(7));
         let listed: Vec<_> = list_inbound_links()
             .into_iter()
@@ -10948,8 +11217,9 @@ mod tests {
         assert_eq!(listed[0].input_events, 0);
         assert!(!listed[0].driving);
         // Serve-loop bumps surface through the listing (the yield
-        // probe's activity signal).
-        inputs.fetch_add(25, std::sync::atomic::Ordering::Relaxed);
+        // probe's activity signal), together with the freshness stamp
+        // that makes the sticky driving flag decidable.
+        note_inbound_activity(&inputs, &last_input);
         driving.store(true, std::sync::atomic::Ordering::Relaxed);
         let relisted: Vec<_> = list_inbound_links()
             .into_iter()
@@ -10957,6 +11227,7 @@ mod tests {
             .collect();
         assert_eq!(relisted[0].input_events, 25);
         assert!(relisted[0].driving);
+        assert!(relisted[0].last_input_age_ms.is_some_and(|age| age < 1_000));
         assert!(drop_inbound_link(&fp));
         // Wrong id must not unregister (a redialed successor survives).
         remove_inbound_link(&fp, id + 999);
@@ -11107,7 +11378,6 @@ mod tests {
         assert!(snapshot.state.pressed_keys.is_empty());
     }
 
-    #[test]
     #[test]
     fn clipboard_chunks_split_on_char_boundaries() {
         // Small text is a single piece.

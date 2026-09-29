@@ -5,6 +5,8 @@
 //! on Windows through `SendInput` from a LocalSystem service attached to the
 //! current input desktop (Default, Winlogon, or Screen-saver).
 
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
+pub mod autostart;
 pub mod capture;
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 pub mod clipboard;
@@ -40,4 +42,6 @@ pub enum PlatformError {
     Capture(String),
     #[error("clipboard unavailable: {0}")]
     Clipboard(String),
+    #[error("autostart unavailable: {0}")]
+    Autostart(String),
 }

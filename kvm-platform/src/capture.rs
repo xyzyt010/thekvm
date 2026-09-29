@@ -1828,23 +1828,19 @@ mod win32_hooks {
             let (out_x, out_y) = match self.lock {
                 Some(PanAxis::X) => {
                     self.acc_y = 0;
-                    let out_x =
-                        (self.acc_x.saturating_mul(120) / units_x).clamp(-120_000, 120_000);
+                    let out_x = (self.acc_x.saturating_mul(120) / units_x).clamp(-120_000, 120_000);
                     self.acc_x -= out_x.saturating_mul(units_x) / 120;
                     (out_x, 0)
                 }
                 Some(PanAxis::Y) => {
                     self.acc_x = 0;
-                    let out_y =
-                        (self.acc_y.saturating_mul(120) / units_y).clamp(-120_000, 120_000);
+                    let out_y = (self.acc_y.saturating_mul(120) / units_y).clamp(-120_000, 120_000);
                     self.acc_y -= out_y.saturating_mul(units_y) / 120;
                     (0, out_y)
                 }
                 None => {
-                    let out_x =
-                        (self.acc_x.saturating_mul(120) / units_x).clamp(-120_000, 120_000);
-                    let out_y =
-                        (self.acc_y.saturating_mul(120) / units_y).clamp(-120_000, 120_000);
+                    let out_x = (self.acc_x.saturating_mul(120) / units_x).clamp(-120_000, 120_000);
+                    let out_y = (self.acc_y.saturating_mul(120) / units_y).clamp(-120_000, 120_000);
                     self.acc_x -= out_x.saturating_mul(units_x) / 120;
                     self.acc_y -= out_y.saturating_mul(units_y) / 120;
                     (out_x, out_y)

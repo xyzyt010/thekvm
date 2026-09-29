@@ -445,6 +445,26 @@ pub struct EdgeRouter {
     /// or switching edge restarts the run from zero.
     push_edge: Option<Edge>,
     push_accum: i64,
+    /// Sustained-pressure window for the ARMED home-facing return (see
+    /// set_return_hold). Zero keeps the event-only rule (byte-identical
+    /// to every release before this knob, so pure router tests stay
+    /// deterministic); the daemon opts in with a real window. Without it
+    /// the natural post-crossing pull-back — the physical mouse has to
+    /// come back to the desk while the remote cursor starts one inset
+    /// inside the edge — reads as "come inside, then push back out" and
+    /// snap-control home mid-roam.
+    return_hold: std::time::Duration,
+    /// When the current home-facing overflow run began (see return_hold).
+    return_run_since: Option<std::time::Instant>,
+    /// Post-handoff grace (see set_handoff_grace): for this long after a
+    /// crossing commits, home-facing overflow CLAMPS instead of
+    /// returning. The entry lands one inset inside the edge, so the
+    /// crossing's own fling tail and the immediate reposition pull-back
+    /// both overflow the entry edge within the first few hundred
+    /// milliseconds — clamping that window is what makes a crossing stick.
+    handoff_grace: std::time::Duration,
+    /// When the last handoff committed (see handoff_grace).
+    handoff_at: Option<std::time::Instant>,
     /// Deskflow-style screen lock (ScrollLock): while set, no edge crossing
     /// opens a new handoff — the cursor stays where it is. Locking never
     /// strands control remotely: engaging it returns home first (see the
@@ -488,9 +508,38 @@ impl EdgeRouter {
             edge_mode: EdgeMode::Single,
             push_edge: None,
             push_accum: 0,
+            return_hold: std::time::Duration::ZERO,
+            return_run_since: None,
+            handoff_grace: std::time::Duration::ZERO,
+            handoff_at: None,
             locked: false,
             startup_gate: false,
         })
+    }
+
+    /// Arm the sustained-pressure window on the ARMED home-facing return
+    /// (see the field). The daemon sets a real window so a flap of the
+    /// physical mouse on its way back to the desk cannot end the drive;
+    /// a deliberate "push back out" holds the boundary far longer.
+    /// Zero (the default) keeps the historical event-only rule.
+    pub fn set_return_hold(&mut self, hold: std::time::Duration) {
+        self.return_hold = hold;
+    }
+
+    /// Arm the post-handoff grace (see the field): home-facing overflow
+    /// clamps for this long after each crossing. Zero (default) keeps the
+    /// historical behavior.
+    pub fn set_handoff_grace(&mut self, grace: std::time::Duration) {
+        self.handoff_grace = grace;
+    }
+
+    /// Whether a home-facing overflow is currently held off by the
+    /// post-handoff grace (see handoff_grace).
+    fn in_handoff_grace(&self) -> bool {
+        !self.handoff_grace.is_zero()
+            && self
+                .handoff_at
+                .is_some_and(|when| when.elapsed() < self.handoff_grace)
     }
 
     /// Engage or release the screen lock. Locking only affects FUTURE
@@ -749,6 +798,7 @@ impl EdgeRouter {
         self.return_accum = 0;
         self.return_edge = None;
         self.return_edge_accum = 0;
+        self.return_run_since = None;
         Some((screen.width, screen.height))
     }
 
@@ -794,6 +844,7 @@ impl EdgeRouter {
                         self.return_accum = 0;
                         self.return_edge = None;
                         self.return_edge_accum = 0;
+                        self.return_run_since = None;
                         // Settling inside arms the entry edge (see above):
                         // a firm flick arms in one event, resting noise
                         // never reaches the threshold.
@@ -838,8 +889,19 @@ impl EdgeRouter {
                             } else {
                                 self.return_edge = Some(edge);
                                 self.return_edge_accum = overflow;
+                                self.return_run_since = Some(std::time::Instant::now());
                             }
-                            if self.return_edge_accum >= RETURN_EDGE_PX {
+                            // Sustained-pressure gate (see return_hold):
+                            // the run must ALSO have lasted the configured
+                            // window. A reposition pull-back crosses the
+                            // entry inset in a few fast events; a
+                            // deliberate shove back out keeps pressing.
+                            let held = self.return_hold.is_zero()
+                                || self
+                                    .return_run_since
+                                    .is_some_and(|since| since.elapsed() >= self.return_hold);
+                            let grace = self.in_handoff_grace();
+                            if self.return_edge_accum >= RETURN_EDGE_PX && held && !grace {
                                 // Park at the edge with the roamed height
                                 // (mapped vertical, saved edge x): a return
                                 // never lands mid-screen, nor teleports
@@ -874,7 +936,7 @@ impl EdgeRouter {
                                 Edge::Bottom => next_y - (i64::from(remote.height) - 1),
                             };
                             self.return_accum += overflow.max(0);
-                            if self.return_accum >= RETURN_PUSH_PX {
+                            if self.return_accum >= RETURN_PUSH_PX && !self.in_handoff_grace() {
                                 let entry_edge = self.entry_edge;
                                 let armed = self.return_armed;
                                 let _ = self.restore_local(target);
@@ -889,6 +951,7 @@ impl EdgeRouter {
                             self.return_accum = 0;
                             self.return_edge = None;
                             self.return_edge_accum = 0;
+                            self.return_run_since = None;
                         }
                         // Any other edge (or the still-disarmed entry):
                         // stop at the border and keep driving. Local
@@ -1011,6 +1074,11 @@ impl EdgeRouter {
         self.return_accum = 0;
         self.return_edge = None;
         self.return_edge_accum = 0;
+        self.return_run_since = None;
+        // Stamp the crossing so the post-handoff grace (see handoff_grace)
+        // covers this drive's opening: the entry lands one inset inside
+        // the edge, and the physical mouse must come back to the desk.
+        self.handoff_at = Some(std::time::Instant::now());
         // Preserve the overshoot as a relative event. The receiver can use
         // the handoff coordinates to establish its own logical pointer and
         // then apply this small remainder.
@@ -1087,6 +1155,7 @@ impl EdgeRouter {
         self.push_accum = 0;
         self.return_edge = None;
         self.return_edge_accum = 0;
+        self.return_run_since = None;
         Ok(())
     }
 
@@ -1130,6 +1199,7 @@ impl EdgeRouter {
         self.push_accum = 0;
         self.return_edge = None;
         self.return_edge_accum = 0;
+        self.return_run_since = None;
         Ok((self.cursor_x, self.cursor_y))
     }
 
@@ -1154,6 +1224,7 @@ impl EdgeRouter {
             self.push_accum = 0;
             self.return_edge = None;
             self.return_edge_accum = 0;
+            self.return_run_since = None;
             return Ok(false);
         }
         if self.current_screen == self.local_screen {
@@ -1171,6 +1242,12 @@ impl EdgeRouter {
         self.return_armed = true;
         self.return_edge = None;
         self.return_edge_accum = 0;
+        self.return_run_since = None;
+        // Peer-placed drive (see above): no entry shove of our own
+        // happened, so the post-handoff grace gets its window from here
+        // — the peer is free to place us anywhere, including next to the
+        // home-facing edge.
+        self.handoff_at = Some(std::time::Instant::now());
         Ok(true)
     }
 }
@@ -1698,6 +1775,90 @@ mod tests {
         }
         assert!(fired, "sustained 1px pushes with agreeing truth must cross");
         assert_eq!(router.active_remote(), Some(ScreenId(2)));
+    }
+
+    #[test]
+    fn post_crossing_pull_back_does_not_return_with_hold_armed() {
+        // The real-world shape: cross right, keep going inside (arms the
+        // entry edge), then the physical mouse comes back toward the user
+        // and the REMOTE cursor slides off the entry edge. With the
+        // sustained-pressure window armed that single fast pull-back must
+        // clamp at the boundary, not snap control home mid-drive; a second,
+        // deliberate shove (after the window) still comes home.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_return_hold(std::time::Duration::from_millis(120));
+        router.set_handoff_grace(std::time::Duration::from_millis(60));
+        // Cross to the peer (entry edge is our Left there).
+        let mut crossed = false;
+        for _ in 0..40 {
+            if matches!(
+                router.route(InputEvent::MouseMove { dx: 400, dy: 0 }),
+                RoutedEvent::Handoff { .. }
+            ) {
+                crossed = true;
+                break;
+            }
+        }
+        assert!(crossed, "sustained push must cross");
+        // Roam well inside so the entry edge arms.
+        for _ in 0..4 {
+            let out = router.route(InputEvent::MouseMove { dx: 200, dy: 0 });
+            assert!(
+                !matches!(out, RoutedEvent::ReturnHome { .. }),
+                "roaming inside must never return"
+            );
+        }
+        assert!(router.return_state().1, "roaming inside arms the return");
+        // Reposition pull-back: past the entry edge, still inside the grace
+        // window and far too short to be a sustained shove.
+        for _ in 0..12 {
+            let out = router.route(InputEvent::MouseMove { dx: -600, dy: 0 });
+            assert!(
+                !matches!(out, RoutedEvent::ReturnHome { .. }),
+                "a fast pull-back must clamp, not return"
+            );
+        }
+        // The deliberate version: press out past the edge and hold past
+        // the window. The run is still the one started above, so once the
+        // window and the grace have both elapsed it comes home.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let out = router.route(InputEvent::MouseMove { dx: -600, dy: 0 });
+        assert!(
+            matches!(out, RoutedEvent::ReturnHome { .. }),
+            "a held shove after the window must still come home"
+        );
+    }
+
+    #[test]
+    fn default_router_keeps_the_event_only_return_rule() {
+        // Zero knobs (every pure caller, including the unit tests below)
+        // must behave exactly as the pre-knob releases did: no clock, no
+        // grace, no delay before the armed return.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        for _ in 0..40 {
+            if matches!(
+                router.route(InputEvent::MouseMove { dx: 400, dy: 0 }),
+                RoutedEvent::Handoff { .. }
+            ) {
+                break;
+            }
+        }
+        for _ in 0..4 {
+            let _ = router.route(InputEvent::MouseMove { dx: 200, dy: 0 });
+        }
+        let mut returned = false;
+        for _ in 0..12 {
+            if matches!(
+                router.route(InputEvent::MouseMove { dx: -600, dy: 0 }),
+                RoutedEvent::ReturnHome { .. }
+            ) {
+                returned = true;
+                break;
+            }
+        }
+        assert!(returned, "the default rule returns on the first brush");
     }
 
     #[test]

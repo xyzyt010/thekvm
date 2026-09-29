@@ -255,8 +255,23 @@ pub struct ActiveSession {
     /// the field. The outbound drive loop reads it (via Status) to break
     /// the dual-drive idle standoff: both sides driving with no input
     /// flowing either way would otherwise sit suppressed forever.
+    ///
+    /// STICKY by construction: the flag clears when the session ends, not
+    /// when the peer's user stops moving. Auto-yield must therefore never
+    /// read it alone — a two-way-edge dial-back keeps the session open for
+    /// hours, so after one takeover the flag would read "peer is driving
+    /// us" forever and yank every later crossing home. Pair it with
+    /// `last_input_age_ms`.
     #[serde(default)]
     pub driving: bool,
+    /// Milliseconds since this peer last sent input OR took the cursor on
+    /// this session (freshness stamp for `driving`, see above). `None`
+    /// when the peer has sent nothing since it dialed, and on older
+    /// daemons that predate the field: consumers must then treat the peer
+    /// as "not provably driving right now" — a link we cannot time-stamp
+    /// is exactly the link we must not pre-empt on.
+    #[serde(default)]
+    pub last_input_age_ms: Option<u64>,
 }
 
 /// A recently seen inbound peer: dialed us, session since ended (or
