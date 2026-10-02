@@ -142,6 +142,12 @@ enum Command {
         /// Largest single clipboard update in MiB (1..=16, default 2).
         #[arg(long)]
         clipboard_max_mb: Option<u32>,
+        /// Reverse outbound scroll direction when driving the peer.
+        #[arg(long, conflicts_with = "normal_scroll")]
+        reverse_scroll: bool,
+        /// Normal outbound scroll direction when driving the peer.
+        #[arg(long, conflicts_with = "reverse_scroll")]
+        normal_scroll: bool,
     },
 }
 
@@ -374,6 +380,8 @@ async fn async_main() -> Result<()> {
             enable_clipboard,
             disable_clipboard,
             clipboard_max_mb,
+            reverse_scroll,
+            normal_scroll,
         } => {
             if transport.is_some() {
                 // Transport is cemented to UDP: the flag is accepted so old
@@ -403,6 +411,13 @@ async fn async_main() -> Result<()> {
                     None
                 },
                 clipboard_max_mb,
+                reverse_scroll: if reverse_scroll {
+                    Some(true)
+                } else if normal_scroll {
+                    Some(false)
+                } else {
+                    None
+                },
             })
             .await
         }

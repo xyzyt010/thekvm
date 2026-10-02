@@ -51,6 +51,13 @@ pub struct Config {
     /// files without this field load as the default.
     #[serde(default = "default_clipboard_max_mb")]
     pub clipboard_max_mb: u32,
+    /// Reverse the scroll direction for outbound drive sessions from THIS
+    /// machine: when true, wheel deltas captured here are negated before
+    /// they reach the wire, so driving the peer scrolls the opposite way.
+    /// Local scrolling is untouched; the peer needs nothing. Old config
+    /// files without this field load as false (normal scroll).
+    #[serde(default)]
+    pub reverse_scroll: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -102,6 +109,7 @@ impl Default for Config {
             auto_connect_address: None,
             clipboard_enabled: true,
             clipboard_max_mb: DEFAULT_CLIPBOARD_MAX_MB,
+            reverse_scroll: false,
         }
     }
 }

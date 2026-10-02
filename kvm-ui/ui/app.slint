@@ -56,6 +56,7 @@ export component AppWindow inherits Window {
     in-out property <bool> lock-screen-control: false;
     in-out property <bool> clipboard-enabled: true;
     in-out property <string> clipboard-max-mb: "2";
+    in-out property <bool> reverse-scroll: false;
     // Login auto-start (kvm-platform::autostart): the switch reflects
     // what the OS will actually do at the next logon, not a config
     // value, so it can never claim a state the machine does not have.
@@ -105,6 +106,7 @@ export component AppWindow inherits Window {
     callback disconnect();
     callback set-role(int /* 0 both, 1 controller, 2 receiver */);
     callback set-edge-mode(int /* 0 single facing edge, 1 double horizontal edges */);
+    callback set-reverse-scroll(bool /* true reverses outbound wheel */);
     callback pair-from-invite(string /* invite */);
     callback discover-lan();
     callback start-daemon();
@@ -712,6 +714,24 @@ export component AppWindow inherits Window {
                             checked <=> root.clipboard-enabled;
                             toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
                         }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Reverse scroll direction on the other computer";
+                            color: #d1d5db;
+                            vertical-alignment: center;
+                        }
+                        Switch {
+                            checked <=> root.reverse-scroll;
+                            toggled => { root.set-reverse-scroll(root.reverse-scroll); }
+                        }
+                    }
+                    Text {
+                        text: "When on, scrolling while driving the peer goes the opposite way. Local scrolling is unchanged.";
+                        color: #9ca3af;
+                        font-size: 11px;
+                        wrap: word-wrap;
                     }
                     HorizontalLayout {
                         spacing: 12px;

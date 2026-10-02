@@ -134,6 +134,11 @@ pub enum ControlRequest {
         /// current value. The listener always serves both.
         #[serde(default)]
         transport: Option<TransportProtocol>,
+        /// Reverse outbound scroll from this machine (see
+        /// `Config::reverse_scroll`); omission preserves the current value
+        /// so partial CLI/UI updates are safe.
+        #[serde(default)]
+        reverse_scroll: Option<bool>,
     },
     /// Take one chunk of the latest peer paste stashed for this
     /// logged-in session (see [`ClipboardUpdate`]): the headless
@@ -217,6 +222,10 @@ pub struct DaemonStatus {
     /// Cemented transport. Always Udp; defaults to Udp for older daemons.
     #[serde(default)]
     pub transport: TransportProtocol,
+    /// Reverse outbound scroll (see `Config::reverse_scroll`). Defaults to
+    /// false for older daemons that predate the field.
+    #[serde(default)]
+    pub reverse_scroll: bool,
     pub peer_count: usize,
     pub active_session_count: usize,
     pub uptime_seconds: u64,
@@ -460,6 +469,7 @@ mod tests {
             clipboard_max_mb: Some(2),
             edge_mode: Some(EdgeMode::Double),
             transport: Some(TransportProtocol::Udp),
+            reverse_scroll: None,
         };
         let expected_address = "127.0.0.1:42110".to_owned();
         let sender = tokio::spawn(async move {
@@ -477,6 +487,7 @@ mod tests {
             clipboard_max_mb,
             edge_mode,
             transport,
+            reverse_scroll,
         }) = read_request(&mut right).await.unwrap()
         else {
             panic!("expected SetConfig request");
@@ -495,6 +506,7 @@ mod tests {
         assert_eq!(clipboard_max_mb, Some(2));
         assert_eq!(edge_mode, Some(EdgeMode::Double));
         assert_eq!(transport, Some(TransportProtocol::Udp));
+        assert_eq!(reverse_scroll, None);
         sender.await.unwrap();
     }
 

@@ -612,6 +612,17 @@ static RECEIPTS: HelperReceipts = HelperReceipts {
     last_error: std::sync::Mutex::new(String::new()),
 };
 
+/// Consecutive SendInput failures without one success. A transient blip
+/// resets on the next ok; a sustained run means the injector is dead
+/// (revoked seat, lost desktop rights) while SetCursorPos warps keep the
+/// cursor gliding - the moves-but-wont-click split with green upstream
+/// counters. The helper exits loudly past the bound so the session tears
+/// down and re-dials instead of sitting half-dead forever.
+static CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bound for CONSECUTIVE_FAILURES: 50 straight failures is never a blip.
+const CONSECUTIVE_FAILURE_BOUND: u64 = 50;
+
 impl HelperReceipts {
     fn ok(&self) -> u64 {
         self.ok.load(std::sync::atomic::Ordering::Relaxed)
@@ -635,6 +646,7 @@ impl HelperReceipts {
             .unwrap_or_default()
     }
     fn reset(&self) {
+        CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
         self.ok.store(0, std::sync::atomic::Ordering::Relaxed);
         self.failed.store(0, std::sync::atomic::Ordering::Relaxed);
         self.skipped.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -650,12 +662,14 @@ fn receipt_ok() {
     RECEIPTS
         .ok
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn receipt_failed(error: String) {
     RECEIPTS
         .failed
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    CONSECUTIVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut guard) = RECEIPTS.last_error.lock() {
         guard.clear();
         guard.push_str(&error.chars().take(256).collect::<String>());
@@ -757,6 +771,13 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                             Err(error) => {
                                 tracing::warn!(%error, "helper input injection failed; continuing");
                                 receipt_failed(error.to_string());
+                                if CONSECUTIVE_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+                                    >= CONSECUTIVE_FAILURE_BOUND
+                                {
+                                    anyhow::bail!(
+                                        "helper injector dead: consecutive SendInput failures; tearing down so the session re-dials"
+                                    );
+                                }
                             }
                         }
                     }

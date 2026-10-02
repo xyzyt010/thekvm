@@ -1028,6 +1028,7 @@ pub(crate) struct ConfigureOptions<'a> {
     pub(crate) clear_auto_connect: bool,
     pub(crate) clipboard_enabled: Option<bool>,
     pub(crate) clipboard_max_mb: Option<u32>,
+    pub(crate) reverse_scroll: Option<bool>,
 }
 
 pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
@@ -1042,6 +1043,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
         clear_auto_connect,
         clipboard_enabled,
         clipboard_max_mb,
+        reverse_scroll,
     } = options;
     let requested_mode = mode
         .map(|mode| match mode.to_ascii_lowercase().as_str() {
@@ -1088,6 +1090,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
             clipboard_max_mb,
             edge_mode: None,
             transport,
+            reverse_scroll,
         },
     )
     .await
@@ -1134,6 +1137,9 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     }
     if let Some(enabled) = clipboard_enabled {
         config.clipboard_enabled = enabled;
+    }
+    if let Some(reverse) = reverse_scroll {
+        config.reverse_scroll = reverse;
     }
     if let Some(max_mb) = clipboard_max_mb {
         if max_mb == 0 || max_mb > kvm_core::config::MAX_CLIPBOARD_MAX_MB {
@@ -1467,6 +1473,7 @@ pub async fn capture(address: &str) -> Result<()> {
         config.clipboard_max_bytes() as u64,
         capabilities.smooth_scroll,
         capabilities.pinch_zoom,
+        config.reverse_scroll,
     )
     .await;
     // Keep local input usable after Ctrl+C, peer loss, or any protocol error.
@@ -1653,6 +1660,7 @@ async fn run_windows_service_controller(
     request_lock_screen: bool,
     mode: Mode,
     screen_geometry: Option<ScreenGeometry>,
+    reverse_scroll: bool,
 ) -> Result<()> {
     // Suppression watchdog for this process (see TASK_HEARTBEAT_MS).
     spawn_suppression_watchdog();
@@ -1714,6 +1722,7 @@ async fn run_windows_service_controller(
                         peer_fingerprint,
                         capabilities.smooth_scroll,
                         capabilities.pinch_zoom,
+                        reverse_scroll,
                         revoked_peers.clone(),
                     )
                     .await;
@@ -1763,6 +1772,7 @@ async fn run_windows_service_capture_stream(
     peer_fingerprint: String,
     peer_smooth: bool,
     peer_pinch: bool,
+    reverse_scroll: bool,
     revoked_peers: tokio::sync::broadcast::Sender<String>,
 ) -> Result<()> {
     let (remote_closed_tx, mut remote_closed_rx) = tokio::sync::oneshot::channel();
@@ -1795,6 +1805,7 @@ async fn run_windows_service_capture_stream(
                     stamp_task_heartbeat();
                     let physical_ctrl = state.keys.contains(&HID_LEFT_CTRL);
                     let mut send_failed: Option<anyhow::Error> = None;
+                    let event = apply_reverse_scroll(event, reverse_scroll);
                     for out in pinch_for_send(event, peer_pinch, physical_ctrl, &mut pinch_held) {
                         state.record(out);
                         let Some(outgoing) =
@@ -1825,12 +1836,14 @@ async fn run_windows_service_capture_stream(
                             | InputEvent::SmoothWheel { .. } => {
                                 send_input(&connection, &mut send, sequence, outgoing).await
                             }
-                            _ => write_frame(
-                                &mut send,
-                                &WireMessage::Input(InputPacket { sequence, event: outgoing }),
-                            )
-                            .await
-                            .map_err(Into::into),
+                            // Keys/buttons (and the synthetic pinch Ctrl)
+                            // ride the same bounded episode stream as wheel:
+                            // the old unbounded write pended forever on a
+                            // half-dead association and stalled this whole
+                            // privileged loop with suppression held — motion
+                            // kept best-effort gliding while clicks/keys
+                            // wedged, the Win-Win freeze shape.
+                            _ => send_input(&connection, &mut send, sequence, outgoing).await,
                         };
                         if let Err(error) = send_result {
                             send_failed = Some(error);
@@ -1962,8 +1975,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // the physical mouse back to the desk both overflow that edge
     // within a few hundred ms — the "exits mid-screen" snap-back. A
     // deliberate shove back out holds the boundary far longer than
-    // either window, so returning home still feels immediate.
-    router.set_return_hold(Duration::from_millis(180));
+    // either window, so returning home still feels immediate. 100ms
+    // (down from 180): the 28px sustained-overflow rule already eats
+    // brushes, so the hold only needs to cover the crossing fling tail —
+    // shorter holds make deliberate returns feel instant (MWB parity)
+    // without re-arming the snap-back.
+    router.set_return_hold(Duration::from_millis(100));
     router.set_handoff_grace(Duration::from_millis(400));
     match kvm_platform::capture::screen_size() {
         Ok(Some((width, height))) => match router.adopt_local_screen_size(width, height) {
@@ -2664,6 +2681,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     want_udp_motion: true, // UDP cemented: every dial offers motion fast path
                     send_strikes: &mut send_strikes,
                     send_stall_since: &mut send_stall_since,
+                    reverse_scroll: config.reverse_scroll,
                 })
                 .await?;
             }
@@ -2797,6 +2815,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     want_udp_motion: true, // UDP cemented: every dial offers motion fast path
                     send_strikes: &mut send_strikes,
                     send_stall_since: &mut send_stall_since,
+                    reverse_scroll: config.reverse_scroll,
                 })
                 .await?;
             }
@@ -3429,7 +3448,8 @@ fn resync_home_to_truth(router: &mut EdgeRouter) {
 /// MWB lastJump parity: ignore a new edge transfer within 100ms of the last
 /// completed one, so two facing edges can never ping-pong the cursor
 /// forever. Pure so the determinism is unit-tested.
-fn transfer_debounced(last_transfer: Option<std::time::Instant>) -> bool {    last_transfer.is_some_and(|when| when.elapsed() < Duration::from_millis(25))
+fn transfer_debounced(last_transfer: Option<std::time::Instant>) -> bool {
+    last_transfer.is_some_and(|when| when.elapsed() < Duration::from_millis(25))
 }
 
 /// Best-effort release of local-input suppression. A failed ungrab must
@@ -4073,6 +4093,10 @@ struct TopologyEventContext<'a> {
     /// (the mid-display sudden-exit shape) — only sustained silence
     /// with nothing getting through for seconds means dead network.
     send_stall_since: &'a mut Option<std::time::Instant>,
+    /// Sender's reverse-scroll setting (see Config::reverse_scroll):
+    /// loop-local copy taken at drive start. Wheel deltas are negated
+    /// before pinch expansion and the downgrade debt.
+    reverse_scroll: bool,
 }
 
 /// Stall-breaker trip thresholds: this many consecutive un-sent inputs
@@ -4206,6 +4230,7 @@ async fn handle_topology_event(
         want_udp_motion,
         send_strikes,
         send_stall_since,
+        reverse_scroll,
     } = context;
     // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
     // Raw deltas keep flowing after the OS pointer has stopped at the edge,
@@ -4353,6 +4378,7 @@ async fn handle_topology_event(
                 .pressed_keys
                 .contains(&HID_LEFT_CTRL);
             let peer_pinch = session.peer_pinch;
+            let event = apply_reverse_scroll(event, reverse_scroll);
             let send_list =
                 pinch_for_send(event, peer_pinch, physical_ctrl, &mut session.pinch_held);
             for event in send_list {
@@ -7184,6 +7210,7 @@ async fn run_capture_stream(
     clipboard_max_bytes: u64,
     peer_smooth: bool,
     peer_pinch: bool,
+    reverse_scroll: bool,
 ) -> Result<()> {
     // The receiver replies to pings on the same bidirectional stream. Drain
     // that direction so the QUIC receive window cannot fill during a long
@@ -7279,8 +7306,9 @@ async fn run_capture_stream(
                         }
                     }
                     let mut send_failed: Option<anyhow::Error> = None;
+                    let reversed = apply_reverse_scroll(captured.event, reverse_scroll);
                     for outgoing in pinch_for_send(
-                        captured.event,
+                        reversed,
                         peer_pinch,
                         ctrl_shadow,
                         &mut pinch_held,
@@ -7288,9 +7316,12 @@ async fn run_capture_stream(
                         // Expanded synthetic Ctrl presses flow like any key
                         // (ordered with their wheels on this one reliable
                         // stream); native Pinch passes through untouched.
+                        // Bounded like every other drive write (see
+                        // send_input): an unbounded key write pends forever
+                        // on a half-dead association with suppression held.
                         sequence = sequence.wrapping_add(1);
-                        if let Err(error) = write_frame(&mut send, &WireMessage::Input(InputPacket { sequence, event: outgoing })).await {
-                            send_failed = Some(error.into());
+                        if let Err(error) = send_input(&connection, &mut send, sequence, outgoing).await {
+                            send_failed = Some(error);
                             break;
                         }
                     }
@@ -7305,8 +7336,9 @@ async fn run_capture_stream(
                 Some(captured) => {
                     // Drive-task heartbeat (see TASK_HEARTBEAT_MS).
                     stamp_task_heartbeat();
+                    let reversed = apply_reverse_scroll(captured.event, reverse_scroll);
                     let Some(outgoing) =
-                        outgoing_wheel_event(captured.event, peer_smooth, &mut wheel_debt)
+                        outgoing_wheel_event(reversed, peer_smooth, &mut wheel_debt)
                     else {
                         continue;
                     };
@@ -7676,6 +7708,7 @@ pub async fn run() -> Result<()> {
                     controller_config.allow_lock_screen_control,
                     controller_config.mode,
                     local_screen_geometry(&controller_config.layout),
+                    controller_config.reverse_scroll,
                 )
                 .await
                 {
@@ -8364,6 +8397,12 @@ async fn handle_connection(
             // never tracks" names its dropping line instead of guessing.
             let mut dropped_duplicate = 0u64;
             let mut dropped_stale = 0u64;
+            // Datagrams dropped because another input session already holds
+            // the single-driver slot: without this, motion datagrams inject
+            // while stream clicks die on input_session_busy — the exact
+            // "cursor moves but clicks dead" split. Gated below so both die
+            // together (loudly) instead of misleadingly half-working.
+            let mut dropped_busy = 0u64;
             // Datagrams that decoded cleanly off the association socket:
             // received>0 with motion=0 names the drop logic; received=0
             // with sender datagrams_sent>0 names the wire/task; the warn
@@ -8824,6 +8863,26 @@ async fn handle_connection(
                             }
                         };
                         datagrams_received += 1;
+                        // Single-driver gate for the datagram path: the stream
+                        // Handoff arm claims the slot lazily; a datagram from
+                        // a second live driver must not inject motion while
+                        // its clicks die busy. First datagram claims like a
+                        // handoff (association stays up for the next one).
+                        if input_permit.is_none() {
+                            match input_session_slot.clone().try_acquire_owned() {
+                                Ok(permit) => input_permit = Some(permit),
+                                Err(_) => {
+                                    dropped_busy += 1;
+                                    if dropped_busy == 1 || dropped_busy.is_multiple_of(100) {
+                                        tracing::warn!(
+                                            dropped_busy,
+                                            "dropping input datagram: another input session already controls this node"
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         // Same live-drive signal for the datagram path
                         // (motion usually arrives here, not on the stream).
                         note_inbound_activity(&link_input_events, &link_last_input);
@@ -9073,6 +9132,7 @@ async fn handle_connection(
                 keys = key_count,
                 dropped_duplicate,
                 dropped_stale,
+                dropped_busy,
                 datagrams_received,
                 reason = end_reason,
                 error = session_result
@@ -9407,6 +9467,33 @@ async fn process_remote_input(
 struct WheelDowngrade {
     x: i32,
     y: i32,
+}
+
+/// Apply the sender's reverse-scroll setting to one outbound event. Pure
+/// for tests. When `reverse` is false this is the identity. When true,
+/// wheel deltas are negated on both axes BEFORE pinch expansion and the
+/// smooth downgrade debt, so legacy peers, debt math, and census sums all
+/// see the reversed direction consistently. Motion, keys, buttons, and
+/// pinch gestures pass through untouched: reverse scroll inverts the
+/// scroll wheel only, never zoom or pointer motion. The setting lives on
+/// the SENDER (the machine whose fingers scroll), so turning it on here
+/// reverses scrolling on the driven peer while local scrolling stays
+/// normal.
+fn apply_reverse_scroll(event: InputEvent, reverse: bool) -> InputEvent {
+    if !reverse {
+        return event;
+    }
+    match event {
+        InputEvent::SmoothWheel { x, y } => InputEvent::SmoothWheel {
+            x: x.saturating_neg(),
+            y: y.saturating_neg(),
+        },
+        InputEvent::Wheel(delta) => InputEvent::Wheel(WheelDelta {
+            x: delta.x.saturating_neg(),
+            y: delta.y.saturating_neg(),
+        }),
+        other => other,
+    }
 }
 
 /// Map one captured event onto what this peer can receive. Smooth-capable
@@ -10810,16 +10897,20 @@ async fn send_input(
     // it. The receiver still accepts datagrams from older peers (shared
     // dedup sets cover both arms).
     //
-    // BOUNDED (2s): a peer that stops reading (wedged app, dead helper,
+    // BOUNDED (800ms): a peer that stops reading (wedged app, dead helper,
     // dropped network) would otherwise park this write — and the whole
     // drive task — until the next watchdog. That is the freeze class:
     // local suppression stays engaged while the stalled task cannot
     // stamp liveness. A timed-out write ends the EPISODE instead (every
     // call site tears down and releases suppression), so a dead peer
     // costs a crossing, never the local desktop. Motion never comes
-    // here (see send_motion_best_effort): it drops, never waits.
+    // here (see send_motion_best_effort): it drops, never waits. 800ms
+    // (down from 2s): keys/buttons/wheel stay reliable on healthy LAN
+    // (<5ms), but a half-dead peer releases local input in under a
+    // second instead of reading as a multi-second "clicks dead" freeze
+    // while UDP motion keeps gliding.
     match tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_millis(800),
         write_frame(
             &mut *send,
             &WireMessage::Input(InputPacket { sequence, event }),
@@ -12294,6 +12385,38 @@ mod tests {
             None
         );
         assert_eq!((debt2.x, debt2.y), (50, 100));
+    }
+
+    #[test]
+    fn reverse_scroll_negates_wheel_only() {
+        use kvm_core::InputEvent;
+        // Off: identity for every event kind.
+        assert_eq!(
+            apply_reverse_scroll(InputEvent::SmoothWheel { x: 10, y: -20 }, false),
+            InputEvent::SmoothWheel { x: 10, y: -20 }
+        );
+        // On: smooth wheel negates on both axes (before downgrade debt, so
+        // legacy peers and census sums see reversed direction consistently).
+        assert_eq!(
+            apply_reverse_scroll(InputEvent::SmoothWheel { x: 10, y: -20 }, true),
+            InputEvent::SmoothWheel { x: -10, y: 20 }
+        );
+        // On: detent wheel negates too (legacy path).
+        assert_eq!(
+            apply_reverse_scroll(InputEvent::Wheel(WheelDelta { x: 1, y: -2 }), true),
+            InputEvent::Wheel(WheelDelta { x: -1, y: 2 })
+        );
+        // On: everything else passes through — motion, keys, buttons, and
+        // pinch gestures are never inverted (reverse scroll inverts the
+        // wheel only, never zoom or pointer motion).
+        let motion = InputEvent::MouseMove { dx: 5, dy: -7 };
+        assert_eq!(apply_reverse_scroll(motion, true), motion);
+        let pinch = InputEvent::Pinch { delta: 120 };
+        assert_eq!(apply_reverse_scroll(pinch, true), pinch);
+        assert_eq!(
+            apply_reverse_scroll(InputEvent::PinchEnd, true),
+            InputEvent::PinchEnd
+        );
     }
 
     #[test]

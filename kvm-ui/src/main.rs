@@ -163,6 +163,7 @@ fn main() -> Result<()> {
     if let Ok(config) = kvm_core::Config::load(&startup_dir.join("config.json")) {
         ui.set_lock_screen_control(config.allow_lock_screen_control);
         ui.set_clipboard_enabled(config.clipboard_enabled);
+        ui.set_reverse_scroll(config.reverse_scroll);
         ui.set_clipboard_max_mb(SharedString::from(config.clipboard_max_mb.to_string()));
         ui.set_device_name(SharedString::from(config.device_name.clone()));
         ui.set_auto_connect_address(SharedString::from(
@@ -584,6 +585,7 @@ fn main() -> Result<()> {
             clipboard_max_mb: None,
             edge_mode: None,
             transport: None,
+            reverse_scroll: None,
         }
     }
 
@@ -791,6 +793,7 @@ fn main() -> Result<()> {
                 clipboard_max_mb: None,
                 edge_mode: None,
                 transport: None,
+                reverse_scroll: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -801,6 +804,7 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(current.edge_mode),
+                        None,
                         None,
                     );
                     ui_log(&format!("role applied: {}", role_name(requested)));
@@ -920,6 +924,7 @@ fn main() -> Result<()> {
                 clipboard_max_mb: None,
                 edge_mode: Some(requested),
                 transport: None,
+                reverse_scroll: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -930,6 +935,7 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(requested),
+                        None,
                         None,
                     );
                     ui_log(&format!(
@@ -974,6 +980,75 @@ fn main() -> Result<()> {
                     ui_log(&format!("edge change failed: {error}"));
                     set_status(&weak, format!("Cannot set edge crossing: {error}"))
                 }
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_set_reverse_scroll(move |wanted| {
+        let weak = weak.clone();
+        set_status(&weak, "Applying scroll direction…".into());
+        std::thread::spawn(move || {
+            let current = match control_request(ControlRequest::GetConfig) {
+                Ok(ControlResponse::Config(config)) => config,
+                Ok(other) => {
+                    set_status(&weak, format!("Cannot read settings: {other:?}"));
+                    return;
+                }
+                Err(error) => {
+                    set_status(
+                        &weak,
+                        control_denied_status(&error, "Background service unreachable"),
+                    );
+                    return;
+                }
+            };
+            match control_request(ControlRequest::SetConfig {
+                device_name: Some(current.device_name.clone()),
+                mode: Some(current.mode),
+                allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                listen_port: None,
+                layout: None,
+                auto_connect_address: current.auto_connect_address.clone(),
+                clear_auto_connect: current.auto_connect_address.is_none(),
+                clipboard_enabled: Some(current.clipboard_enabled),
+                clipboard_max_mb: None,
+                edge_mode: None,
+                transport: None,
+                reverse_scroll: Some(wanted),
+            }) {
+                Ok(ControlResponse::Applied { .. }) => {
+                    mirror_user_config(
+                        &current.device_name,
+                        current.mode,
+                        current.allow_lock_screen_control,
+                        current.clipboard_enabled,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(wanted),
+                    );
+                    let _ = slint::invoke_from_event_loop({
+                        let weak = weak.clone();
+                        move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_reverse_scroll(wanted);
+                            }
+                        }
+                    });
+                    set_status(
+                        &weak,
+                        if wanted {
+                            "Reverse scroll on: driving the peer scrolls the opposite way.".into()
+                        } else {
+                            "Reverse scroll off: driving the peer scrolls normally.".into()
+                        },
+                    );
+                }
+                Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+                Ok(other) => set_status(&weak, format!("Unexpected daemon response: {other:?}")),
+                Err(error) => set_status(&weak, format!("Cannot set scroll direction: {error}")),
             }
         });
     });
@@ -1295,6 +1370,7 @@ fn main() -> Result<()> {
                     None,
                     None,
                     Some(requested_transport),
+                    None,
                 );
                 let mode = match mode_index {
                     1 => "server-client",
@@ -1345,6 +1421,7 @@ fn main() -> Result<()> {
                     // The Settings form has no edge control: preserve it.
                     edge_mode: None,
                     transport: Some(requested_transport),
+                    reverse_scroll: None,
                 }) {
                     Ok(ControlResponse::Applied { restart_required }) => {
                         // Same truth rule as the role buttons: the green
@@ -1424,6 +1501,7 @@ fn main() -> Result<()> {
                             clipboard_max_mb: None,
                             edge_mode: None,
                             transport: None,
+                            reverse_scroll: None,
                         })? {
                             ControlResponse::Applied { .. } => Ok(()),
                             ControlResponse::Error { message } => anyhow::bail!(message),
@@ -1667,6 +1745,7 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                 )));
                 ui.set_lock_screen_control(status.allow_lock_screen_control);
                 ui.set_clipboard_enabled(status.clipboard_enabled);
+                ui.set_reverse_scroll(status.reverse_scroll);
                 ui.set_clipboard_max_mb(SharedString::from(status.clipboard_max_mb.to_string()));
                 // Tray tooltip stays static ("TheKVM"): the TrayIcon is
                 // owned by its pump thread (neither Send nor Sync), so
@@ -2285,6 +2364,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         clipboard_max_mb: None,
         edge_mode: None,
         transport: None,
+        reverse_scroll: None,
     }) {
         Ok(ControlResponse::Applied { .. }) => {}
         Ok(ControlResponse::Error { message }) => anyhow::bail!("{message}"),
@@ -2298,6 +2378,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         current.clipboard_enabled,
         None,
         Some(layout.clone()),
+        None,
         None,
         None,
     );
@@ -4151,6 +4232,7 @@ fn mirror_user_config(
     layout: Option<kvm_core::Layout>,
     edge_mode: Option<EdgeMode>,
     transport: Option<TransportProtocol>,
+    reverse_scroll: Option<bool>,
 ) {
     let path = data_dir().join("config.json");
     let mut config = kvm_core::Config::load(&path).unwrap_or_default();
@@ -4178,6 +4260,9 @@ fn mirror_user_config(
     }
     if let Some(transport) = transport {
         config.transport = transport;
+    }
+    if let Some(reverse) = reverse_scroll {
+        config.reverse_scroll = reverse;
     }
     let _ = config.save(&path);
 }

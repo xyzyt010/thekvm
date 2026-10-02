@@ -395,18 +395,30 @@ mod linux_uinput {
         pub fn release_all(&mut self) -> Result<(), PlatformError> {
             // A session that ends mid-pinch must not leave touch contacts
             // down (stuck DOWN contacts eat every later tap): lift first,
-            // then release keys/buttons as usual.
+            // then release keys/buttons as usual. Best-effort both halves:
+            // one failed emit must never strand the other half's holds
+            // (the "clicks dead while motion moves" freeze shape).
             self.end_pinch();
             let keys = self.pressed_keys.iter().copied().collect::<Vec<_>>();
+            let mut first_error: Option<PlatformError> = None;
             for code in keys {
-                Self::emit(&mut self.keyboard, EV_KEY, code, 0).map_err(io_error)?;
+                if let Err(error) =
+                    Self::emit(&mut self.keyboard, EV_KEY, code, 0).map_err(io_error)
+                {
+                    first_error.get_or_insert(error);
+                }
             }
             let buttons = self.pressed_buttons.iter().copied().collect::<Vec<_>>();
             for code in buttons {
-                Self::emit(&mut self.mouse, EV_KEY, code, 0).map_err(io_error)?;
+                if let Err(error) = Self::emit(&mut self.mouse, EV_KEY, code, 0).map_err(io_error) {
+                    first_error.get_or_insert(error);
+                }
             }
             self.pressed_keys.clear();
             self.pressed_buttons.clear();
+            if let Some(error) = first_error {
+                return Err(error);
+            }
             Ok(())
         }
     }
@@ -1770,7 +1782,11 @@ mod win32_inject {
         pub fn release_all(&self) -> Result<(), PlatformError> {
             // A session that ends mid-pinch must not leave touch contacts
             // down (or the fallback Ctrl held): lift everything first,
-            // then release keys/buttons as usual.
+            // then release keys/buttons as usual. Best-effort both halves:
+            // the old `?` aborted the button releases when one key release
+            // failed, stranding a held button that reads as "clicks dead"
+            // while motion keeps injecting. A stuck modifier/drag is the
+            // freeze shape; collect the first error but always finish.
             self.end_pinch();
             let keys = self
                 .pressed_keys
@@ -1786,18 +1802,26 @@ mod win32_inject {
                 .iter()
                 .copied()
                 .collect::<Vec<_>>();
+            let mut first_error: Option<PlatformError> = None;
             for usage in keys {
-                self.send(InputEvent::Key(kvm_core::KeyEvent {
+                if let Err(error) = self.send(InputEvent::Key(kvm_core::KeyEvent {
                     usage,
                     pressed: false,
                     repeat: false,
-                }))?;
+                })) {
+                    first_error.get_or_insert(error);
+                }
             }
             for button in buttons {
-                self.send(InputEvent::MouseButton {
+                if let Err(error) = self.send(InputEvent::MouseButton {
                     button,
                     pressed: false,
-                })?;
+                }) {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
             }
             Ok(())
         }
