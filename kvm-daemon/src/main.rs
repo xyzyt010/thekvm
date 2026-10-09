@@ -433,6 +433,9 @@ async fn async_main() -> Result<()> {
                 } else {
                     None
                 },
+                // Edge crossing is UI-driven (no CLI switch, like the
+                // edge-mode toggle): the CLI never resets it.
+                double_edge_style: None,
             })
             .await
         }

@@ -53,6 +53,11 @@ export component AppWindow inherits Window {
     in-out property <string> incoming-pairing: "";
     in-out property <string> incoming-pairing-fingerprint: "";
     in-out property <string> incoming-verification-code: "";
+    // Inbound link approval (see PendingLink): a paired peer dialing a
+    // fresh epoch waits for Allow/Deny here. Set from the poll loop;
+    // cleared when the queue empties.
+    in-out property <string> incoming-link: "";
+    in-out property <string> incoming-link-fingerprint: "";
     in-out property <bool> lock-screen-control: false;
     in-out property <bool> clipboard-enabled: true;
     in-out property <string> clipboard-max-mb: "2";
@@ -125,6 +130,8 @@ export component AppWindow inherits Window {
     callback cancel-pairing();
     callback approve-incoming-pairing(string);
     callback reject-incoming-pairing(string);
+    callback approve-incoming-link(string);
+    callback reject-incoming-link(string);
     callback revoke-peer(string);
     callback place-peer-left();
     callback place-peer-right();
@@ -199,6 +206,35 @@ export component AppWindow inherits Window {
                 Button {
                     text: "Deny";
                     clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
+                }
+            }
+        }
+
+        Rectangle {
+            // Same rendezvous rule for LINK approvals: a paired computer
+            // dialing a fresh link waits here until the local human allows
+            // it — no input flows before that click, on any tab.
+            visible: incoming-link != "";
+            background: #123a2a;
+            border-radius: 8px;
+            HorizontalLayout {
+                padding: 8px;
+                spacing: 12px;
+                Text {
+                    text: "INCOMING link — " + incoming-link + " wants to connect (details under Connect tab)";
+                    color: #6ee7b7;
+                    font-size: 13px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+                Button {
+                    text: "Allow";
+                    primary: true;
+                    clicked => { approve-incoming-link(incoming-link-fingerprint); }
+                }
+                Button {
+                    text: "Deny";
+                    clicked => { reject-incoming-link(incoming-link-fingerprint); }
                 }
             }
         }
@@ -454,6 +490,40 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                    VerticalLayout {
+                        spacing: 6px;
+                        // Paired computers still ask before driving: a
+                        // fresh link epoch from a trusted peer waits here
+                        // (Allow once per link — retries and the dial-back
+                        // on the same link never ask again).
+                        visible: incoming-link != "";
+                        Text {
+                            text: "INCOMING link — a paired computer wants to drive:";
+                            color: #6ee7b7;
+                            font-size: 12px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: incoming-link + " is calling. Allow it to connect and drive this computer.";
+                            color: white;
+                            font-size: 15px;
+                            font-weight: 700;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            alignment: center;
+                            Button {
+                                text: "Allow link";
+                                primary: true;
+                                clicked => { approve-incoming-link(incoming-link-fingerprint); }
+                            }
+                            Button {
+                                text: "Deny";
+                                clicked => { reject-incoming-link(incoming-link-fingerprint); }
+                            }
+                        }
+                    }
                 }
                 }
             }
@@ -674,13 +744,26 @@ export component AppWindow inherits Window {
                             clicked => { set-edge-mode(0); }
                         }
                         Button {
-                            text: "Double edge";
+                            text: "Double inverse";
                             enabled: linked-peer-name != "";
                             clicked => { set-edge-mode(1); }
                         }
                     }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Button {
+                            text: "Double fixed left";
+                            enabled: linked-peer-name != "";
+                            clicked => { set-edge-mode(2); }
+                        }
+                        Button {
+                            text: "Double fixed right";
+                            enabled: linked-peer-name != "";
+                            clicked => { set-edge-mode(3); }
+                        }
+                    }
                     Text {
-                        text: edge-mode-index == 1 ? "Double edge: both left and right outer edges cross on a two-computer link." : "Single edge: only the facing edge crosses.";
+                        text: edge-mode-index == 0 ? "Single edge: only the facing edge crosses." : edge-mode-index == 1 ? "Double inverse: exit left to enter at the right edge and back — either edge returns once settled." : edge-mode-index == 2 ? "Double fixed left: every arrival (and return) uses the left edge, no matter the exit edge." : "Double fixed right: every arrival (and return) uses the right edge, no matter the exit edge.";
                         color: #9ca3af;
                         font-size: 12px;
                         wrap: word-wrap;

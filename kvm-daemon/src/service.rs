@@ -629,6 +629,18 @@ fn is_link_ended_rejection(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("link ended"))
 }
 
+/// True when the dial failed because the peer's human declined this link
+/// (or the device is in its 1-minute denial freeze). Callers exit instead
+/// of retrying: every retry would re-ring a peer that just said no.
+/// Matches only our own decline wording (lowercase), never UI display
+/// texts. Pure for tests.
+fn is_link_declined_rejection(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains("declined the link") || text.contains("paused for 1 minute")
+    })
+}
+
 /// Shared ban-exit status line: `THEKVM_STATUS ended ban <epoch>` so the
 /// supervising UI can tell a deliberate remote Disconnect (auto-redial on
 /// the peer's fresh epoch) from a crash (report, stay down).
@@ -1036,6 +1048,7 @@ pub(crate) struct ConfigureOptions<'a> {
     pub(crate) clipboard_max_mb: Option<u32>,
     pub(crate) reverse_scroll: Option<bool>,
     pub(crate) auto_discover: Option<bool>,
+    pub(crate) double_edge_style: Option<kvm_core::DoubleEdgeStyle>,
 }
 
 pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
@@ -1052,6 +1065,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
         clipboard_max_mb,
         reverse_scroll,
         auto_discover,
+        double_edge_style,
     } = options;
     let requested_mode = mode
         .map(|mode| match mode.to_ascii_lowercase().as_str() {
@@ -1100,6 +1114,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
             transport,
             reverse_scroll,
             auto_discover,
+            double_edge_style,
         },
     )
     .await
@@ -1152,6 +1167,9 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     }
     if let Some(discover) = auto_discover {
         config.auto_discover = discover;
+    }
+    if let Some(style) = double_edge_style {
+        config.double_edge_style = style;
     }
     if let Some(max_mb) = clipboard_max_mb {
         if max_mb == 0 || max_mb > kvm_core::config::MAX_CLIPBOARD_MAX_MB {
@@ -1645,6 +1663,16 @@ pub async fn connect(
                     eprintln!("THEKVM_STATUS {}", ban_ended_status(link_id));
                     return Err(error);
                 }
+                // A declined (or denial-frozen) link is a deliberate human
+                // answer, not an outage: exit like a ban instead of
+                // retrying the same epoch forever — every retry would
+                // re-ring the peer and re-pop the approval it just
+                // denied. The UI shows "rejected"; a fresh Connect asks
+                // again with a new epoch.
+                if is_link_declined_rejection(&error) {
+                    eprintln!("THEKVM_STATUS ended {error:#}");
+                    return Err(error);
+                }
                 tracing::warn!(%error, peer = %address, "peer unavailable; retrying");
                 eprintln!("THEKVM_STATUS waiting {error:#}");
             }
@@ -2026,10 +2054,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
         Err(error) => tracing::debug!(%error, "could not query initial cursor position"),
     }
     // The Settings edge discipline applies from the first crossing: the
-    // router starts in the configured Single/Double mode, and the toggle
-    // only affects later handoffs through a fresh child.
+    // router starts in the configured Single/Double mode and entry
+    // style, and the toggles only affect later handoffs through a fresh
+    // child.
     router.set_edge_mode(config.edge_mode);
-    tracing::info!(edge_mode = ?config.edge_mode, "topology edge discipline");
+    router.set_double_style(config.double_edge_style);
+    tracing::info!(edge_mode = ?config.edge_mode, double_style = ?config.double_edge_style, "topology edge discipline");
     // Episodes advertise the ADOPTED router geometry (real measured dims),
     // never the configured fallback: the peer maps every entry point
     // against this. Plus publish it for the headless daemon sidecar.
@@ -8107,6 +8137,78 @@ async fn handle_connection(
                 reject(&mut send, "peer is configured as receiver-only").await?;
                 bail!("peer cannot initiate control from receiver-only mode");
             }
+            // Per-link approval (the request+accept rule): pairing trust
+            // alone never opens a link. Every fresh epoch waits for the
+            // local human to allow it; approved epochs — and the link
+            // born from a just-completed pairing — pass silently, so
+            // retries and the dial-back on the same epoch never prompt
+            // again. Epoch-less admin paths (fixed boot peer, CLI
+            // capture) carry no epoch to approve and proceed on pairing
+            // trust with an audit line — no UI exists there to ask.
+            match hello.link_id {
+                None => {
+                    audit_event(
+                        audit_dir,
+                        &format!(
+                            "link auto-passed peer={peer_fingerprint} remote={} reason=no_epoch_fixed_admin_path",
+                            conn.remote_address(),
+                        ),
+                    );
+                }
+                Some(epoch) => {
+                    let links = crate::control::link_approvals();
+                    if !links.is_approved(&peer_fingerprint, epoch).await
+                        && !links.recently_paired(&peer_fingerprint).await
+                    {
+                        let request = kvm_protocol::control::PendingLink {
+                            node_name: hello.node_name.clone(),
+                            fingerprint_hex: peer_fingerprint.clone(),
+                            address: conn.remote_address().to_string(),
+                            link_id: Some(epoch),
+                        };
+                        match links.register(request).await {
+                            Ok(waiter) => {
+                                tracing::info!(
+                                    peer = %peer_fingerprint,
+                                    epoch,
+                                    "link awaiting local approval; no input flows until allowed"
+                                );
+                                // A vanished initiator must not park a row
+                                // for the whole timeout (see pairing).
+                                let approved = tokio::select! {
+                                    _ = conn.closed() => {
+                                        links.cancel(&peer_fingerprint, epoch).await;
+                                        bail!("peer disconnected while its link awaited approval");
+                                    }
+                                    decision = waiter.wait() => decision?,
+                                };
+                                if !approved {
+                                    reject(&mut send, "declined the link on this computer").await?;
+                                    audit_event(
+                                        audit_dir,
+                                        &format!(
+                                            "session-rejected peer={peer_fingerprint} remote={} reason=link_not_approved",
+                                            conn.remote_address(),
+                                        ),
+                                    );
+                                    bail!("link epoch {epoch} not approved by local user");
+                                }
+                            }
+                            Err(error) => {
+                                reject(&mut send, &format!("{error:#}")).await?;
+                                audit_event(
+                                    audit_dir,
+                                    &format!(
+                                        "session-rejected peer={peer_fingerprint} remote={} reason=link_approval_refused",
+                                        conn.remote_address(),
+                                    ),
+                                );
+                                bail!("link not approved: {error:#}");
+                            }
+                        }
+                    }
+                }
+            }
             // Effective grant: requested AND allowed. A downgrade (peer
             // asked, we did not opt in) stays an ordinary desktop session
             // instead of a rejection, so reverse control survives a
@@ -9381,11 +9483,15 @@ async fn process_remote_input(
         if hop_ready {
             *hop_edge = None;
             *hop_accum = 0;
-            if let Some(handoff) =
-                config
-                    .layout
-                    .handoff_for_motion(screen_id, x, y, dx, dy, config.edge_mode)
-            {
+            if let Some(handoff) = config.layout.handoff_for_motion(
+                screen_id,
+                x,
+                y,
+                dx,
+                dy,
+                config.edge_mode,
+                config.double_edge_style,
+            ) {
                 let screen = config
                     .layout
                     .screen(screen_id)
@@ -10014,6 +10120,13 @@ async fn handle_pairing(
         .write()
         .await
         .pin(node_name, actual_peer_fingerprint.to_owned())?;
+    // A completed pairing IS a link approval for the link born right
+    // after it: the human approved this exact device seconds ago, so its
+    // first link epoch passes silently instead of popping a second
+    // approval for the same decision.
+    crate::control::link_approvals()
+        .note_paired(actual_peer_fingerprint)
+        .await;
     write_frame(
         send,
         &WireMessage::Accepted {
@@ -11330,6 +11443,22 @@ mod tests {
         )));
         // Display-case text never matches (the matcher is lowercase-only).
         assert!(!is_link_ended_rejection(&anyhow::anyhow!("Link ended")));
+    }
+
+    #[test]
+    fn declined_links_exit_instead_of_reringing_the_peer() {
+        assert!(is_link_declined_rejection(&anyhow::anyhow!(
+            "peer rejected session: declined the link on this computer"
+        )));
+        assert!(is_link_declined_rejection(&anyhow::anyhow!(
+            "peer rejected session: link attempts from this device are paused for 1 minute after repeated denials"
+        )));
+        assert!(!is_link_declined_rejection(&anyhow::anyhow!(
+            "peer rejected session: peer is not paired"
+        )));
+        assert!(!is_link_declined_rejection(&anyhow::anyhow!(
+            "Connection refused (os error 111)"
+        )));
     }
 
     #[test]

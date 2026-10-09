@@ -7,10 +7,10 @@ slint::include_modules!();
 mod tray;
 
 use anyhow::{Context, Result};
-use kvm_core::{EdgeMode, Mode, TransportProtocol};
+use kvm_core::{DoubleEdgeStyle, EdgeMode, Mode, TransportProtocol};
 use kvm_protocol::control::{
     read_response, write_request, ClipboardKind, ControlRequest, ControlResponse, DaemonStatus,
-    PendingPairing,
+    PendingLink, PendingPairing,
 };
 use kvm_protocol::pairing::Identity;
 use kvm_protocol::transport;
@@ -130,6 +130,10 @@ fn main() -> Result<()> {
 
     let ui = AppWindow::new()?;
     let pending_pair = Arc::new(Mutex::new(None::<PendingPair>));
+    // Last polled inbound-link queue (see ListPendingLinks): handlers need
+    // each entry's epoch to approve/deny it.
+    let pending_links = Arc::new(Mutex::new(Vec::<PendingLink>::new()));
+    let pending_links_for_poll = pending_links.clone();
     let startup_dir = data_dir();
     ui.set_app_version(SharedString::from(format!(
         "v{}",
@@ -180,10 +184,10 @@ fn main() -> Result<()> {
             kvm_core::Mode::ServerClient => 1,
             kvm_core::Mode::ClientOnly => 2,
         });
-        ui.set_edge_mode_index(match config.edge_mode {
-            EdgeMode::Single => 0,
-            EdgeMode::Double => 1,
-        });
+        ui.set_edge_mode_index(edge_choice_index(
+            config.edge_mode,
+            config.double_edge_style,
+        ));
         // Seed the green "Current role" text from the same file: until the
         // first successful poll it is the only source of truth on screen.
         ui.set_role_text(SharedString::from(role_name(config.mode)));
@@ -440,6 +444,44 @@ fn main() -> Result<()> {
                             }
                             set_incoming_pairing(&weak, pairings);
                         }
+                        if let Ok(ControlResponse::PendingLinks(links)) =
+                            control_request(ControlRequest::ListPendingLinks)
+                        {
+                            // Our own link's other half never pops: the peer's
+                            // dial-back carries the epoch WE minted, so
+                            // approve it silently (logged) instead of asking
+                            // the local human to approve their own link.
+                            let outbound_epoch = session_for_poll
+                                .lock()
+                                .ok()
+                                .and_then(|slot| slot.as_ref().and_then(|session| session.link_id));
+                            let mut visible = Vec::new();
+                            for link in links {
+                                if link.link_id.is_some() && link.link_id == outbound_epoch {
+                                    ui_log(&format!(
+                                        "link: approved our own outbound epoch {} silently (dial-back half)",
+                                        link.link_id.unwrap_or(0)
+                                    ));
+                                    let _ = control_request(ControlRequest::ApproveLink {
+                                        fingerprint_hex: link.fingerprint_hex.clone(),
+                                        link_id: link.link_id,
+                                    });
+                                    continue;
+                                }
+                                visible.push(link);
+                            }
+                            let count = visible.len();
+                            if LAST_INCOMING_LINK_COUNT
+                                .swap(count, std::sync::atomic::Ordering::Relaxed)
+                                != count
+                            {
+                                ui_log(&format!("poll: {count} incoming link(s) listed"));
+                            }
+                            if let Ok(mut slot) = pending_links_for_poll.lock() {
+                                *slot = visible.clone();
+                            }
+                            set_incoming_link(&weak, visible);
+                        }
                     }
                     Ok(other) => {
                         consecutive_failures += 1;
@@ -638,6 +680,7 @@ fn main() -> Result<()> {
             transport: None,
             reverse_scroll: None,
             auto_discover: None,
+            double_edge_style: None,
         }
     }
 
@@ -847,6 +890,7 @@ fn main() -> Result<()> {
                 transport: None,
                 reverse_scroll: None,
                 auto_discover: None,
+                double_edge_style: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -860,7 +904,8 @@ fn main() -> Result<()> {
                         None,
                         None,
                         None,
-                    );
+
+                    None,);
                     ui_log(&format!("role applied: {}", role_name(requested)));
                     // Update the green role text from the authoritative
                     // Applied result now; the poll refreshes it again when
@@ -938,13 +983,10 @@ fn main() -> Result<()> {
     ui.on_set_edge_mode(move |index| {
         let weak = weak.clone();
         let edge_session = edge_session.clone();
-        let requested = match index {
-            1 => EdgeMode::Double,
-            _ => EdgeMode::Single,
-        };
+        let (requested_mode, requested_style) = edge_choice_from_index(index);
         ui_log(&format!(
             "edge button pressed: {}",
-            edge_mode_name(requested)
+            edge_choice_name(requested_mode, requested_style)
         ));
         set_status(&weak, "Applying edge crossing…".into());
         std::thread::spawn(move || {
@@ -976,10 +1018,11 @@ fn main() -> Result<()> {
                 clear_auto_connect: current.auto_connect_address.is_none(),
                 clipboard_enabled: Some(current.clipboard_enabled),
                 clipboard_max_mb: None,
-                edge_mode: Some(requested),
+                edge_mode: Some(requested_mode),
                 transport: None,
                 reverse_scroll: None,
                 auto_discover: None,
+                double_edge_style: Some(requested_style),
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -989,16 +1032,17 @@ fn main() -> Result<()> {
                         current.clipboard_enabled,
                         None,
                         None,
-                        Some(requested),
+                        Some(requested_mode),
                         None,
                         None,
                         None,
+                        Some(requested_style),
                     );
                     ui_log(&format!(
                         "edge crossing applied: {}",
-                        edge_mode_name(requested)
+                        edge_choice_name(requested_mode, requested_style)
                     ));
-                    set_edge_mode_display(&weak, requested);
+                    set_edge_mode_display(&weak, requested_mode, requested_style);
                     refresh_arrangement(&weak, child_running(&edge_session));
                     if edge_session
                         .lock()
@@ -1014,13 +1058,16 @@ fn main() -> Result<()> {
                             &weak,
                             format!(
                                 "Edge crossing set: {}. Link stopped — Connect again to re-link.",
-                                edge_mode_name(requested)
+                                edge_choice_name(requested_mode, requested_style)
                             ),
                         );
                     } else {
                         set_status(
                             &weak,
-                            format!("Edge crossing set: {}.", edge_mode_name(requested)),
+                            format!(
+                                "Edge crossing set: {}.",
+                                edge_choice_name(requested_mode, requested_style)
+                            ),
                         );
                     }
                 }
@@ -1073,6 +1120,7 @@ fn main() -> Result<()> {
                 transport: None,
                 reverse_scroll: Some(wanted),
                 auto_discover: None,
+                double_edge_style: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -1085,6 +1133,7 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(wanted),
+                        None,
                         None,
                     );
                     let _ = slint::invoke_from_event_loop({
@@ -1323,6 +1372,7 @@ fn main() -> Result<()> {
                 transport: None,
                 reverse_scroll: None,
                 auto_discover: Some(wanted),
+                double_edge_style: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -1336,7 +1386,8 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(wanted),
-                    );
+
+                    None,);
                     let _ = slint::invoke_from_event_loop({
                         let weak = weak.clone();
                         move || {
@@ -1443,6 +1494,18 @@ fn main() -> Result<()> {
     });
 
     let weak = ui.as_weak();
+    let links_for_approve = pending_links.clone();
+    ui.on_approve_incoming_link(move |fingerprint| {
+        decide_incoming_link(&weak, &links_for_approve, fingerprint.to_string(), true);
+    });
+
+    let weak = ui.as_weak();
+    let links_for_reject = pending_links.clone();
+    ui.on_reject_incoming_link(move |fingerprint| {
+        decide_incoming_link(&weak, &links_for_reject, fingerprint.to_string(), false);
+    });
+
+    let weak = ui.as_weak();
     ui.on_revoke_peer(move |fingerprint| {
         let weak = weak.clone();
         let fingerprint = fingerprint.to_string();
@@ -1529,7 +1592,8 @@ fn main() -> Result<()> {
                     Some(requested_transport),
                     None,
                     None,
-                );
+
+                None,);
                 let mode = match mode_index {
                     1 => "server-client",
                     2 => "receiver-only",
@@ -1581,6 +1645,7 @@ fn main() -> Result<()> {
                     transport: Some(requested_transport),
                     reverse_scroll: None,
                     auto_discover: None,
+                    double_edge_style: None,
                 }) {
                     Ok(ControlResponse::Applied { restart_required }) => {
                         // Same truth rule as the role buttons: the green
@@ -1662,6 +1727,7 @@ fn main() -> Result<()> {
                             transport: None,
                             reverse_scroll: None,
                             auto_discover: None,
+                            double_edge_style: None,
                         })? {
                             ControlResponse::Applied { .. } => Ok(()),
                             ControlResponse::Error { message } => anyhow::bail!(message),
@@ -1776,26 +1842,53 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Plain-language edge-discipline names shown in the Devices tab log lines
-/// and status sentences.
-fn edge_mode_name(mode: EdgeMode) -> &'static str {
-    match mode {
-        EdgeMode::Single => "Single edge",
-        EdgeMode::Double => "Double edge",
+/// Plain-language edge-discipline names.
+fn edge_style_name(style: DoubleEdgeStyle) -> &'static str {
+    match style {
+        DoubleEdgeStyle::Mirror => "inverse entry",
+        DoubleEdgeStyle::FixedLeft => "fixed left entry",
+        DoubleEdgeStyle::FixedRight => "fixed right entry",
     }
 }
 
-/// Show the authoritative edge discipline immediately (same rule as the
+/// Full choice label, e.g. "Double edge (inverse entry)". The style only
+/// matters in Double mode.
+fn edge_choice_name(mode: EdgeMode, style: DoubleEdgeStyle) -> String {
+    match mode {
+        EdgeMode::Single => "Single edge".to_owned(),
+        EdgeMode::Double => format!("Double edge ({})", edge_style_name(style)),
+    }
+}
+
+/// Devices-tab button index: 0 Single, 1 Double inverse (the default),
+/// 2 Double fixed-left, 3 Double fixed-right. Pure for tests.
+fn edge_choice_index(mode: EdgeMode, style: DoubleEdgeStyle) -> i32 {
+    match (mode, style) {
+        (EdgeMode::Single, _) => 0,
+        (EdgeMode::Double, DoubleEdgeStyle::Mirror) => 1,
+        (EdgeMode::Double, DoubleEdgeStyle::FixedLeft) => 2,
+        (EdgeMode::Double, DoubleEdgeStyle::FixedRight) => 3,
+    }
+}
+
+/// Inverse of [`edge_choice_index`]: 1..=3 imply Double. Pure for tests.
+fn edge_choice_from_index(index: i32) -> (EdgeMode, DoubleEdgeStyle) {
+    match index {
+        1 => (EdgeMode::Double, DoubleEdgeStyle::Mirror),
+        2 => (EdgeMode::Double, DoubleEdgeStyle::FixedLeft),
+        3 => (EdgeMode::Double, DoubleEdgeStyle::FixedRight),
+        _ => (EdgeMode::Single, DoubleEdgeStyle::Mirror),
+    }
+}
+
+/// Show the authoritative edge choice immediately (same rule as the
 /// role display: never wait for the next poll).
-fn set_edge_mode_display(weak: &slint::Weak<AppWindow>, mode: EdgeMode) {
+fn set_edge_mode_display(weak: &slint::Weak<AppWindow>, mode: EdgeMode, style: DoubleEdgeStyle) {
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
-                ui.set_edge_mode_index(match mode {
-                    EdgeMode::Single => 0,
-                    EdgeMode::Double => 1,
-                });
+                ui.set_edge_mode_index(edge_choice_index(mode, style));
             }
         }
     });
@@ -1920,10 +2013,10 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                     Mode::ServerClient => 1,
                     Mode::ClientOnly => 2,
                 });
-                ui.set_edge_mode_index(match status.edge_mode {
-                    EdgeMode::Single => 0,
-                    EdgeMode::Double => 1,
-                });
+                ui.set_edge_mode_index(edge_choice_index(
+                    status.edge_mode,
+                    status.double_edge_style,
+                ));
                 ui.set_fingerprint(SharedString::from(status.fingerprint_hex));
                 ui.set_role_text(SharedString::from(role_name(status.mode)));
                 ui.set_pairing_code(SharedString::from(status.pairing_code));
@@ -2036,6 +2129,95 @@ fn decide_incoming_pairing(weak: &slint::Weak<AppWindow>, fingerprint: String, a
             Ok(ControlResponse::Error { message }) => set_status(&weak, message),
             Ok(other) => set_status(&weak, format!("Unexpected pairing decision: {other:?}")),
             Err(error) => set_status(&weak, format!("Pairing decision failed: {error}")),
+        }
+    });
+}
+
+/// Show the first queued inbound link (name + address) in the strip and
+/// the Connect tab. Empty clears both. Mirrors the pairing strip so a
+/// link request is unmissable on any tab.
+fn set_incoming_link(weak: &slint::Weak<AppWindow>, links: Vec<PendingLink>) {
+    let (summary, fingerprint) = match links.first() {
+        Some(link) => {
+            let suffix = if links.len() > 1 {
+                format!(" (+{} more)", links.len() - 1)
+            } else {
+                String::new()
+            };
+            (
+                format!("{} · {}{}", link.node_name, link.address, suffix),
+                link.fingerprint_hex.clone(),
+            )
+        }
+        None => (String::new(), String::new()),
+    };
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                if summary.is_empty() {
+                    ui.set_title_alert(SharedString::new());
+                } else {
+                    ui.set_title_alert(SharedString::from(" — incoming link!"));
+                }
+                ui.set_incoming_link(SharedString::from(summary));
+                ui.set_incoming_link_fingerprint(SharedString::from(fingerprint));
+            }
+        }
+    });
+}
+
+fn decide_incoming_link(
+    weak: &slint::Weak<AppWindow>,
+    pending_links: &Arc<Mutex<Vec<PendingLink>>>,
+    fingerprint: String,
+    approved: bool,
+) {
+    // The daemon keys approvals by (fingerprint, epoch): look the epoch
+    // up in the last polled queue. A stale click (queue already moved
+    // on) reports instead of approving blindly.
+    let link_id = pending_links.lock().ok().and_then(|slot| {
+        slot.iter()
+            .find(|link| link.fingerprint_hex == fingerprint)
+            .and_then(|link| link.link_id)
+    });
+    let weak = weak.clone();
+    std::thread::spawn(move || {
+        let Some(link_id) = link_id else {
+            set_status(
+                &weak,
+                "That link request is gone already — it was answered, timed out, or superseded."
+                    .into(),
+            );
+            return;
+        };
+        let request = if approved {
+            ControlRequest::ApproveLink {
+                fingerprint_hex: fingerprint.clone(),
+                link_id: Some(link_id),
+            }
+        } else {
+            ControlRequest::RejectLink {
+                fingerprint_hex: fingerprint.clone(),
+                link_id: Some(link_id),
+            }
+        };
+        match control_request(request) {
+            Ok(ControlResponse::LinkApproved { .. }) if approved => {
+                set_status(&weak, format!("Approved incoming link {fingerprint}"));
+                ui_log(&format!(
+                    "link: approved inbound epoch {link_id} from {fingerprint}"
+                ));
+            }
+            Ok(ControlResponse::LinkRejected { .. }) if !approved => {
+                set_status(&weak, format!("Rejected incoming link {fingerprint}"));
+                ui_log(&format!(
+                    "link: rejected inbound epoch {link_id} from {fingerprint}"
+                ));
+            }
+            Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+            Ok(other) => set_status(&weak, format!("Unexpected link decision: {other:?}")),
+            Err(error) => set_status(&weak, format!("Link decision failed: {error}")),
         }
     });
 }
@@ -2527,6 +2709,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         transport: None,
         reverse_scroll: None,
         auto_discover: None,
+        double_edge_style: None,
     }) {
         Ok(ControlResponse::Applied { .. }) => {}
         Ok(ControlResponse::Error { message }) => anyhow::bail!("{message}"),
@@ -2540,6 +2723,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         current.clipboard_enabled,
         None,
         Some(layout.clone()),
+        None,
         None,
         None,
         None,
@@ -3551,6 +3735,8 @@ fn relay_session_progress(
                     )
                 } else if let Some(guidance) = mode_mismatch_guidance(detail, address) {
                     guidance
+                } else if detail.contains("declined the link") {
+                    format!("{address} declined the link — nothing changed on either side and both stay usable. Press Disconnect to stop retrying, or ask them to Allow next time.")
                 } else {
                     format!("Still reaching {address}… ({detail})")
                 }
@@ -3610,6 +3796,8 @@ fn relay_session_progress(
                     }
                 } else if let Some(guidance) = mode_mismatch_guidance(detail, address) {
                     guidance
+                } else if detail.contains("declined the link") {
+                    format!("{address} declined the link — nothing changed on either side and both stay usable.")
                 } else {
                     format!("Connection to {address} ended ({detail})")
                 }
@@ -4101,6 +4289,8 @@ static LAST_INCOMING_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// logged once with the station-code state, so a healthy-but-silent poll is
 /// distinguishable from a dead one in ui.log alone.
 static POLL_FIRST_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAST_INCOMING_LINK_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether the user-socket fallback warning fired already. Talking to a
 /// user-session daemon instead of the system service splits identity and
@@ -4420,6 +4610,7 @@ fn mirror_user_config(
     transport: Option<TransportProtocol>,
     reverse_scroll: Option<bool>,
     auto_discover: Option<bool>,
+    double_edge_style: Option<kvm_core::DoubleEdgeStyle>,
 ) {
     let path = data_dir().join("config.json");
     let mut config = kvm_core::Config::load(&path).unwrap_or_default();
@@ -4453,6 +4644,9 @@ fn mirror_user_config(
     }
     if let Some(discover) = auto_discover {
         config.auto_discover = discover;
+    }
+    if let Some(style) = double_edge_style {
+        config.double_edge_style = style;
     }
     let _ = config.save(&path);
 }
@@ -5039,10 +5233,10 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        edge_mode_name, edge_name, mode_mismatch_guidance, pair_status_text, parse_ban_epoch,
-        should_dial_back,
+        edge_choice_from_index, edge_choice_index, edge_name, mode_mismatch_guidance,
+        pair_status_text, parse_ban_epoch, should_dial_back,
     };
-    use kvm_core::EdgeMode;
+    use kvm_core::{DoubleEdgeStyle, EdgeMode};
 
     #[test]
     fn compare_screen_names_peer_and_code() {
@@ -5068,9 +5262,23 @@ mod tests {
     }
 
     #[test]
-    fn edge_mode_names_are_plain_words() {
-        assert_eq!(edge_mode_name(EdgeMode::Single), "Single edge");
-        assert_eq!(edge_mode_name(EdgeMode::Double), "Double edge");
+    fn edge_choices_round_trip_through_button_indices() {
+        assert_eq!(
+            edge_choice_index(EdgeMode::Single, DoubleEdgeStyle::Mirror),
+            0
+        );
+        assert_eq!(
+            edge_choice_index(EdgeMode::Double, DoubleEdgeStyle::FixedRight),
+            3
+        );
+        assert_eq!(
+            edge_choice_from_index(2),
+            (EdgeMode::Double, DoubleEdgeStyle::FixedLeft)
+        );
+        assert_eq!(
+            edge_choice_from_index(99),
+            (EdgeMode::Single, DoubleEdgeStyle::Mirror)
+        );
     }
 
     #[test]

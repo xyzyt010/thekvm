@@ -3,7 +3,8 @@
 use anyhow::{bail, Context, Result};
 use kvm_core::Config;
 use kvm_protocol::control::{
-    read_request, write_response, ControlRequest, ControlResponse, DaemonStatus, PendingPairing,
+    read_request, write_response, ControlRequest, ControlResponse, DaemonStatus, PendingLink,
+    PendingPairing,
 };
 use kvm_protocol::pairing::PeerBook;
 use std::collections::BTreeMap;
@@ -184,6 +185,247 @@ impl PairingApprovals {
     }
 }
 
+/// How long one inbound link waits for the local human: a link is a tap,
+/// not a code ceremony, so this is far shorter than pairing — but long
+/// enough that a user who stepped away hears "no answer" instead of the
+/// initiator hanging forever. Expiry denies loudly.
+const LINK_APPROVAL_TIMEOUT: Duration = Duration::from_secs(150);
+/// A pairing IS a link approval for the link born right after it: the
+/// human approved this exact device seconds ago, so the first link epoch
+/// inside this window passes silently instead of popping a second
+/// approval for the same decision.
+const PAIRING_LINK_GRACE: Duration = Duration::from_secs(120);
+/// Approved epochs are remembered (retries and the dial-back on the same
+/// epoch never prompt again) but not forever: entries older than a day
+/// are pruned, and the set is capped so months of uptime cannot grow it.
+const APPROVED_LINK_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const APPROVED_LINK_CAP: usize = 512;
+
+/// In-memory link-approval queue owned by the running daemon. Pairing
+/// trust alone never opens a link: every fresh link epoch from a paired
+/// peer waits here until the local user allows or denies it, and no
+/// input flows before that decision.
+#[derive(Clone, Default)]
+pub struct LinkApprovals {
+    pending: Arc<tokio::sync::Mutex<BTreeMap<(String, u64), PendingLinkEntry>>>,
+    approved: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, u64), Instant>>>,
+    rejects: Arc<tokio::sync::Mutex<std::collections::HashMap<String, RejectRecord>>>,
+    paired_at: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Instant>>>,
+}
+
+struct PendingLinkEntry {
+    request: PendingLink,
+    decision: oneshot::Sender<bool>,
+}
+
+/// Process-global link approvals (see [`LinkApprovals`]): the network
+/// session task and the local control server must share one queue without
+/// re-plumbing every server signature — the same shape as the daemon's
+/// other cross-cutting registries.
+pub fn link_approvals() -> LinkApprovals {
+    static LINKS: std::sync::OnceLock<LinkApprovals> = std::sync::OnceLock::new();
+    LINKS.get_or_init(LinkApprovals::default).clone()
+}
+
+impl LinkApprovals {
+    /// Queue one inbound link for local approval. Epoch-less sessions
+    /// never queue (fixed/admin paths carry no epoch to approve).
+    /// A repeated denial freezes the device for a minute (same rule as
+    /// pairing denials), and a second request for a queued epoch is
+    /// refused so retries surface as guidance instead of silent rows.
+    pub async fn register(&self, request: PendingLink) -> Result<LinkDecisionWaiter> {
+        let fingerprint = request.fingerprint_hex.to_ascii_lowercase();
+        let Some(link_id) = request.link_id else {
+            bail!("epoch-less links never queue for approval");
+        };
+        let key = (fingerprint, link_id);
+        let (decision_tx, decision_rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            if pending.contains_key(&key) {
+                bail!("link is already awaiting local approval");
+            }
+            {
+                let mut rejects = self.rejects.lock().await;
+                if let Some(record) = rejects.get(&key.0) {
+                    if record
+                        .frozen_until
+                        .is_some_and(|until| Instant::now() < until)
+                    {
+                        bail!(
+                            "link attempts from this device are paused for 1 minute after repeated denials"
+                        );
+                    }
+                }
+                rejects.retain(|_, record| {
+                    record
+                        .frozen_until
+                        .is_some_and(|until| Instant::now() < until)
+                        || record.window_started.elapsed() < REJECT_WINDOW
+                });
+            }
+            pending.insert(
+                key.clone(),
+                PendingLinkEntry {
+                    request,
+                    decision: decision_tx,
+                },
+            );
+        }
+        Ok(LinkDecisionWaiter {
+            approvals: self.clone(),
+            key,
+            receiver: Some(decision_rx),
+        })
+    }
+
+    pub async fn list(&self) -> Vec<PendingLink> {
+        self.pending
+            .lock()
+            .await
+            .values()
+            .map(|entry| entry.request.clone())
+            .collect()
+    }
+
+    /// Decide one queued link. Approvals remember the epoch (retries and
+    /// the dial-back pass silently) and clear the denial count; denials
+    /// grow it toward the 1-minute freeze.
+    pub async fn decide(&self, fingerprint: &str, link_id: u64, approved: bool) -> bool {
+        let key = (fingerprint.to_ascii_lowercase(), link_id);
+        let removed = self
+            .pending
+            .lock()
+            .await
+            .remove(&key)
+            .map(|entry| entry.decision.send(approved).is_ok())
+            .unwrap_or(false);
+        if removed {
+            if approved {
+                self.approved
+                    .lock()
+                    .await
+                    .insert(key.clone(), Instant::now());
+                self.prune_approved().await;
+                self.rejects.lock().await.remove(&key.0);
+            } else {
+                let mut rejects = self.rejects.lock().await;
+                let now = Instant::now();
+                let record = rejects.entry(key.0).or_insert(RejectRecord {
+                    count: 0,
+                    window_started: now,
+                    frozen_until: None,
+                });
+                if record.window_started.elapsed() >= REJECT_WINDOW {
+                    record.count = 0;
+                    record.window_started = now;
+                    record.frozen_until = None;
+                }
+                record.count += 1;
+                if record.count >= MAX_PAIRING_REJECTS {
+                    record.frozen_until = Some(now + REJECT_FREEZE);
+                }
+            }
+        }
+        removed
+    }
+
+    /// True when this exact epoch was approved (or auto-passed) before.
+    /// Prunes day-old entries on the way so the set stays bounded.
+    pub async fn is_approved(&self, fingerprint: &str, link_id: u64) -> bool {
+        self.prune_approved().await;
+        self.approved
+            .lock()
+            .await
+            .contains_key(&(fingerprint.to_ascii_lowercase(), link_id))
+    }
+
+    async fn prune_approved(&self) {
+        let mut approved = self.approved.lock().await;
+        approved.retain(|_, when| when.elapsed() < APPROVED_LINK_TTL);
+        if approved.len() > APPROVED_LINK_CAP {
+            approved.clear();
+        }
+    }
+
+    /// Record a completed pairing: the link born from it inside
+    /// PAIRING_LINK_GRACE passes silently (the human approved this exact
+    /// device seconds ago — no second popup for the same decision).
+    pub async fn note_paired(&self, fingerprint: &str) {
+        let mut paired = self.paired_at.lock().await;
+        paired.insert(fingerprint.to_ascii_lowercase(), Instant::now());
+        paired.retain(|_, when| when.elapsed() < PAIRING_LINK_GRACE);
+    }
+
+    pub async fn recently_paired(&self, fingerprint: &str) -> bool {
+        self.paired_at
+            .lock()
+            .await
+            .get(&fingerprint.to_ascii_lowercase())
+            .is_some_and(|when| when.elapsed() < PAIRING_LINK_GRACE)
+    }
+
+    /// Forget every approval for one epoch (Disconnect bans it) or one
+    /// device (hang-up / unpair): the next dial prompts again.
+    pub async fn revoke_epoch(&self, link_id: u64) {
+        self.approved
+            .lock()
+            .await
+            .retain(|(_, epoch), _| *epoch != link_id);
+        self.pending
+            .lock()
+            .await
+            .retain(|(_, epoch), _| *epoch != link_id);
+    }
+
+    pub async fn revoke_peer(&self, fingerprint: &str) {
+        let fingerprint = fingerprint.to_ascii_lowercase();
+        self.approved
+            .lock()
+            .await
+            .retain(|(fp, _), _| *fp != fingerprint);
+        self.pending
+            .lock()
+            .await
+            .retain(|(fp, _), _| *fp != fingerprint);
+    }
+
+    pub async fn cancel(&self, fingerprint: &str, link_id: u64) {
+        self.pending
+            .lock()
+            .await
+            .remove(&(fingerprint.to_ascii_lowercase(), link_id));
+    }
+}
+
+/// Handle for one queued link approval. Registering (listing it for the
+/// local approval UI) and waiting for the decision are separate steps so
+/// the station can show the request while the initiator still dials.
+pub struct LinkDecisionWaiter {
+    approvals: LinkApprovals,
+    key: (String, u64),
+    receiver: Option<oneshot::Receiver<bool>>,
+}
+
+impl LinkDecisionWaiter {
+    /// Wait for the local decision (up to LINK_APPROVAL_TIMEOUT).
+    /// Expiry denies: the initiator hears "no answer" and its child
+    /// exits instead of hanging on a silent stream.
+    pub async fn wait(mut self) -> Result<bool> {
+        let Some(receiver) = self.receiver.take() else {
+            return Ok(true);
+        };
+        let key = std::mem::take(&mut self.key);
+        let decision = match tokio::time::timeout(LINK_APPROVAL_TIMEOUT, receiver).await {
+            Ok(Ok(approved)) => approved,
+            Ok(Err(_)) => false,
+            Err(_) => false,
+        };
+        self.approvals.pending.lock().await.remove(&key);
+        Ok(decision)
+    }
+}
+
 impl DecisionWaiter {
     /// Wait for the local decision (up to the approval timeout). Works no
     /// matter which side approved first: an early local decision is already
@@ -330,6 +572,7 @@ where
                 transport: current.transport,
                 reverse_scroll: current.reverse_scroll,
                 auto_discover: current.auto_discover,
+                double_edge_style: current.double_edge_style,
                 peer_count,
                 active_session_count: active_sessions.load(std::sync::atomic::Ordering::Relaxed),
                 sessions: crate::service::list_inbound_links(),
@@ -419,6 +662,77 @@ where
                 }
             }
         }
+        ControlRequest::ListPendingLinks => {
+            ControlResponse::PendingLinks(link_approvals().list().await)
+        }
+        ControlRequest::ApproveLink {
+            fingerprint_hex,
+            link_id,
+        } => {
+            if !is_fingerprint(&fingerprint_hex) {
+                ControlResponse::Error {
+                    message: "peer fingerprint must contain 64 hexadecimal characters".into(),
+                }
+            } else if link_id.is_none() {
+                ControlResponse::Error {
+                    message: "epoch-less links never queue for approval".into(),
+                }
+            } else {
+                let fingerprint_hex = fingerprint_hex.to_ascii_lowercase();
+                let link_id = link_id.unwrap_or(0);
+                if link_approvals()
+                    .decide(&fingerprint_hex, link_id, true)
+                    .await
+                {
+                    crate::service::audit_event(
+                        &data_dir,
+                        &format!("link-approved fingerprint={fingerprint_hex} link_id={link_id}"),
+                    );
+                    ControlResponse::LinkApproved {
+                        fingerprint_hex,
+                        link_id: Some(link_id),
+                    }
+                } else {
+                    ControlResponse::Error {
+                        message: "pending link request was not found".into(),
+                    }
+                }
+            }
+        }
+        ControlRequest::RejectLink {
+            fingerprint_hex,
+            link_id,
+        } => {
+            if !is_fingerprint(&fingerprint_hex) {
+                ControlResponse::Error {
+                    message: "peer fingerprint must contain 64 hexadecimal characters".into(),
+                }
+            } else if link_id.is_none() {
+                ControlResponse::Error {
+                    message: "epoch-less links never queue for approval".into(),
+                }
+            } else {
+                let fingerprint_hex = fingerprint_hex.to_ascii_lowercase();
+                let link_id = link_id.unwrap_or(0);
+                if link_approvals()
+                    .decide(&fingerprint_hex, link_id, false)
+                    .await
+                {
+                    crate::service::audit_event(
+                        &data_dir,
+                        &format!("link-rejected fingerprint={fingerprint_hex} link_id={link_id}"),
+                    );
+                    ControlResponse::LinkRejected {
+                        fingerprint_hex,
+                        link_id: Some(link_id),
+                    }
+                } else {
+                    ControlResponse::Error {
+                        message: "pending link request was not found".into(),
+                    }
+                }
+            }
+        }
         ControlRequest::Unpair { fingerprint_hex } => {
             if !is_fingerprint(&fingerprint_hex) {
                 ControlResponse::Error {
@@ -429,6 +743,9 @@ where
                 match peers.write().await.unpin(&fingerprint_hex) {
                     Ok(true) => {
                         let _ = revoked_peers.send(fingerprint_hex.clone());
+                        // Trust gone means approvals gone too: a revoked
+                        // device must prompt again even on a live epoch.
+                        link_approvals().revoke_peer(&fingerprint_hex).await;
                         crate::service::audit_event(
                             &data_dir,
                             &format!("peer-revoked fingerprint={fingerprint_hex}"),
@@ -452,6 +769,9 @@ where
             } else {
                 let fingerprint_hex = fingerprint_hex.to_ascii_lowercase();
                 if crate::service::drop_inbound_link(&fingerprint_hex) {
+                    // A hung-up link must not silently re-open: forget its
+                    // approvals so the next dial prompts again.
+                    link_approvals().revoke_peer(&fingerprint_hex).await;
                     crate::service::audit_event(
                         &data_dir,
                         &format!("session-dropped fingerprint={fingerprint_hex}"),
@@ -466,6 +786,8 @@ where
         }
         ControlRequest::EndLink { link_id } => {
             crate::service::end_link(link_id);
+            // A banned epoch must never ride a stale approval back in.
+            link_approvals().revoke_epoch(link_id).await;
             crate::service::persist_ended_links(&data_dir);
             crate::service::audit_event(&data_dir, &format!("link-ended link_id={link_id}"));
             ControlResponse::LinkEnded { link_id }
@@ -564,6 +886,7 @@ where
             transport,
             reverse_scroll,
             auto_discover,
+            double_edge_style,
         } => {
             if listen_port == Some(0) {
                 ControlResponse::Error {
@@ -635,6 +958,9 @@ where
                     }
                     if let Some(discover) = auto_discover {
                         updated.auto_discover = discover;
+                    }
+                    if let Some(style) = double_edge_style {
+                        updated.double_edge_style = style;
                     }
                     if transport.is_some() {
                         // Transport is cemented to UDP: a stale client asking
@@ -861,6 +1187,71 @@ mod tests {
         let _waiter = approvals.register(pending.clone()).await.unwrap();
         assert!(approvals.decide(&pending.fingerprint_hex, false).await);
         assert!(approvals.register(pending.clone()).await.is_ok());
+    }
+
+    fn pending_link(fingerprint: &str, link_id: u64) -> PendingLink {
+        PendingLink {
+            node_name: "peer".into(),
+            fingerprint_hex: fingerprint.to_owned(),
+            address: "192.168.1.8:42110".into(),
+            link_id: Some(link_id),
+        }
+    }
+
+    #[tokio::test]
+    async fn link_approval_gates_each_fresh_epoch() {
+        let approvals = LinkApprovals::default();
+        let fp = "cc".repeat(32);
+        // Unknown epoch is not approved and nothing is pending.
+        assert!(!approvals.is_approved(&fp, 7).await);
+        assert!(approvals.list().await.is_empty());
+        // Queue + approve: the epoch passes from here on.
+        let _waiter = approvals.register(pending_link(&fp, 7)).await.unwrap();
+        assert_eq!(approvals.list().await.len(), 1);
+        assert!(approvals.decide(&fp, 7, true).await);
+        assert!(approvals.is_approved(&fp, 7).await);
+        assert!(approvals.list().await.is_empty());
+        // A different epoch still prompts.
+        assert!(!approvals.is_approved(&fp, 8).await);
+    }
+
+    #[tokio::test]
+    async fn link_denial_freezes_like_pairing_denial() {
+        let approvals = LinkApprovals::default();
+        let fp = "dd".repeat(32);
+        for epoch in 1..=5 {
+            let _waiter = approvals.register(pending_link(&fp, epoch)).await.unwrap();
+            assert!(approvals.decide(&fp, epoch, false).await);
+        }
+        let frozen = approvals
+            .register(pending_link(&fp, 6))
+            .await
+            .err()
+            .expect("frozen link must fail");
+        assert!(frozen.to_string().contains("paused for 1 minute"));
+    }
+
+    #[tokio::test]
+    async fn pairing_grace_passes_the_first_link_silently() {
+        let approvals = LinkApprovals::default();
+        let fp = "ee".repeat(32);
+        assert!(!approvals.recently_paired(&fp).await);
+        approvals.note_paired(&fp).await;
+        assert!(approvals.recently_paired(&fp).await);
+    }
+
+    #[tokio::test]
+    async fn revoke_forgets_epochs_and_peers() {
+        let approvals = LinkApprovals::default();
+        let fp = "ff".repeat(32);
+        let _waiter = approvals.register(pending_link(&fp, 9)).await.unwrap();
+        assert!(approvals.decide(&fp, 9, true).await);
+        approvals.revoke_epoch(9).await;
+        assert!(!approvals.is_approved(&fp, 9).await);
+        let _waiter = approvals.register(pending_link(&fp, 10)).await.unwrap();
+        assert!(approvals.decide(&fp, 10, true).await);
+        approvals.revoke_peer(&fp).await;
+        assert!(!approvals.is_approved(&fp, 10).await);
     }
 }
 

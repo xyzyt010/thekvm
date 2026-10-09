@@ -299,6 +299,7 @@ impl Layout {
     /// Resolve a relative motion that would leave `screen_id`. This stateless
     /// form is used by a receiver to request the next network hop while the
     /// stateful `EdgeRouter` is used by the controller.
+    #[allow(clippy::too_many_arguments)]
     pub fn handoff_for_motion(
         &self,
         screen_id: ScreenId,
@@ -307,6 +308,7 @@ impl Layout {
         dx: i32,
         dy: i32,
         edge_mode: EdgeMode,
+        double_style: DoubleEdgeStyle,
     ) -> Option<EdgeHandoff> {
         let screen = self.screen(screen_id)?;
         let x = x.min(screen.width - 1);
@@ -339,7 +341,12 @@ impl Layout {
             Edge::Top | Edge::Bottom => target_screen.width,
         };
         let mapped = map_coordinate(along, source_span, target_span);
-        let (target_x, target_y) = entry_target_coords(edge, target_screen, mapped);
+        // Double-edge entry discipline (see DoubleEdgeStyle): Mirror
+        // inverts the crossing (exit Left lands at the peer's Right edge
+        // and back); Fixed pins every arrival at the selected peer edge
+        // no matter which edge was exited.
+        let entry = double_style.entry_for_exit(edge);
+        let (target_x, target_y) = entry_target_coords(entry.opposite(), target_screen, mapped);
         Some(EdgeHandoff {
             from: screen_id,
             target,
@@ -410,12 +417,13 @@ pub struct EdgeRouter {
     local_cursor_x: u32,
     local_cursor_y: u32,
     active_remote: Option<ScreenId>,
-    /// Remote edge this drive entered through (the local exit edge's
-    /// opposite). Starts DISARMED: overflow there clamps until the cursor
-    /// settles inside (see SETTLE_PX), which arms the return. Entry always
-    /// faces home by grid symmetry, so arming exactly this edge is the
-    /// whole snap-back fix — and future modes only widen which edges are
-    /// return-eligible.
+    /// Remote edge this drive entered through (Mirror: the local exit
+    /// edge's opposite; Fixed: the selected edge). Starts DISARMED:
+    /// overflow there clamps until the cursor settles inside (see
+    /// SETTLE_PX), which arms the return. Entry always faces home by
+    /// grid symmetry, so arming exactly this edge is the whole snap-back
+    /// fix — and Mirror double-edge additionally returns through the
+    /// other horizontal edge (see the return rule in route()).
     entry_edge: Option<Edge>,
     /// True once the cursor has moved SETTLE_PX inside from the entry
     /// edge (or the peer placed us while driving). Only an armed,
@@ -439,6 +447,10 @@ pub struct EdgeRouter {
     /// only; Double = both horizontal outer edges on a lone-peer link).
     /// Return hysteresis is identical in both modes.
     edge_mode: EdgeMode,
+    /// Double-edge entry discipline (see [`DoubleEdgeStyle`]): Mirror
+    /// inverts every crossing, Fixed pins entry (and return) to one peer
+    /// edge. Only read in Double mode on a lone-peer link.
+    double_style: DoubleEdgeStyle,
     /// Push-through streak toward one edge: the edge of the current
     /// outward run and the accumulated overflow px. A Handoff fires only
     /// once the run reaches EDGE_PUSH_PX (see above); coming back inside
@@ -505,7 +517,8 @@ impl EdgeRouter {
             return_accum: 0,
             return_edge: None,
             return_edge_accum: 0,
-            edge_mode: EdgeMode::Single,
+            edge_mode: EdgeMode::Double,
+            double_style: DoubleEdgeStyle::Mirror,
             push_edge: None,
             push_accum: 0,
             return_hold: std::time::Duration::ZERO,
@@ -615,6 +628,26 @@ impl EdgeRouter {
     /// it entered through.
     pub fn set_edge_mode(&mut self, mode: EdgeMode) {
         self.edge_mode = mode;
+    }
+
+    /// Switch the double-edge entry discipline live: Mirror inverts every
+    /// crossing (exit Left enters the peer at its Right edge and back),
+    /// Fixed pins all entries and returns to one peer edge. Applies to
+    /// the NEXT handoff; an active drive keeps the edge it entered
+    /// through.
+    pub fn set_double_style(&mut self, style: DoubleEdgeStyle) {
+        self.double_style = style;
+    }
+
+    /// Whether this drive entered through a pinned edge: Fixed modes
+    /// return through the selected edge only, never the arranged facing
+    /// edge. None in Mirror mode (both horizontal edges return).
+    fn fixed_return_edge(&self) -> Option<Edge> {
+        match self.double_style {
+            DoubleEdgeStyle::Mirror => None,
+            DoubleEdgeStyle::FixedLeft => Some(Edge::Left),
+            DoubleEdgeStyle::FixedRight => Some(Edge::Right),
+        }
     }
 
     /// Mode-aware crossing target for the router: the arranged grid
@@ -868,8 +901,28 @@ impl EdgeRouter {
                         // the snap-back fix: post-entry jitter and fling
                         // tails pin at the boundary instead of firing.
                         let unarmed_entry = self.entry_edge == Some(edge) && !self.return_armed;
-                        let faces_home =
-                            self.layout.neighbor_for_edge(from, edge) == Some(self.local_screen);
+                        // Home-facing edges return. Beyond the arranged
+                        // facing edge: on a lone-peer Double link in
+                        // Mirror style BOTH horizontal edges return once
+                        // the drive has settled (armed), so a drive
+                        // entered at either peer edge comes home through
+                        // either one — the inverse double-edge feel (exit
+                        // Left, enter Right, push Right to come home).
+                        // Unarmed drives still clamp on the second edge
+                        // (fresh-entry fling tails must never return), and
+                        // Fixed styles return through the selected edge
+                        // only, wherever the drive entered.
+                        let faces_home = match self.fixed_return_edge() {
+                            Some(fixed) => edge == fixed,
+                            None => {
+                                self.layout.neighbor_for_edge(from, edge) == Some(self.local_screen)
+                                    || (self.return_armed
+                                        && self.edge_mode == EdgeMode::Double
+                                        && matches!(edge, Edge::Left | Edge::Right)
+                                        && from != self.local_screen
+                                        && self.layout.single_peer_screen().is_some())
+                            }
+                        };
                         if faces_home && !unarmed_entry {
                             // Brush-proof armed return (see RETURN_EDGE_PX):
                             // accumulate same-edge overflow instead of
@@ -1057,7 +1110,10 @@ impl EdgeRouter {
             Edge::Top | Edge::Bottom => target_screen.width,
         };
         let mapped = map_coordinate(along, source_span, target_span);
-        let (target_x, target_y) = entry_target_coords(edge, target_screen, mapped);
+        // Same entry discipline as the stateful exit above (see
+        // DoubleEdgeStyle): Mirror inverts, Fixed pins the arrival.
+        let entry = self.double_style.entry_for_exit(edge);
+        let (target_x, target_y) = entry_target_coords(entry.opposite(), target_screen, mapped);
         let from = self.current_screen;
         if from == self.local_screen {
             self.local_cursor_x = self.cursor_x;
@@ -1067,9 +1123,10 @@ impl EdgeRouter {
         self.cursor_x = target_x;
         self.cursor_y = target_y;
         self.active_remote = Some(target);
-        // Arm the Schmitt trigger: the remote entry edge is the local
-        // exit edge's opposite, and it starts disarmed (see route()).
-        self.entry_edge = Some(edge.opposite());
+        // Arm the Schmitt trigger: the remote entry edge follows the
+        // double-edge discipline (Mirror inverts the exit, Fixed pins
+        // the selected edge), and it starts disarmed (see route()).
+        self.entry_edge = Some(entry);
         self.return_armed = false;
         self.return_accum = 0;
         self.return_edge = None;
@@ -2115,12 +2172,16 @@ mod tests {
 
     #[test]
     fn lone_peer_far_edge_clamps_without_returning() {
-        // Two-machine link, driving the peer: pushing past the FAR side
-        // has nowhere arranged to go, so it pins at the border and keeps
-        // driving. Only the home-facing edge ever returns (the old
-        // push-through rule turned every far-side brush into a snap-back).
+        // Two-machine link in Single mode, driving the peer: pushing past
+        // the FAR side has nowhere arranged to go, so it pins at the
+        // border and keeps driving. Only the home-facing edge ever
+        // returns in Single (the old push-through rule turned every
+        // far-side brush into a snap-back). Mirror Double returns
+        // through either edge once settled (see
+        // mirror_double_returns_through_either_edge_once_settled).
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_edge_mode(EdgeMode::Single);
         let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
         // Settle first, so the clamp below proves the edge rule and not
@@ -2395,6 +2456,7 @@ mod tests {
         // clamp in both modes.
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut single = EdgeRouter::new(layout.clone()).unwrap();
+        single.set_edge_mode(EdgeMode::Single);
         assert!(matches!(
             single.route(InputEvent::MouseMove { dx: -5000, dy: 0 }),
             RoutedEvent::Local(_)
@@ -2414,16 +2476,40 @@ mod tests {
         // The stateless receiver hop agrees, per mode.
         let layout2 = Layout::pair_default("me", "peer", &"ab".repeat(32));
         assert!(layout2
-            .handoff_for_motion(SELF_SCREEN_ID, 0, 540, -50, 0, EdgeMode::Single)
+            .handoff_for_motion(
+                SELF_SCREEN_ID,
+                0,
+                540,
+                -50,
+                0,
+                EdgeMode::Single,
+                DoubleEdgeStyle::Mirror
+            )
             .is_none());
         let hop = layout2
-            .handoff_for_motion(SELF_SCREEN_ID, 0, 540, -50, 0, EdgeMode::Double)
+            .handoff_for_motion(
+                SELF_SCREEN_ID,
+                0,
+                540,
+                -50,
+                0,
+                EdgeMode::Double,
+                DoubleEdgeStyle::Mirror,
+            )
             .expect("double mode must hand off the outer edge");
         assert_eq!(hop.target, FIRST_PEER_SCREEN_ID);
         assert_eq!(hop.target_x, 1887);
         // Top and bottom never cross implicitly, even doubled.
         assert!(layout2
-            .handoff_for_motion(SELF_SCREEN_ID, 960, 0, 0, -50, EdgeMode::Double)
+            .handoff_for_motion(
+                SELF_SCREEN_ID,
+                960,
+                0,
+                0,
+                -50,
+                EdgeMode::Double,
+                DoubleEdgeStyle::Mirror
+            )
             .is_none());
         // Grids stay facing-only in Double mode: the third screen owns
         // the left edge, so no fallback fires there.
@@ -2444,6 +2530,145 @@ mod tests {
             routed,
             RoutedEvent::Handoff { target, .. } if target == ScreenId(9)
         ));
+    }
+
+    #[test]
+    fn double_edge_style_maps_entry_for_exit() {
+        assert_eq!(
+            DoubleEdgeStyle::Mirror.entry_for_exit(Edge::Left),
+            Edge::Right
+        );
+        assert_eq!(
+            DoubleEdgeStyle::Mirror.entry_for_exit(Edge::Right),
+            Edge::Left
+        );
+        assert_eq!(
+            DoubleEdgeStyle::FixedLeft.entry_for_exit(Edge::Right),
+            Edge::Left
+        );
+        assert_eq!(
+            DoubleEdgeStyle::FixedLeft.entry_for_exit(Edge::Left),
+            Edge::Left
+        );
+        assert_eq!(
+            DoubleEdgeStyle::FixedRight.entry_for_exit(Edge::Left),
+            Edge::Right
+        );
+    }
+
+    #[test]
+    fn fixed_entry_pins_stateless_arrival_no_matter_the_exit_edge() {
+        // Peer on the right (1920 wide): exiting Right but FixedLeft
+        // still arrives at x=32 (the peer's Left edge); exiting Left
+        // but FixedRight still arrives at x=1887.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let hop = layout
+            .handoff_for_motion(
+                SELF_SCREEN_ID,
+                1919,
+                540,
+                50,
+                0,
+                EdgeMode::Double,
+                DoubleEdgeStyle::FixedLeft,
+            )
+            .expect("right edge must hand off");
+        assert_eq!((hop.target_x, hop.target_y), (32, 540));
+        let hop = layout
+            .handoff_for_motion(
+                SELF_SCREEN_ID,
+                0,
+                540,
+                -50,
+                0,
+                EdgeMode::Double,
+                DoubleEdgeStyle::FixedRight,
+            )
+            .expect("left edge must hand off");
+        assert_eq!((hop.target_x, hop.target_y), (1887, 540));
+    }
+
+    #[test]
+    fn mirror_double_returns_through_either_edge_once_settled() {
+        // Peer on the right, Double Mirror: exit LEFT (the outer edge)
+        // enters the peer at its RIGHT edge (inverse).
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_edge_mode(EdgeMode::Double);
+        router.set_double_style(DoubleEdgeStyle::Mirror);
+        let handoff = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(matches!(
+            handoff,
+            RoutedEvent::Handoff {
+                edge: Edge::Left,
+                target_x: 1887,
+                ..
+            }
+        ));
+        // Settle inside (arms the drive), then push back out the ENTRY
+        // edge: inverse return, no need to cross the whole peer screen.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -100, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        let home = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(
+            matches!(
+                home,
+                RoutedEvent::ReturnHome {
+                    edge: Edge::Right,
+                    ..
+                }
+            ),
+            "settled drive must return through the entry edge, got {home:?}"
+        );
+        assert_eq!(router.active_remote(), None);
+    }
+
+    #[test]
+    fn fixed_edge_returns_through_the_selected_edge_only() {
+        // Peer on the right, Double FixedLeft: exit RIGHT but arrive at
+        // the peer's LEFT edge anyway.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_edge_mode(EdgeMode::Double);
+        router.set_double_style(DoubleEdgeStyle::FixedLeft);
+        let handoff = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(matches!(
+            handoff,
+            RoutedEvent::Handoff {
+                edge: Edge::Right,
+                target_x: 32,
+                ..
+            }
+        ));
+        // Settle, then push back out the fixed edge: home.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 100, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        let home = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(matches!(
+            home,
+            RoutedEvent::ReturnHome {
+                edge: Edge::Left,
+                ..
+            }
+        ));
+        assert_eq!(router.active_remote(), None);
+        // Again — but push out the OTHER (arrangement-facing) edge: it
+        // clamps and the drive lives on. Only the selected edge exits.
+        let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 100, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        let held = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(
+            matches!(held, RoutedEvent::Forward { .. }),
+            "non-fixed edge must clamp, got {held:?}"
+        );
+        assert!(router.active_remote().is_some());
     }
 
     #[test]
@@ -2502,7 +2727,15 @@ mod tests {
         assert_eq!(layout.peer_exit_edge(), Some(Edge::Right));
         // Facing edges agree across the pair: A pushes right into B.
         let handoff = layout
-            .handoff_for_motion(SELF_SCREEN_ID, 1919, 540, 50, 0, EdgeMode::Single)
+            .handoff_for_motion(
+                SELF_SCREEN_ID,
+                1919,
+                540,
+                50,
+                0,
+                EdgeMode::Single,
+                DoubleEdgeStyle::Mirror,
+            )
             .expect("right edge must hand off");
         assert_eq!(handoff.target, FIRST_PEER_SCREEN_ID);
         assert_eq!(handoff.target_x, 32);
@@ -2586,12 +2819,41 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Edge {
     Left,
     Right,
     Top,
     Bottom,
+}
+
+/// Double-edge entry discipline for a lone-peer link: which peer edge a
+/// crossing enters through. Mirror (default) keeps the inverse mapping —
+/// exiting Left enters the peer at its Right edge and vice versa — so
+/// each side's exit edge faces the other side's entry edge. Fixed pins
+/// entry to one peer edge no matter which edge was exited: every arrival
+/// (and every return) uses the selected edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DoubleEdgeStyle {
+    /// Inverse entry (the classic double-edge feel).
+    #[default]
+    Mirror,
+    /// Always enter (and return) through the peer's Left edge.
+    FixedLeft,
+    /// Always enter (and return) through the peer's Right edge.
+    FixedRight,
+}
+
+impl DoubleEdgeStyle {
+    /// The peer edge a crossing enters through. Mirror inverts the exit
+    /// edge; Fixed pins it. Pure for tests.
+    pub fn entry_for_exit(self, exit: Edge) -> Edge {
+        match self {
+            DoubleEdgeStyle::Mirror => exit.opposite(),
+            DoubleEdgeStyle::FixedLeft => Edge::Left,
+            DoubleEdgeStyle::FixedRight => Edge::Right,
+        }
+    }
 }
 
 impl Edge {

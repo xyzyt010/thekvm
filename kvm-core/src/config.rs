@@ -1,3 +1,4 @@
+use crate::layout::DoubleEdgeStyle;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
@@ -24,11 +25,11 @@ pub struct Config {
     /// carry `"transport":"Quic"` are migrated to Udp on load.
     #[serde(default)]
     pub transport: TransportProtocol,
-    /// Which screen edges may open a crossing. Single (default) crosses
-    /// only the arranged facing edge; Double additionally opens the other
-    /// horizontal outer edge to the lone peer on a two-machine link
-    /// (top/bottom always clamp; grids stay facing-only in both modes).
-    /// Old config files without this field load as Single.
+    /// Which screen edges may open a crossing. Double (the default) opens
+    /// both horizontal outer edges to the lone peer on a two-machine link
+    /// (top/bottom always clamp; grids stay facing-only in every mode).
+    /// Single crosses only the arranged facing edge. Old config files
+    /// without this field load as Double.
     #[serde(default)]
     pub edge_mode: EdgeMode,
     #[serde(default)]
@@ -65,6 +66,13 @@ pub struct Config {
     /// files without this field load as true.
     #[serde(default = "default_auto_discover")]
     pub auto_discover: bool,
+    /// Double-edge entry discipline (see [`DoubleEdgeStyle`]): Mirror
+    /// inverts every crossing (exit Left enters the peer at its Right
+    /// edge and back), Fixed pins all entries — and returns — to one
+    /// peer edge. Only matters in Double mode on a lone-peer link; old
+    /// config files without this field load as Mirror.
+    #[serde(default)]
+    pub double_edge_style: DoubleEdgeStyle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -96,10 +104,11 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum EdgeMode {
     /// Cross only the arranged facing edge (strict Deskflow/MWB parity).
-    #[default]
     Single,
     /// Two-machine link: both horizontal outer edges lead to the lone
     /// peer; top/bottom still clamp. Grids are unaffected (facing-only).
+    /// The default: most two-computer desks want both edges live.
+    #[default]
     Double,
 }
 
@@ -110,7 +119,7 @@ impl Default for Config {
             listen_port: 42110,
             mode: Mode::Bidirectional,
             transport: TransportProtocol::Udp,
-            edge_mode: EdgeMode::Single,
+            edge_mode: EdgeMode::Double,
             layout: Default::default(),
             allow_lock_screen_control: false,
             auto_connect_address: None,
@@ -118,6 +127,7 @@ impl Default for Config {
             clipboard_max_mb: DEFAULT_CLIPBOARD_MAX_MB,
             reverse_scroll: false,
             auto_discover: true,
+            double_edge_style: DoubleEdgeStyle::Mirror,
         }
     }
 }
@@ -387,11 +397,13 @@ mod tests {
             config.clipboard_max_bytes(),
             DEFAULT_CLIPBOARD_MAX_MB as usize * 1024 * 1024
         );
-        assert_eq!(config.edge_mode, EdgeMode::Single);
+        assert_eq!(config.edge_mode, EdgeMode::Double);
         assert_eq!(config.transport, TransportProtocol::Udp);
-        // Predates both toggles: scroll stays normal, discovery is on.
+        // Predates the toggles: scroll stays normal, discovery is on,
+        // double-edge entry mirrors.
         assert!(!config.reverse_scroll);
         assert!(config.auto_discover);
+        assert_eq!(config.double_edge_style, DoubleEdgeStyle::Mirror);
         assert!(config.validate().is_ok());
     }
 
@@ -416,8 +428,8 @@ mod tests {
     }
 
     #[test]
-    fn edge_mode_defaults_single_and_roundtrips() {
-        assert_eq!(Config::default().edge_mode, EdgeMode::Single);
+    fn edge_mode_defaults_double_and_roundtrips() {
+        assert_eq!(Config::default().edge_mode, EdgeMode::Double);
         let double = Config {
             edge_mode: EdgeMode::Double,
             ..Config::default()

@@ -1,7 +1,7 @@
 //! Local daemon-control protocol shared by the daemon and the desktop UI.
 
 use crate::pairing::Peer;
-use kvm_core::{Config, EdgeMode, Layout, Mode, TransportProtocol};
+use kvm_core::{Config, DoubleEdgeStyle, EdgeMode, Layout, Mode, TransportProtocol};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -58,6 +58,28 @@ pub enum ControlRequest {
     /// Reject one incoming pairing request by certificate fingerprint.
     RejectPairing {
         fingerprint_hex: String,
+    },
+    /// Return inbound LINK requests waiting for local approval: a paired
+    /// peer dialed a fresh link epoch this machine never approved. The
+    /// session waits (no input flows) until the local user allows or
+    /// denies it — no computer drives this one unapproved.
+    ListPendingLinks,
+    /// Approve one inbound link by certificate fingerprint and epoch: the
+    /// waiting session proceeds, and the epoch is remembered so retries
+    /// and the dial-back on the same epoch never prompt again. The link
+    /// still ends on Disconnect/ban like any other.
+    ApproveLink {
+        fingerprint_hex: String,
+        #[serde(default)]
+        link_id: Option<u64>,
+    },
+    /// Deny one inbound link: the dialer is told this computer declined,
+    /// and repeated denials freeze that device for a minute (the same
+    /// rule as pairing denials).
+    RejectLink {
+        fingerprint_hex: String,
+        #[serde(default)]
+        link_id: Option<u64>,
     },
     /// Drop one live INBOUND input session by peer fingerprint, without
     /// touching trust. The dialer's side notices the closed connection and
@@ -144,6 +166,11 @@ pub enum ControlRequest {
         /// are safe.
         #[serde(default)]
         auto_discover: Option<bool>,
+        /// Double-edge entry discipline (see `Config::double_edge_style`);
+        /// omission preserves the current value so partial CLI/UI updates
+        /// are safe.
+        #[serde(default)]
+        double_edge_style: Option<DoubleEdgeStyle>,
     },
     /// Take one chunk of the latest peer paste stashed for this
     /// logged-in session (see [`ClipboardUpdate`]): the headless
@@ -240,6 +267,10 @@ pub struct DaemonStatus {
     /// Defaults to true for older daemons that predate the field.
     #[serde(default = "default_auto_discover")]
     pub auto_discover: bool,
+    /// Double-edge entry discipline (see `Config::double_edge_style`).
+    /// Defaults to Mirror for older daemons that predate the field.
+    #[serde(default)]
+    pub double_edge_style: DoubleEdgeStyle,
     pub peer_count: usize,
     pub active_session_count: usize,
     pub uptime_seconds: u64,
@@ -341,6 +372,20 @@ pub struct PendingPairing {
     pub verification_code: String,
 }
 
+/// A paired peer dialing a fresh link epoch, waiting for this machine's
+/// explicit local approval before any input flows. Pairing trust alone
+/// never auto-opens a link: every new epoch is a deliberate human
+/// decision on the driven side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingLink {
+    pub node_name: String,
+    pub fingerprint_hex: String,
+    pub address: String,
+    /// Administrative link epoch from the dialer's Hello.
+    #[serde(default)]
+    pub link_id: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlResponse {
     Status(DaemonStatus),
@@ -358,6 +403,17 @@ pub enum ControlResponse {
     },
     PairingRejected {
         fingerprint_hex: String,
+    },
+    PendingLinks(Vec<PendingLink>),
+    LinkApproved {
+        fingerprint_hex: String,
+        #[serde(default)]
+        link_id: Option<u64>,
+    },
+    LinkRejected {
+        fingerprint_hex: String,
+        #[serde(default)]
+        link_id: Option<u64>,
     },
     Pinned {
         fingerprint_hex: String,
@@ -485,6 +541,7 @@ mod tests {
             transport: Some(TransportProtocol::Udp),
             reverse_scroll: None,
             auto_discover: Some(true),
+            double_edge_style: None,
         };
         let expected_address = "127.0.0.1:42110".to_owned();
         let sender = tokio::spawn(async move {
@@ -504,6 +561,7 @@ mod tests {
             transport,
             reverse_scroll,
             auto_discover,
+            double_edge_style,
         }) = read_request(&mut right).await.unwrap()
         else {
             panic!("expected SetConfig request");
@@ -524,6 +582,7 @@ mod tests {
         assert_eq!(transport, Some(TransportProtocol::Udp));
         assert_eq!(reverse_scroll, None);
         assert_eq!(auto_discover, Some(true));
+        assert_eq!(double_edge_style, None);
         sender.await.unwrap();
     }
 
@@ -579,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn older_daemon_status_defaults_edge_mode_to_single() {
+    fn older_daemon_status_defaults_edge_mode_to_double() {
         let status: DaemonStatus = serde_json::from_str(
             r#"{
                 "node_name": "old",
@@ -595,9 +654,10 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(status.edge_mode, EdgeMode::Single);
+        assert_eq!(status.edge_mode, EdgeMode::Double);
         assert_eq!(status.clipboard_max_mb, 2);
         assert!(status.auto_discover);
+        assert_eq!(status.double_edge_style, DoubleEdgeStyle::Mirror);
     }
 
     #[test]
