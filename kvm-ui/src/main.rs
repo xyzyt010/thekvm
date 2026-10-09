@@ -568,6 +568,27 @@ fn main() -> Result<()> {
                     if idle && wanted {
                         let found = scan_lan_devices();
                         if !found.is_empty() {
+                            // Log only when the nearby set changes: a line
+                            // every 15s forever would bury the journal.
+                            let changed = discovered_for_poll.lock().ok().is_none_or(|slot| {
+                                let mut old = slot.clone();
+                                old.sort();
+                                let mut new: Vec<String> =
+                                    found.iter().map(|(_, addr)| addr.clone()).collect();
+                                new.sort();
+                                old != new
+                            });
+                            if changed {
+                                ui_log(&format!(
+                                    "discovery: auto-scan found {} device(s): {}",
+                                    found.len(),
+                                    found
+                                        .iter()
+                                        .map(|(label, _)| label.clone())
+                                        .collect::<Vec<_>>()
+                                        .join("; ")
+                                ));
+                            }
                             store_discovered(&weak, &discovered_for_poll, found, false);
                         }
                     }

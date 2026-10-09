@@ -86,17 +86,45 @@ pub fn is_request(payload: &[u8]) -> bool {
     payload == REQUEST
 }
 
+/// Every address one discovery request is sent to: the limited broadcast
+/// plus each usable local subnet's directed broadcast (deduplicated).
+/// Link-local (169.254/16), loopback, and down interfaces are skipped —
+/// a request there can only ever find this machine itself.
+fn broadcast_targets() -> Vec<Ipv4Addr> {
+    let mut targets = vec![Ipv4Addr::BROADCAST];
+    for interface in if_addrs::get_if_addrs().unwrap_or_default() {
+        let (ip, mask) = match interface.addr {
+            if_addrs::IfAddr::V4(v4) => (v4.ip, v4.netmask),
+            _ => continue,
+        };
+        if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+            continue;
+        }
+        let broadcast = Ipv4Addr::from(u32::from(ip) | !u32::from(mask));
+        if broadcast != Ipv4Addr::BROADCAST && !targets.contains(&broadcast) {
+            targets.push(broadcast);
+        }
+    }
+    targets
+}
+
 /// Scan the local IPv4 LAN for metadata-only advertisements. The caller still
 /// has to pair through QUIC and confirm the returned certificate fingerprint.
+///
+/// Requests go to the global broadcast address AND to every local subnet's
+/// directed broadcast (e.g. 192.168.1.255): some stacks (observed live on
+/// Windows with several interfaces) route the limited broadcast
+/// 255.255.255.255 out the wrong interface only, so a scanner hears just
+/// itself. Directed broadcasts route through the normal table and reach
+/// the real LAN. Replies are unicast and deduped by fingerprint.
 pub async fn scan(timeout: Duration) -> std::io::Result<Vec<(SocketAddr, Advertisement)>> {
     let socket = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
     socket.set_broadcast(true)?;
-    socket
-        .send_to(
-            REQUEST,
-            SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)),
-        )
-        .await?;
+    for target in broadcast_targets() {
+        let _ = socket
+            .send_to(REQUEST, SocketAddr::from((target, DISCOVERY_PORT)))
+            .await;
+    }
 
     let deadline = Instant::now() + timeout;
     let mut results = Vec::new();
@@ -157,6 +185,20 @@ fn validate(advertisement: &Advertisement) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broadcast_targets_always_cover_global_and_skip_link_local() {
+        let targets = broadcast_targets();
+        // The limited broadcast is always first (legacy behavior kept).
+        assert_eq!(targets.first(), Some(&Ipv4Addr::BROADCAST));
+        // Deduplicated, and never a loopback/unspecified address itself.
+        let mut seen = std::collections::BTreeSet::new();
+        for target in &targets {
+            assert!(seen.insert(*target), "duplicate broadcast target {target}");
+            assert!(!target.is_loopback());
+            assert!(!target.is_unspecified());
+        }
+    }
 
     #[test]
     fn advertisements_round_trip_and_reject_untrusted_shapes() {
