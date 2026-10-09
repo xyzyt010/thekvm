@@ -1,4 +1,4 @@
-import { Button, LineEdit, Palette, Switch, TabWidget } from "std-widgets.slint";
+import { Button, ComboBox, LineEdit, Palette, Switch, TabWidget } from "std-widgets.slint";
 
 // TheKVM: Deskflow-simple. The Connect tab is the whole product for most
 // users: pick what this computer does, type the other computer's address,
@@ -85,6 +85,15 @@ export component AppWindow inherits Window {
     in-out property <string> pair-code: "";
     in property <string> pairing-code: "";
     in-out property <string> discovery-text: "No LAN scan yet";
+    // Scanned devices (label + dial address behind each row): refreshed by
+    // the Scan button and, when auto-discovery is on, the background poll.
+    // Picking a row and pressing Connect dials it through the normal
+    // pairing/mode-checked flow — a tap never bypasses approval.
+    in-out property <[string]> discovered-labels: [];
+    in-out property <int> discovered-index: 0;
+    // Automatic LAN discovery listing (Settings, default on): listing
+    // only, never dials by itself.
+    in-out property <bool> auto-discover: true;
     in-out property <string> device-name: "";
     in-out property <string> auto-connect-address: "";
     in-out property <string> local-address: "";
@@ -109,6 +118,8 @@ export component AppWindow inherits Window {
     callback set-reverse-scroll(bool /* true reverses outbound wheel */);
     callback pair-from-invite(string /* invite */);
     callback discover-lan();
+    callback connect-discovered(int /* ComboBox row */);
+    callback apply-auto-discover(bool /* wanted */);
     callback start-daemon();
     callback confirm-pairing();
     callback cancel-pairing();
@@ -454,6 +465,12 @@ export component AppWindow inherits Window {
                     padding: 12px;
                     spacing: 10px;
                     Text { text: "Find on my network"; color: white; font-size: 16px; font-weight: 700; }
+                    Text {
+                        text: auto-discover ? "Nearby TheKVM computers appear below on their own. Tap one, then Connect — the other side still approves." : "Automatic listing is off (see Settings). Scan once, tap a device, then Connect — the other side still approves.";
+                        color: #9ca3af;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
                     HorizontalLayout {
                         spacing: 12px;
                         Button { text: "Scan network"; clicked => { discover-lan(); } }
@@ -462,6 +479,20 @@ export component AppWindow inherits Window {
                             color: #9ca3af;
                             font-size: 11px;
                             vertical-alignment: center;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        visible: discovered-labels.length > 0;
+                        found := ComboBox {
+                            model: root.discovered-labels;
+                            current-index <=> root.discovered-index;
+                        }
+                        Button {
+                            text: "Connect";
+                            primary: true;
+                            enabled: discovered-labels.length > 0 && !session-active;
+                            clicked => { connect-discovered(root.discovered-index); }
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }
@@ -729,6 +760,24 @@ export component AppWindow inherits Window {
                     }
                     Text {
                         text: "When on, scrolling while driving the peer goes the opposite way. Local scrolling is unchanged.";
+                        color: #9ca3af;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Find nearby computers automatically";
+                            color: #d1d5db;
+                            vertical-alignment: center;
+                        }
+                        Switch {
+                            checked <=> root.auto-discover;
+                            toggled => { root.apply-auto-discover(root.auto-discover); }
+                        }
+                    }
+                    Text {
+                        text: "When on, other TheKVM computers on this network list themselves under Devices. Listing only — nothing connects without a tap and the other side's approval.";
                         color: #9ca3af;
                         font-size: 11px;
                         wrap: word-wrap;

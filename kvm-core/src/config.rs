@@ -58,6 +58,13 @@ pub struct Config {
     /// files without this field load as false (normal scroll).
     #[serde(default)]
     pub reverse_scroll: bool,
+    /// Automatically scan the LAN for other TheKVM machines and list them
+    /// under Devices. Default on: discovery is metadata-only (name, role,
+    /// address, fingerprint) and never pairs or connects by itself — the
+    /// user still picks a device and both sides still approve. Old config
+    /// files without this field load as true.
+    #[serde(default = "default_auto_discover")]
+    pub auto_discover: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -110,8 +117,15 @@ impl Default for Config {
             clipboard_enabled: true,
             clipboard_max_mb: DEFAULT_CLIPBOARD_MAX_MB,
             reverse_scroll: false,
+            auto_discover: true,
         }
     }
+}
+
+/// Auto-discovery defaults on: it only lists machines, never connects, so
+/// there is nothing to opt out of for safety — only for quiet networks.
+fn default_auto_discover() -> bool {
+    true
 }
 
 /// Fresh installs sync clipboard by default. Config files that already
@@ -375,6 +389,9 @@ mod tests {
         );
         assert_eq!(config.edge_mode, EdgeMode::Single);
         assert_eq!(config.transport, TransportProtocol::Udp);
+        // Predates both toggles: scroll stays normal, discovery is on.
+        assert!(!config.reverse_scroll);
+        assert!(config.auto_discover);
         assert!(config.validate().is_ok());
     }
 

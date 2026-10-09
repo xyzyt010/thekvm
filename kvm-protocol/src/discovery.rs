@@ -5,7 +5,7 @@
 //! never authenticates a peer or authorizes input. Pairing must still show and
 //! confirm the fingerprint through the normal QUIC ceremony.
 
-use kvm_core::MAX_DEVICE_NAME_BYTES;
+use kvm_core::{Mode, MAX_DEVICE_NAME_BYTES};
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -20,6 +20,26 @@ pub struct Advertisement {
     pub node_name: String,
     pub listen_port: u16,
     pub fingerprint_hex: String,
+    /// This machine's input role (see `kvm_core::Mode`). Old responders
+    /// predate the field and decode as Bidirectional; the UI labels that
+    /// accordingly and the connect path re-checks live, so a stale label
+    /// can never bypass mode enforcement.
+    #[serde(default = "default_advertised_mode")]
+    pub mode: Mode,
+}
+
+fn default_advertised_mode() -> Mode {
+    Mode::Bidirectional
+}
+
+/// Short role label for discovery lists ("both ways", "controls other",
+/// "is controlled"). Pure for tests.
+pub fn role_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Bidirectional => "both ways",
+        Mode::ServerClient => "controls other",
+        Mode::ClientOnly => "is controlled",
+    }
 }
 
 pub fn request() -> &'static [u8] {
@@ -144,7 +164,20 @@ mod tests {
             node_name: "desk".into(),
             listen_port: 42110,
             fingerprint_hex: "ab".repeat(32),
+            mode: Mode::ServerClient,
         };
+        let encoded = encode_advertisement(&expected).unwrap();
+        assert_eq!(decode_advertisement(&encoded).unwrap(), expected);
+        // Old responders predate the mode field: they still decode, as
+        // both-ways (the connect path re-checks live).
+        let legacy: Advertisement = serde_json::from_str(
+            r#"{"node_name":"old","listen_port":42110,"fingerprint_hex":"ab"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.mode, Mode::Bidirectional);
+        assert_eq!(role_label(Mode::Bidirectional), "both ways");
+        assert_eq!(role_label(Mode::ServerClient), "controls other");
+        assert_eq!(role_label(Mode::ClientOnly), "is controlled");
         let encoded = encode_advertisement(&expected).unwrap();
         assert_eq!(decode_advertisement(&encoded).unwrap(), expected);
         assert!(decode_advertisement(b"THEKVM-ADVERTISE/1\0{}").is_err());

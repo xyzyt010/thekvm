@@ -711,6 +711,12 @@ fn data_dir() -> std::path::PathBuf {
 /// service, but is surfaced through tracing.
 pub(crate) fn audit_event(dir: &std::path::Path, event: &str) {
     let path = dir.join("audit.log");
+    // Capped like the per-peer link logs: pairing/mode/session lines are
+    // low-frequency, but an unbounded file over months of uptime is a
+    // leak all the same.
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 512 * 1024) {
+        let _ = std::fs::remove_file(&path);
+    }
     let result = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         let mut options = std::fs::OpenOptions::new();
@@ -1029,6 +1035,7 @@ pub(crate) struct ConfigureOptions<'a> {
     pub(crate) clipboard_enabled: Option<bool>,
     pub(crate) clipboard_max_mb: Option<u32>,
     pub(crate) reverse_scroll: Option<bool>,
+    pub(crate) auto_discover: Option<bool>,
 }
 
 pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
@@ -1044,6 +1051,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
         clipboard_enabled,
         clipboard_max_mb,
         reverse_scroll,
+        auto_discover,
     } = options;
     let requested_mode = mode
         .map(|mode| match mode.to_ascii_lowercase().as_str() {
@@ -1091,6 +1099,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
             edge_mode: None,
             transport,
             reverse_scroll,
+            auto_discover,
         },
     )
     .await
@@ -1140,6 +1149,9 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     }
     if let Some(reverse) = reverse_scroll {
         config.reverse_scroll = reverse;
+    }
+    if let Some(discover) = auto_discover {
+        config.auto_discover = discover;
     }
     if let Some(max_mb) = clipboard_max_mb {
         if max_mb == 0 || max_mb > kvm_core::config::MAX_CLIPBOARD_MAX_MB {
@@ -1979,9 +1991,13 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // (down from 180): the 28px sustained-overflow rule already eats
     // brushes, so the hold only needs to cover the crossing fling tail —
     // shorter holds make deliberate returns feel instant (MWB parity)
-    // without re-arming the snap-back.
+    // without re-arming the snap-back. Grace 150ms (down from 400): the
+    // same 28px rule carries the anti-flap weight now, so rapid
+    // show-off re-crossings (several per second) pass at once instead
+    // of queueing behind the old window. No count or time caps beyond
+    // these two sub-second windows: deliberate motion always crosses.
     router.set_return_hold(Duration::from_millis(100));
-    router.set_handoff_grace(Duration::from_millis(400));
+    router.set_handoff_grace(Duration::from_millis(150));
     match kvm_platform::capture::screen_size() {
         Ok(Some((width, height))) => match router.adopt_local_screen_size(width, height) {
             Some((w, h)) => {
@@ -7688,7 +7704,12 @@ pub async fn run() -> Result<()> {
     tracing::info!(port = listen_port, "listening for QUIC connections");
     let udp_motion_port = kvm_protocol::udp::udp_port(listen_port);
     tracing::info!(port = udp_motion_port, "listening for UDP motion");
-    spawn_discovery_responder(identity.clone(), listen_port, configured_node_name);
+    spawn_discovery_responder(
+        identity.clone(),
+        listen_port,
+        configured_node_name,
+        dir.clone(),
+    );
     spawn_udp_motion_listener(udp_motion_port);
 
     #[cfg(target_os = "windows")]
@@ -7811,7 +7832,12 @@ pub async fn run() -> Result<()> {
     }
 }
 
-fn spawn_discovery_responder(identity: Identity, listen_port: u16, node_name: String) {
+fn spawn_discovery_responder(
+    identity: Identity,
+    listen_port: u16,
+    node_name: String,
+    dir: std::path::PathBuf,
+) {
     tokio::spawn(async move {
         let socket = match tokio::net::UdpSocket::bind((
             std::net::Ipv4Addr::UNSPECIFIED,
@@ -7825,19 +7851,19 @@ fn spawn_discovery_responder(identity: Identity, listen_port: u16, node_name: St
                 return;
             }
         };
-        let advertisement = match kvm_protocol::discovery::encode_advertisement(
+        // Rebuilt per request from the live config file: a role change
+        // (Both ways / Control other only / Be controlled only) shows up
+        // in other machines' discovery lists without a daemon restart.
+        // Encode failures fall back to the startup values, never silence.
+        let fallback = kvm_protocol::discovery::encode_advertisement(
             &kvm_protocol::discovery::Advertisement {
-                node_name,
+                node_name: node_name.clone(),
                 listen_port,
                 fingerprint_hex: identity.fingerprint_hex(),
+                mode: kvm_core::Mode::Bidirectional,
             },
-        ) {
-            Ok(advertisement) => advertisement,
-            Err(error) => {
-                tracing::warn!(%error, "cannot encode LAN discovery advertisement");
-                return;
-            }
-        };
+        )
+        .unwrap_or_default();
         let mut buffer = [0u8; 128];
         loop {
             let (length, source) = tokio::select! {
@@ -7851,7 +7877,23 @@ fn spawn_discovery_responder(identity: Identity, listen_port: u16, node_name: St
                 },
             };
             if kvm_protocol::discovery::is_request(&buffer[..length]) {
-                let _ = socket.send_to(&advertisement, source).await;
+                let live = kvm_core::Config::load(&dir.join("config.json"))
+                    .map(|config| {
+                        kvm_protocol::discovery::encode_advertisement(
+                            &kvm_protocol::discovery::Advertisement {
+                                node_name: config.device_name.clone(),
+                                listen_port: config.listen_port,
+                                fingerprint_hex: identity.fingerprint_hex(),
+                                mode: config.mode,
+                            },
+                        )
+                        .unwrap_or_default()
+                    })
+                    .unwrap_or_else(|_| fallback.clone());
+                if live.is_empty() {
+                    continue;
+                }
+                let _ = socket.send_to(&live, source).await;
             }
         }
     });

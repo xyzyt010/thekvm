@@ -139,6 +139,11 @@ pub enum ControlRequest {
         /// so partial CLI/UI updates are safe.
         #[serde(default)]
         reverse_scroll: Option<bool>,
+        /// Automatic LAN discovery listing (see `Config::auto_discover`);
+        /// omission preserves the current value so partial CLI/UI updates
+        /// are safe.
+        #[serde(default)]
+        auto_discover: Option<bool>,
     },
     /// Take one chunk of the latest peer paste stashed for this
     /// logged-in session (see [`ClipboardUpdate`]): the headless
@@ -202,6 +207,11 @@ fn default_clipboard_max_mb() -> u32 {
     kvm_core::config::DEFAULT_CLIPBOARD_MAX_MB
 }
 
+/// Discovery lists default on for status frames from older daemons.
+fn default_auto_discover() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub node_name: String,
@@ -226,6 +236,10 @@ pub struct DaemonStatus {
     /// false for older daemons that predate the field.
     #[serde(default)]
     pub reverse_scroll: bool,
+    /// Automatic LAN discovery listing (see `Config::auto_discover`).
+    /// Defaults to true for older daemons that predate the field.
+    #[serde(default = "default_auto_discover")]
+    pub auto_discover: bool,
     pub peer_count: usize,
     pub active_session_count: usize,
     pub uptime_seconds: u64,
@@ -470,6 +484,7 @@ mod tests {
             edge_mode: Some(EdgeMode::Double),
             transport: Some(TransportProtocol::Udp),
             reverse_scroll: None,
+            auto_discover: Some(true),
         };
         let expected_address = "127.0.0.1:42110".to_owned();
         let sender = tokio::spawn(async move {
@@ -488,6 +503,7 @@ mod tests {
             edge_mode,
             transport,
             reverse_scroll,
+            auto_discover,
         }) = read_request(&mut right).await.unwrap()
         else {
             panic!("expected SetConfig request");
@@ -507,6 +523,7 @@ mod tests {
         assert_eq!(edge_mode, Some(EdgeMode::Double));
         assert_eq!(transport, Some(TransportProtocol::Udp));
         assert_eq!(reverse_scroll, None);
+        assert_eq!(auto_discover, Some(true));
         sender.await.unwrap();
     }
 
@@ -580,6 +597,7 @@ mod tests {
         .unwrap();
         assert_eq!(status.edge_mode, EdgeMode::Single);
         assert_eq!(status.clipboard_max_mb, 2);
+        assert!(status.auto_discover);
     }
 
     #[test]

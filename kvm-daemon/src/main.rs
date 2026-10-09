@@ -148,6 +148,12 @@ enum Command {
         /// Normal outbound scroll direction when driving the peer.
         #[arg(long, conflicts_with = "reverse_scroll")]
         normal_scroll: bool,
+        /// List other TheKVM machines on the LAN automatically (default on).
+        #[arg(long, conflicts_with = "disable_auto_discover")]
+        enable_auto_discover: bool,
+        /// Stop listing other TheKVM machines on the LAN automatically.
+        #[arg(long, conflicts_with = "enable_auto_discover")]
+        disable_auto_discover: bool,
     },
 }
 
@@ -382,6 +388,8 @@ async fn async_main() -> Result<()> {
             clipboard_max_mb,
             reverse_scroll,
             normal_scroll,
+            enable_auto_discover,
+            disable_auto_discover,
         } => {
             if transport.is_some() {
                 // Transport is cemented to UDP: the flag is accepted so old
@@ -414,6 +422,13 @@ async fn async_main() -> Result<()> {
                 reverse_scroll: if reverse_scroll {
                     Some(true)
                 } else if normal_scroll {
+                    Some(false)
+                } else {
+                    None
+                },
+                auto_discover: if enable_auto_discover {
+                    Some(true)
+                } else if disable_auto_discover {
                     Some(false)
                 } else {
                     None

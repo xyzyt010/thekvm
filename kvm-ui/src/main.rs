@@ -164,6 +164,7 @@ fn main() -> Result<()> {
         ui.set_lock_screen_control(config.allow_lock_screen_control);
         ui.set_clipboard_enabled(config.clipboard_enabled);
         ui.set_reverse_scroll(config.reverse_scroll);
+        ui.set_auto_discover(config.auto_discover);
         ui.set_clipboard_max_mb(SharedString::from(config.clipboard_max_mb.to_string()));
         ui.set_device_name(SharedString::from(config.device_name.clone()));
         ui.set_auto_connect_address(SharedString::from(
@@ -211,6 +212,11 @@ fn main() -> Result<()> {
     let last_link_seen_state = last_link_seen.clone();
     let pending_for_poll = pending_pair.clone();
     let link_dir = startup_dir.clone();
+    // Last LAN scan results (dial addresses in ComboBox order): shared by
+    // the manual Scan button, the automatic poll-loop scan, and the
+    // click-to-connect handler so all three see the same list.
+    let discovered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let discovered_for_poll = discovered.clone();
     // Local LAN address is shown even while the daemon is unreachable so the
     // Status tab never reads "unknown" for something the UI can compute
     // itself.
@@ -326,6 +332,8 @@ fn main() -> Result<()> {
         let weak = poll_weak;
         let mut consecutive_failures: u32 = 0;
         let mut was_failing = false;
+        // Countdown to the next background LAN scan (see below): ~15s.
+        let mut auto_scan_in: u32 = 5;
         ui_log("poll thread started");
         loop {
             // NOTE: never gate this loop on weak.upgrade(). Slint component
@@ -544,6 +552,28 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                // Automatic LAN discovery (Settings, default on): every ~15s
+                // while no link runs, refresh the Devices list in the
+                // background. Listing only — never autofills, never dials.
+                // Skipped while a link runs so scans never disturb a drive.
+                if auto_scan_in == 0 {
+                    auto_scan_in = 15;
+                    let idle = session_for_poll
+                        .lock()
+                        .ok()
+                        .is_none_or(|slot| slot.is_none());
+                    let wanted = kvm_core::Config::load(&link_dir.join("config.json"))
+                        .map(|config| config.auto_discover)
+                        .unwrap_or(true);
+                    if idle && wanted {
+                        let found = scan_lan_devices();
+                        if !found.is_empty() {
+                            store_discovered(&weak, &discovered_for_poll, found, false);
+                        }
+                    }
+                } else {
+                    auto_scan_in -= 1;
+                }
             })); // end catch_unwind for one poll iteration
             if iteration.is_err() {
                 consecutive_failures += 1;
@@ -586,6 +616,7 @@ fn main() -> Result<()> {
             edge_mode: None,
             transport: None,
             reverse_scroll: None,
+            auto_discover: None,
         }
     }
 
@@ -794,6 +825,7 @@ fn main() -> Result<()> {
                 edge_mode: None,
                 transport: None,
                 reverse_scroll: None,
+                auto_discover: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -804,6 +836,7 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(current.edge_mode),
+                        None,
                         None,
                         None,
                     );
@@ -925,6 +958,7 @@ fn main() -> Result<()> {
                 edge_mode: Some(requested),
                 transport: None,
                 reverse_scroll: None,
+                auto_discover: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -935,6 +969,7 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(requested),
+                        None,
                         None,
                         None,
                     );
@@ -1016,6 +1051,7 @@ fn main() -> Result<()> {
                 edge_mode: None,
                 transport: None,
                 reverse_scroll: Some(wanted),
+                auto_discover: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -1028,6 +1064,7 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(wanted),
+                        None,
                     );
                     let _ = slint::invoke_from_event_loop({
                         let weak = weak.clone();
@@ -1174,33 +1211,132 @@ fn main() -> Result<()> {
     });
 
     let weak = ui.as_weak();
+    let discovered_for_scan = discovered.clone();
     ui.on_discover_lan(move || {
         let weak = weak.clone();
+        let discovered_for_scan = discovered_for_scan.clone();
         std::thread::spawn(move || {
-            let result = (|| -> Result<(String, Option<String>)> {
-                let runtime = runtime();
-                let peers = runtime.block_on(kvm_protocol::discovery::scan(
-                    std::time::Duration::from_secs(1),
-                ))?;
-                if peers.is_empty() {
-                    return Ok(("No TheKVM receivers found".into(), None));
+            let found = scan_lan_devices();
+            let single = found.len() == 1;
+            if found.is_empty() {
+                ui_log("discovery: manual scan found nothing");
+            } else {
+                ui_log(&format!(
+                    "discovery: manual scan found {} device(s)",
+                    found.len()
+                ));
+            }
+            store_discovered(&weak, &discovered_for_scan, found, single);
+        });
+    });
+
+    // Click-to-connect for a scanned device: dials the address behind the
+    // selected ComboBox row through the normal session flow (pairing
+    // ceremony + mode checks included — a tap never bypasses approval).
+    let weak = ui.as_weak();
+    let pending_for_scanned = pending_pair.clone();
+    let scanned_data_dir = startup_dir.clone();
+    let scanned_session = session_state.clone();
+    let discovered_for_connect = discovered.clone();
+    ui.on_connect_discovered(move |index| {
+        let address = discovered_for_connect
+            .lock()
+            .ok()
+            .and_then(|slot| slot.get(index as usize).cloned());
+        match address {
+            Some(address) => {
+                ui_log(&format!(
+                    "discovery: connecting to scanned device {address}"
+                ));
+                set_link_connecting(&weak, true);
+                start_session_flow(
+                    &weak,
+                    &pending_for_scanned,
+                    &scanned_data_dir,
+                    &scanned_session,
+                    address,
+                    None,
+                );
+            }
+            None => set_status(
+                &weak,
+                "That scanned device is no longer listed — press Scan network and try again."
+                    .into(),
+            ),
+        }
+    });
+
+    // Automatic LAN discovery listing (Settings, default on): listing only,
+    // never dials. Takes effect at once; the poll loop picks it up within
+    // one scan interval.
+    let weak = ui.as_weak();
+    ui.on_apply_auto_discover(move |wanted| {
+        let weak = weak.clone();
+        set_status(&weak, "Applying device discovery…".into());
+        std::thread::spawn(move || {
+            let current = match control_request(ControlRequest::GetConfig) {
+                Ok(ControlResponse::Config(config)) => config,
+                Ok(other) => {
+                    set_status(&weak, format!("Cannot read settings: {other:?}"));
+                    return;
                 }
-                let text = peers
-                    .iter()
-                    .map(|(address, peer)| {
-                        format!(
-                            "{} · {} · {}",
-                            peer.node_name, address, peer.fingerprint_hex
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let address = (peers.len() == 1).then(|| peers[0].0.to_string());
-                Ok((text, address))
-            })();
-            match result {
-                Ok((text, address)) => set_discovery(&weak, text, address),
-                Err(error) => set_discovery(&weak, format!("Discovery failed: {error}"), None),
+                Err(error) => {
+                    set_status(
+                        &weak,
+                        control_denied_status(&error, "Background service unreachable"),
+                    );
+                    return;
+                }
+            };
+            match control_request(ControlRequest::SetConfig {
+                device_name: Some(current.device_name.clone()),
+                mode: Some(current.mode),
+                allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                listen_port: None,
+                layout: None,
+                auto_connect_address: current.auto_connect_address.clone(),
+                clear_auto_connect: current.auto_connect_address.is_none(),
+                clipboard_enabled: Some(current.clipboard_enabled),
+                clipboard_max_mb: None,
+                edge_mode: None,
+                transport: None,
+                reverse_scroll: None,
+                auto_discover: Some(wanted),
+            }) {
+                Ok(ControlResponse::Applied { .. }) => {
+                    mirror_user_config(
+                        &current.device_name,
+                        current.mode,
+                        current.allow_lock_screen_control,
+                        current.clipboard_enabled,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(wanted),
+                    );
+                    let _ = slint::invoke_from_event_loop({
+                        let weak = weak.clone();
+                        move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_auto_discover(wanted);
+                            }
+                        }
+                    });
+                    set_status(
+                        &weak,
+                        if wanted {
+                            "Automatic device discovery on: nearby TheKVM computers appear under Devices."
+                                .into()
+                        } else {
+                            "Automatic device discovery off: use Scan network to look once.".into()
+                        },
+                    );
+                }
+                Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+                Ok(other) => set_status(&weak, format!("Unexpected daemon response: {other:?}")),
+                Err(error) => set_status(&weak, format!("Cannot set discovery: {error}")),
             }
         });
     });
@@ -1371,6 +1507,7 @@ fn main() -> Result<()> {
                     None,
                     Some(requested_transport),
                     None,
+                    None,
                 );
                 let mode = match mode_index {
                     1 => "server-client",
@@ -1422,6 +1559,7 @@ fn main() -> Result<()> {
                     edge_mode: None,
                     transport: Some(requested_transport),
                     reverse_scroll: None,
+                    auto_discover: None,
                 }) {
                     Ok(ControlResponse::Applied { restart_required }) => {
                         // Same truth rule as the role buttons: the green
@@ -1502,6 +1640,7 @@ fn main() -> Result<()> {
                             edge_mode: None,
                             transport: None,
                             reverse_scroll: None,
+                            auto_discover: None,
                         })? {
                             ControlResponse::Applied { .. } => Ok(()),
                             ControlResponse::Error { message } => anyhow::bail!(message),
@@ -1746,6 +1885,7 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                 ui.set_lock_screen_control(status.allow_lock_screen_control);
                 ui.set_clipboard_enabled(status.clipboard_enabled);
                 ui.set_reverse_scroll(status.reverse_scroll);
+                ui.set_auto_discover(status.auto_discover);
                 ui.set_clipboard_max_mb(SharedString::from(status.clipboard_max_mb.to_string()));
                 // Tray tooltip stays static ("TheKVM"): the TrayIcon is
                 // owned by its pump thread (neither Send nor Sync), so
@@ -2365,6 +2505,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         edge_mode: None,
         transport: None,
         reverse_scroll: None,
+        auto_discover: None,
     }) {
         Ok(ControlResponse::Applied { .. }) => {}
         Ok(ControlResponse::Error { message }) => anyhow::bail!("{message}"),
@@ -2378,6 +2519,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         current.clipboard_enabled,
         None,
         Some(layout.clone()),
+        None,
         None,
         None,
         None,
@@ -3193,6 +3335,25 @@ fn launch_child(
     }
 }
 
+/// Actionable text for mode-mismatch rejections. The daemon rejects with
+/// terse reasons ("controller-only", "receiver-only"); the user needs to
+/// know WHICH side to change and that the role buttons on the Connect tab
+/// (or Disconnect to stop retrying) are the fix — right here, no docs
+/// hunt. Pure for tests. Returns None for non-mode rejections.
+fn mode_mismatch_guidance(detail: &str, address: &str) -> Option<String> {
+    if detail.contains("controller-only") {
+        Some(format!(
+            "{address} is set to 'Control other only', so it accepts no incoming control. On {address}, press 'Both ways' (or 'Be controlled only'), then Connect again here — or press Disconnect to stop retrying."
+        ))
+    } else if detail.contains("receiver-only") {
+        Some(format!(
+            "The roles do not match ({detail}). A computer set to 'Be controlled only' cannot dial out: set THIS computer to 'Both ways' (or 'Control other only') with the role buttons above, then Connect again — or press Disconnect to stop retrying."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Parse the shared ban-exit detail `ban <epoch> (...)`: outer None means
 /// not a ban line at all; inner None means a ban without a usable epoch
 /// (legacy builds print `ban none`). Pure for tests — the wording is a
@@ -3367,6 +3528,8 @@ fn relay_session_progress(
                     format!(
                         "{address} does not recognize this computer (pairing was left half-finished). Press Disconnect, {fix}, then Connect again to repeat the code check."
                     )
+                } else if let Some(guidance) = mode_mismatch_guidance(detail, address) {
+                    guidance
                 } else {
                     format!("Still reaching {address}… ({detail})")
                 }
@@ -3424,6 +3587,8 @@ fn relay_session_progress(
                     } else {
                         format!("Connection to {address} ended ({detail})")
                     }
+                } else if let Some(guidance) = mode_mismatch_guidance(detail, address) {
+                    guidance
                 } else {
                     format!("Connection to {address} ended ({detail})")
                 }
@@ -4233,6 +4398,7 @@ fn mirror_user_config(
     edge_mode: Option<EdgeMode>,
     transport: Option<TransportProtocol>,
     reverse_scroll: Option<bool>,
+    auto_discover: Option<bool>,
 ) {
     let path = data_dir().join("config.json");
     let mut config = kvm_core::Config::load(&path).unwrap_or_default();
@@ -4263,6 +4429,9 @@ fn mirror_user_config(
     }
     if let Some(reverse) = reverse_scroll {
         config.reverse_scroll = reverse;
+    }
+    if let Some(discover) = auto_discover {
+        config.auto_discover = discover;
     }
     let _ = config.save(&path);
 }
@@ -4720,6 +4889,69 @@ fn set_discovery(weak: &slint::Weak<AppWindow>, text: String, address: Option<St
     });
 }
 
+/// Scan the LAN for TheKVM advertisements and return `(display label,
+/// dial address)` pairs sorted by name. Shared by the manual Scan button
+/// and the automatic poll-loop scan so both show the same list. A failed
+/// scan yields an empty list (never an error popup on its own).
+fn scan_lan_devices() -> Vec<(String, String)> {
+    let peers = runtime()
+        .block_on(kvm_protocol::discovery::scan(
+            std::time::Duration::from_secs(1),
+        ))
+        .unwrap_or_default();
+    let mut found: Vec<(String, String)> = peers
+        .iter()
+        .map(|(address, peer)| {
+            (
+                format!(
+                    "{} · {} · {address}",
+                    peer.node_name,
+                    kvm_protocol::discovery::role_label(peer.mode)
+                ),
+                address.to_string(),
+            )
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Publish one scan result to the Devices ComboBox (labels), the shared
+/// dial-address list (click-to-connect), and the summary text. The address
+/// field is only autofilled when the caller passes `autofill` (manual scan
+/// with exactly one device) — background scans must never clobber typing.
+fn store_discovered(
+    weak: &slint::Weak<AppWindow>,
+    discovered: &Arc<Mutex<Vec<String>>>,
+    found: Vec<(String, String)>,
+    autofill: bool,
+) {
+    let (labels, addrs): (Vec<String>, Vec<String>) = found.into_iter().unzip();
+    if let Ok(mut slot) = discovered.lock() {
+        *slot = addrs.clone();
+    }
+    let text = if labels.is_empty() {
+        "No TheKVM devices found".to_owned()
+    } else {
+        format!(
+            "{} TheKVM device(s) on this network — pick one and press Connect:",
+            labels.len()
+        )
+    };
+    let fill = autofill.then(|| addrs.first().cloned()).flatten();
+    let models: Vec<SharedString> = labels.into_iter().map(SharedString::from).collect();
+    set_discovery(weak, text, fill);
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_discovered_labels(slint::ModelRc::new(slint::VecModel::from(models)));
+                ui.set_discovered_index(0);
+            }
+        }
+    });
+}
+
 fn data_dir() -> PathBuf {
     if let Ok(path) = std::env::var("THEKVM_DATA_DIR") {
         return PathBuf::from(path);
@@ -4785,7 +5017,10 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{edge_mode_name, edge_name, pair_status_text, parse_ban_epoch, should_dial_back};
+    use super::{
+        edge_mode_name, edge_name, mode_mismatch_guidance, pair_status_text, parse_ban_epoch,
+        should_dial_back,
+    };
     use kvm_core::EdgeMode;
 
     #[test]
@@ -4871,5 +5106,25 @@ mod tests {
         assert_eq!(parse_ban_epoch("link ended by the other side"), None);
         assert_eq!(parse_ban_epoch("bandwidth exceeded"), None);
         assert_eq!(parse_ban_epoch("interrupted"), None);
+    }
+
+    #[test]
+    fn mode_mismatch_names_which_side_to_change() {
+        let peer = mode_mismatch_guidance(
+            "peer rejected session: this node is configured as controller-only",
+            "192.168.1.8:42110",
+        )
+        .unwrap();
+        assert!(peer.contains("192.168.1.8:42110"));
+        assert!(peer.contains("Both ways"));
+        let local = mode_mismatch_guidance(
+            "receiver-only mode cannot initiate an input session",
+            "192.168.1.8:42110",
+        )
+        .unwrap();
+        assert!(local.contains("THIS computer"));
+        assert!(local.contains("Disconnect"));
+        assert!(mode_mismatch_guidance("peer is not paired", "x").is_none());
+        assert!(mode_mismatch_guidance("link ended by this computer", "x").is_none());
     }
 }

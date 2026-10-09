@@ -23,6 +23,14 @@ const MAX_PENDING_PAIRINGS: usize = 16;
 // network handshake. A tight timeout turns slow humans into expired
 // requests that look exactly like a broken network on the other side.
 const PAIRING_APPROVAL_TIMEOUT: Duration = Duration::from_secs(1800);
+// Denial freeze: after this many denials of the same device inside
+// REJECT_WINDOW, new pairing requests from it are refused for
+// REJECT_FREEZE. A denied initiator auto-retries otherwise, so without
+// the freeze one restless peer can ring the station forever. Approving
+// clears the count — only sustained denial freezes.
+const MAX_PAIRING_REJECTS: u32 = 5;
+const REJECT_WINDOW: Duration = Duration::from_secs(10 * 60);
+const REJECT_FREEZE: Duration = Duration::from_secs(60);
 
 /// In-memory approval queue owned by the running daemon. A pairing request is
 /// not persisted or trusted until the local user approves it through the
@@ -30,6 +38,14 @@ const PAIRING_APPROVAL_TIMEOUT: Duration = Duration::from_secs(1800);
 #[derive(Clone, Default)]
 pub struct PairingApprovals {
     pending: Arc<tokio::sync::Mutex<BTreeMap<String, PendingEntry>>>,
+    rejects: Arc<tokio::sync::Mutex<std::collections::HashMap<String, RejectRecord>>>,
+}
+
+#[derive(Debug, Clone)]
+struct RejectRecord {
+    count: u32,
+    window_started: Instant,
+    frozen_until: Option<Instant>,
 }
 
 struct PendingEntry {
@@ -76,6 +92,30 @@ impl PairingApprovals {
             if pending.contains_key(&fingerprint) {
                 bail!("pairing is already awaiting local approval");
             }
+            // Denial freeze (see MAX_PAIRING_REJECTS): a device denied 5
+            // times recently must cool off for a minute instead of ringing
+            // the station again immediately.
+            {
+                let mut rejects = self.rejects.lock().await;
+                if let Some(record) = rejects.get(&fingerprint) {
+                    if record
+                        .frozen_until
+                        .is_some_and(|until| Instant::now() < until)
+                    {
+                        bail!(
+                            "pairing attempts from this device are paused for 1 minute after repeated denials"
+                        );
+                    }
+                }
+                // Opportunistic janitor: drop cooled-off records so the map
+                // cannot grow over months of uptime.
+                rejects.retain(|_, record| {
+                    record
+                        .frozen_until
+                        .is_some_and(|until| Instant::now() < until)
+                        || record.window_started.elapsed() < REJECT_WINDOW
+                });
+            }
             pending.insert(
                 fingerprint.clone(),
                 PendingEntry {
@@ -102,12 +142,38 @@ impl PairingApprovals {
 
     pub async fn decide(&self, fingerprint: &str, approved: bool) -> bool {
         let fingerprint = fingerprint.to_ascii_lowercase();
-        self.pending
+        let removed = self
+            .pending
             .lock()
             .await
             .remove(&fingerprint)
             .map(|entry| entry.decision.send(approved).is_ok())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if removed {
+            // Denial accounting (see MAX_PAIRING_REJECTS): approvals clear
+            // the count, denials grow it toward the 1-minute freeze.
+            let mut rejects = self.rejects.lock().await;
+            if approved {
+                rejects.remove(&fingerprint);
+            } else {
+                let now = Instant::now();
+                let record = rejects.entry(fingerprint).or_insert(RejectRecord {
+                    count: 0,
+                    window_started: now,
+                    frozen_until: None,
+                });
+                if record.window_started.elapsed() >= REJECT_WINDOW {
+                    record.count = 0;
+                    record.window_started = now;
+                    record.frozen_until = None;
+                }
+                record.count += 1;
+                if record.count >= MAX_PAIRING_REJECTS {
+                    record.frozen_until = Some(now + REJECT_FREEZE);
+                }
+            }
+        }
+        removed
     }
 
     pub async fn cancel(&self, fingerprint: &str) {
@@ -263,6 +329,7 @@ where
                 edge_mode: current.edge_mode,
                 transport: current.transport,
                 reverse_scroll: current.reverse_scroll,
+                auto_discover: current.auto_discover,
                 peer_count,
                 active_session_count: active_sessions.load(std::sync::atomic::Ordering::Relaxed),
                 sessions: crate::service::list_inbound_links(),
@@ -496,6 +563,7 @@ where
             edge_mode,
             transport,
             reverse_scroll,
+            auto_discover,
         } => {
             if listen_port == Some(0) {
                 ControlResponse::Error {
@@ -564,6 +632,9 @@ where
                     }
                     if let Some(reverse) = reverse_scroll {
                         updated.reverse_scroll = reverse;
+                    }
+                    if let Some(discover) = auto_discover {
+                        updated.auto_discover = discover;
                     }
                     if transport.is_some() {
                         // Transport is cemented to UDP: a stale client asking
@@ -743,6 +814,53 @@ mod tests {
         assert!(approvals.register(pending.clone()).await.is_err());
         approvals.cancel(&pending.fingerprint_hex).await;
         assert!(approvals.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn five_denials_freeze_new_requests_for_a_minute() {
+        let approvals = PairingApprovals::default();
+        let pending = PendingPairing {
+            node_name: "restless".into(),
+            fingerprint_hex: "aa".repeat(32),
+            address: "127.0.0.1:42110".into(),
+            verification_code: "222222".into(),
+        };
+        for _ in 0..5 {
+            let _waiter = approvals.register(pending.clone()).await.unwrap();
+            assert!(approvals.decide(&pending.fingerprint_hex, false).await);
+        }
+        // Fifth denial freezes: the next request is refused with the
+        // cool-off reason instead of listing.
+        let frozen = approvals
+            .register(pending.clone())
+            .await
+            .err()
+            .expect("frozen request must fail");
+        assert!(
+            frozen.to_string().contains("paused for 1 minute"),
+            "unexpected freeze error: {frozen:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_clears_the_denial_count() {
+        let approvals = PairingApprovals::default();
+        let pending = PendingPairing {
+            node_name: "flip".into(),
+            fingerprint_hex: "bb".repeat(32),
+            address: "127.0.0.1:42110".into(),
+            verification_code: "333333".into(),
+        };
+        for _ in 0..4 {
+            let _waiter = approvals.register(pending.clone()).await.unwrap();
+            assert!(approvals.decide(&pending.fingerprint_hex, false).await);
+        }
+        // An approval resets the streak: four more denials still list.
+        let _waiter = approvals.register(pending.clone()).await.unwrap();
+        assert!(approvals.decide(&pending.fingerprint_hex, true).await);
+        let _waiter = approvals.register(pending.clone()).await.unwrap();
+        assert!(approvals.decide(&pending.fingerprint_hex, false).await);
+        assert!(approvals.register(pending.clone()).await.is_ok());
     }
 }
 
