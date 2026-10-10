@@ -852,9 +852,15 @@ fn main() -> Result<()> {
 
     let weak = ui.as_weak();
     let role_session = session_state.clone();
+    let role_pending = pending_pair.clone();
+    let role_dir = startup_dir.clone();
+    let role_inbound = last_inbound.clone();
     ui.on_set_role(move |role| {
         let weak = weak.clone();
         let role_session = role_session.clone();
+        let role_pending = role_pending.clone();
+        let role_dir = role_dir.clone();
+        let role_inbound = role_inbound.clone();
         ui_log(&format!("role button pressed: {role}"));
         // Instant local feedback: the press always lands, even if the daemon
         // turns out to be unreachable. The result overwrites this below.
@@ -944,28 +950,18 @@ fn main() -> Result<()> {
                         }
                     }
                     // Edge control drives under a role contract: a role
-                    // change stops it rather than letting it drive under a
-                    // stale one (e.g. receiver-only still crossing).
-                    if role_session
-                        .lock()
-                        .ok()
-                        .is_some_and(|slot| slot.as_ref().is_some())
-                    {
-                        ui_log("role changed: stopping the link; it re-arms by itself when a link is live");
-                        stop_session(&weak, &role_session, "Link stopped");
-                        set_status(
-                            &weak,
-                            format!(
-                                "Role set: {}. Link stopped — Connect again to re-link.{one_way_cost}",
-                                role_name(requested)
-                            ),
-                        );
-                    } else {
-                        set_status(
-                            &weak,
-                            format!("Role set: {}.{one_way_cost}", role_name(requested)),
-                        );
-                    }
+                    // change re-links at once (progress spinner included)
+                    // rather than driving under a stale one or stranding
+                    // the user on a dead "Link stopped" line.
+                    relink_with_new_settings(
+                        &weak,
+                        &role_session,
+                        &role_pending,
+                        &role_dir,
+                        &role_inbound,
+                        format!("Role set: {}.{one_way_cost}", role_name(requested)),
+                        requested != Mode::ClientOnly,
+                    );
                 }
                 Ok(ControlResponse::Error { message }) => {
                     ui_log(&format!("role change refused: {message}"));
@@ -985,9 +981,15 @@ fn main() -> Result<()> {
 
     let weak = ui.as_weak();
     let edge_session = session_state.clone();
+    let edge_pending = pending_pair.clone();
+    let edge_dir = startup_dir.clone();
+    let edge_inbound = last_inbound.clone();
     ui.on_set_edge_mode(move |index| {
         let weak = weak.clone();
         let edge_session = edge_session.clone();
+        let edge_pending = edge_pending.clone();
+        let edge_dir = edge_dir.clone();
+        let edge_inbound = edge_inbound.clone();
         let (requested_mode, requested_style) = edge_choice_from_index(index);
         ui_log(&format!(
             "edge button pressed: {}",
@@ -1049,32 +1051,21 @@ fn main() -> Result<()> {
                     ));
                     set_edge_mode_display(&weak, requested_mode, requested_style);
                     refresh_arrangement(&weak, child_running(&edge_session));
-                    if edge_session
-                        .lock()
-                        .ok()
-                        .is_some_and(|slot| slot.as_ref().is_some())
-                    {
-                        // The running child routed under the old discipline;
-                        // stop it rather than drive stale (re-Connect
-                        // re-arms under the new one).
-                        ui_log("edge change: stopping the link; Connect again to re-link");
-                        stop_session(&weak, &edge_session, "Link stopped");
-                        set_status(
-                            &weak,
-                            format!(
-                                "Edge crossing set: {}. Link stopped — Connect again to re-link.",
-                                edge_choice_name(requested_mode, requested_style)
-                            ),
-                        );
-                    } else {
-                        set_status(
-                            &weak,
-                            format!(
-                                "Edge crossing set: {}.",
-                                edge_choice_name(requested_mode, requested_style)
-                            ),
-                        );
-                    }
+                    // The running child routed under the old discipline:
+                    // re-link at once under the new one (spinner shows
+                    // the progress) instead of stranding a dead line.
+                    relink_with_new_settings(
+                        &weak,
+                        &edge_session,
+                        &edge_pending,
+                        &edge_dir,
+                        &edge_inbound,
+                        format!(
+                            "Edge crossing set: {}.",
+                            edge_choice_name(requested_mode, requested_style)
+                        ),
+                        current.mode != Mode::ClientOnly,
+                    );
                 }
                 Ok(ControlResponse::Error { message }) => {
                     ui_log(&format!("edge change refused: {message}"));
@@ -1094,9 +1085,15 @@ fn main() -> Result<()> {
 
     let weak = ui.as_weak();
     let scroll_session = session_state.clone();
+    let scroll_pending = pending_pair.clone();
+    let scroll_dir = startup_dir.clone();
+    let scroll_inbound = last_inbound.clone();
     ui.on_set_reverse_scroll(move |wanted| {
         let weak = weak.clone();
         let scroll_session = scroll_session.clone();
+        let scroll_pending = scroll_pending.clone();
+        let scroll_dir = scroll_dir.clone();
+        let scroll_inbound = scroll_inbound.clone();
         set_status(&weak, "Applying scroll direction…".into());
         std::thread::spawn(move || {
             let current = match control_request(ControlRequest::GetConfig) {
@@ -1155,35 +1152,23 @@ fn main() -> Result<()> {
                         "reverse scroll {}",
                         if wanted { "on" } else { "off" }
                     ));
-                    if scroll_session
-                        .lock()
-                        .ok()
-                        .is_some_and(|slot| slot.as_ref().is_some())
-                    {
-                        // The running child captured under the old
-                        // direction; stop it rather than scroll stale
-                        // (re-Connect re-arms under the new one) — same
-                        // rule as the edge-crossing switch.
-                        ui_log("scroll change: stopping the link; Connect again to re-link");
-                        stop_session(&weak, &scroll_session, "Link stopped");
-                        set_status(
-                            &weak,
-                            if wanted {
-                                "Reverse scroll on: mouse + trackpad scroll the opposite way on the peer. Link stopped — Connect again to re-link.".into()
-                            } else {
-                                "Reverse scroll off: scrolling normally on the peer. Link stopped — Connect again to re-link.".into()
-                            },
-                        );
-                    } else {
-                        set_status(
-                            &weak,
-                            if wanted {
-                                "Reverse scroll on: driving the peer scrolls the opposite way.".into()
-                            } else {
-                                "Reverse scroll off: driving the peer scrolls normally.".into()
-                            },
-                        );
-                    }
+                    // The running child captured under the old direction:
+                    // re-link at once under the new one (spinner shows
+                    // the progress) — same rule as edge crossing.
+                    relink_with_new_settings(
+                        &weak,
+                        &scroll_session,
+                        &scroll_pending,
+                        &scroll_dir,
+                        &scroll_inbound,
+                        if wanted {
+                            "Reverse scroll on: mouse + trackpad scroll the opposite way on the peer."
+                                .into()
+                        } else {
+                            "Reverse scroll off: scrolling normally on the peer.".into()
+                        },
+                        current.mode != Mode::ClientOnly,
+                    );
                 }
                 Ok(ControlResponse::Error { message }) => set_status(&weak, message),
                 Ok(other) => set_status(&weak, format!("Unexpected daemon response: {other:?}")),
@@ -1638,12 +1623,20 @@ fn main() -> Result<()> {
 
     let weak = ui.as_weak();
     ui.on_apply_config(
-        move |allow_lock_screen, mode_index, device_name, auto_address, clipboard_enabled, clipboard_max_mb| {
+        move |allow_lock_screen,
+              mode_index,
+              device_name,
+              auto_address,
+              clipboard_enabled,
+              clipboard_max_mb| {
             let weak = weak.clone();
             let device_name = device_name.to_string();
             let auto_address = auto_address.to_string();
             let clipboard_max_mb = clipboard_max_mb.to_string();
             let config_session = session_state.clone();
+            let config_pending = pending_pair.clone();
+            let config_dir = startup_dir.clone();
+            let config_inbound = last_inbound.clone();
             std::thread::spawn(move || {
                 let requested_mode = match mode_index {
                     1 => Mode::ServerClient,
@@ -1656,11 +1649,7 @@ fn main() -> Result<()> {
                 // Clipboard cap from the MB field: refuse garbage instead
                 // of silently keeping the old limit.
                 let max_mb: u32 = match clipboard_max_mb.trim().parse() {
-                    Ok(mb)
-                        if (1..=kvm_core::config::MAX_CLIPBOARD_MAX_MB).contains(&mb) =>
-                    {
-                        mb
-                    }
+                    Ok(mb) if (1..=kvm_core::config::MAX_CLIPBOARD_MAX_MB).contains(&mb) => mb,
                     _ => {
                         let message = format!(
                             "Clipboard limit must be 1..={} MB",
@@ -1686,8 +1675,8 @@ fn main() -> Result<()> {
                     Some(requested_transport),
                     None,
                     None,
-
-                None,);
+                    None,
+                );
                 let mode = match mode_index {
                     1 => "server-client",
                     2 => "receiver-only",
@@ -1745,24 +1734,30 @@ fn main() -> Result<()> {
                         // Same truth rule as the role buttons: the green
                         // role text follows the Applied result at once.
                         set_role_display(&weak, requested_mode);
-                        // Settings (role included) can invalidate a running
-                        // link contract: stop it rather than drive stale.
-                        if config_session
-                            .lock()
-                            .ok()
-                            .is_some_and(|slot| slot.as_ref().is_some())
-                        {
-                            ui_log("settings saved: stopping the link; it re-arms by itself when a link is live");
-                            stop_session(&weak, &config_session, "Link stopped");
+                        // A saved Settings form can invalidate a running
+                        // link contract: re-link at once under the new one
+                        // (spinner shows the progress), unless the daemon
+                        // itself needs a restart first.
+                        if restart_required {
+                            if config_session
+                                .lock()
+                                .ok()
+                                .is_some_and(|slot| slot.as_ref().is_some())
+                            {
+                                stop_session(&weak, &config_session, "Link stopped");
+                            }
+                            set_status(&weak, "Configuration saved; restart daemon".into());
+                        } else {
+                            relink_with_new_settings(
+                                &weak,
+                                &config_session,
+                                &config_pending,
+                                &config_dir,
+                                &config_inbound,
+                                "Configuration saved.".into(),
+                                requested_mode != Mode::ClientOnly,
+                            );
                         }
-                        set_status(
-                            &weak,
-                            if restart_required {
-                                "Configuration saved; restart daemon".into()
-                            } else {
-                                "Configuration saved".into()
-                            },
-                        )
                     }
                     Ok(ControlResponse::Error { message }) => {
                         ui_log(&format!("settings save refused: {message}"));
@@ -2389,6 +2384,78 @@ fn decide_incoming_link(
             Err(error) => set_status(&weak, format!("Link decision failed: {error}")),
         }
     });
+}
+
+/// Re-link right after a mid-session settings change, with visible
+/// progress: stops the stale child (which routed and captured under the
+/// old values) and immediately re-arms the link instead of leaving a
+/// dead "Link stopped — Connect again" behind. The Connect-tab spinner
+/// (`set_link_connecting`) shows the reconnection working.
+///
+/// Dial-back (station) halves re-arm on the SAME live epoch through the
+/// poll loop — no new approval, no new epoch. User-dialed halves do the
+/// full bilateral hang-up of the stale epoch (ban + peer notify, the
+/// Disconnect rule) and then auto-Connect fresh (the peer approves the
+/// new epoch once, like any fresh link). When this machine must not
+/// dial out (receiver-only), it only stops.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn relink_with_new_settings(
+    weak: &slint::Weak<AppWindow>,
+    session: &Arc<Mutex<Option<Session>>>,
+    pending: &Arc<Mutex<Option<PendingPair>>>,
+    data_dir: &std::path::Path,
+    last_inbound: &Arc<Mutex<Option<(String, Option<u64>)>>>,
+    applied_summary: String,
+    may_dial_out: bool,
+) {
+    let snapshot = session.lock().ok().and_then(|slot| {
+        slot.as_ref()
+            .map(|session| (session.address.clone(), session.link_id, session.dialback))
+    });
+    let Some((address, link_id, dialback)) = snapshot else {
+        set_status(weak, applied_summary);
+        return;
+    };
+    if dialback {
+        // Station half: our outbound dies, but the peer's inbound-to-us
+        // is still live on the same approved epoch, so the poll's
+        // follow_link redials it back within a tick. Reset the transition
+        // latch first: without it the poll sees "same link as before"
+        // (no announce, throttled redial, stuck spinner) instead of the
+        // fresh-link path that re-arms at once.
+        if let Ok(mut slot) = last_inbound.lock() {
+            *slot = None;
+        }
+        ui_log("settings change: stopping station half; it re-arms on the live epoch");
+        stop_session(weak, session, "Link stopped");
+        set_link_connecting(weak, true);
+        set_status(weak, format!("{applied_summary}. Re-arming the link…"));
+        return;
+    }
+    if !may_dial_out {
+        stop_session(weak, session, "Link stopped");
+        set_status(weak, format!("{applied_summary}. Link stopped."));
+        return;
+    }
+    // User-dialed half: bilateral hang-up first (stale redials must
+    // never resurrect the old epoch mid-reconnect), then a fresh
+    // auto-Connect with progress.
+    if let Some(link_id) = link_id {
+        end_link(link_id);
+    }
+    stop_session(weak, session, "Link stopped");
+    let data_dir_notify = data_dir.to_path_buf();
+    let address_notify = address.clone();
+    std::thread::spawn(move || {
+        if let Some(fingerprint) = fingerprint_for_address(&data_dir_notify, &address_notify) {
+            notify_peer_ended(&fingerprint, link_id);
+        }
+    });
+    ui_log(&format!(
+        "{applied_summary} — auto re-dialing {address} with the new settings"
+    ));
+    set_link_connecting(weak, true);
+    start_session_flow(weak, pending, data_dir, session, address, None);
 }
 
 /// Deskflow-simple connect flow: type (or scan) the other computer's

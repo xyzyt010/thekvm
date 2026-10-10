@@ -2499,6 +2499,33 @@ mod tests {
             .expect("double mode must hand off the outer edge");
         assert_eq!(hop.target, FIRST_PEER_SCREEN_ID);
         assert_eq!(hop.target_x, 1887);
+        // Proportional height across asymmetric dims: exit right at
+        // y=540 of 1080 lands at 540*863/1079 = 431 of 864 (not
+        // clamped, not stretched); the way back maps 431*1079/863 =
+        // 538 — integer rounding only, never a jump.
+        let mut tall = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        for screen in &mut tall.screens {
+            if screen.id == FIRST_PEER_SCREEN_ID {
+                screen.width = 1536;
+                screen.height = 864;
+            }
+        }
+        let hop = tall
+            .handoff_for_motion(
+                SELF_SCREEN_ID,
+                1919,
+                540,
+                50,
+                0,
+                EdgeMode::Double,
+                DoubleEdgeStyle::Mirror,
+            )
+            .expect("right edge must hand off");
+        assert_eq!(
+            (hop.target, hop.target_x, hop.target_y),
+            (FIRST_PEER_SCREEN_ID, 32, 431)
+        );
+        assert_eq!(map_coordinate(431, 864, 1080), 538);
         // Top and bottom never cross implicitly, even doubled.
         assert!(layout2
             .handoff_for_motion(

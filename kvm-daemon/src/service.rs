@@ -1844,6 +1844,7 @@ async fn run_windows_service_capture_stream(
                     // Drive-task heartbeat (see TASK_HEARTBEAT_MS).
                     stamp_task_heartbeat();
                     let physical_ctrl = state.keys.contains(&HID_LEFT_CTRL);
+                    let keys_held = !state.keys.is_empty();
                     let mut send_failed: Option<anyhow::Error> = None;
                     let event = apply_reverse_scroll(event, reverse_scroll);
                     for out in pinch_for_send(event, peer_pinch, physical_ctrl, &mut pinch_held) {
@@ -1856,15 +1857,32 @@ async fn run_windows_service_capture_stream(
                         };
                         sequence = sequence.wrapping_add(1);
                         // Tiered sends (freeze-proofing, both OSes): motion
-                        // drops on a 300ms stall instead of wedging this
-                        // privileged loop with suppression held; keys and
-                        // wheel stay reliable below.
+                        // drops on a 200ms stall instead of wedging this
+                        // privileged loop with suppression held; wheel rides
+                        // the motion lane under the same rule as the
+                        // topology arm (see `wheel_use_lane`) and drops
+                        // best-effort otherwise, so scrolls never
+                        // head-of-line-block clicks. Only keys/buttons stay
+                        // reliable below.
+                        let lane = match outgoing {
+                            InputEvent::MouseMove { .. } => motion_send.as_mut(),
+                            InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
+                                if wheel_use_lane(
+                                    motion_send.is_some(),
+                                    keys_held,
+                                    pinch_held,
+                                ) =>
+                            {
+                                motion_send.as_mut()
+                            }
+                            _ => None,
+                        };
                         let send_result = match outgoing {
                             InputEvent::MouseMove { .. } => {
                                 // Motion lane when negotiated (see
                                 // open_episode_stream); everything else
                                 // stays ordered on the episode stream.
-                                let stream = match motion_send.as_mut() {
+                                let stream = match lane {
                                     Some(motion) => motion,
                                     None => &mut send,
                                 };
@@ -1874,11 +1892,22 @@ async fn run_windows_service_capture_stream(
                             }
                             InputEvent::Wheel(_)
                             | InputEvent::SmoothWheel { .. } => {
-                                send_input(&connection, &mut send, sequence, outgoing).await
+                                // Lane when the rule allows (see above),
+                                // else best-effort on the episode stream:
+                                // a stalled stream drops a superseded
+                                // scroll instead of wedging clicks behind
+                                // an 800ms reliable write.
+                                let stream = match lane {
+                                    Some(motion) => motion,
+                                    None => &mut send,
+                                };
+                                send_motion_best_effort(stream, sequence, outgoing)
+                                    .await
+                                    .map(|_| ())
                             }
                             // Keys/buttons (and the synthetic pinch Ctrl)
-                            // ride the same bounded episode stream as wheel:
-                            // the old unbounded write pended forever on a
+                            // ride the bounded episode stream: the old
+                            // unbounded write pended forever on a
                             // half-dead association and stalled this whole
                             // privileged loop with suppression held — motion
                             // kept best-effort gliding while clicks/keys
@@ -2145,6 +2174,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // Last OS-pointer truth resync (see handle_topology_event): throttles
     // the GetCursorPos/query_pointer read to 20Hz so motion stays cheap.
     let mut last_resync: Option<std::time::Instant> = None;
+    let mut last_dims_check: Option<std::time::Instant> = None;
     // Last backend-census journal line (see the keep-alive tick).
     let mut last_census_log: Option<std::time::Instant> = None;
     // Last peer-app heartbeat on the active episode (see Progress): None
@@ -2717,6 +2747,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     discarded_event_barrier: &mut discarded_event_barrier,
                     local_wheel_dropped: &mut local_wheel_dropped,
                     last_resync: &mut last_resync,
+                    last_dims_check: &mut last_dims_check,
                     suppression_requested: &mut suppression_requested,
                     last_peer_progress: &mut last_peer_progress,
                     unacked_pings: &mut unacked_pings,
@@ -2851,6 +2882,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     discarded_event_barrier: &mut discarded_event_barrier,
                     local_wheel_dropped: &mut local_wheel_dropped,
                     last_resync: &mut last_resync,
+                    last_dims_check: &mut last_dims_check,
                     suppression_requested: &mut suppression_requested,
                     last_peer_progress: &mut last_peer_progress,
                     unacked_pings: &mut unacked_pings,
@@ -3202,8 +3234,10 @@ struct TopologySession {
     connection: quinn::Connection,
     send: quinn::SendStream,
     /// Per-episode motion lane (own stream, own loss domain) when the peer
-    /// negotiated one: `MouseMove` rides here, everything else on `send`.
-    /// `None` for older peers (all input on `send`, as before).
+    /// negotiated one: `MouseMove` rides here, plus `Wheel`/`SmoothWheel`
+    /// when no key is held and no pinch gesture is mid-expansion (see
+    /// `wheel_use_lane`); everything else on `send`. `None` for older
+    /// peers (all input on `send`, as before).
     motion_send: Option<quinn::SendStream>,
     signals: tokio::sync::mpsc::UnboundedReceiver<RemoteSignal>,
     response_drain: tokio::task::JoinHandle<()>,
@@ -3246,12 +3280,17 @@ struct TopologySession {
     /// packet by the motion arm instead of sent as their own QUIC frame.
     /// Logged at teardown: proves the coalescer engaged under flood.
     motion_coalesced: u64,
-    /// Best-effort motion drops: stream-bound deltas that hit the 300ms
+    /// Best-effort motion drops: stream-bound deltas that hit the 200ms
     /// stall bound and were dropped instead of awaited (the freeze fix).
     /// A climbing count with low forwarded proves a struggling network,
     /// not a dead capture; the breaker ends the episode when nothing
     /// gets through at all. Logged at teardown.
     motion_dropped_stall: u64,
+    /// Best-effort wheel drops (same 200ms rule as motion): scroll deltas
+    /// a stalled stream refused, dropped instead of head-of-line-blocking
+    /// clicks/keys behind an 800ms reliable write. The next delta
+    /// supersedes a dropped one. Logged at teardown.
+    wheel_dropped_stall: u64,
     /// Motion VALUE probe: the first forwarded delta, how many forwarded
     /// deltas were exactly zero, and the signed sums. Counts prove flow;
     /// only values prove the cursor CAN track: a drive whose warp lands
@@ -3369,6 +3408,7 @@ impl TopologySession {
                 motion_forwarded = self.motion_forwarded,
                 motion_coalesced = self.motion_coalesced,
                 motion_dropped_stall = self.motion_dropped_stall,
+                wheel_dropped_stall = self.wheel_dropped_stall,
                 motion_first = ?self.motion_first,
                 motion_zero_deltas = self.motion_zero_deltas,
                 motion_sum_dx = self.motion_sum_dx,
@@ -4097,6 +4137,8 @@ struct TopologyEventContext<'a> {
     local_wheel_dropped: &'a mut u64,
     /// Throttle stamp for the OS-pointer truth resync below.
     last_resync: &'a mut Option<std::time::Instant>,
+    /// Throttle stamp for the mid-drive display-dims re-adopt below.
+    last_dims_check: &'a mut Option<std::time::Instant>,
     /// Belief flag for the suppression-hold reaper: set on drive start,
     /// cleared on every release.
     suppression_requested: &'a mut bool,
@@ -4266,6 +4308,7 @@ async fn handle_topology_event(
         discarded_event_barrier,
         local_wheel_dropped,
         last_resync,
+        last_dims_check,
         suppression_requested,
         last_peer_progress,
         unacked_pings,
@@ -4303,6 +4346,38 @@ async fn handle_topology_event(
                 Ok(None) => {}
                 Err(error) => {
                     tracing::debug!(%error, "truth resync unavailable");
+                }
+            }
+        }
+        // Display truth can change mid-drive (resolution/scale switch):
+        // the router pins dims once per child, so a stale fallback keeps
+        // firing crossings the user sees far from any visible edge.
+        // Re-adopt on change at a slow cadence — adopt clamps cursors and
+        // restarts push runs by construction, so it can never teleport.
+        let dims_due = last_dims_check
+            .map(|when| when.elapsed() >= Duration::from_secs(5))
+            .unwrap_or(true);
+        if dims_due {
+            *last_dims_check = Some(Instant::now());
+            match kvm_platform::capture::screen_size() {
+                Ok(Some((width, height))) => {
+                    let current = router
+                        .layout()
+                        .screen(router.local_screen())
+                        .map(|screen| (screen.width, screen.height));
+                    if current.is_some_and(|dims| dims != (width, height))
+                        && router.adopt_local_screen_size(width, height).is_some()
+                    {
+                        tracing::info!(
+                            width,
+                            height,
+                            "topology local geometry re-adopted mid-drive"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%error, "dims re-check unavailable");
                 }
             }
         }
@@ -4418,11 +4493,13 @@ async fn handle_topology_event(
             // transient gesture state it lives and dies with the session;
             // a mid-gesture StateSync may release it early, degrading the
             // gesture tail to plain scroll instead of sticking anything.)
-            let physical_ctrl = capture_control
-                .snapshot()
-                .state
-                .pressed_keys
-                .contains(&HID_LEFT_CTRL);
+            let snapshot = capture_control.snapshot();
+            let physical_ctrl = snapshot.state.pressed_keys.contains(&HID_LEFT_CTRL);
+            // Any held key (Ctrl for zoom, Shift for horizontal, ...) pins
+            // wheel to the episode stream with it: only one stream keeps
+            // key/wheel order, and order is what makes Ctrl+wheel zoom
+            // instead of plain scroll. Key-free wheel may ride the lane.
+            let keys_held = !snapshot.state.pressed_keys.is_empty();
             let peer_pinch = session.peer_pinch;
             let event = apply_reverse_scroll(event, reverse_scroll);
             let send_list =
@@ -4502,17 +4579,40 @@ async fn handle_topology_event(
                     }
                 }
                 // Tiered sends (freeze-proofing, both OSes): motion is
-                // loss-tolerant — 300ms bound, then the delta DROPS
+                // loss-tolerant — 200ms bound, then the delta DROPS
                 // (superseded by the next; UDP carries it anyway). Awaiting
                 // a dead stream per event is what wedged the drive task
                 // with suppression held and froze the local desktop for
-                // seconds per network blip. Keys/buttons/wheel stay
-                // reliable (2s bound): they cannot drop silently.
+                // seconds per network blip. Wheel is loss-tolerant the
+                // same way (the next delta supersedes a dropped scroll),
+                // so it rides the motion lane when one is open and no key
+                // or pinch gesture needs order with it (see
+                // `wheel_use_lane`), else best-effort on the episode
+                // stream — never the reliable write, so a stalled stream
+                // drops a scroll instead of head-of-line-blocking the
+                // clicks/keys behind it. Only keys/buttons stay reliable
+                // (800ms bound): they cannot drop silently.
+                let outgoing_is_wheel = matches!(
+                    outgoing,
+                    InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
+                );
                 let lane = match outgoing {
                     InputEvent::MouseMove { .. } => session.motion_send.as_mut(),
+                    InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
+                        if wheel_use_lane(
+                            session.motion_send.is_some(),
+                            keys_held,
+                            session.pinch_held,
+                        ) =>
+                    {
+                        session.motion_send.as_mut()
+                    }
                     _ => None,
                 };
-                let send_outcome: Result<bool> = if outgoing_is_motion {
+                let send_outcome: Result<bool> = if outgoing_is_motion || outgoing_is_wheel {
+                    // Motion and key-free wheel share the best-effort
+                    // path (lane when open, else the episode stream):
+                    // both are superseded by the next delta on stall.
                     let stream = match lane {
                         Some(motion) => motion,
                         None => &mut session.send,
@@ -4536,13 +4636,17 @@ async fn handle_topology_event(
                         None
                     }
                     Ok(false) => {
-                        // Best-effort motion stall: drop this delta, count
-                        // the strike, keep driving — the heartbeat keeps
+                        // Best-effort stall: drop this delta, count the
+                        // strike, keep driving — the heartbeat keeps
                         // stamping and the desktop stays alive. The breaker
                         // needs sustained silence (count AND seconds with
                         // nothing getting through): a loss burst drops and
                         // recovers, only a dead network ends the episode.
-                        session.motion_dropped_stall += 1;
+                        if outgoing_is_motion {
+                            session.motion_dropped_stall += 1;
+                        } else {
+                            session.wheel_dropped_stall += 1;
+                        }
                         *send_strikes += 1;
                         let since = send_stall_since.get_or_insert(std::time::Instant::now());
                         let stalled_ms =
@@ -5592,6 +5696,7 @@ fn spawn_episode_driver(
         motion_forwarded: 0,
         motion_coalesced: 0,
         motion_dropped_stall: 0,
+        wheel_dropped_stall: 0,
         motion_first: None,
         motion_zero_deltas: 0,
         motion_sum_dx: 0,
@@ -7391,9 +7496,12 @@ async fn run_capture_stream(
                     sequence = sequence.wrapping_add(1);
                     // Pointer motion rides the motion lane when negotiated
                     // (own flow-control window and loss domain — a stalled
-                    // motion packet never head-of-line-blocks keys); wheel
-                    // stays ordered with keys on the episode stream.
-                    // Best-effort motion (freeze-proofing): a 300ms stall
+                    // motion packet never head-of-line-blocks keys). Wheel
+                    // stays ordered with keys on the episode stream, but
+                    // best-effort (200ms, then drop): a stalled stream drops
+                    // a superseded scroll instead of wedging this loop
+                    // behind an 800ms reliable write while motion glides.
+                    // Best-effort motion (freeze-proofing): a 200ms stall
                     // drops the delta instead of wedging this loop with
                     // suppression held; the next delta supersedes it.
                     let lane = match outgoing {
@@ -7408,6 +7516,12 @@ async fn run_capture_stream(
                         }
                         None => match outgoing {
                             InputEvent::MouseMove { .. } => {
+                                send_motion_best_effort(&mut send, sequence, outgoing)
+                                    .await
+                                    .map(|_| ())
+                            }
+                            InputEvent::Wheel(_)
+                            | InputEvent::SmoothWheel { .. } => {
                                 send_motion_best_effort(&mut send, sequence, outgoing)
                                     .await
                                     .map(|_| ())
@@ -11078,10 +11192,13 @@ async fn send_input(
     // call site tears down and releases suppression), so a dead peer
     // costs a crossing, never the local desktop. Motion never comes
     // here (see send_motion_best_effort): it drops, never waits. 800ms
-    // (down from 2s): keys/buttons/wheel stay reliable on healthy LAN
+    // (down from 2s): keys/buttons stay reliable on healthy LAN
     // (<5ms), but a half-dead peer releases local input in under a
     // second instead of reading as a multi-second "clicks dead" freeze
-    // while UDP motion keeps gliding.
+    // while UDP motion keeps gliding. Wheel never comes here either:
+    // scroll deltas are superseded like motion, so they ride the motion
+    // lane (or best-effort on the stream) instead of head-of-line
+    // blocking clicks behind an 800ms write.
     match tokio::time::timeout(
         Duration::from_millis(800),
         write_frame(
@@ -11097,9 +11214,9 @@ async fn send_input(
     Ok(())
 }
 
-/// Best-effort motion send for loss-tolerant pointer deltas (both OSes,
-/// all drive paths): 300ms bound, then the delta is DROPPED — never
-/// awaited, never fatal. The next delta supersedes a dropped one
+/// Best-effort send for loss-tolerant pointer and scroll deltas (both
+/// OSes, all drive paths): 200ms bound, then the delta is DROPPED —
+/// never awaited, never fatal. The next delta supersedes a dropped one
 /// (and UDP carries motion anyway when armed), while awaiting a dead
 /// stream is what wedges the drive task with suppression held and
 /// freezes the local desktop for seconds. Returns true when the delta
@@ -11126,6 +11243,18 @@ async fn send_motion_best_effort(
         }
         Err(_) => Ok(false),
     }
+}
+
+/// Wheel transport rule: scroll deltas may ride the motion lane only when
+/// one is open AND no key is held AND no pinch gesture is mid-expansion.
+/// Ctrl+wheel zoom (and Shift+wheel) needs key/wheel arrival order, which
+/// only a single stream guarantees; the legacy pinch expansion's
+/// synthetic Ctrl travels the episode stream, so its wheels must too.
+/// Key-free, gesture-free scroll has no order partner (motion adjacency
+/// is approximate across transports already), so the lane's own loss
+/// domain serves it. Pure for tests.
+fn wheel_use_lane(lane_open: bool, keys_held: bool, pinch_held: bool) -> bool {
+    lane_open && !keys_held && !pinch_held
 }
 
 async fn send_state_sync(send: &mut quinn::SendStream, state: InputState) -> Result<()> {
@@ -11549,6 +11678,22 @@ mod tests {
                 y: -i32::MAX
             }
         );
+    }
+
+    #[test]
+    fn wheel_lane_needs_open_lane_quiet_keys_and_no_pinch() {
+        // Key-free, gesture-free scroll may ride the motion lane's own
+        // loss domain; anything needing order stays on the episode
+        // stream (best-effort there, never the reliable write).
+        assert!(wheel_use_lane(true, false, false));
+        assert!(!wheel_use_lane(false, false, false));
+        // Ctrl+wheel zoom (or Shift+wheel): the key and the wheel must
+        // share one stream or zoom degrades to plain scroll.
+        assert!(!wheel_use_lane(true, true, false));
+        // Legacy pinch expansion's synthetic Ctrl travels the episode
+        // stream, so its wheels must too.
+        assert!(!wheel_use_lane(true, false, true));
+        assert!(!wheel_use_lane(false, true, true));
     }
 
     #[test]
