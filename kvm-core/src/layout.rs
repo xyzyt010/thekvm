@@ -1317,7 +1317,7 @@ impl EdgeRouter {
 /// hold a crossing — each micro-correction re-warped the cursor to the
 /// edge, which reads as "pinned". A firm deliberate roam exceeds 48px in
 /// one gesture; resting trackpad noise never reaches it.
-const SETTLE_PX: u32 = 48;
+const SETTLE_PX: u32 = 40;
 
 /// Sustained outward pressure (px of accumulated edge overflow) required
 /// to OPEN a crossing. Deskflow's half of this is the jump zone (the
@@ -1329,7 +1329,7 @@ const SETTLE_PX: u32 = 48;
 /// resting noise, single stray deltas and fling tails pin at the border.
 /// The streak resets the moment motion comes back inside or changes
 /// edge, so drift can never save up for a phantom crossing.
-pub const EDGE_PUSH_PX: i64 = 24;
+pub const EDGE_PUSH_PX: i64 = 16;
 /// Handoff landing inset (px inside the peer edge): entries land here
 /// instead of exactly on the edge. A cursor placed exactly on the facing
 /// edge re-fires the peer's own push budget from resting noise, so two
@@ -1393,9 +1393,9 @@ pub const RETURN_PUSH_PX: i64 = 64;
 /// on the driven side) could hold 12px of phantom overflow for the
 /// whole hold window and return while the visible cursor was still a
 /// little short of the edge. A deliberate home shove is hundreds of px
-/// and trips 28px in the first events, so genuine returns feel
+/// and trips 20px in the first events, so genuine returns feel
 /// identical — only phantom drift stops coming home.
-const RETURN_EDGE_PX: i64 = 28;
+const RETURN_EDGE_PX: i64 = 20;
 
 /// A truth re-pin that moves the cursor further than this keeps the
 /// position but restarts the push run (the old position was phantom);
@@ -2290,17 +2290,17 @@ mod tests {
         let mut router = EdgeRouter::new(layout).unwrap();
         // Peer on the right: enter 32px inside its left edge.
         let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
-        // 15px more (47px inside): still disarmed — facing overflow clamps.
+        // 5px more (37px inside): still disarmed — facing overflow clamps.
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 15, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: 5, dy: 0 }),
             RoutedEvent::Forward { .. }
         ));
         let clamped = router.route(InputEvent::MouseMove { dx: -100, dy: 0 });
         assert!(matches!(clamped, RoutedEvent::Forward { .. }));
         assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
-        // One step to exactly 48px inside: armed — facing overflow home.
+        // A few steps to 40px inside: armed — facing overflow home.
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 48, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: 50, dy: 0 }),
             RoutedEvent::Forward { .. }
         ));
         let back = router.route(InputEvent::MouseMove { dx: -100, dy: 0 });
@@ -2324,7 +2324,7 @@ mod tests {
         let mut router = EdgeRouter::new(layout).unwrap();
         // Peer on the right: enter 32px inside its left edge.
         let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
-        // Settle at 48px inside: armed.
+        // Settle deeper inside: armed.
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: 16, dy: 0 }),
             RoutedEvent::Forward { .. }
@@ -2346,14 +2346,14 @@ mod tests {
             ));
             assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
         }
-        // Fresh run from the boundary: 15px still clamps (15 < 28),
-        // the next 15px (30 >= 28) comes home.
+        // Fresh run from the boundary: 10px still clamps (10 < 20),
+        // then 15px more (25 >= 20) comes home.
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: 30, dy: 0 }),
             RoutedEvent::Forward { .. }
         ));
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: -50, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: -40, dy: 0 }),
             RoutedEvent::Forward { .. }
         ));
         assert!(matches!(

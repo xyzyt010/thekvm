@@ -79,7 +79,7 @@ export component AppWindow inherits Window {
     in-out property <bool> auto-connect-busy: false;
     in-out property <string> auto-connect-note: "";
     in-out property <int> mode-index: 0;
-    in-out property <int> edge-mode-index: 0;
+    in-out property <int> edge-mode-index: 1;
     in property <string> role-text: "Both ways";
     in property <string> app-version: "";
     // Taskbar/dock alert: set while an incoming pairing waits, so a
@@ -90,6 +90,13 @@ export component AppWindow inherits Window {
     in-out property <string> pair-code: "";
     in property <string> pairing-code: "";
     in-out property <string> discovery-text: "No LAN scan yet";
+    // Nearby-devices card (top of the Connect tab): shown on startup so
+    // the LAN set is visible without hunting for the Devices tab. The ✕
+    // hides it (cancel); Scan re-shows it. Listing only — never dials.
+    in-out property <bool> discovery-card-visible: true;
+    // True while a scan is in flight: the card shows the detection
+    // animation instead of a dead row.
+    in-out property <bool> discovery-scanning: false;
     // Scanned devices (label + dial address behind each row): refreshed by
     // the Scan button and, when auto-discovery is on, the background poll.
     // Picking a row and pressing Connect dials it through the normal
@@ -123,6 +130,7 @@ export component AppWindow inherits Window {
     callback set-reverse-scroll(bool /* true reverses outbound wheel */);
     callback pair-from-invite(string /* invite */);
     callback discover-lan();
+    callback hide-discovery();
     callback connect-discovered(int /* ComboBox row */);
     callback apply-auto-discover(bool /* wanted */);
     callback start-daemon();
@@ -183,29 +191,46 @@ export component AppWindow inherits Window {
             // Approval rendezvous must not depend on which tab is open. A
             // missed incoming request (wrong tab, minimized window) used to
             // be indistinguishable from a broken network — same silence on
-            // both ends. This strip is visible on EVERY tab while a request
+            // both ends. This card is visible on EVERY tab while a request
             // is pending, with the full details under the Connect tab.
             visible: incoming-pairing != "";
             background: #453008;
-            border-radius: 8px;
-            HorizontalLayout {
-                padding: 8px;
-                spacing: 12px;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: #f59e0b;
+            VerticalLayout {
+                padding: 10px;
+                spacing: 6px;
                 Text {
-                    text: "INCOMING pairing — code " + incoming-verification-code + " (details under Connect tab)";
-                    color: #fcd34d;
-                    font-size: 13px;
+                    text: "Pairing request — allow this computer to pair?";
+                    color: #fde68a;
+                    font-size: 12px;
                     font-weight: 700;
-                    vertical-alignment: center;
                 }
-                Button {
-                    text: "Allow";
-                    primary: true;
-                    clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
+                HorizontalLayout {
+                    spacing: 12px;
+                    Text {
+                        text: incoming-pairing + " · code " + incoming-verification-code;
+                        color: white;
+                        font-size: 15px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Button {
+                        text: "Allow";
+                        primary: true;
+                        clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
+                    }
+                    Button {
+                        text: "Deny";
+                        clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
+                    }
                 }
-                Button {
-                    text: "Deny";
-                    clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
+                Text {
+                    text: "Full details under the Connect tab. No input flows until you allow.";
+                    color: #fcd34d;
+                    font-size: 11px;
                 }
             }
         }
@@ -216,25 +241,43 @@ export component AppWindow inherits Window {
             // it — no input flows before that click, on any tab.
             visible: incoming-link != "";
             background: #123a2a;
-            border-radius: 8px;
-            HorizontalLayout {
-                padding: 8px;
-                spacing: 12px;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: #22c55e;
+            VerticalLayout {
+                padding: 10px;
+                spacing: 6px;
                 Text {
-                    text: "INCOMING link — " + incoming-link + " wants to connect (details under Connect tab)";
-                    color: #6ee7b7;
-                    font-size: 13px;
+                    text: "Connection request — a paired computer wants to drive this one";
+                    color: #a7f3d0;
+                    font-size: 12px;
                     font-weight: 700;
-                    vertical-alignment: center;
                 }
-                Button {
-                    text: "Allow";
-                    primary: true;
-                    clicked => { approve-incoming-link(incoming-link-fingerprint); }
+                HorizontalLayout {
+                    spacing: 12px;
+                    Text {
+                        text: incoming-link;
+                        color: white;
+                        font-size: 15px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Button {
+                        text: "Allow";
+                        primary: true;
+                        clicked => { approve-incoming-link(incoming-link-fingerprint); }
+                    }
+                    Button {
+                        text: "Deny";
+                        clicked => { reject-incoming-link(incoming-link-fingerprint); }
+                    }
                 }
-                Button {
-                    text: "Deny";
-                    clicked => { reject-incoming-link(incoming-link-fingerprint); }
+                Text {
+                    text: "Allow once per link. Until you allow, this computer cannot be driven — and it cannot drive back either.";
+                    color: #6ee7b7;
+                    font-size: 11px;
+                    wrap: word-wrap;
                 }
             }
         }
@@ -250,6 +293,88 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     padding: 12px;
                     spacing: 10px;
+                    Rectangle {
+                        visible: discovery-card-visible;
+                        background: #111827;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: #374151;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 8px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: "Nearby devices";
+                                    color: white;
+                                    font-size: 14px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                Button {
+                                    text: "✕";
+                                    clicked => { hide-discovery(); }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                visible: discovery-scanning;
+                                Rectangle {
+                                    width: 18px;
+                                    height: 18px;
+                                    Rectangle {
+                                        width: 6px;
+                                        height: 6px;
+                                        border-radius: 3px;
+                                        background: #22c55e;
+                                        x: spinner-tick == 0 ? 12px : spinner-tick == 1 ? 9px : spinner-tick == 2 ? 6px : spinner-tick == 3 ? 2px : spinner-tick == 4 ? 0px : spinner-tick == 5 ? 2px : spinner-tick == 6 ? 6px : 9px;
+                                        y: 6px;
+                                    }
+                                }
+                                Text {
+                                    text: "Detecting… devices appear below as they answer";
+                                    color: #6ee7b7;
+                                    font-size: 12px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Text {
+                                visible: !discovery-scanning;
+                                text: discovery-text;
+                                color: #9ca3af;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 12px;
+                                visible: discovered-labels.length > 0;
+                                found2 := ComboBox {
+                                    model: root.discovered-labels;
+                                    current-index <=> root.discovered-index;
+                                }
+                                Button {
+                                    text: "Connect";
+                                    primary: true;
+                                    enabled: discovered-labels.length > 0 && !session-active;
+                                    clicked => { connect-discovered(root.discovered-index); }
+                                }
+                                Button {
+                                    text: "Scan";
+                                    enabled: !discovery-scanning;
+                                    clicked => { discover-lan(); }
+                                }
+                            }
+                            Text {
+                                visible: discovered-labels.length == 0 && !discovery-scanning;
+                                text: "Nothing here yet — press Scan, or wait for the automatic listing. Tapping a device dials it with approval on the other side.";
+                                color: #6b7280;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
                     Text { text: "This computer will:"; color: white; font-size: 16px; font-weight: 700; }
                     Text {
                         text: "Current role: " + role-text;

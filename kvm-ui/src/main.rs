@@ -337,7 +337,7 @@ fn main() -> Result<()> {
         let mut consecutive_failures: u32 = 0;
         let mut was_failing = false;
         // Countdown to the next background LAN scan (see below): ~15s.
-        let mut auto_scan_in: u32 = 5;
+        let mut auto_scan_in: u32 = 1;
         ui_log("poll thread started");
         loop {
             // NOTE: never gate this loop on weak.upgrade(). Slint component
@@ -595,9 +595,12 @@ fn main() -> Result<()> {
                     }
                 }
                 // Automatic LAN discovery (Settings, default on): every ~15s
-                // while no link runs, refresh the Devices list in the
+                // while no link runs, refresh the device lists in the
                 // background. Listing only — never autofills, never dials.
                 // Skipped while a link runs so scans never disturb a drive.
+                // The first scan fires on the second poll tick so the card
+                // at the top of the Connect tab populates right after
+                // startup (plus the dedicated startup scan below).
                 if auto_scan_in == 0 {
                     auto_scan_in = 15;
                     let idle = session_for_poll
@@ -608,7 +611,9 @@ fn main() -> Result<()> {
                         .map(|config| config.auto_discover)
                         .unwrap_or(true);
                     if idle && wanted {
+                        set_discovery_scanning(&weak, true);
                         let found = scan_lan_devices();
+                        set_discovery_scanning(&weak, false);
                         if !found.is_empty() {
                             // Log only when the nearby set changes: a line
                             // every 15s forever would bury the journal.
@@ -616,7 +621,7 @@ fn main() -> Result<()> {
                                 let mut old = slot.clone();
                                 old.sort();
                                 let mut new: Vec<String> =
-                                    found.iter().map(|(_, addr)| addr.clone()).collect();
+                                    found.iter().map(|(_, addr, _)| addr.clone()).collect();
                                 new.sort();
                                 old != new
                             });
@@ -626,7 +631,7 @@ fn main() -> Result<()> {
                                     found.len(),
                                     found
                                         .iter()
-                                        .map(|(label, _)| label.clone())
+                                        .map(|(label, _, _)| label.clone())
                                         .collect::<Vec<_>>()
                                         .join("; ")
                                 ));
@@ -1285,6 +1290,13 @@ fn main() -> Result<()> {
     ui.on_discover_lan(move || {
         let weak = weak.clone();
         let discovered_for_scan = discovered_for_scan.clone();
+        set_discovery_card(&weak, true);
+        set_discovery_scanning(&weak, true);
+        set_discovery(
+            &weak,
+            "Scanning… devices appear below as they answer".into(),
+            None,
+        );
         std::thread::spawn(move || {
             let found = scan_lan_devices();
             let single = found.len() == 1;
@@ -1297,8 +1309,41 @@ fn main() -> Result<()> {
                 ));
             }
             store_discovered(&weak, &discovered_for_scan, found, single);
+            set_discovery_scanning(&weak, false);
         });
     });
+
+    // Nearby-devices card ✕ (top of the Connect tab): hides the card,
+    // cancelling the visible scan. Any later Scan re-shows it.
+    let weak = ui.as_weak();
+    ui.on_hide_discovery(move || {
+        set_discovery_card(&weak, false);
+        set_discovery_scanning(&weak, false);
+        ui_log("discovery: nearby-devices card hidden");
+    });
+
+    // Startup scan: the card is visible from the first frame, so populate
+    // it immediately instead of waiting for the first poll tick.
+    {
+        let weak = ui.as_weak();
+        let discovered_for_startup = discovered.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            set_discovery_card(&weak, true);
+            set_discovery_scanning(&weak, true);
+            let found = scan_lan_devices();
+            if !found.is_empty() {
+                ui_log(&format!(
+                    "discovery: startup scan found {} device(s)",
+                    found.len()
+                ));
+                store_discovered(&weak, &discovered_for_startup, found, false);
+            } else {
+                set_discovery(&weak, "No TheKVM devices found".into(), None);
+            }
+            set_discovery_scanning(&weak, false);
+        });
+    }
 
     // Click-to-connect for a scanned device: dials the address behind the
     // selected ComboBox row through the normal session flow (pairing
@@ -1495,14 +1540,36 @@ fn main() -> Result<()> {
 
     let weak = ui.as_weak();
     let links_for_approve = pending_links.clone();
+    let approve_session = session_state.clone();
+    let approve_pending = pending_pair.clone();
+    let approve_dir = startup_dir.clone();
     ui.on_approve_incoming_link(move |fingerprint| {
-        decide_incoming_link(&weak, &links_for_approve, fingerprint.to_string(), true);
+        decide_incoming_link(
+            &weak,
+            &links_for_approve,
+            &approve_session,
+            &approve_pending,
+            &approve_dir,
+            fingerprint.to_string(),
+            true,
+        );
     });
 
     let weak = ui.as_weak();
     let links_for_reject = pending_links.clone();
+    let reject_session = session_state.clone();
+    let reject_pending = pending_pair.clone();
+    let reject_dir = startup_dir.clone();
     ui.on_reject_incoming_link(move |fingerprint| {
-        decide_incoming_link(&weak, &links_for_reject, fingerprint.to_string(), false);
+        decide_incoming_link(
+            &weak,
+            &links_for_reject,
+            &reject_session,
+            &reject_pending,
+            &reject_dir,
+            fingerprint.to_string(),
+            false,
+        );
     });
 
     let weak = ui.as_weak();
@@ -2170,18 +2237,28 @@ fn set_incoming_link(weak: &slint::Weak<AppWindow>, links: Vec<PendingLink>) {
 fn decide_incoming_link(
     weak: &slint::Weak<AppWindow>,
     pending_links: &Arc<Mutex<Vec<PendingLink>>>,
+    session: &Arc<Mutex<Option<Session>>>,
+    pending_pair: &Arc<Mutex<Option<PendingPair>>>,
+    data_dir: &std::path::Path,
     fingerprint: String,
     approved: bool,
 ) {
     // The daemon keys approvals by (fingerprint, epoch): look the epoch
-    // up in the last polled queue. A stale click (queue already moved
-    // on) reports instead of approving blindly.
-    let link_id = pending_links.lock().ok().and_then(|slot| {
-        slot.iter()
-            .find(|link| link.fingerprint_hex == fingerprint)
-            .and_then(|link| link.link_id)
-    });
+    // AND the dial-back address up in the last polled queue. A stale click
+    // (queue already moved on) reports instead of approving blindly.
+    let (link_id, link_address) = pending_links
+        .lock()
+        .ok()
+        .and_then(|slot| {
+            slot.iter()
+                .find(|link| link.fingerprint_hex == fingerprint)
+                .map(|link| (link.link_id, link.address.clone()))
+        })
+        .unwrap_or((None, String::new()));
     let weak = weak.clone();
+    let session = session.clone();
+    let pending_pair = pending_pair.clone();
+    let data_dir = data_dir.to_path_buf();
     std::thread::spawn(move || {
         let Some(link_id) = link_id else {
             set_status(
@@ -2204,10 +2281,31 @@ fn decide_incoming_link(
         };
         match control_request(request) {
             Ok(ControlResponse::LinkApproved { .. }) if approved => {
-                set_status(&weak, format!("Approved incoming link {fingerprint}"));
                 ui_log(&format!(
                     "link: approved inbound epoch {link_id} from {fingerprint}"
                 ));
+                // Arm the reverse half NOW instead of waiting for the next
+                // poll tick: until our dial-back child is up, this computer
+                // can be driven but cannot drive back — the exact one-way
+                // trap. The poll's follow_link would do it a second later;
+                // doing it here makes both directions live together.
+                let already_running = session.lock().ok().is_some_and(|slot| slot.is_some());
+                if !already_running && !link_address.is_empty() {
+                    set_status(
+                        &weak,
+                        format!("Approved {fingerprint} — arming two-way edge…"),
+                    );
+                    spawn_dial_back(
+                        &weak,
+                        &session,
+                        &pending_pair,
+                        &data_dir,
+                        link_address,
+                        Some(link_id),
+                    );
+                } else {
+                    set_status(&weak, format!("Approved incoming link {fingerprint}"));
+                }
             }
             Ok(ControlResponse::LinkRejected { .. }) if !approved => {
                 set_status(&weak, format!("Rejected incoming link {fingerprint}"));
@@ -5105,17 +5203,29 @@ fn set_discovery(weak: &slint::Weak<AppWindow>, text: String, address: Option<St
 }
 
 /// Scan the LAN for TheKVM advertisements and return `(display label,
-/// dial address)` pairs sorted by name. Shared by the manual Scan button
-/// and the automatic poll-loop scan so both show the same list. A failed
-/// scan yields an empty list (never an error popup on its own).
-fn scan_lan_devices() -> Vec<(String, String)> {
+/// dial address, fingerprint)` triples sorted by name. Shared by the manual
+/// Scan button and the automatic poll-loop scan so both show the same list.
+/// A failed scan yields an empty list (never an error popup on its own).
+/// This machine itself is filtered out by certificate fingerprint (never by
+/// name — two machines can share a hostname): without this the list shows
+/// "itself" and tapping it dials a loopback link.
+fn scan_lan_devices() -> Vec<(String, String, String)> {
     let peers = runtime()
         .block_on(kvm_protocol::discovery::scan(
             std::time::Duration::from_secs(1),
         ))
         .unwrap_or_default();
-    let mut found: Vec<(String, String)> = peers
+    let local_fingerprint: Option<String> = match control_request(ControlRequest::Status) {
+        Ok(ControlResponse::Status(status)) => Some(status.fingerprint_hex),
+        _ => None,
+    };
+    let mut found: Vec<(String, String, String)> = peers
         .iter()
+        .filter(|(_, peer)| {
+            local_fingerprint
+                .as_deref()
+                .is_none_or(|local| !peer.fingerprint_hex.eq_ignore_ascii_case(local))
+        })
         .map(|(address, peer)| {
             (
                 format!(
@@ -5124,6 +5234,7 @@ fn scan_lan_devices() -> Vec<(String, String)> {
                     kvm_protocol::discovery::role_label(peer.mode)
                 ),
                 address.to_string(),
+                peer.fingerprint_hex.clone(),
             )
         })
         .collect();
@@ -5135,33 +5246,103 @@ fn scan_lan_devices() -> Vec<(String, String)> {
 /// dial-address list (click-to-connect), and the summary text. The address
 /// field is only autofilled when the caller passes `autofill` (manual scan
 /// with exactly one device) — background scans must never clobber typing.
+/// Labels reveal progressively (one row per tick) so the card visibly
+/// detects devices instead of blinking the whole set at once.
 fn store_discovered(
     weak: &slint::Weak<AppWindow>,
     discovered: &Arc<Mutex<Vec<String>>>,
-    found: Vec<(String, String)>,
+    found: Vec<(String, String, String)>,
     autofill: bool,
 ) {
-    let (labels, addrs): (Vec<String>, Vec<String>) = found.into_iter().unzip();
+    let addrs: Vec<String> = found.iter().map(|(_, addr, _)| addr.clone()).collect();
     if let Ok(mut slot) = discovered.lock() {
         *slot = addrs.clone();
     }
-    let text = if labels.is_empty() {
+    let text = if found.is_empty() {
         "No TheKVM devices found".to_owned()
     } else {
         format!(
             "{} TheKVM device(s) on this network — pick one and press Connect:",
-            labels.len()
+            found.len()
         )
     };
     let fill = autofill.then(|| addrs.first().cloned()).flatten();
-    let models: Vec<SharedString> = labels.into_iter().map(SharedString::from).collect();
     set_discovery(weak, text, fill);
+    // Progressive reveal: first row now, the rest 120ms apart. Small LANs
+    // (1-2 machines) finish in a blink; the animation still reads.
+    let labels: Vec<String> = found.into_iter().map(|(label, _, _)| label).collect();
+    let first_labels: Vec<String> = labels.iter().take(1).cloned().collect();
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
-                ui.set_discovered_labels(slint::ModelRc::new(slint::VecModel::from(models)));
+                let first: Vec<SharedString> = first_labels
+                    .iter()
+                    .map(|label| SharedString::from(label.clone()))
+                    .collect();
+                ui.set_discovered_labels(slint::ModelRc::new(slint::VecModel::from(first)));
                 ui.set_discovered_index(0);
+            }
+        }
+    });
+    if labels.len() > 1 {
+        let weak_reveal = weak.clone();
+        std::thread::spawn(move || {
+            for end in 2..=labels.len() {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                let partial: Vec<SharedString> = labels[..end]
+                    .iter()
+                    .map(|label| SharedString::from(label.clone()))
+                    .collect();
+                let done = slint::invoke_from_event_loop({
+                    let weak_reveal = weak_reveal.clone();
+                    move || {
+                        if let Some(ui) = weak_reveal.upgrade() {
+                            ui.set_discovered_labels(slint::ModelRc::new(slint::VecModel::from(
+                                partial,
+                            )));
+                        }
+                    }
+                });
+                if done.is_err() {
+                    break;
+                }
+            }
+        });
+    } else if labels.is_empty() {
+        let _ = slint::invoke_from_event_loop({
+            let weak = weak.clone();
+            move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_discovered_labels(slint::ModelRc::new(slint::VecModel::from(Vec::<
+                        SharedString,
+                    >::new(
+                    ))));
+                }
+            }
+        });
+    }
+}
+
+/// Show/hide the Connect-tab nearby-devices card and its scanning state.
+/// The ✕ hides (cancels) the card; any Scan re-shows it.
+fn set_discovery_card(weak: &slint::Weak<AppWindow>, visible: bool) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_discovery_card_visible(visible);
+            }
+        }
+    });
+}
+
+fn set_discovery_scanning(weak: &slint::Weak<AppWindow>, scanning: bool) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_discovery_scanning(scanning);
             }
         }
     });

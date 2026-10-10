@@ -2024,8 +2024,8 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // show-off re-crossings (several per second) pass at once instead
     // of queueing behind the old window. No count or time caps beyond
     // these two sub-second windows: deliberate motion always crosses.
-    router.set_return_hold(Duration::from_millis(100));
-    router.set_handoff_grace(Duration::from_millis(150));
+    router.set_return_hold(Duration::from_millis(60));
+    router.set_handoff_grace(Duration::from_millis(100));
     match kvm_platform::capture::screen_size() {
         Ok(Some((width, height))) => match router.adopt_local_screen_size(width, height) {
             Some((w, h)) => {
@@ -2749,13 +2749,13 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // final displacement, far fewer frames. Wheels stop the
                 // fold (scroll position relative to motion is preserved)
                 // and wait in the pending slot above. The fold stays small
-                // (12, about one 1000Hz frame-batch at 60fps): merging a
+                // (16, about one 1000Hz frame-batch at 60fps): merging a
                 // whole burst into one giant delta makes the remote cursor
                 // jump in visible steps instead of gliding.
                 let mut captured = first;
                 if let InputEvent::MouseMove { mut dx, mut dy } = captured.event {
                     let mut folded = 0u32;
-                    while folded < 12 {
+                    while folded < 16 {
                         match motion_rx.try_recv() {
                             Ok(next) => match next.event {
                                 InputEvent::MouseMove { dx: mx, dy: my } => {
@@ -2785,7 +2785,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     // Touchpad scroll bursts: a two-finger glide queues many
                     // small SmoothWheel events that each cost a QUIC frame.
                     // Fold a FEW consecutively queued smooth wheels into one
-                    // packet — fewer frames, but the fold STAYS SMALL (6, not
+                    // packet — fewer frames, but the fold STAYS SMALL (8, not
                     // 32 like motion): merging a whole glide into one giant
                     // delta makes the receiver inject it as a single jump,
                     // which is exactly the chunky non-native scroll feel. A
@@ -2794,7 +2794,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     // Motion stops the fold (scroll position relative to
                     // motion is preserved).
                     let mut folded = 0u32;
-                    while folded < 6 {
+                    while folded < 8 {
                         match motion_rx.try_recv() {
                             Ok(next) => match next.event {
                                 InputEvent::SmoothWheel { x: nx, y: ny } => {
@@ -3703,7 +3703,7 @@ fn episode_cooling_down(last_failed_episode: Option<std::time::Instant>) -> bool
 /// structural anti-flap guard, so the shorter time loses no safety.
 /// Pure for tests.
 fn yield_cooling_down(last_yield: Option<std::time::Instant>) -> bool {
-    last_yield.is_some_and(|when| when.elapsed() < Duration::from_millis(350))
+    last_yield.is_some_and(|when| when.elapsed() < Duration::from_millis(200))
 }
 
 /// Candidate control endpoints that may know about a live inbound drive.
@@ -11094,7 +11094,7 @@ async fn send_motion_best_effort(
     event: InputEvent,
 ) -> Result<bool> {
     match tokio::time::timeout(
-        Duration::from_millis(300),
+        Duration::from_millis(200),
         write_frame(
             &mut *send,
             &WireMessage::Input(InputPacket { sequence, event }),
@@ -11965,8 +11965,8 @@ mod tests {
         // briefly, so a deliberate push a beat later crosses at once
         // instead of demanding the wiggle ritual.
         assert!(yield_cooling_down(Some(just)));
-        assert!(yield_cooling_down(Some(just - Duration::from_millis(200))));
-        assert!(!yield_cooling_down(Some(just - Duration::from_millis(500))));
+        assert!(yield_cooling_down(Some(just - Duration::from_millis(100))));
+        assert!(!yield_cooling_down(Some(just - Duration::from_millis(300))));
         // An old yield: drive again.
         let old = just - Duration::from_secs(3);
         assert!(!yield_cooling_down(Some(old)));

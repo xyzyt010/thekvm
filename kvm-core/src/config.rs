@@ -162,6 +162,15 @@ impl Config {
         // config files may still carry `"transport":"Quic"` — the variant
         // stays deserializable for that reason, but it never takes effect.
         config.transport = TransportProtocol::Udp;
+        // Double-edge upgrade: files written before the entry-style field
+        // existed predate the Double default (their `"edge_mode":"Single"`
+        // is the old implicit default, not an explicit choice). Force them
+        // onto Double/Mirror so both edges cross from the first link after
+        // upgrade. Files that already carry the field keep their choice.
+        if !raw.contains("\"double_edge_style\"") {
+            config.edge_mode = EdgeMode::Double;
+            config.double_edge_style = crate::layout::DoubleEdgeStyle::Mirror;
+        }
         config.validate().map_err(std::io::Error::other)?;
         Ok(config)
     }
@@ -405,6 +414,40 @@ mod tests {
         assert!(config.auto_discover);
         assert_eq!(config.double_edge_style, DoubleEdgeStyle::Mirror);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn pre_style_single_configs_upgrade_to_double_mirror() {
+        // Files written before the entry-style field existed carry the old
+        // implicit Single default — upgrade them so both edges cross from
+        // the first link after update.
+        let dir = std::env::temp_dir().join(format!(
+            "thekvm-edge-migrate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"device_name":"n","listen_port":42110,"mode":"Bidirectional","edge_mode":"Single"}"#,
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.edge_mode, EdgeMode::Double);
+        assert_eq!(config.double_edge_style, DoubleEdgeStyle::Mirror);
+        // An explicit post-upgrade Single (field present) is preserved.
+        std::fs::write(
+            &path,
+            r#"{"device_name":"n","listen_port":42110,"mode":"Bidirectional","edge_mode":"Single","double_edge_style":"FixedLeft"}"#,
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.edge_mode, EdgeMode::Single);
+        assert_eq!(config.double_edge_style, DoubleEdgeStyle::FixedLeft);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
