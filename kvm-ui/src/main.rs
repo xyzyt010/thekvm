@@ -2289,20 +2289,64 @@ fn decide_incoming_link(
                 // can be driven but cannot drive back — the exact one-way
                 // trap. The poll's follow_link would do it a second later;
                 // doing it here makes both directions live together.
+                // The address dialed MUST be dialable: older daemons queued
+                // the socket's ephemeral source port here, and dialling
+                // that back times out forever while wedging the session
+                // slot (blocking the correct dial-back). Prefer the live
+                // session registry (always dialable), then the recent
+                // registry, and only then the queued host on the standard
+                // daemon port. A Be-controlled-only machine never dials
+                // (same gate as follow_link).
+                let ceremony_open = pending_pair.lock().ok().is_some_and(|slot| slot.is_some());
+                let dial_address = match control_request(ControlRequest::Status) {
+                    Ok(ControlResponse::Status(status)) => {
+                        if status.mode == kvm_core::Mode::ClientOnly || ceremony_open {
+                            None
+                        } else {
+                            status
+                                .sessions
+                                .iter()
+                                .find(|session| {
+                                    session.fingerprint_hex == fingerprint
+                                        && session.link_id == Some(link_id)
+                                })
+                                .map(|session| session.address.clone())
+                                .or_else(|| {
+                                    status
+                                        .recent_inbound
+                                        .iter()
+                                        .find(|recent| {
+                                            recent.fingerprint_hex == fingerprint
+                                                && recent.link_id == Some(link_id)
+                                        })
+                                        .map(|recent| recent.address.clone())
+                                })
+                                .or_else(|| dialable_host_port(&link_address))
+                        }
+                    }
+                    _ => dialable_host_port(&link_address),
+                };
                 let already_running = session.lock().ok().is_some_and(|slot| slot.is_some());
-                if !already_running && !link_address.is_empty() {
-                    set_status(
-                        &weak,
-                        format!("Approved {fingerprint} — arming two-way edge…"),
-                    );
-                    spawn_dial_back(
-                        &weak,
-                        &session,
-                        &pending_pair,
-                        &data_dir,
-                        link_address,
-                        Some(link_id),
-                    );
+                if !already_running {
+                    match dial_address {
+                        Some(address) => {
+                            set_status(
+                                &weak,
+                                format!("Approved {fingerprint} — arming two-way edge…"),
+                            );
+                            spawn_dial_back(
+                                &weak,
+                                &session,
+                                &pending_pair,
+                                &data_dir,
+                                address,
+                                Some(link_id),
+                            );
+                        }
+                        None => {
+                            set_status(&weak, format!("Approved incoming link {fingerprint}"));
+                        }
+                    }
                 } else {
                     set_status(&weak, format!("Approved incoming link {fingerprint}"));
                 }
@@ -5324,6 +5368,28 @@ fn store_discovered(
     }
 }
 
+/// Dialable fallback for a queued link address: keep the host, use the
+/// standard daemon port. Queued addresses from older daemons may carry the
+/// socket's ephemeral source port (dialling it back times out forever), so
+/// the last-resort dial is host:42110 — always the right shape on a LAN
+/// (custom ports still resolve via the session registries tried first).
+/// Pure for tests.
+fn dialable_host_port(queued: &str) -> Option<String> {
+    let queued = queued.trim();
+    if queued.is_empty() {
+        return None;
+    }
+    let host = queued
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(queued);
+    let host = host.trim().trim_matches(|char| char == '[' || char == ']');
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{host}:{}", kvm_protocol::DEFAULT_PORT))
+}
+
 /// Show/hide the Connect-tab nearby-devices card and its scanning state.
 /// The ✕ hides (cancels) the card; any Scan re-shows it.
 fn set_discovery_card(weak: &slint::Weak<AppWindow>, visible: bool) {
@@ -5414,8 +5480,8 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        edge_choice_from_index, edge_choice_index, edge_name, mode_mismatch_guidance,
-        pair_status_text, parse_ban_epoch, should_dial_back,
+        dialable_host_port, edge_choice_from_index, edge_choice_index, edge_name,
+        mode_mismatch_guidance, pair_status_text, parse_ban_epoch, should_dial_back,
     };
     use kvm_core::{DoubleEdgeStyle, EdgeMode};
 
@@ -5473,6 +5539,18 @@ mod tests {
         // An open pairing ceremony is never hijacked.
         assert!(!should_dial_back(Bidirectional, true));
         assert!(!should_dial_back(ClientOnly, true));
+    }
+
+    #[test]
+    fn dial_fallback_never_dials_an_ephemeral_port() {
+        // An older daemon queued the socket's ephemeral source port: the
+        // fallback keeps the host and restores the standard daemon port.
+        assert_eq!(
+            dialable_host_port("192.168.1.6:65274").as_deref(),
+            Some("192.168.1.6:42110")
+        );
+        assert_eq!(dialable_host_port(""), None);
+        assert_eq!(dialable_host_port("   "), None);
     }
 
     #[test]

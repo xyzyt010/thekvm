@@ -8160,10 +8160,28 @@ async fn handle_connection(
                     if !links.is_approved(&peer_fingerprint, epoch).await
                         && !links.recently_paired(&peer_fingerprint).await
                     {
+                        // The queued address MUST be dialable: the socket's
+                        // remote is an ephemeral source port, and the
+                        // approving side dials this address back for its
+                        // reverse half. Queuing the ephemeral port dials
+                        // death (timed-out forever) and wedges the session
+                        // slot so the correct dial-back never fires — the
+                        // one-way link where the approver can be driven but
+                        // can never drive back. Same dialable rule as the
+                        // live inbound registry below.
+                        let dialable = {
+                            let peer_book = peers.read().await;
+                            dialable_peer_address(
+                                &peer_book,
+                                &peer_fingerprint,
+                                &hello.node_name,
+                                conn.remote_address(),
+                            )
+                        };
                         let request = kvm_protocol::control::PendingLink {
                             node_name: hello.node_name.clone(),
                             fingerprint_hex: peer_fingerprint.clone(),
-                            address: conn.remote_address().to_string(),
+                            address: dialable,
                             link_id: Some(epoch),
                         };
                         match links.register(request).await {
