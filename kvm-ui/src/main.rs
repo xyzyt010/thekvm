@@ -1093,8 +1093,10 @@ fn main() -> Result<()> {
     });
 
     let weak = ui.as_weak();
+    let scroll_session = session_state.clone();
     ui.on_set_reverse_scroll(move |wanted| {
         let weak = weak.clone();
+        let scroll_session = scroll_session.clone();
         set_status(&weak, "Applying scroll direction…".into());
         std::thread::spawn(move || {
             let current = match control_request(ControlRequest::GetConfig) {
@@ -1149,14 +1151,39 @@ fn main() -> Result<()> {
                             }
                         }
                     });
-                    set_status(
-                        &weak,
-                        if wanted {
-                            "Reverse scroll on: driving the peer scrolls the opposite way.".into()
-                        } else {
-                            "Reverse scroll off: driving the peer scrolls normally.".into()
-                        },
-                    );
+                    ui_log(&format!(
+                        "reverse scroll {}",
+                        if wanted { "on" } else { "off" }
+                    ));
+                    if scroll_session
+                        .lock()
+                        .ok()
+                        .is_some_and(|slot| slot.as_ref().is_some())
+                    {
+                        // The running child captured under the old
+                        // direction; stop it rather than scroll stale
+                        // (re-Connect re-arms under the new one) — same
+                        // rule as the edge-crossing switch.
+                        ui_log("scroll change: stopping the link; Connect again to re-link");
+                        stop_session(&weak, &scroll_session, "Link stopped");
+                        set_status(
+                            &weak,
+                            if wanted {
+                                "Reverse scroll on: mouse + trackpad scroll the opposite way on the peer. Link stopped — Connect again to re-link.".into()
+                            } else {
+                                "Reverse scroll off: scrolling normally on the peer. Link stopped — Connect again to re-link.".into()
+                            },
+                        );
+                    } else {
+                        set_status(
+                            &weak,
+                            if wanted {
+                                "Reverse scroll on: driving the peer scrolls the opposite way.".into()
+                            } else {
+                                "Reverse scroll off: driving the peer scrolls normally.".into()
+                            },
+                        );
+                    }
                 }
                 Ok(ControlResponse::Error { message }) => set_status(&weak, message),
                 Ok(other) => set_status(&weak, format!("Unexpected daemon response: {other:?}")),

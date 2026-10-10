@@ -11516,6 +11516,42 @@ mod tests {
     }
 
     #[test]
+    fn reverse_scroll_inverts_wheel_and_trackpad_only() {
+        use kvm_core::{InputEvent, WheelDelta};
+        // Off: everything passes through untouched (the default feel).
+        let wheel = InputEvent::SmoothWheel { x: 30, y: -240 };
+        assert_eq!(apply_reverse_scroll(wheel, false), wheel);
+        let motion = InputEvent::MouseMove { dx: 5, dy: -7 };
+        assert_eq!(apply_reverse_scroll(motion, true), motion);
+        let pinch = InputEvent::Pinch { delta: 240 };
+        assert_eq!(apply_reverse_scroll(pinch, true), pinch);
+        // On: mouse detents AND trackpad smooth deltas negate on both
+        // axes (same inverse option for both devices); zoom/motion never.
+        assert_eq!(
+            apply_reverse_scroll(InputEvent::SmoothWheel { x: 30, y: -240 }, true),
+            InputEvent::SmoothWheel { x: -30, y: 240 }
+        );
+        assert_eq!(
+            apply_reverse_scroll(InputEvent::Wheel(WheelDelta { x: 1, y: -2 }), true),
+            InputEvent::Wheel(WheelDelta { x: -1, y: 2 })
+        );
+        // Overflow-safe: extreme deltas saturate instead of wrapping.
+        assert_eq!(
+            apply_reverse_scroll(
+                InputEvent::SmoothWheel {
+                    x: i32::MIN,
+                    y: i32::MAX
+                },
+                true
+            ),
+            InputEvent::SmoothWheel {
+                x: i32::MAX,
+                y: -i32::MAX
+            }
+        );
+    }
+
+    #[test]
     fn geometry_sidecar_parses_and_preference_holds() {
         // Sidecar truth beats live measure beats configured fallback;
         // garbage never corrupts an advertisement.
