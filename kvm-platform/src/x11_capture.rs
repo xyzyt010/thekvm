@@ -394,12 +394,19 @@ fn derive_scroll_wheel(
     phase.last = now;
     phase.gest_x += intent_x.abs();
     phase.gest_y += intent_y.abs();
-    const LOCK_MIN_120THS: f64 = 120.0;
+    // Horizontal locks FIRST (half the vertical floor): trackpad pans
+    // are short and wobbly, so a symmetric 120-unit verdict lets
+    // vertical wobble starve or out-race the horizontal axis and the pan
+    // reads dead or late. A pure vertical gesture can never trip the
+    // X arm (X needs twice the accumulated Y), so vertical is
+    // unaffected; true diagonals still never lock.
+    const LOCK_MIN_X_120THS: f64 = 60.0;
+    const LOCK_MIN_Y_120THS: f64 = 120.0;
     const LOCK_RATIO: f64 = 2.0;
     if phase.lock.is_none() {
-        if phase.gest_x >= LOCK_MIN_120THS && phase.gest_x >= phase.gest_y * LOCK_RATIO {
+        if phase.gest_x >= LOCK_MIN_X_120THS && phase.gest_x >= phase.gest_y * LOCK_RATIO {
             phase.lock = Some(ScrollLock::X);
-        } else if phase.gest_y >= LOCK_MIN_120THS && phase.gest_y >= phase.gest_x * LOCK_RATIO {
+        } else if phase.gest_y >= LOCK_MIN_Y_120THS && phase.gest_y >= phase.gest_x * LOCK_RATIO {
             phase.lock = Some(ScrollLock::Y);
         }
     }
@@ -1737,8 +1744,9 @@ mod tests {
             integral: 0,
             frac: 1_073_741_824,
         };
-        // First detent verdict (120 x at 2:1): the wobble is eaten from
-        // the very first frame, and its banked remainder is dropped
+        // First detent verdict (horizontal locks at 60 x-120ths at
+        // 2:1, half the vertical floor): the wobble is eaten from the
+        // very first frame, and its banked remainder is dropped
         // with it — no later jump.
         for _ in 0..4 {
             assert_eq!(
@@ -1760,6 +1768,53 @@ mod tests {
             assert_eq!(
                 derive_scroll_wheel(14, &mask, &[x_one, x_one], &axes, &mut banks, &mut phases),
                 Some(InputEvent::SmoothWheel { x: -120, y: -120 })
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_verdict_locks_before_vertical_floor() {
+        // Trackpad pans are short: a half-detent horizontal intent (60
+        // 120ths) with wobble locks X on the very first frame and eats
+        // the wobble, while the same intent vertically would still be
+        // undecided. Pure vertical keeps the full 120 floor (see the
+        // signed-wheels test above).
+        use super::{derive_scroll_wheel, ScrollAxis};
+        use std::collections::HashMap;
+        let axes = vec![
+            ScrollAxis {
+                axis: 2,
+                horizontal: true,
+                units_120ths: 120.0,
+            },
+            ScrollAxis {
+                axis: 3,
+                horizontal: false,
+                units_120ths: 120.0,
+            },
+        ];
+        let mask = [0b1100u32];
+        let x_half = xinput::Fp3232 {
+            integral: 0,
+            frac: 2_147_483_648,
+        };
+        let y_wobble = xinput::Fp3232 {
+            integral: 0,
+            frac: 1_073_741_824,
+        };
+        let mut banks = HashMap::new();
+        let mut phases = HashMap::new();
+        for _ in 0..3 {
+            assert_eq!(
+                derive_scroll_wheel(
+                    13,
+                    &mask,
+                    &[x_half, y_wobble],
+                    &axes,
+                    &mut banks,
+                    &mut phases
+                ),
+                Some(InputEvent::SmoothWheel { x: -60, y: 0 })
             );
         }
     }

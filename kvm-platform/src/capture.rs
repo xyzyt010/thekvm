@@ -1932,15 +1932,20 @@ mod win32_hooks {
             self.gest_x = self.gest_x.saturating_add(dx.abs());
             self.gest_y = self.gest_y.saturating_add(dy.abs());
             // Lock verdict: enough intent at a clear ratio owns the
-            // gesture from here on.
-            const LOCK_MIN_UNITS: i64 = 120;
+            // gesture from here on. Horizontal locks FIRST (half the
+            // vertical floor): trackpad pans are short and wobbly, so a
+            // symmetric verdict lets vertical wobble starve the pan.
+            // A pure vertical gesture can never trip the X arm, and true
+            // diagonals still never lock.
+            const LOCK_MIN_X_UNITS: i64 = 60;
+            const LOCK_MIN_Y_UNITS: i64 = 120;
             const LOCK_RATIO: i64 = 2;
             if self.lock.is_none() {
-                if self.gest_x >= LOCK_MIN_UNITS
+                if self.gest_x >= LOCK_MIN_X_UNITS
                     && self.gest_x >= self.gest_y.saturating_mul(LOCK_RATIO)
                 {
                     self.lock = Some(PanAxis::X);
-                } else if self.gest_y >= LOCK_MIN_UNITS
+                } else if self.gest_y >= LOCK_MIN_Y_UNITS
                     && self.gest_y >= self.gest_x.saturating_mul(LOCK_RATIO)
                 {
                     self.lock = Some(PanAxis::Y);
@@ -2840,18 +2845,18 @@ mod win32_hooks {
         fn ptp_horizontal_pan_locks_out_vertical_wobble() {
             // The native feel: a horizontal pan with vertical finger
             // wobble must not scroll the peer diagonally. Before the
-            // verdict both axes emit; past 120 x-units at 2:1 the
+            // verdict both axes emit; past 60 x-units at 2:1 the
             // gesture locks horizontal and the wobble is eaten.
             let mut pan = PtpPan::new();
             pan.units_per_detent_x = 10;
             pan.units_per_detent_y = 10;
             assert_eq!(pan.feed(&[(100, 100), (100, 100)]), (0, 0));
-            for step in 1..12 {
+            for step in 1..6 {
                 let p = 100 + 10 * step;
                 let q = 100 + 2 * step;
                 assert_eq!(pan.feed(&[(p, q), (p, q)]), (120, -24));
             }
-            for step in 12..16 {
+            for step in 6..16 {
                 let p = 100 + 10 * step;
                 let q = 100 + 2 * step;
                 assert_eq!(pan.feed(&[(p, q), (p, q)]), (120, 0));
