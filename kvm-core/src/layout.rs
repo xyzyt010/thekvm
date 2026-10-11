@@ -490,6 +490,18 @@ pub struct EdgeRouter {
     /// drive.) Cleared once the cursor is observed beyond EDGE_PUSH_PX
     /// of every crossable edge; set only by set_local_cursor_position.
     startup_gate: bool,
+    /// Post-return refractory: the edge a ReturnHome just came home
+    /// through. A return followed by the SAME outward push is one held
+    /// shove, not a deliberate re-cross — without this the return lands
+    /// home and the still-held push instantly re-opens the edge, so the
+    /// drive ping-pongs back into the peer on the same motion and the
+    /// user never sees home at all ("push out the far edge, end up back
+    /// at the entry edge"). While set, that edge clamps instead of
+    /// handing off, until the cursor has come back inside past
+    /// POST_RETURN_CLEAR_PX (a pull-back-then-push recrosses at once).
+    /// Set only by ReturnHome; cleared by coming inside, by any fresh
+    /// handoff, and by explicit cursor placement.
+    post_return_edge: Option<Edge>,
 }
 
 impl EdgeRouter {
@@ -527,6 +539,7 @@ impl EdgeRouter {
             handoff_at: None,
             locked: false,
             startup_gate: false,
+            post_return_edge: None,
         })
     }
 
@@ -705,6 +718,10 @@ impl EdgeRouter {
         self.local_cursor_y = self.cursor_y;
         self.push_edge = None;
         self.push_accum = 0;
+        // Explicit placement is deliberate by construction: it lifts the
+        // post-return refractory (a veto-park or a seed must never poison
+        // the next deliberate push).
+        self.post_return_edge = None;
         // Arm the fresh-entry gate when the seed sits at a facing edge
         // (see the field): the first gestures after (re)start must come
         // inside before any outward run can open a crossing. Deliberate
@@ -963,7 +980,8 @@ impl EdgeRouter {
                                 // it (see the ReturnHome docs).
                                 let entry_edge = self.entry_edge;
                                 let armed = self.return_armed;
-                                let _ = self.restore_local(target);
+                                let _ = self.restore_local_at_edge(target, edge);
+                                self.post_return_edge = Some(edge);
                                 return RoutedEvent::ReturnHome {
                                     from,
                                     edge,
@@ -992,7 +1010,8 @@ impl EdgeRouter {
                             if self.return_accum >= RETURN_PUSH_PX && !self.in_handoff_grace() {
                                 let entry_edge = self.entry_edge;
                                 let armed = self.return_armed;
-                                let _ = self.restore_local(target);
+                                let _ = self.restore_local_at_edge(target, edge);
+                                self.post_return_edge = Some(edge);
                                 return RoutedEvent::ReturnHome {
                                     from,
                                     edge,
@@ -1048,6 +1067,20 @@ impl EdgeRouter {
             // and jitter can never save up for a phantom crossing.
             self.push_edge = None;
             self.push_accum = 0;
+            // A pull comfortably back inside lifts the post-return
+            // refractory: the next deliberate push out may cross again.
+            if let Some(suppressed) = self.post_return_edge {
+                if distance_from_edge(
+                    suppressed,
+                    self.cursor_x,
+                    self.cursor_y,
+                    screen.width,
+                    screen.height,
+                ) >= POST_RETURN_CLEAR_PX
+                {
+                    self.post_return_edge = None;
+                }
+            }
             // Comfortably inside (beyond push range of every crossable
             // edge) lifts the fresh-entry gate: the next deliberate
             // outward run may cross.
@@ -1076,6 +1109,14 @@ impl EdgeRouter {
             self.push_accum = 0;
             return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
         }
+        // Post-return refractory (see the field): the edge a return just
+        // came home through clamps until the cursor pulls back inside.
+        // A held shove must never save up across the return boundary.
+        if self.post_return_edge == Some(edge) {
+            self.push_edge = None;
+            self.push_accum = 0;
+            return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
+        }
         // Push-through (Deskflow jump-zone + switch-delay spirit): one
         // stray delta never crosses. The outward run on THIS edge must
         // accumulate EDGE_PUSH_PX before the Handoff fires; a firm push
@@ -1093,6 +1134,7 @@ impl EdgeRouter {
         }
         self.push_edge = None;
         self.push_accum = 0;
+        self.post_return_edge = None;
         let target_screen = self
             .layout
             .screen(target)
@@ -1216,6 +1258,73 @@ impl EdgeRouter {
         Ok(())
     }
 
+    /// Edge-pinned variant of [`Self::restore_local`] for ReturnHome: land
+    /// INSIDE the returned-through edge (crossing axis at the return
+    /// inset, along axis mapped proportionally) instead of the stale
+    /// pre-exit pixel. A fling exit saves mid-screen, so the plain
+    /// restore can land mid-screen — and a mid-screen landing both reads
+    /// as a teleport and defeats the post-return refractory (it clears
+    /// on the first inside event). Shares the state reset.
+    pub fn restore_local_at_edge(
+        &mut self,
+        from: ScreenId,
+        edge: Edge,
+    ) -> Result<(u32, u32), String> {
+        if self.active_remote != Some(from) {
+            return Err(format!(
+                "cannot restore control from {:?}; active remote is {:?}",
+                from, self.active_remote
+            ));
+        }
+        let local = self.local_screen;
+        let screen = self
+            .layout
+            .screen(local)
+            .ok_or_else(|| "local screen is missing from layout".to_string())?;
+        let (width, height) = (screen.width, screen.height);
+        let (remote_width, remote_height) = self
+            .layout
+            .screen(from)
+            .map(|remote| (remote.width, remote.height))
+            .unwrap_or((width, height));
+        // Crossing axis pins at the return inset (a return never lands
+        // mid-screen); the along axis maps the roamed remote position
+        // proportionally, exactly like entry mapping in reverse.
+        let (x, y) = match edge {
+            Edge::Left => (
+                RETURN_INSET_PX,
+                map_coordinate(self.cursor_y, remote_height, height),
+            ),
+            Edge::Right => (
+                width.saturating_sub(1).saturating_sub(RETURN_INSET_PX),
+                map_coordinate(self.cursor_y, remote_height, height),
+            ),
+            Edge::Top => (
+                map_coordinate(self.cursor_x, remote_width, width),
+                RETURN_INSET_PX,
+            ),
+            Edge::Bottom => (
+                map_coordinate(self.cursor_x, remote_width, width),
+                height.saturating_sub(1).saturating_sub(RETURN_INSET_PX),
+            ),
+        };
+        self.current_screen = local;
+        self.cursor_x = x.min(width.saturating_sub(1));
+        self.cursor_y = y.min(height.saturating_sub(1));
+        self.local_cursor_x = self.cursor_x;
+        self.local_cursor_y = self.cursor_y;
+        self.active_remote = None;
+        self.entry_edge = None;
+        self.return_armed = false;
+        self.push_edge = None;
+        self.push_accum = 0;
+        self.post_return_edge = None;
+        self.return_edge = None;
+        self.return_edge_accum = 0;
+        self.return_run_since = None;
+        Ok((self.cursor_x, self.cursor_y))
+    }
+
     /// Return control to the local screen using the position saved immediately
     /// before the active remote handoff. This is used when a peer disconnects
     /// or cannot be opened, where no trustworthy remote cursor coordinate is
@@ -1254,6 +1363,7 @@ impl EdgeRouter {
         self.return_armed = false;
         self.push_edge = None;
         self.push_accum = 0;
+        self.post_return_edge = None;
         self.return_edge = None;
         self.return_edge_accum = 0;
         self.return_run_since = None;
@@ -1279,6 +1389,7 @@ impl EdgeRouter {
             self.return_armed = false;
             self.push_edge = None;
             self.push_accum = 0;
+            self.post_return_edge = None;
             self.return_edge = None;
             self.return_edge_accum = 0;
             self.return_run_since = None;
@@ -1300,6 +1411,7 @@ impl EdgeRouter {
         self.return_edge = None;
         self.return_edge_accum = 0;
         self.return_run_since = None;
+        self.post_return_edge = None;
         // Peer-placed drive (see above): no entry shove of our own
         // happened, so the post-handoff grace gets its window from here
         // — the peer is free to place us anywhere, including next to the
@@ -1318,6 +1430,19 @@ impl EdgeRouter {
 /// edge, which reads as "pinned". A firm deliberate roam exceeds 48px in
 /// one gesture; resting trackpad noise never reaches it.
 const SETTLE_PX: u32 = 40;
+
+/// How far back inside from a suppressed edge the cursor must travel to
+/// lift the post-return refractory (see the field): a pull-back-then-push
+/// recrosses at once, while the held shove that just came home keeps
+/// clamping. Past the 32px entry inset with margin, so a return landing
+/// (near the edge by construction) always engages it first.
+const POST_RETURN_CLEAR_PX: u32 = 64;
+
+/// Return landing inset (px inside the returned-through edge): mirrors
+/// the service-side park step, so the warped OS cursor and the router
+/// agree and the post-return refractory always engages (a return
+/// landing is near-edge by construction, never mid-screen).
+const RETURN_INSET_PX: u32 = 8;
 
 /// Sustained outward pressure (px of accumulated edge overflow) required
 /// to OPEN a crossing. Deskflow's half of this is the jump zone (the
@@ -2151,11 +2276,12 @@ mod tests {
             RoutedEvent::Forward { .. }
         ));
         assert_eq!(router.cursor_position(), (129, 590));
-        // Pushing back past the facing edge returns: x stays the saved
-        // edge pixel (never mid-screen), y maps the roamed remote height
-        // back (100,590 roamed -> same spans -> (1160,590) home) — with
-        // no network round trip. The return carries the pre-restore
-        // Schmitt state (settled inside, then pushed out armed).
+        // Pushing back past the facing edge returns: x pins 8px inside
+        // the returned-through edge (never mid-screen, never the stale
+        // exit pixel), y maps the roamed remote height back (100,590
+        // roamed -> same spans -> (8,590) home) — with no network round
+        // trip. The return carries the pre-restore Schmitt state
+        // (settled inside, then pushed out armed).
         let back = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
         assert!(matches!(
             back,
@@ -2167,7 +2293,7 @@ mod tests {
             } if from == FIRST_PEER_SCREEN_ID
         ));
         assert_eq!(router.active_remote(), None);
-        assert_eq!(router.cursor_position(), (1160, 590));
+        assert_eq!(router.cursor_position(), (8, 590));
     }
 
     #[test]
@@ -2281,7 +2407,106 @@ mod tests {
             } if from == ScreenId(1)
         ));
         assert_eq!(router.active_remote(), None);
-        assert_eq!(router.cursor_position(), (960, 1079));
+        // Edge-pinned landing (not the stale exit pixel): back through
+        // the right edge lands 8px inside it, roamed height preserved.
+        assert_eq!(router.cursor_position(), (1911, 1079));
+    }
+
+    #[test]
+    fn post_return_refractory_blocks_held_push_until_pullback() {
+        // The ping-pong shape: exit left, come home through the far
+        // (left) edge, keep holding left — without a refractory the
+        // still-held shove re-opens the edge on the same motion and the
+        // drive bounces straight back into the peer.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_edge_mode(EdgeMode::Double);
+        router.set_double_style(DoubleEdgeStyle::Mirror);
+        // Exit the outer left edge into the peer's right edge.
+        let handoff = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(matches!(
+            handoff,
+            RoutedEvent::Handoff {
+                edge: Edge::Left,
+                ..
+            }
+        ));
+        // Settle (arms), traverse to the far edge, push out: home.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -100, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        let home = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(
+            matches!(
+                home,
+                RoutedEvent::ReturnHome {
+                    edge: Edge::Left,
+                    ..
+                }
+            ),
+            "far-edge push of a settled drive must come home, got {home:?}"
+        );
+        assert_eq!(router.active_remote(), None);
+        // Landing is edge-pinned (8px inside the left edge).
+        assert_eq!(router.cursor_position().0, 8);
+        // The SAME held push keeps overflowing left: clamp, never a
+        // fresh handoff — no ping-pong back into the peer.
+        for _ in 0..5 {
+            assert!(
+                matches!(
+                    router.route(InputEvent::MouseMove { dx: -500, dy: 0 }),
+                    RoutedEvent::Local(_)
+                ),
+                "held post-return push must clamp at the edge"
+            );
+        }
+        assert_eq!(router.active_remote(), None);
+        // Pull back inside past the clear distance, push out again: a
+        // deliberate re-cross opens at once.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 200, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        let again = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(
+            matches!(
+                again,
+                RoutedEvent::Handoff {
+                    edge: Edge::Left,
+                    ..
+                }
+            ),
+            "pull-back-then-push must re-cross, got {again:?}"
+        );
+    }
+
+    #[test]
+    fn post_return_refractory_is_edge_specific() {
+        // Returning through the left edge must not strand the right
+        // edge: other edges cross immediately.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_edge_mode(EdgeMode::Double);
+        let _ = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -100, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        let home = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(matches!(home, RoutedEvent::ReturnHome { .. }));
+        // Right edge (never returned through) opens at once.
+        let out = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(
+            matches!(
+                out,
+                RoutedEvent::Handoff {
+                    edge: Edge::Right,
+                    ..
+                }
+            ),
+            "unaffected edge must cross at once, got {out:?}"
+        );
     }
 
     #[test]
@@ -2410,7 +2635,7 @@ mod tests {
             RoutedEvent::Forward { .. }
         ));
         // Sustained shove home returns at the roamed height mapped back:
-        // 800/960 -> 900/1080, x stays the saved edge pixel.
+        // 800/960 -> 900/1080, x pins 8px inside the left edge.
         let home = router.route(InputEvent::MouseMove { dx: -600, dy: 0 });
         assert!(matches!(
             home,
@@ -2420,7 +2645,7 @@ mod tests {
             }
         ));
         assert_eq!(router.active_remote(), None);
-        assert_eq!(router.cursor_position(), (960, 900));
+        assert_eq!(router.cursor_position(), (8, 900));
     }
 
     #[test]

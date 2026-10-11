@@ -316,6 +316,31 @@ fn note_inbound_activity(
     stamp.store(now_millis(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Registry input freshness for the episode lease (see the lease arm):
+/// true when this peer's shared stamp moved within the lease window —
+/// via the episode stream, the motion lane, or UDP motion (which
+/// bypasses the episode task entirely). Pure apart from the registry
+/// read. Never true for an unseen peer.
+fn registry_input_recent(fingerprint_hex: &str) -> bool {
+    registry_input_recent_at(fingerprint_hex, now_millis())
+}
+
+/// Injectable clock behind [`registry_input_recent`]: pure over the
+/// stamp for the boundary tests below.
+fn registry_input_recent_at(fingerprint_hex: &str, now: u64) -> bool {
+    const LEASE_MS: u64 = 45_000;
+    inbound_link_registry()
+        .lock()
+        .ok()
+        .and_then(|links| {
+            links.get(fingerprint_hex).map(|(link, _)| {
+                let stamp = link.last_input.load(std::sync::atomic::Ordering::Relaxed);
+                stamp != NO_INPUT_YET && stamp <= now && now - stamp < LEASE_MS
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Remove a registration, but only when the id still matches — a redialed
 /// successor must survive its predecessor's cleanup.
 pub(crate) fn remove_inbound_link(fingerprint_hex: &str, id: u64) {
@@ -8141,12 +8166,16 @@ fn spawn_udp_motion_listener(port: u16) {
             {
                 continue;
             }
-            // Same live-drive signal the QUIC datagram path emits so the
-            // station UI and the idle-dual arbitration see UDP motion too.
+            // Same live-drive signal the QUIC stream path emits so the
+            // station UI, the idle-dual arbitration, AND the input lease
+            // see UDP motion too. Without the stamp, pure-motion driving
+            // (no clicks for 45s) looks dead to the episode lease while
+            // the cursor keeps gliding over UDP — the lease then kills
+            // the episode out from under the driver, and clicks/scrolls
+            // die with it until the next crossing re-opens the stream.
             if let Ok(links) = inbound_link_registry().lock() {
                 if let Some((link, _)) = links.get(fingerprint_hex.as_str()) {
-                    link.input_events
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    note_inbound_activity(&link.input_events, &link.last_input);
                 }
             }
         }
@@ -9333,8 +9362,15 @@ async fn handle_connection(
                         // session out from under the driver. Truly dead peers
                         // are still reaped by the QUIC idle timeout and the
                         // keep-alive watchdogs; the lease is only the last
-                        // backstop for a silent-but-connected peer.
-                        if last_activity.elapsed() > Duration::from_secs(45) {
+                        // backstop for a silent-but-connected peer. UDP
+                        // motion bypasses this task's stream arms (and their
+                        // last_activity stamps) by design, so consult the
+                        // registry's UDP-fed stamp too — otherwise
+                        // pure-motion driving reads as silence here while
+                        // the cursor glides, and the lease kills the very
+                        // episode the next click needs.
+                        let udp_fresh = registry_input_recent(&peer_fingerprint);
+                        if last_activity.elapsed() > Duration::from_secs(45) && !udp_fresh {
                             end_reason = "input lease expired without activity";
                             break Err(anyhow::anyhow!(
                                 "input session lease expired; released remote input"
@@ -12497,6 +12533,28 @@ mod tests {
             assembly.feed_end(11),
             ClipboardFeed::Ready(done) if done == "hello"
         ));
+    }
+
+    #[test]
+    fn registry_freshness_covers_udp_motion_for_the_lease() {
+        // UDP motion bypasses the episode task, so the lease must read
+        // the registry stamp: fresh stamp counts, unseen/stale/sentinel
+        // does not. Explicit clock: the test process is younger than the
+        // 45s lease, so "old" is constructed arithmetically.
+        let fp = "fd".repeat(32);
+        assert!(!registry_input_recent_at(&fp, 1_000_000));
+        let (id, _drop, _events, _driving, last_input) =
+            register_inbound_link(&fp, "lease-probe", "192.168.1.9:42110", Some(7));
+        // Registered but silent: the sentinel is not freshness.
+        assert!(!registry_input_recent_at(&fp, 1_000_000));
+        last_input.store(900_000, std::sync::atomic::Ordering::Relaxed);
+        // 44.999s old: fresh; exactly 45s: past the lease.
+        assert!(registry_input_recent_at(&fp, 944_999));
+        assert!(!registry_input_recent_at(&fp, 945_000));
+        // Future stamps (clock skew) never count.
+        assert!(!registry_input_recent_at(&fp, 899_999));
+        remove_inbound_link(&fp, id);
+        assert!(!registry_input_recent_at(&fp, 944_999));
     }
 
     #[test]
