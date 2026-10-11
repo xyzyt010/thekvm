@@ -980,8 +980,11 @@ impl EdgeRouter {
                                 // it (see the ReturnHome docs).
                                 let entry_edge = self.entry_edge;
                                 let armed = self.return_armed;
+                                // restore_local_at_edge lands mirrored (see
+                                // the fn) and arms the refractory on the
+                                // LOCAL landing edge; ReturnHome.edge keeps
+                                // the REMOTE overflow edge for telemetry.
                                 let _ = self.restore_local_at_edge(target, edge);
-                                self.post_return_edge = Some(edge);
                                 return RoutedEvent::ReturnHome {
                                     from,
                                     edge,
@@ -1011,7 +1014,6 @@ impl EdgeRouter {
                                 let entry_edge = self.entry_edge;
                                 let armed = self.return_armed;
                                 let _ = self.restore_local_at_edge(target, edge);
-                                self.post_return_edge = Some(edge);
                                 return RoutedEvent::ReturnHome {
                                     from,
                                     edge,
@@ -1123,11 +1125,33 @@ impl EdgeRouter {
         // gets there in a couple of events, resting noise never does.
         // A fresh truth resync (see resync_if_local) already restarted
         // the run, so only genuinely sustained pressure opens the edge.
+        //
+        // Single-event credit cap (phantom-exit fix): a run that starts
+        // far inside can credit at most EDGE_PUSH_PX-1 per event, so a
+        // crossing from mid-screen always spans at least two events. A
+        // burst-folded fling can carry hundreds of px in ONE event and
+        // overflow from the middle while the visible cursor never
+        // touched the edge; a held push streams events at 100s/sec, so
+        // the second event lands milliseconds later and genuine held
+        // crossings stay instant. Pushes that start AT the border keep
+        // full credit and still cross in one event.
+        let near = distance_from_edge(
+            edge,
+            self.cursor_x,
+            self.cursor_y,
+            screen.width,
+            screen.height,
+        ) <= PHANTOM_START_GUARD_PX;
+        let credit = if near {
+            overflow
+        } else {
+            overflow.min(EDGE_PUSH_PX - 1)
+        };
         if self.push_edge == Some(edge) {
-            self.push_accum += overflow;
+            self.push_accum += credit;
         } else {
             self.push_edge = Some(edge);
-            self.push_accum = overflow;
+            self.push_accum = credit;
         }
         if self.push_accum < EDGE_PUSH_PX {
             return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
@@ -1259,12 +1283,18 @@ impl EdgeRouter {
     }
 
     /// Edge-pinned variant of [`Self::restore_local`] for ReturnHome: land
-    /// INSIDE the returned-through edge (crossing axis at the return
-    /// inset, along axis mapped proportionally) instead of the stale
-    /// pre-exit pixel. A fling exit saves mid-screen, so the plain
-    /// restore can land mid-screen — and a mid-screen landing both reads
-    /// as a teleport and defeats the post-return refractory (it clears
-    /// on the first inside event). Shares the state reset.
+    /// INSIDE the home edge (crossing axis at the return inset, along
+    /// axis mapped proportionally) instead of the stale pre-exit pixel.
+    /// In Double Mirror the home edge is the MIRROR of the peer edge the
+    /// drive left through (out the peer's left comes home through the
+    /// local right, and vice versa) — exactly like entry mapping in
+    /// reverse, so the cursor travels edge to edge instead of landing
+    /// back at the old exit pixel. Single and Fixed modes land on the
+    /// same edge. A fling exit saves mid-screen, so the plain restore
+    /// can land mid-screen — and a mid-screen landing both reads as a
+    /// teleport and defeats the post-return refractory (it clears on the
+    /// first inside event). Also arms the refractory on the landing
+    /// edge (see the field). Shares the state reset.
     pub fn restore_local_at_edge(
         &mut self,
         from: ScreenId,
@@ -1287,10 +1317,27 @@ impl EdgeRouter {
             .screen(from)
             .map(|remote| (remote.width, remote.height))
             .unwrap_or((width, height));
+        // Mirror landing (Double inverse on a horizontal edge): the
+        // return mirrors the exit, exactly like the entry did. Exit
+        // Left entered the peer at its Right edge, so pushing out the
+        // peer's Left edge comes home through the LOCAL Right edge (and
+        // vice versa) — the cursor travels Right-to-Left or
+        // Left-to-Right automatically, with the along axis mapped
+        // proportionally. Landing on the same edge instead reads as
+        // "back at the old position". Single and Fixed modes keep the
+        // same-edge landing.
+        let landing = if self.edge_mode == EdgeMode::Double
+            && self.double_style == DoubleEdgeStyle::Mirror
+            && matches!(edge, Edge::Left | Edge::Right)
+        {
+            edge.opposite()
+        } else {
+            edge
+        };
         // Crossing axis pins at the return inset (a return never lands
         // mid-screen); the along axis maps the roamed remote position
         // proportionally, exactly like entry mapping in reverse.
-        let (x, y) = match edge {
+        let (x, y) = match landing {
             Edge::Left => (
                 RETURN_INSET_PX,
                 map_coordinate(self.cursor_y, remote_height, height),
@@ -1318,7 +1365,10 @@ impl EdgeRouter {
         self.return_armed = false;
         self.push_edge = None;
         self.push_accum = 0;
-        self.post_return_edge = None;
+        // Refractory on the LOCAL landing edge (see the field): the held
+        // shove that just came home must clamp, or it re-opens the same
+        // edge on the same motion and ping-pongs back into the peer.
+        self.post_return_edge = Some(landing);
         self.return_edge = None;
         self.return_edge_accum = 0;
         self.return_run_since = None;
@@ -1455,6 +1505,13 @@ const RETURN_INSET_PX: u32 = 8;
 /// The streak resets the moment motion comes back inside or changes
 /// edge, so drift can never save up for a phantom crossing.
 pub const EDGE_PUSH_PX: i64 = 16;
+/// How close (px from the exit edge) a crossing run must start for full
+/// single-event credit (see route()): pushes that begin at the border
+/// cross in one event, while a run starting further inside credits at
+/// most EDGE_PUSH_PX-1 per event — so a burst-folded fling from
+/// mid-screen pins at the border first and crosses on the next
+/// sustained push instead of phantom-exiting on one giant delta.
+const PHANTOM_START_GUARD_PX: u32 = 64;
 /// Handoff landing inset (px inside the peer edge): entries land here
 /// instead of exactly on the edge. A cursor placed exactly on the facing
 /// edge re-fires the peer's own push budget from resting noise, so two
@@ -1642,6 +1699,9 @@ mod tests {
             self_screen: Some(ScreenId(1)),
         };
         let mut router = EdgeRouter::new(layout).unwrap();
+        // Crossing runs start at the border (see PHANTOM_START_GUARD_PX):
+        // pre-position at the exit edge, then push.
+        router.place_local_cursor(1900, 540).unwrap();
         let result = router.route(InputEvent::MouseMove { dx: 1000, dy: 0 });
         assert!(matches!(
             result,
@@ -1741,6 +1801,7 @@ mod tests {
             self_screen: Some(ScreenId(1)),
         };
         let mut router = EdgeRouter::new(layout).unwrap();
+        router.place_local_cursor(1900, 540).unwrap();
         let handoff = router.route(InputEvent::MouseMove { dx: 1000, dy: 0 });
         assert!(matches!(handoff, RoutedEvent::Handoff { .. }));
         // Parked unarmed 32px inside the entry edge: shoves walk to the
@@ -1777,6 +1838,7 @@ mod tests {
             self_screen: Some(ScreenId(1)),
         };
         let mut router = EdgeRouter::new(layout).unwrap();
+        router.place_local_cursor(1900, 540).unwrap();
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: 1000, dy: 0 }),
             RoutedEvent::Handoff { .. }
@@ -1804,6 +1866,7 @@ mod tests {
         assert_eq!(router.active_remote(), None);
         router.set_locked(false);
         assert!(!router.is_locked());
+        router.place_local_cursor(1900, 540).unwrap();
         let result = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert!(matches!(result, RoutedEvent::Handoff { .. }));
     }
@@ -2255,7 +2318,9 @@ mod tests {
         let _ = router.route(InputEvent::MouseMove { dx: 200, dy: 0 });
         // Exit right into the peer: entry lands 32px inside the peer's
         // left edge (never exactly on it, so resting noise cannot
-        // re-fire the peer's own push budget).
+        // re-fire the peer's own push budget). Pre-positioned at the
+        // border: crossing runs start there (see PHANTOM_START_GUARD_PX).
+        router.place_local_cursor(1900, 540).unwrap();
         let handoff = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert!(matches!(
             handoff,
@@ -2276,12 +2341,13 @@ mod tests {
             RoutedEvent::Forward { .. }
         ));
         assert_eq!(router.cursor_position(), (129, 590));
-        // Pushing back past the facing edge returns: x pins 8px inside
-        // the returned-through edge (never mid-screen, never the stale
-        // exit pixel), y maps the roamed remote height back (100,590
-        // roamed -> same spans -> (8,590) home) — with no network round
-        // trip. The return carries the pre-restore Schmitt state
-        // (settled inside, then pushed out armed).
+        // Pushing back past the facing edge returns through the MIRRORED
+        // local edge (Double inverse: out the peer's left comes home
+        // through the local right — Right-to-Left travel, never the
+        // stale exit pixel), y mapped from the roamed remote height
+        // (100,590 roamed -> same spans -> (1911,590) home) — with no
+        // network round trip. The return carries the pre-restore
+        // Schmitt state (settled inside, then pushed out armed).
         let back = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
         assert!(matches!(
             back,
@@ -2293,7 +2359,7 @@ mod tests {
             } if from == FIRST_PEER_SCREEN_ID
         ));
         assert_eq!(router.active_remote(), None);
-        assert_eq!(router.cursor_position(), (8, 590));
+        assert_eq!(router.cursor_position(), (1911, 590));
     }
 
     #[test]
@@ -2308,6 +2374,7 @@ mod tests {
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
         router.set_edge_mode(EdgeMode::Single);
+        router.place_local_cursor(1900, 540).unwrap();
         let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
         // Settle first, so the clamp below proves the edge rule and not
@@ -2352,6 +2419,7 @@ mod tests {
             self_screen: Some(ScreenId(2)),
         };
         let mut router = EdgeRouter::new(layout).unwrap();
+        router.place_local_cursor(20, 540).unwrap();
         let handoff = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
         assert!(matches!(
             handoff,
@@ -2407,22 +2475,25 @@ mod tests {
             } if from == ScreenId(1)
         ));
         assert_eq!(router.active_remote(), None);
-        // Edge-pinned landing (not the stale exit pixel): back through
-        // the right edge lands 8px inside it, roamed height preserved.
-        assert_eq!(router.cursor_position(), (1911, 1079));
+        // Mirrored landing (Double inverse): back through the peer's
+        // right edge lands 8px inside the LOCAL left edge — the cursor
+        // travels Left-to-Right automatically — roamed height preserved.
+        assert_eq!(router.cursor_position(), (8, 1079));
     }
 
     #[test]
     fn post_return_refractory_blocks_held_push_until_pullback() {
-        // The ping-pong shape: exit left, come home through the far
-        // (left) edge, keep holding left — without a refractory the
-        // still-held shove re-opens the edge on the same motion and the
+        // The ping-pong shape, mirrored: exit left, come home through
+        // the far (left) peer edge, landing on the LOCAL right edge —
+        // and keep holding. Without a refractory on the LANDING edge
+        // the still-held shove re-opens it on the same motion and the
         // drive bounces straight back into the peer.
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
         router.set_edge_mode(EdgeMode::Double);
         router.set_double_style(DoubleEdgeStyle::Mirror);
         // Exit the outer left edge into the peer's right edge.
+        router.place_local_cursor(20, 540).unwrap();
         let handoff = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
         assert!(matches!(
             handoff,
@@ -2448,32 +2519,31 @@ mod tests {
             "far-edge push of a settled drive must come home, got {home:?}"
         );
         assert_eq!(router.active_remote(), None);
-        // Landing is edge-pinned (8px inside the left edge).
-        assert_eq!(router.cursor_position().0, 8);
-        // The SAME held push keeps overflowing left: clamp, never a
-        // fresh handoff — no ping-pong back into the peer.
+        // Mirrored landing: out the peer's left lands 8px inside the
+        // LOCAL right edge.
+        assert_eq!(router.cursor_position(), (1911, 540));
+        // Pushing further out the landing edge clamps, never a fresh
+        // handoff — no ping-pong back into the peer.
         for _ in 0..5 {
             assert!(
                 matches!(
-                    router.route(InputEvent::MouseMove { dx: -500, dy: 0 }),
+                    router.route(InputEvent::MouseMove { dx: 500, dy: 0 }),
                     RoutedEvent::Local(_)
                 ),
-                "held post-return push must clamp at the edge"
+                "held post-return push must clamp at the landing edge"
             );
         }
         assert_eq!(router.active_remote(), None);
-        // Pull back inside past the clear distance, push out again: a
-        // deliberate re-cross opens at once.
-        assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 200, dy: 0 }),
-            RoutedEvent::Local(_)
-        ));
-        let again = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        // Pull back inside past the clear distance, come at the edge
+        // again: a deliberate re-cross opens at once (re-approach via
+        // an explicit pin, then push — the refractory is behind us).
+        router.place_local_cursor(1855, 540).unwrap();
+        let again = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert!(
             matches!(
                 again,
                 RoutedEvent::Handoff {
-                    edge: Edge::Left,
+                    edge: Edge::Right,
                     ..
                 }
             ),
@@ -2482,12 +2552,115 @@ mod tests {
     }
 
     #[test]
+    fn mid_screen_fling_pins_instead_of_crossing() {
+        // Phantom-exit guard (see PHANTOM_START_GUARD_PX): a single
+        // burst-folded fling from the middle of the screen must pin at
+        // the border, never open a crossing — the visible cursor never
+        // touched the edge. The next sustained push (now starting at
+        // the border) crosses at once.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        assert_eq!(router.cursor_position(), (960, 540));
+        let pinned = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(
+            matches!(pinned, RoutedEvent::Local(_)),
+            "mid-screen fling must pin, got {pinned:?}"
+        );
+        assert_eq!(router.active_remote(), None);
+        assert_eq!(router.cursor_position(), (1919, 540));
+        let crossed = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(
+            matches!(
+                crossed,
+                RoutedEvent::Handoff {
+                    edge: Edge::Right,
+                    ..
+                }
+            ),
+            "border push must cross at once, got {crossed:?}"
+        );
+    }
+
+    #[test]
+    fn mirror_round_trip_preserves_proportional_height() {
+        // The user's exact shape (Double inverse, asymmetric heights):
+        // exit local-Left at N% height enters the peer at its Right at
+        // N%, and pushing out the peer's Left comes home through the
+        // LOCAL Right at N% — Right-to-Left travel automatically, and
+        // the way back is the same in reverse.
+        let fp = "ab".repeat(32);
+        let layout = Layout {
+            screens: vec![
+                Screen {
+                    id: ScreenId(1),
+                    name: "d1".into(),
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    peer_fingerprint: None,
+                },
+                Screen {
+                    id: ScreenId(2),
+                    name: "d2".into(),
+                    x: 1,
+                    y: 0,
+                    width: 1536,
+                    height: 864,
+                    peer_fingerprint: Some(fp),
+                },
+            ],
+            self_screen: Some(ScreenId(1)),
+        };
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_edge_mode(EdgeMode::Double);
+        router.set_double_style(DoubleEdgeStyle::Mirror);
+        // Out local-Left at y=270 (25% of 1080): enter peer-Right at
+        // 25% of 864 (215, inset 32px inside).
+        router.place_local_cursor(20, 270).unwrap();
+        let out = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(
+            matches!(
+                out,
+                RoutedEvent::Handoff {
+                    edge: Edge::Left,
+                    target_x: 1503,
+                    target_y: 215,
+                    ..
+                }
+            ),
+            "mirror exit must enter the peer's right edge proportionally, got {out:?}"
+        );
+        // Roam a little to settle (arms), then push out the peer's
+        // Left edge: home through the LOCAL Right at 25% of 1080.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -100, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        let home = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(
+            matches!(
+                home,
+                RoutedEvent::ReturnHome {
+                    edge: Edge::Left,
+                    ..
+                }
+            ),
+            "far-edge push must come home, got {home:?}"
+        );
+        assert_eq!(router.active_remote(), None);
+        assert_eq!(router.cursor_position(), (1911, 268));
+    }
+
+    #[test]
     fn post_return_refractory_is_edge_specific() {
-        // Returning through the left edge must not strand the right
-        // edge: other edges cross immediately.
+        // The refractory covers the LANDING edge only: mirrored home
+        // through the peer's left edge lands on the local right, so the
+        // right edge clamps while the left crosses at once.
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
         router.set_edge_mode(EdgeMode::Double);
+        router.place_local_cursor(20, 540).unwrap();
         let _ = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: -100, dy: 0 }),
@@ -2495,13 +2668,23 @@ mod tests {
         ));
         let home = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
         assert!(matches!(home, RoutedEvent::ReturnHome { .. }));
-        // Right edge (never returned through) opens at once.
-        let out = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert_eq!(router.cursor_position(), (1911, 540));
+        // Landing (right) edge: the held push clamps.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 5000, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        // The other edge was never returned through: travel there and it
+        // crosses at once.
+        for _ in 0..4 {
+            let _ = router.route(InputEvent::MouseMove { dx: -500, dy: 0 });
+        }
+        let out = router.route(InputEvent::MouseMove { dx: -500, dy: 0 });
         assert!(
             matches!(
                 out,
                 RoutedEvent::Handoff {
-                    edge: Edge::Right,
+                    edge: Edge::Left,
                     ..
                 }
             ),
@@ -2514,6 +2697,7 @@ mod tests {
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
         // Peer on the right: enter 32px inside its left edge.
+        router.place_local_cursor(1900, 540).unwrap();
         let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         // 5px more (37px inside): still disarmed — facing overflow clamps.
         assert!(matches!(
@@ -2548,6 +2732,7 @@ mod tests {
         let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
         let mut router = EdgeRouter::new(layout).unwrap();
         // Peer on the right: enter 32px inside its left edge.
+        router.place_local_cursor(1900, 540).unwrap();
         let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         // Settle deeper inside: armed.
         assert!(matches!(
@@ -2624,7 +2809,8 @@ mod tests {
             self_screen: Some(ScreenId(1)),
         };
         let mut router = EdgeRouter::new(layout).unwrap();
-        // Exit right from local center (960, 540).
+        // Exit right from near the edge (crossing runs start there).
+        router.place_local_cursor(1900, 540).unwrap();
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: 2000, dy: 0 }),
             RoutedEvent::Handoff { .. }
@@ -2635,7 +2821,8 @@ mod tests {
             RoutedEvent::Forward { .. }
         ));
         // Sustained shove home returns at the roamed height mapped back:
-        // 800/960 -> 900/1080, x pins 8px inside the left edge.
+        // 800/960 -> 900/1080, x pins 8px inside the LOCAL right edge
+        // (mirrored: out the peer's left comes home through the right).
         let home = router.route(InputEvent::MouseMove { dx: -600, dy: 0 });
         assert!(matches!(
             home,
@@ -2645,7 +2832,7 @@ mod tests {
             }
         ));
         assert_eq!(router.active_remote(), None);
-        assert_eq!(router.cursor_position(), (8, 900));
+        assert_eq!(router.cursor_position(), (1911, 900));
     }
 
     #[test]
@@ -2688,6 +2875,7 @@ mod tests {
         ));
         let mut double = EdgeRouter::new(layout).unwrap();
         double.set_edge_mode(EdgeMode::Double);
+        double.place_local_cursor(20, 540).unwrap();
         let handoff = double.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
         assert!(matches!(
             handoff,
@@ -2777,6 +2965,7 @@ mod tests {
         });
         let mut grid_router = EdgeRouter::new(grid).unwrap();
         grid_router.set_edge_mode(EdgeMode::Double);
+        grid_router.place_local_cursor(20, 540).unwrap();
         let routed = grid_router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
         assert!(matches!(
             routed,
@@ -2848,6 +3037,7 @@ mod tests {
         let mut router = EdgeRouter::new(layout).unwrap();
         router.set_edge_mode(EdgeMode::Double);
         router.set_double_style(DoubleEdgeStyle::Mirror);
+        router.place_local_cursor(20, 540).unwrap();
         let handoff = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
         assert!(matches!(
             handoff,
@@ -2885,6 +3075,7 @@ mod tests {
         let mut router = EdgeRouter::new(layout).unwrap();
         router.set_edge_mode(EdgeMode::Double);
         router.set_double_style(DoubleEdgeStyle::FixedLeft);
+        router.place_local_cursor(1900, 540).unwrap();
         let handoff = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert!(matches!(
             handoff,
@@ -2908,9 +3099,14 @@ mod tests {
             }
         ));
         assert_eq!(router.active_remote(), None);
-        // Again — but push out the OTHER (arrangement-facing) edge: it
+        // Again — re-enter first (crossing runs start at the border),
+        // settle, then push out the OTHER (arrangement-facing) edge: it
         // clamps and the drive lives on. Only the selected edge exits.
-        let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        router.place_local_cursor(1900, 540).unwrap();
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 5000, dy: 0 }),
+            RoutedEvent::Handoff { .. }
+        ));
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: 100, dy: 0 }),
             RoutedEvent::Forward { .. }
@@ -2938,6 +3134,7 @@ mod tests {
             peer_fingerprint: Some("ff".repeat(32)),
         });
         let mut router = EdgeRouter::new(layout).unwrap();
+        router.place_local_cursor(1900, 540).unwrap();
         let _ = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert_eq!(router.active_remote(), Some(FIRST_PEER_SCREEN_ID));
         let pushed = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
@@ -2955,6 +3152,12 @@ mod tests {
         let mut router = EdgeRouter::new(layout).unwrap();
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: 200, dy: 0 }),
+            RoutedEvent::Local(InputEvent::MouseMove { .. })
+        ));
+        // Walk to the border first (crossing runs start there), then the
+        // saved home is the border position the handoff leaves from.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 700, dy: 0 }),
             RoutedEvent::Local(InputEvent::MouseMove { .. })
         ));
         let saved = router.cursor_position();

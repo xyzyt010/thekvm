@@ -1859,9 +1859,11 @@ fn main() -> Result<()> {
         });
     });
 
-    // System tray (best effort): right-click menu with Show, Open logs,
-    // and Quit. Quit is the ONLY full terminate (link banned both sides,
-    // supervised child killed, UI-spawned user daemon killed, exit).
+    // System tray (best effort): right-click menu with Show, Disconnect,
+    // Open logs, and Quit. Quit is the ONLY full terminate (link banned
+    // both sides, supervised child killed, UI-spawned user daemon killed,
+    // exit). Disconnect runs the same bilateral hang-up as the Connect
+    // tab button (safe with no link: the handler no-ops on empty state).
     // Without a tray the app stays window-only and close still hides
     // nothing — the fallback keeps the old exit-on-close.
     let tray_commands = tray::spawn_tray();
@@ -1882,6 +1884,14 @@ fn main() -> Result<()> {
                             let _ = slint::invoke_from_event_loop(move || {
                                 if let Some(ui) = weak.upgrade() {
                                     let _ = ui.window().show();
+                                }
+                            });
+                        }
+                        tray::TrayCommand::Disconnect => {
+                            let weak = watch_weak.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = weak.upgrade() {
+                                    ui.invoke_disconnect();
                                 }
                             });
                         }

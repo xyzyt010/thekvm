@@ -1,4 +1,5 @@
-//! System tray icon with a right-click menu (Show, Open logs, Quit).
+//! System tray icon with a right-click menu (Show, Disconnect, Open
+//! logs, Quit).
 //!
 //! The window close button hides to the tray instead of exiting (see
 //! main.rs `on_close_requested`); only the tray Quit fully terminates the
@@ -11,6 +12,12 @@
 //! a watcher thread in main.rs, so clicks act immediately instead of
 //! waiting for the 1s status poll. The TrayIcon itself is owned by that
 //! pump thread (it is neither Send nor Sync); nothing else touches it.
+//!
+//! NOTE on dark menus: the popup menu is drawn by the OS from the same
+//! native theme as every other tray app (Windows dark mode → dark menu,
+//! Mint likewise) — Win32/AppIndicator HMENUs expose no per-app paint,
+//! so there is deliberately no custom styling here to fight the
+//! desktop. The glyph itself is dark glass (see build_icon) on both.
 
 use std::sync::mpsc::{channel, Receiver};
 use tray_icon::icon::Icon;
@@ -20,6 +27,7 @@ use tray_icon::{tray_event_receiver, ClickEvent, TrayIconBuilder};
 /// Commands the tray thread delivers to the UI thread.
 pub enum TrayCommand {
     Show,
+    Disconnect,
     OpenLogs,
     Quit,
 }
@@ -46,12 +54,14 @@ fn build_tray() -> Option<Receiver<TrayCommand>> {
     let (tx, rx) = channel::<TrayCommand>();
     let menu = Menu::new();
     let show = MenuItem::new("Show TheKVM", true, None);
+    let disconnect = MenuItem::new("Disconnect", true, None);
     let logs = MenuItem::new("Open logs", true, None);
     let quit = MenuItem::new("Quit TheKVM", true, None);
     let show_id = show.id();
+    let disconnect_id = disconnect.id();
     let logs_id = logs.id();
     let quit_id = quit.id();
-    menu.append_items(&[&show, &logs, &quit]);
+    menu.append_items(&[&show, &disconnect, &logs, &quit]);
     let icon = build_icon();
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -74,6 +84,8 @@ fn build_tray() -> Option<Receiver<TrayCommand>> {
                     idle = false;
                     let command = if event.id == show_id {
                         Some(TrayCommand::Show)
+                    } else if event.id == disconnect_id {
+                        Some(TrayCommand::Disconnect)
                     } else if event.id == logs_id {
                         Some(TrayCommand::OpenLogs)
                     } else if event.id == quit_id {

@@ -1937,7 +1937,7 @@ async fn run_windows_service_capture_stream(
                             // privileged loop with suppression held — motion
                             // kept best-effort gliding while clicks/keys
                             // wedged, the Win-Win freeze shape.
-                            _ => send_input(&connection, &mut send, sequence, outgoing).await,
+                            _ => send_input(&connection, &mut send, sequence, outgoing).await.map(|_| ()),
                         };
                         if let Err(error) = send_result {
                             send_failed = Some(error);
@@ -3316,6 +3316,14 @@ struct TopologySession {
     /// clicks/keys behind an 800ms reliable write. The next delta
     /// supersedes a dropped one. Logged at teardown.
     wheel_dropped_stall: u64,
+    /// Reliable-input stall drops (keys/buttons that hit the 800ms bound
+    /// on a half-dead stream): the event is dropped and counted instead
+    /// of ending the episode — one lost click is strictly better than
+    /// every future click dying until the next recross (the clicks-dead
+    /// shape: motion keeps gliding over UDP while the stream stays
+    /// wedged). The stall breaker still reaps a truly dead episode.
+    /// Logged at teardown.
+    input_dropped_stall: u64,
     /// Motion VALUE probe: the first forwarded delta, how many forwarded
     /// deltas were exactly zero, and the signed sums. Counts prove flow;
     /// only values prove the cursor CAN track: a drive whose warp lands
@@ -3434,6 +3442,7 @@ impl TopologySession {
                 motion_coalesced = self.motion_coalesced,
                 motion_dropped_stall = self.motion_dropped_stall,
                 wheel_dropped_stall = self.wheel_dropped_stall,
+                input_dropped_stall = self.input_dropped_stall,
                 motion_first = ?self.motion_first,
                 motion_zero_deltas = self.motion_zero_deltas,
                 motion_sum_dx = self.motion_sum_dx,
@@ -4644,9 +4653,7 @@ async fn handle_topology_event(
                     };
                     send_motion_best_effort(stream, *sequence, outgoing).await
                 } else {
-                    send_input(&session.connection, &mut session.send, *sequence, outgoing)
-                        .await
-                        .map(|()| true)
+                    send_input(&session.connection, &mut session.send, *sequence, outgoing).await
                 };
                 let teardown: Option<anyhow::Error> = match send_outcome {
                     Ok(true) => {
@@ -4667,10 +4674,19 @@ async fn handle_topology_event(
                         // needs sustained silence (count AND seconds with
                         // nothing getting through): a loss burst drops and
                         // recovers, only a dead network ends the episode.
+                        // Keys/buttons land here on an 800ms stall (see
+                        // send_input): one dropped click with the drive
+                        // alive beats every future click dying with it.
                         if outgoing_is_motion {
                             session.motion_dropped_stall += 1;
-                        } else {
+                        } else if outgoing_is_wheel {
                             session.wheel_dropped_stall += 1;
+                        } else {
+                            session.input_dropped_stall += 1;
+                            tracing::warn!(
+                                strikes = *send_strikes + 1,
+                                "key/button stalled on the episode stream; dropped, drive continues"
+                            );
                         }
                         *send_strikes += 1;
                         let since = send_stall_since.get_or_insert(std::time::Instant::now());
@@ -4724,9 +4740,12 @@ async fn handle_topology_event(
             armed,
         } => {
             // Deskflow-style edge return: the virtual remote cursor came
-            // back past the facing edge, so park the episode and re-enter
-            // at the exact saved pixel — no network round trip, no
-            // session death, no mid-screen landing. The stream stays open
+            // back past the facing edge, so park the episode and land
+            // edge-pinned on the mirrored home edge (Double inverse:
+            // out the peer's left lands local-right, traveling
+            // edge to edge — never the stale exit pixel, never
+            // mid-screen) with proportional height. No network round
+            // trip, no session death. The stream stays open
             // (parked): the next push resumes it with one Handoff frame
             // instead of a dial. The transfer stamp doubles as MWB
             // lastJump debounce against instant re-exit. Suppression
@@ -5722,6 +5741,7 @@ fn spawn_episode_driver(
         motion_coalesced: 0,
         motion_dropped_stall: 0,
         wheel_dropped_stall: 0,
+        input_dropped_stall: 0,
         motion_first: None,
         motion_zero_deltas: 0,
         motion_sum_dx: 0,
@@ -7552,7 +7572,7 @@ async fn run_capture_stream(
                                     .map(|_| ())
                             }
                             _ => {
-                                send_input(&connection, &mut send, sequence, outgoing).await
+                                send_input(&connection, &mut send, sequence, outgoing).await.map(|_| ())
                             }
                         },
                     };
@@ -11209,7 +11229,7 @@ async fn send_input(
     send: &mut quinn::SendStream,
     sequence: u64,
     event: InputEvent,
-) -> Result<()> {
+) -> Result<bool> {
     // All input rides the ordered episode stream. QUIC datagrams proved
     // lossy in exactly one direction on real links (live-traced: streams
     // land, datagrams vanish with zero errors on either side), and a
@@ -11224,9 +11244,11 @@ async fn send_input(
     // dropped network) would otherwise park this write — and the whole
     // drive task — until the next watchdog. That is the freeze class:
     // local suppression stays engaged while the stalled task cannot
-    // stamp liveness. A timed-out write ends the EPISODE instead (every
-    // call site tears down and releases suppression), so a dead peer
-    // costs a crossing, never the local desktop. Motion never comes
+    // stamp liveness. A timed-out write DROPS the event and counts a
+    // strike instead of ending the episode (a dead peer then costs one
+    // click, never every future click — the clicks-dead-while-motion-
+    // glides shape); only the stall breaker (sustained silence, count
+    // AND seconds) or a hard write error ends it. Motion never comes
     // here (see send_motion_best_effort): it drops, never waits. 800ms
     // (down from 2s): keys/buttons stay reliable on healthy LAN
     // (<5ms), but a half-dead peer releases local input in under a
@@ -11244,10 +11266,12 @@ async fn send_input(
     )
     .await
     {
-        Ok(result) => result?,
-        Err(_) => bail!("episode stream write stalled; ending the episode"),
+        Ok(result) => {
+            result?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
     }
-    Ok(())
 }
 
 /// Best-effort send for loss-tolerant pointer and scroll deltas (both
@@ -11981,6 +12005,8 @@ mod tests {
             &"ab".repeat(32),
         ))
         .unwrap();
+        // Crossing runs start at the border (see PHANTOM_START_GUARD_PX).
+        router.place_local_cursor(1900, 540).unwrap();
         let handoff = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
         assert!(matches!(handoff, RoutedEvent::Handoff { .. }));
         let target = router.active_remote().unwrap();
