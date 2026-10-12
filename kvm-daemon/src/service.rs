@@ -1882,13 +1882,14 @@ async fn run_windows_service_capture_stream(
                         };
                         sequence = sequence.wrapping_add(1);
                         // Tiered sends (freeze-proofing, both OSes): motion
-                        // drops on a 200ms stall instead of wedging this
+                        // drops on a 120ms stall instead of wedging this
                         // privileged loop with suppression held; wheel rides
                         // the motion lane under the same rule as the
                         // topology arm (see `wheel_use_lane`) and drops
                         // best-effort otherwise, so scrolls never
-                        // head-of-line-block clicks. Only keys/buttons stay
-                        // reliable below.
+                        // head-of-line-block clicks. Key/button presses stay
+                        // reliable below; releases reconcile via state sync
+                        // (a lost release is a stuck key).
                         let lane = match outgoing {
                             InputEvent::MouseMove { .. } => motion_send.as_mut(),
                             InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
@@ -1936,8 +1937,35 @@ async fn run_windows_service_capture_stream(
                             // half-dead association and stalled this whole
                             // privileged loop with suppression held — motion
                             // kept best-effort gliding while clicks/keys
-                            // wedged, the Win-Win freeze shape.
-                            _ => send_input(&connection, &mut send, sequence, outgoing).await.map(|_| ()),
+                            // wedged, the Win-Win freeze shape. Releases
+                            // take the generous path and reconcile with a
+                            // state sync on stall (a lost release strands
+                            // the hold remotely); presses drop the event
+                            // and keep driving on stall, like the
+                            // topology arm.
+                            _ => {
+                                if outgoing.is_release() {
+                                    match send_release(&mut send, sequence, outgoing).await {
+                                        Ok(true) => Ok(()),
+                                        Ok(false) => {
+                                            let sync_state = state.snapshot().state;
+                                            let _ = send_state_sync(&mut send, sync_state).await;
+                                            tracing::warn!(
+                                                "service release stalled; reconciled with state sync"
+                                            );
+                                            Ok(())
+                                        }
+                                        Err(error) => Err(error),
+                                    }
+                                } else {
+                                    match send_input(&connection, &mut send, sequence, outgoing)
+                                        .await
+                                    {
+                                        Ok(_) => Ok(()),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                            }
                         };
                         if let Err(error) = send_result {
                             send_failed = Some(error);
@@ -3305,24 +3333,26 @@ struct TopologySession {
     /// packet by the motion arm instead of sent as their own QUIC frame.
     /// Logged at teardown: proves the coalescer engaged under flood.
     motion_coalesced: u64,
-    /// Best-effort motion drops: stream-bound deltas that hit the 200ms
+    /// Best-effort motion drops: stream-bound deltas that hit the 120ms
     /// stall bound and were dropped instead of awaited (the freeze fix).
     /// A climbing count with low forwarded proves a struggling network,
     /// not a dead capture; the breaker ends the episode when nothing
     /// gets through at all. Logged at teardown.
     motion_dropped_stall: u64,
-    /// Best-effort wheel drops (same 200ms rule as motion): scroll deltas
+    /// Best-effort wheel drops (same 120ms rule as motion): scroll deltas
     /// a stalled stream refused, dropped instead of head-of-line-blocking
-    /// clicks/keys behind an 800ms reliable write. The next delta
+    /// clicks/keys behind a reliable write. The next delta
     /// supersedes a dropped one. Logged at teardown.
     wheel_dropped_stall: u64,
-    /// Reliable-input stall drops (keys/buttons that hit the 800ms bound
-    /// on a half-dead stream): the event is dropped and counted instead
+    /// Reliable-input stall drops (key/button PRESSES that hit the 500ms
+    /// bound on a half-dead stream, plus releases whose 2s write stalled
+    /// even after the state-sync reconcile): the event is counted instead
     /// of ending the episode — one lost click is strictly better than
     /// every future click dying until the next recross (the clicks-dead
     /// shape: motion keeps gliding over UDP while the stream stays
-    /// wedged). The stall breaker still reaps a truly dead episode.
-    /// Logged at teardown.
+    /// wedged). Releases are reconciled via state sync first, so a
+    /// counted release never strands a hold. The stall breaker still
+    /// reaps a truly dead episode. Logged at teardown.
     input_dropped_stall: u64,
     /// Motion VALUE probe: the first forwarded delta, how many forwarded
     /// deltas were exactly zero, and the signed sums. Counts prove flow;
@@ -3950,6 +3980,21 @@ fn inbound_inputs_growth(
 /// backup): fresh inbound input pre-empts our drive within one tick.
 /// Rest does not. A quiet drive holds until the cursor returns past the
 /// facing edge or [`inbound_yield_fires`] sees a real takeover.
+/// Post-handoff settle for the inbound-growth yield (see
+/// probe_inbound_yield): inside this window after a crossing commits, small
+/// inbound growth is the crossing's own echo (the peer injects our drive,
+/// its capture feeds our just-opened drive back), never a counter-drive.
+/// Only a LARGE burst inside the window proves a real takeover (a human
+/// pushing back produces dozens of events per tick). Pure for tests.
+const INBOUND_SETTLE_MS: u64 = 1_000;
+const INBOUND_SETTLE_BURST: u64 = 20;
+
+/// Settle predicate behind the rule above: true while small growth must be
+/// absorbed into the baseline instead of yielding. Pure for tests.
+fn inbound_settle_suppressed(open_for_ms: u64, growth: u64) -> bool {
+    open_for_ms < INBOUND_SETTLE_MS && growth < INBOUND_SETTLE_BURST
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn probe_inbound_yield(
     router: &mut EdgeRouter,
@@ -3996,6 +4041,26 @@ async fn probe_inbound_yield(
     // peer that truly takes the cursor sends a Handoff first (driving
     // non-empty, and FRESH — see snapshot_inbound_inputs), so intent still
     // pre-empts within one 300ms tick.
+    //
+    // Post-handoff settle (see INBOUND_SETTLE_MS): the growth above is
+    // measured against a baseline taken when THIS drive opened, but the
+    // first second of any drive is full of its own echo — the peer's
+    // capture feeds our injected motion back as fresh inbound input
+    // (3-24 events inside half a second on real links). Small growth that
+    // early is absorbed, never a yield; only a large burst proves the
+    // peer's human is pushing back through our drive. The transfer stamp
+    // doubles as the drive-open clock (stamped at every handoff commit).
+    let open_for_ms = last_transfer
+        .map(|when| {
+            std::time::Instant::now()
+                .saturating_duration_since(when)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64
+        })
+        .unwrap_or(u64::MAX);
+    if inbound_settle_suppressed(open_for_ms, growth) {
+        return;
+    }
     if inbound_yield_fires(growth, !driving.is_empty()) {
         let observed = kvm_platform::capture::inbound_while_driving_count();
         tracing::info!(
@@ -4048,6 +4113,24 @@ fn park_inside(router: &mut EdgeRouter, edge: kvm_core::Edge) {
     // "stuck at the edge until wiggled inside" shape. The short transfer
     // debounce already paces re-crossings; no state gate is needed.
     let _ = router.place_local_cursor(x, y);
+}
+
+/// Handoff-remainder shape test: true when ONE fling event carried the
+/// whole crossing budget on its own (see the Handoff arm). The router
+/// preserves the final overflow as a relative event, so its magnitude is
+/// exactly the last event's overshoot: at or past EDGE_PUSH_PX the drive
+/// opened on a single giant delta from wherever the cursor was — the only
+/// shape the phantom veto may refuse. Anything smaller accumulated across
+/// events (a sustained deliberate push, possibly over many small deltas),
+/// and the veto must not second-guess it: re-pinning truth there is what
+/// reads as "stuck at the edge until wiggled". Pure for tests.
+fn handoff_is_single_fling(event: InputEvent) -> bool {
+    match event {
+        InputEvent::MouseMove { dx, dy } => {
+            i64::from(dx).abs().saturating_add(i64::from(dy).abs()) >= kvm_core::EDGE_PUSH_PX
+        }
+        _ => true,
+    }
 }
 
 /// Phantom-handoff veto: the 24px push budget can complete from a SINGLE
@@ -4613,7 +4696,7 @@ async fn handle_topology_event(
                     }
                 }
                 // Tiered sends (freeze-proofing, both OSes): motion is
-                // loss-tolerant — 200ms bound, then the delta DROPS
+                // loss-tolerant — 120ms bound, then the delta DROPS
                 // (superseded by the next; UDP carries it anyway). Awaiting
                 // a dead stream per event is what wedged the drive task
                 // with suppression held and froze the local desktop for
@@ -4624,8 +4707,10 @@ async fn handle_topology_event(
                 // `wheel_use_lane`), else best-effort on the episode
                 // stream — never the reliable write, so a stalled stream
                 // drops a scroll instead of head-of-line-blocking the
-                // clicks/keys behind it. Only keys/buttons stay reliable
-                // (800ms bound): they cannot drop silently.
+                // clicks/keys behind it. Key/button PRESSES stay reliable
+                // (500ms bound): they cannot drop silently. RELEASES get
+                // the generous path (see send_release) plus a state-sync
+                // reconcile on stall: a lost release is a stuck key.
                 let outgoing_is_wheel = matches!(
                     outgoing,
                     InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
@@ -4643,7 +4728,14 @@ async fn handle_topology_event(
                     }
                     _ => None,
                 };
-                let send_outcome: Result<bool> = if outgoing_is_motion || outgoing_is_wheel {
+                let send_outcome: Result<bool> = if outgoing.is_release() {
+                    // Releases are never dropped silently: a lost release
+                    // strands the hold on the receiver, where OS
+                    // auto-repeat turns it into a runaway (one tap types
+                    // forever). Generous bound plus a state-sync reconcile
+                    // on stall (see below) — the hold always terminates.
+                    send_release(&mut session.send, *sequence, outgoing).await
+                } else if outgoing_is_motion || outgoing_is_wheel {
                     // Motion and key-free wheel share the best-effort
                     // path (lane when open, else the episode stream):
                     // both are superseded by the next delta on stall.
@@ -4674,10 +4766,22 @@ async fn handle_topology_event(
                         // needs sustained silence (count AND seconds with
                         // nothing getting through): a loss burst drops and
                         // recovers, only a dead network ends the episode.
-                        // Keys/buttons land here on an 800ms stall (see
-                        // send_input): one dropped click with the drive
-                        // alive beats every future click dying with it.
-                        if outgoing_is_motion {
+                        // Stalled RELEASES are reconciled, never dropped
+                        // (see send_release): push a full state sync so a
+                        // hold the wire ate still terminates remotely —
+                        // best-effort, then the same breaker accounting.
+                        if outgoing.is_release() {
+                            let state = snapshot.state.clone();
+                            if send_state_sync(&mut session.send, state).await.is_err() {
+                                tracing::warn!("release reconcile sync failed; drive continues");
+                            } else {
+                                tracing::warn!(
+                                    strikes = *send_strikes + 1,
+                                    "key/button release stalled on the episode stream; reconciled with state sync, drive continues"
+                                );
+                            }
+                            session.input_dropped_stall += 1;
+                        } else if outgoing_is_motion {
                             session.motion_dropped_stall += 1;
                         } else if outgoing_is_wheel {
                             session.wheel_dropped_stall += 1;
@@ -4856,11 +4960,25 @@ async fn handle_topology_event(
             // in-flight flick can satisfy the push budget while the
             // visible cursor is still mid-screen. Truth decides — genuine
             // pushes (truth at the edge) proceed below instantly.
+            // Sustained pushes skip the veto entirely (see
+            // handoff_is_single_fling): when the budget accumulated over
+            // many small events the user visibly leaned on the edge, and
+            // vetoing there is exactly the "push repeatedly, stuck, then
+            // finally exits" shape. Only a single giant fling can be a
+            // phantom, so only it pays the truth check.
             // (No failed-episode gate here: the parked-stream reuse below
             // costs one Handoff frame, never a dial, so a stall must not
             // wedge reversals for a second. The gate lives on the cold
             // open only, where the dial storm it prevents can start.)
-            if let Some((truth_x, truth_y)) = phantom_handoff_veto(router, from, edge) {
+            //
+            // Single query: the fling test is pure over the remainder,
+            // only the veto arm touches OS truth.
+            let veto = if handoff_is_single_fling(event) {
+                phantom_handoff_veto(router, from, edge)
+            } else {
+                None
+            };
+            if let Some((truth_x, truth_y)) = veto {
                 tracing::info!(?target, ?edge, truth_x, truth_y, "crossing_refused: OS pointer truth is mid-screen, flick vetoed; keep pushing deliberately to cross");
                 let _ = router.restore_local(target);
                 resync_home_to_truth(router);
@@ -6071,7 +6189,9 @@ fn start_capture(
                 // within the bounded queue, but the wait is BOUNDED (20ms
                 // retries) so a wedged task parks this thread in slices,
                 // never forever — the watchdog above keeps releasing
-                // suppression while it does. Motion/wheel stay lossy.
+                // suppression while it does. Motion stays lossy; WHEEL
+                // overflows to the reliable queue instead of dying
+                // silently (see below).
                 if matches!(event, InputEvent::Key(_) | InputEvent::MouseButton { .. }) {
                     if !capture_send_bounded(
                         &priority_tx,
@@ -6081,6 +6201,42 @@ fn start_capture(
                         &thread_exclusive,
                     ) {
                         break 'capture;
+                    }
+                    continue;
+                }
+                // Scroll shares the lossy motion channel — but a fast mouse
+                // flood must never starve it there: a full motion queue
+                // used to drop every wheel event queued behind motion, so
+                // scrolling only worked when the mouse sat still (and
+                // "scroll after a click" only worked because the click
+                // rode the priority queue above). Overflow wheels to the
+                // bounded priority queue instead: scroll stays ordered
+                // with keys (Ctrl+wheel zoom needs it) and is never
+                // dropped by motion floods. Pointer motion itself stays
+                // lossy — the next delta supersedes a dropped one.
+                if matches!(
+                    event,
+                    InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
+                ) {
+                    match motion_tx.try_send(captured) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            break 'capture;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                            // try_send never consumes on Full: the event
+                            // comes back and rides the bounded priority
+                            // queue instead (see above).
+                            if !capture_send_bounded(
+                                &priority_tx,
+                                returned,
+                                &thread_stop,
+                                &mut backend,
+                                &thread_exclusive,
+                            ) {
+                                break 'capture;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -7543,10 +7699,10 @@ async fn run_capture_stream(
                     // (own flow-control window and loss domain — a stalled
                     // motion packet never head-of-line-blocks keys). Wheel
                     // stays ordered with keys on the episode stream, but
-                    // best-effort (200ms, then drop): a stalled stream drops
+                    // best-effort (120ms, then drop): a stalled stream drops
                     // a superseded scroll instead of wedging this loop
-                    // behind an 800ms reliable write while motion glides.
-                    // Best-effort motion (freeze-proofing): a 200ms stall
+                    // behind a reliable press write while motion glides.
+                    // Best-effort motion (freeze-proofing): a 120ms stall
                     // drops the delta instead of wedging this loop with
                     // suppression held; the next delta supersedes it.
                     let lane = match outgoing {
@@ -9546,10 +9702,11 @@ async fn handle_connection(
 /// persisted per site). `THEKVM_WHEEL_PINCH=1` on the receiver forces the
 /// old Ctrl+wheel page-zoom rendering for comparison. On Linux the gesture
 /// renders as Ctrl+wheel page zoom by default (browser-native layout zoom
-/// at the cursor, normal sensitivity, no widget). The experimental virtual
-/// touchscreen viewport rendering (see PINCH-ZOOM/README.md) runs only
-/// under the explicit opt-in `THEKVM_LINUX_PINCH_VIEWPORT=1` (parked work:
-/// see PINCH-ZOOM/README.md). When the opt-in touch frame fails, the
+/// at the cursor, normal sensitivity, no widget). On Linux the receiver
+/// tries the native uinput touch frame first and falls through to page
+/// zoom when the touch channel is unavailable (see the fn body) — the
+/// legacy `THEKVM_LINUX_PINCH_VIEWPORT=1` opt-in is accepted but no
+/// longer required. When the touch frame fails, the
 /// gesture falls through to page zoom rather than swallowing, so a pinch
 /// never dies silently.
 /// `display` is the receiver's session X display (see receiver_display):
@@ -9571,18 +9728,21 @@ fn handle_inbound_pinch(
             return injector.send(event);
         }
     }
-    // Page zoom is the default: only the explicit viewport opt-in tries
-    // native touch first, and a failed touch frame falls through to the
-    // Ctrl+wheel expansion below (never a silent swallow). The two
-    // renderings never mix inside one working gesture: a consumed touch
-    // frame returns early. FreeBSD keeps page zoom (no touch channel).
+    // Native touch first on every OS that has a touch channel (Windows
+    // InjectTouchInput, Linux uinput touch): that is what renders the
+    // trackpad-native viewpane zoom (smooth Direct-Manipulation-style
+    // zoom-to-cursor) instead of the Ctrl+/- page zoom. A failed touch
+    // frame falls through to the Ctrl+wheel expansion below (never a
+    // silent swallow), so machines without a touch channel keep the
+    // compatible page zoom. The two renderings never mix inside one
+    // working gesture: a consumed touch frame returns early. FreeBSD
+    // keeps page zoom (no touch channel).
     #[cfg(not(target_os = "windows"))]
     match event {
-        InputEvent::Pinch { delta } => {
+        InputEvent::Pinch { delta } =>
+        {
             #[cfg(target_os = "linux")]
-            if std::env::var("THEKVM_LINUX_PINCH_VIEWPORT").as_deref() == Ok("1")
-                && injector.inject_pinch(delta, display)
-            {
+            if injector.inject_pinch(delta, display) {
                 return Ok(());
             }
         }
@@ -11240,7 +11400,7 @@ async fn send_input(
     // it. The receiver still accepts datagrams from older peers (shared
     // dedup sets cover both arms).
     //
-    // BOUNDED (800ms): a peer that stops reading (wedged app, dead helper,
+    // BOUNDED (500ms): a peer that stops reading (wedged app, dead helper,
     // dropped network) would otherwise park this write — and the whole
     // drive task — until the next watchdog. That is the freeze class:
     // local suppression stays engaged while the stalled task cannot
@@ -11249,16 +11409,47 @@ async fn send_input(
     // click, never every future click — the clicks-dead-while-motion-
     // glides shape); only the stall breaker (sustained silence, count
     // AND seconds) or a hard write error ends it. Motion never comes
-    // here (see send_motion_best_effort): it drops, never waits. 800ms
-    // (down from 2s): keys/buttons stay reliable on healthy LAN
-    // (<5ms), but a half-dead peer releases local input in under a
-    // second instead of reading as a multi-second "clicks dead" freeze
-    // while UDP motion keeps gliding. Wheel never comes here either:
+    // here (see send_motion_best_effort): it drops, never waits. 500ms
+    // (down from 800): key/button presses stay reliable on healthy LAN
+    // (<5ms), but a half-dead peer releases local input faster instead
+    // of reading as a "clicks dead" freeze while UDP motion keeps
+    // gliding. Wheel never comes here either:
     // scroll deltas are superseded like motion, so they ride the motion
     // lane (or best-effort on the stream) instead of head-of-line
-    // blocking clicks behind an 800ms write.
+    // blocking clicks behind a reliable write. RELEASES never come here
+    // either (see send_release): a dropped release is a stuck key.
     match tokio::time::timeout(
-        Duration::from_millis(800),
+        Duration::from_millis(500),
+        write_frame(
+            &mut *send,
+            &WireMessage::Input(InputPacket { sequence, event }),
+        ),
+    )
+    .await
+    {
+        Ok(result) => {
+            result?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+/// Reliable send for hold-ending events (key/button releases, pinch-end
+/// Ctrl releases): the anti-runaway path. A press that never arrives
+/// costs one missing tap; a RELEASE that never arrives strands the hold
+/// on the receiver, where OS auto-repeat turns one tap into an endless
+/// stream. Generous bound (2s — releases are rare, one per tap, so
+/// waiting cannot flood), and the caller reconciles with a full state
+/// sync on stall (see the Forward arm): the hold terminates remotely
+/// even when this write dies. Never silently dropped.
+async fn send_release(
+    send: &mut quinn::SendStream,
+    sequence: u64,
+    event: InputEvent,
+) -> Result<bool> {
+    match tokio::time::timeout(
+        Duration::from_millis(2000),
         write_frame(
             &mut *send,
             &WireMessage::Input(InputPacket { sequence, event }),
@@ -11275,7 +11466,7 @@ async fn send_input(
 }
 
 /// Best-effort send for loss-tolerant pointer and scroll deltas (both
-/// OSes, all drive paths): 200ms bound, then the delta is DROPPED —
+/// OSes, all drive paths): 120ms bound, then the delta is DROPPED —
 /// never awaited, never fatal. The next delta supersedes a dropped one
 /// (and UDP carries motion anyway when armed), while awaiting a dead
 /// stream is what wedges the drive task with suppression held and
@@ -11289,7 +11480,7 @@ async fn send_motion_best_effort(
     event: InputEvent,
 ) -> Result<bool> {
     match tokio::time::timeout(
-        Duration::from_millis(200),
+        Duration::from_millis(120),
         write_frame(
             &mut *send,
             &WireMessage::Input(InputPacket { sequence, event }),
@@ -11943,6 +12134,49 @@ mod tests {
         // Twelve consecutive Pings (~60s) with no Pong is proof, not noise.
         assert!(drive_starved(12));
         assert!(drive_starved(120));
+    }
+
+    #[test]
+    fn inbound_settle_absorbs_echo_but_not_takeover() {
+        // The first second of a drive is its own echo (3-24 events inside
+        // half a second on real links): absorbed, never a yield.
+        assert!(inbound_settle_suppressed(0, 0));
+        assert!(inbound_settle_suppressed(300, 3));
+        assert!(inbound_settle_suppressed(500, 19));
+        // A large burst inside the window is a human pushing back: yields.
+        assert!(!inbound_settle_suppressed(300, 20));
+        assert!(!inbound_settle_suppressed(999, 100));
+        // Past the window every sustained run yields (see
+        // inbound_yield_fires); the settle no longer suppresses.
+        assert!(!inbound_settle_suppressed(1000, 5));
+        assert!(!inbound_settle_suppressed(u64::MAX, 5));
+    }
+
+    #[test]
+    fn single_fling_test_separates_phantom_shape() {
+        use kvm_core::InputEvent;
+        // One giant delta carrying the whole 16px budget: a fling, the
+        // only shape the phantom veto may refuse.
+        assert!(handoff_is_single_fling(InputEvent::MouseMove {
+            dx: 500,
+            dy: 30
+        }));
+        assert!(handoff_is_single_fling(InputEvent::MouseMove {
+            dx: 16,
+            dy: 0
+        }));
+        // Small final overshoots accumulated over many events: a
+        // sustained deliberate push, never vetoed.
+        assert!(!handoff_is_single_fling(InputEvent::MouseMove {
+            dx: 5,
+            dy: 0
+        }));
+        assert!(!handoff_is_single_fling(InputEvent::MouseMove {
+            dx: 0,
+            dy: -3
+        }));
+        // Non-motion handoffs never bypass the veto.
+        assert!(handoff_is_single_fling(InputEvent::PinchEnd));
     }
 
     #[test]
