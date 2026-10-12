@@ -154,133 +154,23 @@ export component AppWindow inherits Window {
 
 
     VerticalLayout {
-        padding: 12px;
-        spacing: 6px;
+        padding: 0px;
+        spacing: 0px;
 
-        // Slim status row (no big header, no version banner): a small
-        // dot plus one status line. The old 28px title block ate a
-        // permanent strip at the top for information nobody reads.
-        HorizontalLayout {
-            spacing: 8px;
-            Rectangle {
-                width: 10px;
-                height: 10px;
-                border-radius: 5px;
-                background: connected ? #22c55e : #ef4444;
-                vertical-stretch: 0;
-                y: 3px;
-            }
-            Text {
-                text: status-text;
-                color: connected ? #22c55e : #9ca3af;
-                vertical-alignment: center;
-                font-size: 13px;
-            }
-            Text {
-                text: local-address == "" ? "" : "· " + local-address;
-                color: #6b7280;
-                font-size: 11px;
-                vertical-alignment: center;
-                overflow: elide;
-            }
-        }
-
-        Rectangle {
-            // Approval rendezvous must not depend on which tab is open. A
-            // missed incoming request (wrong tab, minimized window) used to
-            // be indistinguishable from a broken network — same silence on
-            // both ends. This card is visible on EVERY tab while a request
-            // is pending, with the full details under the Connect tab.
-            visible: incoming-pairing != "";
-            background: #453008;
-            border-radius: 10px;
-            border-width: 1px;
-            border-color: #f59e0b;
-            VerticalLayout {
-                padding: 10px;
-                spacing: 6px;
-                Text {
-                    text: "Pairing request — allow this computer to pair?";
-                    color: #fde68a;
-                    font-size: 12px;
-                    font-weight: 700;
-                }
-                HorizontalLayout {
-                    spacing: 12px;
-                    Text {
-                        text: incoming-pairing + " · code " + incoming-verification-code;
-                        color: white;
-                        font-size: 15px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
-                    Button {
-                        text: "Allow";
-                        primary: true;
-                        clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
-                    }
-                    Button {
-                        text: "Deny";
-                        clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
-                    }
-                }
-                Text {
-                    text: "Full details under the Connect tab. No input flows until you allow.";
-                    color: #fcd34d;
-                    font-size: 11px;
-                }
-            }
-        }
-
-        Rectangle {
-            // Same rendezvous rule for LINK approvals: a paired computer
-            // dialing a fresh link waits here until the local human allows
-            // it — no input flows before that click, on any tab.
-            visible: incoming-link != "";
-            background: #123a2a;
-            border-radius: 10px;
-            border-width: 1px;
-            border-color: #22c55e;
-            VerticalLayout {
-                padding: 10px;
-                spacing: 6px;
-                Text {
-                    text: "Connection request — a paired computer wants to drive this one";
-                    color: #a7f3d0;
-                    font-size: 12px;
-                    font-weight: 700;
-                }
-                HorizontalLayout {
-                    spacing: 12px;
-                    Text {
-                        text: incoming-link;
-                        color: white;
-                        font-size: 15px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
-                    Button {
-                        text: "Allow";
-                        primary: true;
-                        clicked => { approve-incoming-link(incoming-link-fingerprint); }
-                    }
-                    Button {
-                        text: "Deny";
-                        clicked => { reject-incoming-link(incoming-link-fingerprint); }
-                    }
-                }
-                Text {
-                    text: "Allow once per link. Until you allow, this computer cannot be driven — and it cannot drive back either.";
-                    color: #6ee7b7;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                }
-            }
-        }
+        // NOTE: no header of any kind lives here anymore — not even the
+        // old slim status row. Every in-flow strip above the tabs read
+        // as a permanent black bar (Slint reserves layout space for
+        // hidden elements), so the tabs start at the window padding and
+        // live status already shows inside the Connect tab.
+        GridLayout {
+            padding: 12px;
+            spacing: 0px;
 
         TabWidget {
+            row: 0;
+            col: 0;
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
             Tab {
                 title: "Connect";
                 // Scrollable: tab content is taller than the window, and a
@@ -291,8 +181,7 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     padding: 12px;
                     spacing: 10px;
-                    Rectangle {
-                        visible: discovery-card-visible;
+                    if discovery-card-visible : Rectangle {
                         background: #111827;
                         border-radius: 10px;
                         border-width: 1px;
@@ -315,9 +204,8 @@ export component AppWindow inherits Window {
                                     clicked => { hide-discovery(); }
                                 }
                             }
-                            HorizontalLayout {
+                            if discovery-scanning : HorizontalLayout {
                                 spacing: 10px;
-                                visible: discovery-scanning;
                                 Rectangle {
                                     width: 18px;
                                     height: 18px;
@@ -338,16 +226,14 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                             }
-                            Text {
-                                visible: !discovery-scanning;
+                            if !discovery-scanning : Text {
                                 text: discovery-text;
                                 color: #9ca3af;
                                 font-size: 12px;
                                 wrap: word-wrap;
                             }
-                            HorizontalLayout {
+                            if discovered-labels.length > 0 : HorizontalLayout {
                                 spacing: 12px;
-                                visible: discovered-labels.length > 0;
                                 found2 := ComboBox {
                                     model: root.discovered-labels;
                                     current-index <=> root.discovered-index;
@@ -364,8 +250,7 @@ export component AppWindow inherits Window {
                                     clicked => { discover-lan(); }
                                 }
                             }
-                            Text {
-                                visible: discovered-labels.length == 0 && !discovery-scanning;
+                            if discovered-labels.length == 0 && !discovery-scanning : Text {
                                 text: "Nothing here yet — press Scan, or wait for the automatic listing. Tapping a device dials it with approval on the other side.";
                                 color: #6b7280;
                                 font-size: 11px;
@@ -417,16 +302,14 @@ export component AppWindow inherits Window {
                             placeholder-text: "e.g. 192.168.1.7";
                             enabled: !session-active;
                         }
-                        Button {
+                        if !session-active : Button {
                             text: "Connect";
                             primary: true;
-                            visible: !session-active;
                             enabled: addr.text != "";
                             clicked => { connect-to(addr.text, code-field.text); }
                         }
-                        Button {
+                        if session-active : Button {
                             text: "Disconnect";
-                            visible: session-active;
                             clicked => { disconnect(); }
                         }
                     }
@@ -450,8 +333,7 @@ export component AppWindow inherits Window {
                     // gated until edge-ready, so motion the moment this
                     // disappears rides the warmed stream — super smooth
                     // both directions from the very first push.
-                    HorizontalLayout {
-                        visible: link-connecting && !session-active;
+                    if link-connecting && !session-active : HorizontalLayout {
                         spacing: 10px;
                         Rectangle {
                             width: 26px;
@@ -508,8 +390,7 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
                     Rectangle { height: 1px; background: #262626; }
-                    Text {
-                        visible: driving-text != "";
+                    if driving-text != "" : Text {
                         text: driving-text;
                         color: #22c55e;
                         font-size: 13px;
@@ -517,15 +398,13 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
                     Rectangle { height: 1px; background: #262626; }
-                    Button {
-                        visible: !connected;
+                    if !connected : Button {
                         text: "Start background service";
                         clicked => { start-daemon(); }
                     }
                     Rectangle { height: 1px; background: #262626; }
-                    VerticalLayout {
+                    if pending-verification-code != "" : VerticalLayout {
                         spacing: 6px;
-                        visible: pending-verification-code != "";
                         Text {
                             text: "OUTGOING — you are calling the other computer:";
                             color: #f59e0b;
@@ -567,7 +446,7 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    VerticalLayout {
+                    if incoming-pairing != "" : VerticalLayout {
                         spacing: 6px;
                         // Both directions must be visible SIMULTANEOUSLY. This
                         // used to hide while our own outgoing code check was
@@ -576,7 +455,6 @@ export component AppWindow inherits Window {
                         // could ever approve the other: a mutual-blindness
                         // deadlock with both users staring at unanswerable
                         // code screens until everything timed out.
-                        visible: incoming-pairing != "";
                         Text {
                             text: "INCOMING — the other computer is calling you:";
                             color: #f59e0b;
@@ -590,8 +468,7 @@ export component AppWindow inherits Window {
                             font-weight: 700;
                             wrap: word-wrap;
                         }
-                        Text {
-                            visible: incoming-verification-code != "";
+                        if incoming-verification-code != "" : Text {
                             text: incoming-verification-code;
                             color: #22c55e;
                             font-size: 32px;
@@ -613,13 +490,12 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    VerticalLayout {
+                    if incoming-link != "" : VerticalLayout {
                         spacing: 6px;
                         // Paired computers still ask before driving: a
                         // fresh link epoch from a trusted peer waits here
                         // (Allow once per link — retries and the dial-back
                         // on the same link never ask again).
-                        visible: incoming-link != "";
                         Text {
                             text: "INCOMING link — a paired computer wants to drive:";
                             color: #6ee7b7;
@@ -674,9 +550,8 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                     }
-                    HorizontalLayout {
+                    if discovered-labels.length > 0 : HorizontalLayout {
                         spacing: 12px;
-                        visible: discovered-labels.length > 0;
                         found := ComboBox {
                             model: root.discovered-labels;
                             current-index <=> root.discovered-index;
@@ -703,15 +578,13 @@ export component AppWindow inherits Window {
                             height: 200px;
                             background: white;
                             border-radius: 8px;
-                            Image {
+                            if invite-ready : Image {
                                 x: 8px; y: 8px;
                                 width: 184px; height: 184px;
-                                visible: invite-ready;
                                 source: root.invite-qr;
                                 image-fit: contain;
                             }
-                            Text {
-                                visible: !invite-ready;
+                            if !invite-ready : Text {
                                 text: "Start the app to generate the invite";
                                 color: #6b7280;
                                 font-size: 11px;
@@ -773,9 +646,8 @@ export component AppWindow inherits Window {
                     // Screen icons with names: this computer and the linked
                     // peer, placed left/right as arranged. The exit edge is
                     // the facing edge — the outer edges do nothing.
-                    HorizontalLayout {
+                    if peer-on-right : HorizontalLayout {
                         spacing: 12px;
-                        visible: peer-on-right;
                         Rectangle {
                             width: 130px;
                             height: 92px;
@@ -806,9 +678,8 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    HorizontalLayout {
+                    if !peer-on-right : HorizontalLayout {
                         spacing: 12px;
-                        visible: !peer-on-right;
                         Rectangle {
                             width: 130px;
                             height: 92px;
@@ -891,8 +762,7 @@ export component AppWindow inherits Window {
                         font-size: 12px;
                         wrap: word-wrap;
                     }
-                    Text {
-                        visible: driving-text != "";
+                    if driving-text != "" : Text {
                         text: driving-text;
                         color: #22c55e;
                         font-size: 13px;
@@ -1083,6 +953,115 @@ export component AppWindow inherits Window {
                         clicked => { open-log-folder(); }
                     }
                 }
+                }
+            }
+        }
+
+            // Approval popups: conditional (not merely hidden) so they
+            // occupy ZERO space when nothing pends, and overlapped onto
+            // the tabs' cell so they float above the content instead of
+            // shoving it down. Approval rendezvous still works on every
+            // tab — missed requests used to be indistinguishable from a
+            // broken network. The `if` (not `visible`) matters: Slint
+            // reserves layout space for hidden elements, which is what
+            // used to read as a permanent empty bar.
+            if incoming-pairing != "" || incoming-link != "" : Rectangle {
+                row: 0;
+                col: 0;
+                // Transparent shell: the cell is sized by the tabs, so
+                // this floats over them at zero layout cost; the inner
+                // column stacks the pending cards from the top.
+                VerticalLayout {
+                    spacing: 8px;
+                    if incoming-pairing != "" : Rectangle {
+                        background: #453008;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: #f59e0b;
+                        drop-shadow-color: #000000aa;
+                        drop-shadow-blur: 18px;
+                        drop-shadow-offset-y: 6px;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 6px;
+                            Text {
+                                text: "Pairing request — allow this computer to pair?";
+                                color: #fde68a;
+                                font-size: 12px;
+                                font-weight: 700;
+                            }
+                            HorizontalLayout {
+                                spacing: 12px;
+                                Text {
+                                    text: incoming-pairing + " · code " + incoming-verification-code;
+                                    color: white;
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                Button {
+                                    text: "Allow";
+                                    primary: true;
+                                    clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
+                                }
+                                Button {
+                                    text: "Deny";
+                                    clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
+                                }
+                            }
+                            Text {
+                                text: "Full details under the Connect tab. No input flows until you allow.";
+                                color: #fcd34d;
+                                font-size: 11px;
+                            }
+                        }
+                    }
+                    if incoming-link != "" : Rectangle {
+                        background: #123a2a;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: #22c55e;
+                        drop-shadow-color: #000000aa;
+                        drop-shadow-blur: 18px;
+                        drop-shadow-offset-y: 6px;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 6px;
+                            Text {
+                                text: "Connection request — a paired computer wants to drive this one";
+                                color: #a7f3d0;
+                                font-size: 12px;
+                                font-weight: 700;
+                            }
+                            HorizontalLayout {
+                                spacing: 12px;
+                                Text {
+                                    text: incoming-link;
+                                    color: white;
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                Button {
+                                    text: "Allow";
+                                    primary: true;
+                                    clicked => { approve-incoming-link(incoming-link-fingerprint); }
+                                }
+                                Button {
+                                    text: "Deny";
+                                    clicked => { reject-incoming-link(incoming-link-fingerprint); }
+                                }
+                            }
+                            Text {
+                                text: "Allow once per link. Until you allow, this computer cannot be driven — and it cannot drive back either.";
+                                color: #6ee7b7;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
                 }
             }
         }
