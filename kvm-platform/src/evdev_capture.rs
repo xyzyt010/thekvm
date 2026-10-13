@@ -12,7 +12,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "freebsd")]
@@ -23,6 +23,7 @@ type IoctlRequest = libc::Ioctl;
 const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
+const EV_ABS: u16 = 0x03;
 const SYN_REPORT: u16 = 0;
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
@@ -30,14 +31,44 @@ const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
 const REL_WHEEL_HI_RES: u16 = 0x0b;
 const REL_HWHEEL_HI_RES: u16 = 0x0c;
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+const ABS_MT_SLOT: u16 = 0x2f;
+const ABS_MT_POSITION_X: u16 = 0x35;
+const ABS_MT_POSITION_Y: u16 = 0x36;
+const ABS_MT_TRACKING_ID: u16 = 0x39;
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
 const BTN_SIDE: u16 = 0x113;
 const BTN_EXTRA: u16 = 0x114;
+const BTN_TOOL_FINGER: u16 = 0x145;
+const BTN_TOUCH: u16 = 0x14a;
+const BTN_TOOL_DOUBLETAP: u16 = 0x14d;
+const BTN_TOOL_TRIPLETAP: u16 = 0x14e;
 const EVIOCGRAB: IoctlRequest = 0x4004_4590;
 const KEY_MAX: usize = 0x2ff;
 const REL_MAX: usize = 0x0f;
+const ABS_MAX: usize = 0x3f;
+
+static EVDEV_KEY: AtomicU64 = AtomicU64::new(0);
+static EVDEV_BUTTON: AtomicU64 = AtomicU64::new(0);
+static EVDEV_MOTION: AtomicU64 = AtomicU64::new(0);
+static EVDEV_WHEEL: AtomicU64 = AtomicU64::new(0);
+static EVDEV_INBOUND_DIVERTED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn census() -> (u64, u64, u64, u64) {
+    (
+        EVDEV_KEY.load(Ordering::Relaxed),
+        EVDEV_BUTTON.load(Ordering::Relaxed),
+        EVDEV_MOTION.load(Ordering::Relaxed),
+        EVDEV_WHEEL.load(Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn inbound_diverted_count() -> u64 {
+    EVDEV_INBOUND_DIVERTED.load(Ordering::Relaxed)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -48,11 +79,52 @@ struct RawInputEvent {
     value: i32,
 }
 
+#[derive(Clone, Copy, Default)]
+struct TouchpadState {
+    mt_slot: usize,
+    mt_slots: [(bool, i32, i32); 10],
+    abs_x: i32,
+    abs_y: i32,
+    touch_down: bool,
+    tool_fingers: u8,
+    last_single: Option<(i32, i32)>,
+    last_two_mid: Option<(i32, i32)>,
+    tap_start: Option<(Instant, i32, i32)>,
+    tap_max_move: i32,
+    tap_two_finger: bool,
+    right_click_remapped: bool,
+}
+
+impl TouchpadState {
+    fn active_contacts(&self) -> Vec<(i32, i32)> {
+        let mut out = Vec::with_capacity(4);
+        for &(active, x, y) in &self.mt_slots {
+            if active {
+                out.push((x, y));
+            }
+        }
+        out
+    }
+
+    fn effective_fingers(&self, contacts_len: usize) -> usize {
+        if contacts_len > 0 {
+            contacts_len
+        } else if self.touch_down {
+            usize::from(self.tool_fingers.max(1))
+        } else {
+            0
+        }
+    }
+}
+
 struct Device {
     path: PathBuf,
     file: File,
     is_keyboard: bool,
     is_mouse: bool,
+    is_touchpad: bool,
+    is_own_injector: bool,
+    touchpad: TouchpadState,
     dx: i32,
     dy: i32,
     /// Accumulated scroll in 120ths (one REL_WHEEL_HI_RES step), flushed as
@@ -84,31 +156,76 @@ impl Device {
             .map_err(|e| PlatformError::Capture(format!("open {}: {e}", path.display())))?;
 
         let name = device_name(&file).unwrap_or_default();
-        if name.to_ascii_lowercase().contains("thekvm") {
-            return Ok(None);
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("thekvm") {
+            // Observe our own relative mouse / keyboard injector (never
+            // grabbed, never forwarded) so peer-injected traffic while we
+            // drive out bumps `EVDEV_INBOUND_DIVERTED` for instant
+            // auto-yield. Skip our own local AbsMouse / Touchscreen.
+            if lower.contains("absmouse") || lower.contains("touchscreen") {
+                return Ok(None);
+            }
+            return Ok(Some(Self {
+                path,
+                file,
+                is_keyboard: false,
+                is_mouse: false,
+                is_touchpad: false,
+                is_own_injector: true,
+                touchpad: TouchpadState::default(),
+                dx: 0,
+                dy: 0,
+                scroll_x_120ths: 0,
+                scroll_y_120ths: 0,
+                wheel_detent_x: 0,
+                wheel_detent_y: 0,
+                queue: VecDeque::new(),
+                pressed_keys: BTreeSet::new(),
+                pressed_buttons: BTreeSet::new(),
+                grabbed: false,
+            }));
         }
 
         let key_bits = capability_bits(&file, 1, (KEY_MAX + 8) / 8).unwrap_or_default();
         let rel_bits = capability_bits(&file, 2, (REL_MAX + 8) / 8).unwrap_or_default();
-        let is_mouse = bit_is_set(&rel_bits, REL_X as usize)
-            || bit_is_set(&rel_bits, REL_Y as usize)
+        let abs_bits = capability_bits(&file, 3, (ABS_MAX + 8) / 8).unwrap_or_default();
+        let has_rel_xy =
+            bit_is_set(&rel_bits, REL_X as usize) || bit_is_set(&rel_bits, REL_Y as usize);
+        let is_touchpad = !has_rel_xy
+            && bit_is_set(&abs_bits, ABS_X as usize)
+            && bit_is_set(&abs_bits, ABS_Y as usize)
+            && bit_is_set(&key_bits, BTN_TOOL_FINGER as usize);
+        let is_mouse = has_rel_xy
+            || is_touchpad
             || [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA]
                 .iter()
                 .any(|code| bit_is_set(&key_bits, *code as usize));
-        let is_keyboard = [1u16, 14, 15, 28, 30, 42, 54, 57, 103, 105, 106, 108]
-            .iter()
-            .any(|code| bit_is_set(&key_bits, *code as usize));
+        let is_keyboard = [
+            1u16, 14, 15, 28, 30, 42, 54, 57, 103, 105, 106, 108, 113, 114, 115,
+        ]
+        .iter()
+        .any(|code| bit_is_set(&key_bits, *code as usize));
 
         if !is_keyboard && !is_mouse {
             return Ok(None);
         }
 
-        tracing::debug!(device = %path.display(), name, is_keyboard, is_mouse, "capturing evdev device");
+        tracing::info!(
+            device = %path.display(),
+            name,
+            is_keyboard,
+            is_mouse,
+            is_touchpad,
+            "capturing evdev device"
+        );
         Ok(Some(Self {
             path,
             file,
             is_keyboard,
             is_mouse,
+            is_touchpad,
+            is_own_injector: false,
+            touchpad: TouchpadState::default(),
             dx: 0,
             dy: 0,
             scroll_x_120ths: 0,
@@ -124,7 +241,127 @@ impl Device {
 
     fn process(&mut self, event: RawInputEvent) -> Vec<InputEvent> {
         let mut output = Vec::new();
+        if self.is_own_injector {
+            return output;
+        }
         match event.type_ {
+            EV_KEY if self.is_touchpad => match event.code {
+                BTN_TOUCH => {
+                    let down = event.value != 0;
+                    if down && !self.touchpad.touch_down {
+                        self.touchpad.tap_start =
+                            Some((Instant::now(), self.touchpad.abs_x, self.touchpad.abs_y));
+                        self.touchpad.tap_max_move = 0;
+                        self.touchpad.tap_two_finger = self.touchpad.tool_fingers >= 2;
+                    } else if !down && self.touchpad.touch_down {
+                        if let Some((started, _, _)) = self.touchpad.tap_start.take() {
+                            if started.elapsed() <= Duration::from_millis(180)
+                                && self.touchpad.tap_max_move <= 24
+                                && self.pressed_buttons.is_empty()
+                            {
+                                let button = if self.touchpad.tap_two_finger {
+                                    MouseButton::Right
+                                } else {
+                                    MouseButton::Left
+                                };
+                                output.push(InputEvent::MouseButton {
+                                    button,
+                                    pressed: true,
+                                });
+                                output.push(InputEvent::MouseButton {
+                                    button,
+                                    pressed: false,
+                                });
+                            }
+                        }
+                        self.touchpad.last_single = None;
+                        self.touchpad.last_two_mid = None;
+                    }
+                    self.touchpad.touch_down = down;
+                }
+                BTN_TOOL_FINGER => {
+                    if event.value != 0 && self.touchpad.tool_fingers < 2 {
+                        self.touchpad.tool_fingers = 1;
+                    } else if event.value == 0 && self.touchpad.tool_fingers == 1 {
+                        self.touchpad.tool_fingers = 0;
+                    }
+                }
+                BTN_TOOL_DOUBLETAP => {
+                    if event.value != 0 {
+                        self.touchpad.tool_fingers = 2;
+                        self.touchpad.tap_two_finger = true;
+                    } else if self.touchpad.tool_fingers == 2 {
+                        self.touchpad.tool_fingers = 1;
+                    }
+                }
+                BTN_TOOL_TRIPLETAP => {
+                    if event.value != 0 {
+                        self.touchpad.tool_fingers = 3;
+                    } else if self.touchpad.tool_fingers == 3 {
+                        self.touchpad.tool_fingers = 1;
+                    }
+                }
+                _ => {
+                    if let Some(mut button) = mouse_button(event.code) {
+                        if let Some(pressed) = key_pressed(event.value) {
+                            // 2-finger clickpad press maps to right-click.
+                            if button == MouseButton::Left {
+                                if pressed && self.touchpad.tool_fingers >= 2 {
+                                    button = MouseButton::Right;
+                                    self.touchpad.right_click_remapped = true;
+                                } else if !pressed && self.touchpad.right_click_remapped {
+                                    button = MouseButton::Right;
+                                    self.touchpad.right_click_remapped = false;
+                                }
+                            }
+                            self.touchpad.tap_start = None;
+                            output.push(InputEvent::MouseButton { button, pressed });
+                            if pressed {
+                                self.pressed_buttons.insert(button);
+                            } else {
+                                self.pressed_buttons.remove(&button);
+                            }
+                        }
+                    }
+                }
+            },
+            EV_ABS if self.is_touchpad => match event.code {
+                ABS_MT_SLOT => {
+                    if (0..10).contains(&event.value) {
+                        self.touchpad.mt_slot = event.value as usize;
+                    }
+                }
+                ABS_MT_TRACKING_ID => {
+                    let slot = self.touchpad.mt_slot;
+                    if slot < 10 {
+                        self.touchpad.mt_slots[slot].0 = event.value >= 0;
+                        if event.value >= 0
+                            && self.touchpad.mt_slots.iter().filter(|s| s.0).count() >= 2
+                        {
+                            self.touchpad.tap_two_finger = true;
+                        }
+                    }
+                }
+                ABS_MT_POSITION_X => {
+                    let slot = self.touchpad.mt_slot;
+                    if slot < 10 {
+                        self.touchpad.mt_slots[slot].0 = true;
+                        self.touchpad.mt_slots[slot].1 = event.value;
+                    }
+                    self.touchpad.abs_x = event.value;
+                }
+                ABS_MT_POSITION_Y => {
+                    let slot = self.touchpad.mt_slot;
+                    if slot < 10 {
+                        self.touchpad.mt_slots[slot].0 = true;
+                        self.touchpad.mt_slots[slot].2 = event.value;
+                    }
+                    self.touchpad.abs_y = event.value;
+                }
+                ABS_X => self.touchpad.abs_x = event.value,
+                ABS_Y => self.touchpad.abs_y = event.value,
+                _ => {}
+            },
             EV_KEY if self.is_mouse => {
                 if let Some(button) = mouse_button(event.code) {
                     if let Some(pressed) = key_pressed(event.value) {
@@ -160,6 +397,74 @@ impl Device {
                 _ => {}
             },
             EV_SYN if event.code == SYN_REPORT => {
+                if self.is_touchpad {
+                    let contacts = self.touchpad.active_contacts();
+                    let fingers = self.touchpad.effective_fingers(contacts.len());
+                    if fingers == 1 {
+                        self.touchpad.last_two_mid = None;
+                        let (x, y) = contacts
+                            .first()
+                            .copied()
+                            .unwrap_or((self.touchpad.abs_x, self.touchpad.abs_y));
+                        if let Some((_, sx, sy)) = self.touchpad.tap_start {
+                            let dist = (x - sx).abs().saturating_add((y - sy).abs());
+                            self.touchpad.tap_max_move = self.touchpad.tap_max_move.max(dist);
+                        }
+                        if let Some((lx, ly)) = self.touchpad.last_single {
+                            let rdx = x - lx;
+                            let rdy = y - ly;
+                            if rdx.abs() <= 300 && rdy.abs() <= 300 && (rdx != 0 || rdy != 0) {
+                                let speed = rdx.abs().saturating_add(rdy.abs());
+                                let gain = if speed > 16 {
+                                    4
+                                } else if speed > 6 {
+                                    3
+                                } else {
+                                    2
+                                };
+                                self.dx = self.dx.saturating_add(rdx.saturating_mul(gain));
+                                self.dy = self.dy.saturating_add(rdy.saturating_mul(gain));
+                            }
+                        }
+                        self.touchpad.last_single = Some((x, y));
+                    } else if fingers == 2 {
+                        self.touchpad.last_single = None;
+                        self.touchpad.tap_two_finger = true;
+                        let (mx, my) = if contacts.len() >= 2 {
+                            (
+                                (contacts[0].0 + contacts[1].0) / 2,
+                                (contacts[0].1 + contacts[1].1) / 2,
+                            )
+                        } else {
+                            (self.touchpad.abs_x, self.touchpad.abs_y)
+                        };
+                        if let Some((_, sx, sy)) = self.touchpad.tap_start {
+                            let dist = (mx - sx).abs().saturating_add((my - sy).abs());
+                            self.touchpad.tap_max_move = self.touchpad.tap_max_move.max(dist);
+                        }
+                        if let Some((lmx, lmy)) = self.touchpad.last_two_mid {
+                            let sx = mx - lmx;
+                            let sy = my - lmy;
+                            if sx.abs() <= 300 && sy.abs() <= 300 && (sx != 0 || sy != 0) {
+                                // Two-finger pan in 120ths: moving fingers up
+                                // (sy < 0) scrolls up (+y), moving right
+                                // (sx > 0) scrolls right (+x).
+                                if sy.abs() >= sx.abs() {
+                                    self.scroll_y_120ths = self
+                                        .scroll_y_120ths
+                                        .saturating_add((-sy).saturating_mul(4));
+                                } else {
+                                    self.scroll_x_120ths =
+                                        self.scroll_x_120ths.saturating_add(sx.saturating_mul(4));
+                                }
+                            }
+                        }
+                        self.touchpad.last_two_mid = Some((mx, my));
+                    } else {
+                        self.touchpad.last_single = None;
+                        self.touchpad.last_two_mid = None;
+                    }
+                }
                 if self.dx != 0 || self.dy != 0 {
                     output.push(InputEvent::MouseMove {
                         dx: self.dx,
@@ -258,7 +563,7 @@ impl EvdevCapture {
             last_reload: Instant::now(),
         };
         capture.reload()?;
-        if capture.devices.is_empty() {
+        if !capture.devices.iter().any(|device| !device.is_own_injector) {
             return Err(PlatformError::Capture(
                 "no keyboard or mouse evdev devices found; grant the daemon access to /dev/input"
                     .into(),
@@ -295,33 +600,37 @@ impl EvdevCapture {
     }
 
     fn set_devices_exclusive(&mut self, exclusive: bool) -> Result<(), PlatformError> {
+        let value = i32::from(exclusive);
+        let mut grabbed_any = false;
         for device in &mut self.devices {
-            if device.grabbed == exclusive {
+            if device.is_own_injector || device.grabbed == exclusive {
+                if device.grabbed {
+                    grabbed_any = true;
+                }
                 continue;
             }
-            let value = i32::from(exclusive);
             let result = unsafe { libc::ioctl(device.file.as_raw_fd(), EVIOCGRAB, value) };
             if result < 0 {
-                if exclusive {
-                    for previous in &mut self.devices {
-                        if previous.grabbed {
-                            unsafe {
-                                let _ = libc::ioctl(previous.file.as_raw_fd(), EVIOCGRAB, 0);
-                            }
-                            previous.grabbed = false;
-                        }
-                    }
+                // Best-effort per device: a power button or AVRCP headset
+                // already grabbed by logind/bluetoothd returns EBUSY and
+                // must never abort grabbing the real mouse/touchpad/keyboard.
+                tracing::debug!(
+                    device = %device.path.display(),
+                    exclusive,
+                    error = %io::Error::last_os_error(),
+                    "evdev EVIOCGRAB skipped on one node"
+                );
+                if !exclusive {
+                    device.grabbed = false;
                 }
-                self.exclusive = false;
-                return Err(PlatformError::Capture(format!(
-                    "{} EVIOCGRAB failed: {}",
-                    if exclusive { "enable" } else { "disable" },
-                    io::Error::last_os_error()
-                )));
+                continue;
             }
             device.grabbed = exclusive;
+            if exclusive {
+                grabbed_any = true;
+            }
         }
-        self.exclusive = exclusive;
+        self.exclusive = exclusive && grabbed_any;
         Ok(())
     }
 
@@ -382,34 +691,50 @@ impl EvdevCapture {
     }
 
     fn accept_event(&mut self, source: usize, event: InputEvent) -> Option<InputEvent> {
-        match event {
-            InputEvent::Key(KeyEvent { usage, pressed, .. }) => {
-                if pressed {
-                    self.pressed_keys.insert(usage).then_some(event)
-                } else if self
-                    .devices
-                    .iter()
-                    .enumerate()
-                    .any(|(index, device)| index != source && device.pressed_keys.contains(&usage))
-                {
-                    None
-                } else {
-                    self.pressed_keys.remove(&usage).then_some(event)
+        let accepted =
+            match event {
+                InputEvent::Key(KeyEvent { usage, pressed, .. }) => {
+                    if pressed {
+                        self.pressed_keys.insert(usage).then_some(event)
+                    } else if self.devices.iter().enumerate().any(|(index, device)| {
+                        index != source && device.pressed_keys.contains(&usage)
+                    }) {
+                        None
+                    } else {
+                        self.pressed_keys.remove(&usage).then_some(event)
+                    }
                 }
-            }
-            InputEvent::MouseButton { button, pressed } => {
-                if pressed {
-                    self.pressed_buttons.insert(button).then_some(event)
-                } else if self.devices.iter().enumerate().any(|(index, device)| {
-                    index != source && device.pressed_buttons.contains(&button)
-                }) {
-                    None
-                } else {
-                    self.pressed_buttons.remove(&button).then_some(event)
+                InputEvent::MouseButton { button, pressed } => {
+                    if pressed {
+                        self.pressed_buttons.insert(button).then_some(event)
+                    } else if self.devices.iter().enumerate().any(|(index, device)| {
+                        index != source && device.pressed_buttons.contains(&button)
+                    }) {
+                        None
+                    } else {
+                        self.pressed_buttons.remove(&button).then_some(event)
+                    }
                 }
+                _ => Some(event),
+            };
+        if let Some(ev) = &accepted {
+            match ev {
+                InputEvent::Key(_) => {
+                    EVDEV_KEY.fetch_add(1, Ordering::Relaxed);
+                }
+                InputEvent::MouseButton { .. } => {
+                    EVDEV_BUTTON.fetch_add(1, Ordering::Relaxed);
+                }
+                InputEvent::MouseMove { .. } => {
+                    EVDEV_MOTION.fetch_add(1, Ordering::Relaxed);
+                }
+                InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. } => {
+                    EVDEV_WHEEL.fetch_add(1, Ordering::Relaxed);
+                }
+                InputEvent::Pinch { .. } | InputEvent::PinchEnd => {}
             }
-            _ => Some(event),
         }
+        accepted
     }
 }
 
@@ -437,12 +762,13 @@ impl CaptureBackend for EvdevCapture {
             }
             for device in &mut self.devices {
                 if let Some(event) = device.queue.pop_front() {
+                    EVDEV_KEY.fetch_add(1, Ordering::Relaxed);
                     return Ok(event);
                 }
             }
 
             if self.devices.is_empty() {
-                std::thread::sleep(std::time::Duration::from_millis(250));
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 self.reload()?;
                 continue;
             }
@@ -456,7 +782,10 @@ impl CaptureBackend for EvdevCapture {
                     revents: 0,
                 })
                 .collect::<Vec<_>>();
-            let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, 250) };
+            // 8ms poll cadence: `exclusive` transitions (EVIOCGRAB engage /
+            // release) take effect within one frame instead of stalling the
+            // first 250ms of a crossing or return.
+            let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, 8) };
             if result < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
@@ -480,6 +809,15 @@ impl CaptureBackend for EvdevCapture {
                 loop {
                     match read_event(&self.devices[index].file) {
                         Ok(Some(event)) => {
+                            if self.devices[index].is_own_injector {
+                                if self.exclusive
+                                    && event.type_ == EV_SYN
+                                    && event.code == SYN_REPORT
+                                {
+                                    EVDEV_INBOUND_DIVERTED.fetch_add(1, Ordering::Relaxed);
+                                }
+                                continue;
+                            }
                             let produced = self.devices[index].process(event);
                             let accepted = produced
                                 .into_iter()
@@ -740,6 +1078,9 @@ mod tests {
             file: File::open("/dev/null").unwrap(),
             is_keyboard: true,
             is_mouse: true,
+            is_touchpad: false,
+            is_own_injector: false,
+            touchpad: TouchpadState::default(),
             dx: 0,
             dy: 0,
             scroll_x_120ths: 0,
@@ -751,6 +1092,51 @@ mod tests {
             pressed_buttons: BTreeSet::new(),
             grabbed: false,
         }
+    }
+
+    #[test]
+    fn touchpad_single_finger_moves_and_two_finger_pans() {
+        let mut device = test_device();
+        device.is_touchpad = true;
+        let ev = |type_, code, value| RawInputEvent {
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_,
+            code,
+            value,
+        };
+        let syn = ev(EV_SYN, SYN_REPORT, 0);
+        // 1-finger touch and move right by 10 units.
+        let _ = device.process(ev(EV_KEY, BTN_TOUCH, 1));
+        let _ = device.process(ev(EV_KEY, BTN_TOOL_FINGER, 1));
+        let _ = device.process(ev(EV_ABS, ABS_MT_SLOT, 0));
+        let _ = device.process(ev(EV_ABS, ABS_MT_TRACKING_ID, 1));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_X, 100));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_Y, 200));
+        assert!(device.process(syn).is_empty());
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_X, 110));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_Y, 200));
+        assert_eq!(
+            device.process(syn),
+            vec![InputEvent::MouseMove { dx: 30, dy: 0 }]
+        );
+        // 2-finger pan upward by 20 units -> SmoothWheel +80.
+        let _ = device.process(ev(EV_KEY, BTN_TOOL_DOUBLETAP, 1));
+        let _ = device.process(ev(EV_ABS, ABS_MT_SLOT, 1));
+        let _ = device.process(ev(EV_ABS, ABS_MT_TRACKING_ID, 2));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_X, 210));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_Y, 200));
+        assert!(device.process(syn).is_empty());
+        let _ = device.process(ev(EV_ABS, ABS_MT_SLOT, 0));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_Y, 180));
+        let _ = device.process(ev(EV_ABS, ABS_MT_SLOT, 1));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_Y, 180));
+        assert_eq!(
+            device.process(syn),
+            vec![InputEvent::SmoothWheel { x: 0, y: 80 }]
+        );
     }
 
     #[test]

@@ -957,11 +957,25 @@ impl EdgeRouter {
                         self.cursor_y = next_y as u32;
                         // Inside movement cancels any unarmed escape run
                         // AND any armed brush run: only sustained home-ward
-                        // pressure returns.
-                        self.return_accum = 0;
-                        self.return_edge = None;
-                        self.return_edge_accum = 0;
-                        self.return_run_since = None;
+                        // pressure returns. Sliding along the border itself
+                        // (dx=0 while already clamped at x=0 or width-1) is
+                        // diagonal edge pressure, not inward retreat, and
+                        // keeps the accumulated return run intact.
+                        let active_return_edge = self.return_edge.or(self.entry_edge);
+                        if active_return_edge.is_none_or(|edge| {
+                            distance_from_edge(
+                                edge,
+                                self.cursor_x,
+                                self.cursor_y,
+                                remote.width,
+                                remote.height,
+                            ) > 2
+                        }) {
+                            self.return_accum = 0;
+                            self.return_edge = None;
+                            self.return_edge_accum = 0;
+                            self.return_run_since = None;
+                        }
                         // Settling inside arms the entry edge (see above):
                         // a firm flick arms in one event, resting noise
                         // never reaches the threshold.
@@ -988,10 +1002,11 @@ impl EdgeRouter {
                         // Home-facing edges return. Beyond the arranged
                         // facing edge: on a lone-peer Double link in
                         // Mirror style BOTH horizontal edges return once
-                        // the drive has settled (armed), so a drive
-                        // entered at either peer edge comes home through
-                        // either one — the inverse double-edge feel (exit
-                        // Left, enter Right, push Right to come home).
+                        // the drive has settled (armed), and the entry edge
+                        // itself always faces home for the escape hatch, so
+                        // a drive entered at either peer edge comes home
+                        // through either one — the inverse double-edge feel
+                        // (exit Left, enter Right, push Right to come home).
                         // Unarmed drives still clamp on the second edge
                         // (fresh-entry fling tails must never return), and
                         // Fixed styles return through the selected edge
@@ -1000,7 +1015,7 @@ impl EdgeRouter {
                             Some(fixed) => edge == fixed,
                             None => {
                                 self.layout.neighbor_for_edge(from, edge) == Some(self.local_screen)
-                                    || (self.return_armed
+                                    || ((self.return_armed || self.entry_edge == Some(edge))
                                         && self.edge_mode == EdgeMode::Double
                                         && matches!(edge, Edge::Left | Edge::Right)
                                         && from != self.local_screen
@@ -1134,8 +1149,21 @@ impl EdgeRouter {
             self.local_cursor_y = self.cursor_y;
             // Back inside: any outward run restarts from zero, so drift
             // and jitter can never save up for a phantom crossing.
-            self.push_edge = None;
-            self.push_accum = 0;
+            // Sliding along the border itself (dx=0 while already at
+            // x=0 or width-1) is diagonal edge pressure, not inward
+            // retreat, and keeps the push run alive.
+            if self.push_edge.is_none_or(|edge| {
+                distance_from_edge(
+                    edge,
+                    self.cursor_x,
+                    self.cursor_y,
+                    screen.width,
+                    screen.height,
+                ) > 2
+            }) {
+                self.push_edge = None;
+                self.push_accum = 0;
+            }
             // A pull comfortably back inside lifts the post-return
             // refractory: the next deliberate push out may cross again.
             if let Some(suppressed) = self.post_return_edge {
@@ -1887,6 +1915,53 @@ mod tests {
         router.return_to_local(ScreenId(2), 10, 20).unwrap();
         assert_eq!(router.active_remote(), None);
         assert_eq!(router.cursor_position(), (10, 20));
+    }
+
+    #[test]
+    fn diagonal_edge_slide_preserves_push_and_unarmed_escape_works_both_edges() {
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_edge_mode(EdgeMode::Double);
+        router.set_double_style(DoubleEdgeStyle::Mirror);
+        router.place_local_cursor(0, 540).unwrap();
+        // Push 10px into Left edge (< EDGE_PUSH_PX=16), then slide
+        // vertically along x=0 (dx=0, dy=4), then push 8px more: must
+        // cross instead of wiping the run on the vertical slide.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -10, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 0, dy: 4 }),
+            RoutedEvent::Local(_)
+        ));
+        let crossed = router.route(InputEvent::MouseMove { dx: -8, dy: 0 });
+        assert!(
+            matches!(
+                crossed,
+                RoutedEvent::Handoff {
+                    edge: Edge::Left,
+                    target_x: 1887,
+                    ..
+                }
+            ),
+            "diagonal push must cross Left into peer Right, got {crossed:?}"
+        );
+        // Now at peer's Right edge (x=1887, unarmed) with peer arranged
+        // at x=1: an immediate unarmed shove back out Right (>=
+        // RETURN_PUSH_PX) must escape home through the entry edge.
+        let escaped = router.route(InputEvent::MouseMove { dx: 200, dy: 0 });
+        assert!(
+            matches!(
+                escaped,
+                RoutedEvent::ReturnHome {
+                    edge: Edge::Right,
+                    armed: false,
+                    ..
+                }
+            ),
+            "unarmed escape on Right entry edge must return home, got {escaped:?}"
+        );
     }
 
     #[test]

@@ -89,46 +89,100 @@ pub fn set_exclusive(exclusive: bool) {
 pub fn set_exclusive(_exclusive: bool) {}
 
 #[cfg(target_os = "linux")]
+static LAST_SCREEN_WIDTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(target_os = "linux")]
+static LAST_SCREEN_HEIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record truthful screen dimensions for kernel-level uinput warps on
+/// Linux (used by the headless receiver daemon, which has no `$DISPLAY`
+/// of its own).
+#[cfg(target_os = "linux")]
+pub fn note_screen_size(width: u32, height: u32) {
+    if width > 0 && height > 0 {
+        LAST_SCREEN_WIDTH.store(width, std::sync::atomic::Ordering::Relaxed);
+        LAST_SCREEN_HEIGHT.store(height, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// True when the current Linux desktop session runs under a Wayland
+/// compositor (`WAYLAND_DISPLAY` set or `XDG_SESSION_TYPE=wayland`).
+/// In a Wayland session `$DISPLAY` points at rootless `Xwayland`, which
+/// sees no global desktop input, cannot grab hardware devices, and
+/// ignores `XWarpPointer` for the visible cursor.
+#[cfg(target_os = "linux")]
+pub fn is_wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some_and(|val| !val.is_empty())
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|val| val.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
 pub fn warp_cursor(x: u32, y: u32) -> Result<(), PlatformError> {
     warp_cursor_on(None, x, y)
 }
 
-/// Warp the pointer on an explicitly named X display. Headless daemons
-/// have no DISPLAY of their own: the session side publishes its display
-/// name (see the geometry sidecar) and grants access, so the receiver
-/// can still place the OS cursor exactly on the entry point.
+/// Warp the pointer on Linux. Uses the kernel-level `TheKVM Virtual
+/// AbsMouse` uinput device FIRST (which moves the real visible cursor
+/// on BOTH Wayland compositors and Xorg without needing `$DISPLAY` or
+/// `xhost`), and also performs X11 `warp_pointer` best-effort so
+/// Xwayland / X11 clients see the updated root coordinate.
 #[cfg(target_os = "linux")]
 pub fn warp_cursor_on(display: Option<&str>, x: u32, y: u32) -> Result<(), PlatformError> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt;
 
-    let (connection, screen) = x11rb::connect(display).map_err(|error| {
-        PlatformError::Capture(format!("connect to X11 for pointer warp: {error}"))
-    })?;
-    let root = connection
-        .setup()
-        .roots
-        .get(screen)
-        .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?
-        .root;
-    connection
-        .warp_pointer(
-            x11rb::NONE,
-            root,
-            0,
-            0,
-            0,
-            0,
-            x.min(i16::MAX as u32) as i16,
-            y.min(i16::MAX as u32) as i16,
-        )
-        .map_err(|error| PlatformError::Capture(format!("warp X11 pointer: {error}")))?
-        .check()
-        .map_err(|error| PlatformError::Capture(format!("warp X11 pointer: {error}")))?;
-    connection
-        .flush()
-        .map_err(|error| PlatformError::Capture(format!("flush X11 pointer warp: {error}")))?;
-    Ok(())
+    let mut width = LAST_SCREEN_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
+    let mut height = LAST_SCREEN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+
+    let x11_result: Result<(), PlatformError> = (|| {
+        let (connection, screen) = x11rb::connect(display).map_err(|error| {
+            PlatformError::Capture(format!("connect to X11 for pointer warp: {error}"))
+        })?;
+        let info = connection
+            .setup()
+            .roots
+            .get(screen)
+            .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?;
+        if (width == 0 || height == 0) && info.width_in_pixels > 0 && info.height_in_pixels > 0 {
+            width = info.width_in_pixels as u32;
+            height = info.height_in_pixels as u32;
+            note_screen_size(width, height);
+        }
+        let root = info.root;
+        connection
+            .warp_pointer(
+                x11rb::NONE,
+                root,
+                0,
+                0,
+                0,
+                0,
+                x.min(i16::MAX as u32) as i16,
+                y.min(i16::MAX as u32) as i16,
+            )
+            .map_err(|error| PlatformError::Capture(format!("warp X11 pointer: {error}")))?
+            .check()
+            .map_err(|error| PlatformError::Capture(format!("warp X11 pointer: {error}")))?;
+        connection
+            .flush()
+            .map_err(|error| PlatformError::Capture(format!("flush X11 pointer warp: {error}")))?;
+        Ok(())
+    })();
+
+    let uinput_result = if width > 0 && height > 0 {
+        crate::inject::warp_cursor_uinput(x, y, width, height)
+    } else {
+        Err(PlatformError::Uinput(
+            "screen dimensions unknown for uinput warp".into(),
+        ))
+    };
+
+    if uinput_result.is_ok() || x11_result.is_ok() {
+        Ok(())
+    } else {
+        uinput_result.or(x11_result)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -136,9 +190,14 @@ pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt;
 
-    // This is only a best-effort initialization aid for X11. A negative root
-    // coordinate can represent a monitor left/above the X11 origin and
-    // cannot safely be interpreted as a single-screen layout coordinate.
+    // In a Wayland session, `$DISPLAY` is Xwayland, whose root pointer
+    // coordinate is frozen whenever the cursor is not over a legacy X11
+    // window. Returning Xwayland's stale coordinate resets the edge
+    // router every 50ms and triggers mid-screen exits.
+    if is_wayland_session() {
+        return Ok(None);
+    }
+
     let (connection, screen) = x11rb::connect(None).map_err(|error| {
         PlatformError::Capture(format!("connect to X11 for pointer query: {error}"))
     })?;
@@ -176,10 +235,10 @@ pub fn screen_size() -> Result<Option<(u32, u32)>, PlatformError> {
     if info.width_in_pixels == 0 || info.height_in_pixels == 0 {
         return Ok(None);
     }
-    Ok(Some((
-        info.width_in_pixels as u32,
-        info.height_in_pixels as u32,
-    )))
+    let width = info.width_in_pixels as u32;
+    let height = info.height_in_pixels as u32;
+    note_screen_size(width, height);
+    Ok(Some((width, height)))
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
@@ -209,12 +268,21 @@ pub fn backend_census() -> (u64, u64, u64, u64, u64, u64, u64) {
     (0, 0, 0, 0, 0, 0, 0)
 }
 
-/// Linux census: X11 translated arrivals fill the key/button/move/wheel
-/// slots (raw slots stay zero — no hook/RAW split here).
+/// Linux census: sums X11 and evdev translated arrivals into the
+/// key/button/move/wheel slots.
 #[cfg(target_os = "linux")]
 pub fn backend_census() -> (u64, u64, u64, u64, u64, u64, u64) {
-    let (key, button, motion, wheel) = crate::x11_capture::census();
-    (key, button, motion, wheel, 0, 0, 0)
+    let (xk, xb, xm, xw) = crate::x11_capture::census();
+    let (ek, eb, em, ew) = crate::evdev_capture::census();
+    (
+        xk.saturating_add(ek),
+        xb.saturating_add(eb),
+        xm.saturating_add(em),
+        xw.saturating_add(ew),
+        0,
+        0,
+        0,
+    )
 }
 
 /// Inbound-while-driving signal for the topology child's auto-yield:
@@ -235,6 +303,7 @@ pub fn inbound_while_driving_count() -> u64 {
 #[cfg(target_os = "linux")]
 pub fn inbound_while_driving_count() -> u64 {
     crate::x11_capture::inbound_diverted_count()
+        .saturating_add(crate::evdev_capture::inbound_diverted_count())
 }
 
 /// Platforms without a suppression grab never divert inbound input.
@@ -254,32 +323,45 @@ pub use crate::evdev_capture::EvdevCapture as DefaultCapture;
 #[cfg(target_os = "windows")]
 pub use win32_hooks::Win32Capture as DefaultCapture;
 
-/// Select the sender-side input backend. A logged-in Linux Wayland topology
-/// session can use the compositor's portal/libei API because `/dev/input` is
-/// not a valid or safe capture mechanism for ordinary desktop applications.
-/// XInput2 is suitable for both topology and fixed-peer X11 sessions, so a
-/// logged-in X11 controller does not need privileged evdev access. The evdev
-/// backend remains the fallback for headless/pre-login sessions and systems
-/// without a working user-session backend.
+/// Select the sender-side input backend. On Linux Wayland sessions,
+/// `$DISPLAY` is rootless `Xwayland`, which cannot capture desktop-wide
+/// input or grab physical devices, so when the portal is unavailable we
+/// prefer `EvdevCapture` (`/dev/input/event*`) before falling back to
+/// `X11Capture`. On native X11 sessions `X11Capture` runs first with
+/// `EvdevCapture` as fallback.
 pub fn create_capture(
     _prefer_wayland: bool,
     _exclusive: bool,
 ) -> Result<Box<dyn CaptureBackend>, PlatformError> {
     #[cfg(target_os = "linux")]
-    if _prefer_wayland {
-        match crate::wayland_capture::WaylandCapture::create(_exclusive, true) {
-            Ok(capture) => {
-                tracing::info!("using Wayland input-capture portal backend");
-                return Ok(Box::new(capture));
+    {
+        crate::inject::prewarm_abs_pointer();
+        let wayland = _prefer_wayland || is_wayland_session();
+        if wayland {
+            match crate::wayland_capture::WaylandCapture::create(_exclusive, true) {
+                Ok(capture) => {
+                    tracing::info!("using Wayland input-capture portal backend");
+                    return Ok(Box::new(capture));
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "Wayland input-capture portal unavailable; trying evdev")
+                }
             }
-            Err(error) => {
-                tracing::debug!(%error, "Wayland input-capture portal unavailable; trying evdev")
+            if is_wayland_session() {
+                match DefaultCapture::create() {
+                    Ok(capture) => {
+                        tracing::info!("using evdev kernel capture backend for Wayland session");
+                        return Ok(Box::new(capture));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "evdev capture unavailable in Wayland session; falling back to Xwayland"
+                        );
+                    }
+                }
             }
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
         match crate::x11_capture::X11Capture::create() {
             Ok(capture) => {
                 tracing::info!("using XInput2 raw capture backend");

@@ -2106,8 +2106,8 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // show-off re-crossings (several per second) pass at once instead
     // of queueing behind the old window. No count or time caps beyond
     // these two sub-second windows: deliberate motion always crosses.
-    router.set_return_hold(Duration::from_millis(60));
-    router.set_handoff_grace(Duration::from_millis(100));
+    router.set_return_hold(Duration::from_millis(0));
+    router.set_handoff_grace(Duration::from_millis(40));
     match kvm_platform::capture::screen_size() {
         Ok(Some((width, height))) => match router.adopt_local_screen_size(width, height) {
             Some((w, h)) => {
@@ -4749,6 +4749,25 @@ async fn handle_topology_event(
             // design, and wheels have their own counter above.
             if matches!(event, InputEvent::MouseMove { .. }) {
                 report_stuck_edge(router);
+                // Wayland compositors expose no client pointer query and
+                // apply their own acceleration curve, so an unanchored
+                // virtual cursor would otherwise drift from the visible
+                // one (exiting mid-screen or at a stale height). Lock the
+                // visible cursor to the router's coordinate via the
+                // kernel-level uinput absolute pointer on every local
+                // move so the visible cursor and the edge router stay 1:1.
+                #[cfg(target_os = "linux")]
+                if kvm_platform::capture::is_wayland_session() {
+                    let (cx, cy) = router.cursor_position();
+                    if let Some(screen) = router.layout().screen(router.local_screen()) {
+                        let _ = kvm_platform::inject::sync_cursor_uinput(
+                            cx,
+                            cy,
+                            screen.width,
+                            screen.height,
+                        );
+                    }
+                }
             }
             // A compositor portal may have activated a barrier even when the
             // topology has no neighbor on that edge. Release it so the local
@@ -5301,6 +5320,25 @@ async fn handle_topology_event(
                 }
             }
             if let Some(session) = session {
+                // Snap the departing local cursor right to the exit
+                // border before engaging suppression so the cursor never
+                // appears stranded mid-screen on the exited machine.
+                if let Some(local) = router.layout().screen(router.local_screen()) {
+                    let (lx, ly) = router.local_cursor_position();
+                    let (ex, ey) = match edge {
+                        kvm_core::Edge::Left => (0, ly.min(local.height.saturating_sub(1))),
+                        kvm_core::Edge::Right => (
+                            local.width.saturating_sub(1),
+                            ly.min(local.height.saturating_sub(1)),
+                        ),
+                        kvm_core::Edge::Top => (lx.min(local.width.saturating_sub(1)), 0),
+                        kvm_core::Edge::Bottom => (
+                            lx.min(local.width.saturating_sub(1)),
+                            local.height.saturating_sub(1),
+                        ),
+                    };
+                    let _ = capture_control.warp_cursor(ex, ey);
+                }
                 capture_control.set_exclusive(true)?;
                 *suppression_requested = true;
                 // Fresh episode: grace until the first Pong (see the
@@ -9027,43 +9065,20 @@ async fn handle_connection(
                 "inbound link live; waiting for the peer's dial-back for two-way edge",
             );
             // Motion-lane accept (see open_episode_stream): the sender
-            // opens its lane right after reading our Accepted, so accept
-            // order on this association is deterministic (episode first,
-            // lane second — episodes are served sequentially, so this
-            // accept pairs with THIS episode's lane exactly). A missing
-            // lane DOWNGrades the episode instead of ending it: the sender
-            // falls back to the episode stream when ITS open fails (see
-            // open_episode_stream), so a lane that never arrives means the
-            // sender is already streaming motion past us on the bidi
-            // stream — killing the episode here murders a healthy drive
-            // (the "peer closed; returned control locally" flap a second
-            // into every crossing). Only a lane the sender actually
-            // opened needs reading, and such a lane always becomes
-            // acceptable — an accept timeout then proves none was opened.
-            // Registration above already ran, so even a laneless episode
-            // stays visible in Status instead of blinding the dial-back.
-            let mut motion_recv: Option<quinn::RecvStream> = if hello.motion_lane {
-                match tokio::time::timeout(Duration::from_secs(10), conn.accept_uni()).await {
-                    Ok(Ok(lane)) => {
-                        tracing::info!(
-                            peer = %peer_fingerprint,
-                            stream = ?lane.id(),
-                            "episode motion lane accepted",
-                        );
-                        Some(lane)
-                    }
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "motion lane accept failed; episode proceeds laneless");
-                        None
-                    }
-                    Err(_) => {
-                        tracing::warn!("motion lane accept timed out; episode proceeds laneless");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            // opens its lane right after reading our Accepted and primes
+            // it with a Ping frame so QUIC transmits the unidirectional
+            // STREAM header immediately. We accept the lane LAZILY inside
+            // the session select loop below instead of blocking here:
+            // in Quinn, `open_uni()` sends no wire frame until bytes are
+            // written, so blocking here before the loop stalled
+            // PointerHandoff (the entry cursor warp!) for 10 full seconds
+            // and then timed out `motion_recv` to `None`, sending every
+            // subsequent trackpad scroll event on `motion_send` into a
+            // black hole. Accepting inside `select!` processes
+            // PointerHandoff in 0ms and accepts the lane whenever its
+            // first byte arrives.
+            let mut motion_recv: Option<quinn::RecvStream> = None;
+            let mut motion_lane_closed = !hello.motion_lane;
             let mut seen_sequences = BTreeSet::new();
             let mut motion_sequence = MotionSequence::default();
             let mut last_activity = Instant::now();
@@ -9342,14 +9357,30 @@ async fn handle_connection(
                                         &peer_fingerprint,
                                         &peer_screen_geometry,
                                     );
-                                    tracing::info!(
-                                        width = size.0,
-                                        height = size.1,
-                                        source,
-                                        "announcing drive target size to helpers",
-                                    );
-                                    injector.set_target_size(size.0, size.1);
+                                    // When UDP motion is active, pointer deltas
+                                    // arrive on the dedicated UDP listener's
+                                    // helper in relative mode; arming absolute
+                                    // mode on this stream's helper splits
+                                    // cursor state across two helpers so any
+                                    // stream fallback teleports back to the
+                                    // entry warp. Keep both helpers relative.
+                                    if hello.udp_motion {
+                                        injector.set_target_size(0, 0);
+                                    } else {
+                                        tracing::info!(
+                                            width = size.0,
+                                            height = size.1,
+                                            source,
+                                            "announcing drive target size to helpers",
+                                        );
+                                        injector.set_target_size(size.0, size.1);
+                                    }
                                 }
+                                #[cfg(target_os = "linux")]
+                                kvm_platform::capture::note_screen_size(
+                                    truthful.width,
+                                    truthful.height,
+                                );
                                 // Proves entry exactness per crossing: the OS
                                 // cursor was just placed here, so a later
                                 // "exited mid-screen" report can be checked
@@ -9658,29 +9689,63 @@ async fn handle_connection(
                         }
                     }
                     motion_message = async {
-                        // Disabled arm when no lane was negotiated: pending
-                        // forever so the select below never fires it.
+                        // Single arm for both accepting and reading the
+                        // motion lane: accepts lazily once the sender writes
+                        // its first byte, then reads frames for the rest of
+                        // the episode.
                         match motion_recv.as_mut() {
-                            Some(lane) => read_frame(lane).await,
+                            Some(lane) => Ok(read_frame(lane).await),
+                            None if !motion_lane_closed => Err(conn.accept_uni().await),
                             None => std::future::pending().await,
                         }
                     } => {
-                        let Some(message) = motion_message.inspect_err(|error| {
-                            end_reason = "motion lane read failed";
-                            let _ = error;
-                        })?
-                        else {
-                            // The sender finishes the lane at episode
-                            // teardown: park the arm and let the episode
-                            // stream close (ReleaseAll/FIN) end the
-                            // session normally.
-                            end_reason = "peer finished the motion lane";
-                            motion_recv = None;
-                            continue;
+                        let message = match motion_message {
+                            Err(Ok(lane)) => {
+                                tracing::info!(
+                                    peer = %peer_fingerprint,
+                                    stream = ?lane.id(),
+                                    "episode motion lane accepted",
+                                );
+                                motion_recv = Some(lane);
+                                continue;
+                            }
+                            Err(Err(error)) => {
+                                tracing::warn!(
+                                    %error,
+                                    "motion lane accept failed; episode proceeds laneless"
+                                );
+                                motion_lane_closed = true;
+                                continue;
+                            }
+                            Ok(Ok(Some(message))) => message,
+                            Ok(Ok(None)) => {
+                                // The sender finishes the lane at episode
+                                // teardown: park the arm and let the episode
+                                // stream close (ReleaseAll/FIN) end the
+                                // session normally.
+                                end_reason = "peer finished the motion lane";
+                                motion_recv = None;
+                                motion_lane_closed = true;
+                                continue;
+                            }
+                            Ok(Err(error)) => {
+                                tracing::warn!(
+                                    %error,
+                                    "motion lane read failed; continuing on the episode stream"
+                                );
+                                motion_recv = None;
+                                motion_lane_closed = true;
+                                continue;
+                            }
                         };
                         last_activity = Instant::now();
                         injector.ensure_session()?;
                         match message {
+                            WireMessage::Ping { .. } => {
+                                // Priming frame sent by open_episode_stream
+                                // so Quinn transmits the STREAM header
+                                // immediately on open: absorbed quietly.
+                            }
                             WireMessage::Input(packet) => {
                                 // Byte-identical handling to the episode
                                 // stream arm above: the sender guarantees
@@ -9995,14 +10060,16 @@ async fn process_remote_input(
         *dropped_duplicate += 1;
         return Ok(false);
     }
-    if matches!(
-        packet.event,
-        InputEvent::MouseMove { .. } | InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
-    ) && !motion_sequence.accept(packet.sequence)
+    if matches!(packet.event, InputEvent::MouseMove { .. })
+        && !motion_sequence.accept(packet.sequence)
     {
         // QUIC DATAGRAM is intentionally unordered and lossy. Applying an
         // older motion after a newer one can visibly move the cursor backward,
         // especially during a topology handoff, so stale motion is discarded.
+        // Wheel / SmoothWheel ride ordered QUIC streams (the motion lane or
+        // the episode stream when a key is held) and must NEVER be dropped
+        // here: cross-stream sequence interleaving between the bidi stream
+        // and the motion lane would otherwise eat scroll events.
         *dropped_stale += 1;
         return Ok(false);
     }
@@ -11212,9 +11279,30 @@ async fn open_episode_stream(
             // slow-first-entry shape on a fresh association.
             let motion_send = if motion_lane {
                 match tokio::time::timeout(Duration::from_millis(800), conn.open_uni()).await {
-                    Ok(Ok(lane)) => {
-                        tracing::debug!(stream = ?lane.id(), "episode motion lane opened");
-                        Some(lane)
+                    Ok(Ok(mut lane)) => {
+                        // In Quinn, `open_uni()` allocates the stream ID
+                        // locally without transmitting a STREAM frame on the
+                        // wire until data is written. Prime the lane with a
+                        // Ping frame so the receiver's `accept_uni()` wakes
+                        // immediately instead of timing out before the user
+                        // scrolls.
+                        match tokio::time::timeout(
+                            Duration::from_millis(200),
+                            write_frame(&mut lane, &WireMessage::Ping { nonce: 0 }),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                tracing::debug!(stream = ?lane.id(), "episode motion lane opened");
+                                Some(lane)
+                            }
+                            _ => {
+                                tracing::info!(
+                                    "motion lane prime failed; episode proceeds laneless"
+                                );
+                                None
+                            }
+                        }
                     }
                     Ok(Err(error)) => {
                         tracing::info!(%error, "motion lane open failed; episode proceeds laneless");

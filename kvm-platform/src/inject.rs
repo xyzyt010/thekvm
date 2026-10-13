@@ -179,6 +179,10 @@ mod linux_uinput {
                 unsafe { libc::ioctl(mouse.as_raw_fd(), UI_DEV_DESTROY) };
                 return Err(error);
             }
+            // Pre-warm the process-wide absolute warp device alongside
+            // the relative mouse/keyboard so udev/libinput discovers all
+            // three before the first crossing arrives.
+            prewarm_abs_pointer();
 
             // udev/logind enumeration is asynchronous. This small delay makes
             // the first event reliable on greeters during early boot.
@@ -203,15 +207,29 @@ mod linux_uinput {
             file.write_all(&event_bytes(EV_SYN, 0, SYN_REPORT))
         }
 
+        fn emit_batch(file: &mut File, events: &[(u16, u16, i32)]) -> std::io::Result<()> {
+            if events.is_empty() {
+                return Ok(());
+            }
+            let mut buf = Vec::with_capacity((events.len() + 1) * 24);
+            for &(event_type, code, value) in events {
+                buf.extend_from_slice(&event_bytes(event_type, code, value));
+            }
+            buf.extend_from_slice(&event_bytes(EV_SYN, 0, SYN_REPORT));
+            file.write_all(&buf)
+        }
+
         pub fn send(&mut self, event: InputEvent) -> Result<(), PlatformError> {
             match event {
                 InputEvent::MouseMove { dx, dy } => {
+                    let mut batch = Vec::with_capacity(2);
                     if dx != 0 {
-                        Self::emit(&mut self.mouse, EV_REL, REL_X, dx).map_err(io_error)?;
+                        batch.push((EV_REL, REL_X, dx));
                     }
                     if dy != 0 {
-                        Self::emit(&mut self.mouse, EV_REL, REL_Y, dy).map_err(io_error)?;
+                        batch.push((EV_REL, REL_Y, dy));
                     }
+                    Self::emit_batch(&mut self.mouse, &batch).map_err(io_error)?;
                 }
                 InputEvent::MouseButton { button, pressed } => {
                     let code = button_code(button);
@@ -224,60 +242,51 @@ mod linux_uinput {
                     }
                 }
                 InputEvent::Wheel(delta) => {
-                    // Detent wheel dual-reports legacy + hi-res, exactly like
-                    // real high-resolution hardware: modern stacks (libinput)
-                    // consume the hi-res axis, legacy-only stacks the detent.
+                    // Detent wheel dual-reports legacy + hi-res in a single
+                    // SYN_REPORT frame, exactly like real high-resolution
+                    // hardware: modern stacks (libinput) consume the hi-res
+                    // axis, legacy-only stacks consume the detent.
+                    let mut batch = Vec::with_capacity(4);
                     if delta.y != 0 {
-                        Self::emit(&mut self.mouse, EV_REL, REL_WHEEL, i32::from(delta.y))
-                            .map_err(io_error)?;
-                        Self::emit(
-                            &mut self.mouse,
+                        batch.push((EV_REL, REL_WHEEL, i32::from(delta.y)));
+                        batch.push((
                             EV_REL,
                             REL_WHEEL_HI_RES,
                             i32::from(delta.y).saturating_mul(120),
-                        )
-                        .map_err(io_error)?;
+                        ));
                     }
                     if delta.x != 0 {
-                        Self::emit(&mut self.mouse, EV_REL, REL_HWHEEL, i32::from(delta.x))
-                            .map_err(io_error)?;
-                        Self::emit(
-                            &mut self.mouse,
+                        batch.push((EV_REL, REL_HWHEEL, i32::from(delta.x)));
+                        batch.push((
                             EV_REL,
                             REL_HWHEEL_HI_RES,
                             i32::from(delta.x).saturating_mul(120),
-                        )
-                        .map_err(io_error)?;
+                        ));
                     }
+                    Self::emit_batch(&mut self.mouse, &batch).map_err(io_error)?;
                 }
                 InputEvent::SmoothWheel { x, y } => {
                     // Touchpad smooth scroll in 120ths: hi-res always, plus
-                    // whole detents from the banked debt for stacks without
-                    // hi-res support. Sub-detent motion reports legacy zero
-                    // (no double-scroll anywhere) while hi-res carries it;
-                    // slow scrolling still arrives as detents instead of
-                    // vanishing. Truncation toward zero keeps both
-                    // directions symmetric.
+                    // whole detents from the banked debt in the SAME
+                    // SYN_REPORT frame for stacks without hi-res support.
+                    let mut batch = Vec::with_capacity(4);
                     if y != 0 {
                         let (detents, debt) = bank_smooth_debt(self.wheel_debt_y, y);
                         self.wheel_debt_y = debt;
                         if detents != 0 {
-                            Self::emit(&mut self.mouse, EV_REL, REL_WHEEL, detents)
-                                .map_err(io_error)?;
+                            batch.push((EV_REL, REL_WHEEL, detents));
                         }
-                        Self::emit(&mut self.mouse, EV_REL, REL_WHEEL_HI_RES, y)
-                            .map_err(io_error)?;
+                        batch.push((EV_REL, REL_WHEEL_HI_RES, y));
                     }
                     if x != 0 {
                         let (detents, debt) = bank_smooth_debt(self.wheel_debt_x, x);
                         self.wheel_debt_x = debt;
                         if detents != 0 {
-                            Self::emit(&mut self.mouse, EV_REL, REL_HWHEEL, detents)
-                                .map_err(io_error)?;
+                            batch.push((EV_REL, REL_HWHEEL, detents));
                         }
-                        Self::emit(&mut self.mouse, EV_REL, REL_HWHEEL_HI_RES, x)
-                            .map_err(io_error)?;
+                        batch.push((EV_REL, REL_HWHEEL_HI_RES, x));
                     }
+                    Self::emit_batch(&mut self.mouse, &batch).map_err(io_error)?;
                 }
                 InputEvent::Key(KeyEvent { usage, pressed, .. }) => {
                     let code = hid_to_evdev(usage).ok_or_else(|| {
@@ -747,6 +756,196 @@ mod linux_uinput {
         }
     }
 
+    const ABS_POINTER_MAX: i64 = 65535;
+    const ABS_SETTLE_MS: u64 = 350;
+
+    fn abs_setup_bytes_res(code: u16, minimum: i32, maximum: i32, resolution: i32) -> [u8; 28] {
+        let mut bytes = abs_setup_bytes(code, minimum, maximum);
+        bytes[24..28].copy_from_slice(&resolution.to_ne_bytes());
+        bytes
+    }
+
+    /// Map a pixel coordinate `0..span` onto `0..=65535` with rounding.
+    fn abs_pointer_unit(value: u32, span: u32) -> i32 {
+        let max_coord = i64::from(span.saturating_sub(1).max(1));
+        let clamped = i64::from(value).clamp(0, max_coord);
+        ((clamped * ABS_POINTER_MAX + max_coord / 2) / max_coord).clamp(0, ABS_POINTER_MAX) as i32
+    }
+
+    /// Kernel-level absolute pointer (`"TheKVM Virtual AbsMouse"`):
+    /// places the visible desktop cursor at an exact `(x, y)` pixel on
+    /// BOTH Wayland (where `XWarpPointer` only updates Xwayland's fake
+    /// root coordinates and leaves the visible Wayland cursor mid-screen)
+    /// and X11, without requiring `$DISPLAY`, `XAUTHORITY`, or `xhost`.
+    struct UinputAbsPointer {
+        file: File,
+        created_at: std::time::Instant,
+        settled: bool,
+    }
+
+    impl UinputAbsPointer {
+        fn create() -> Result<Self, PlatformError> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/uinput")
+                .map_err(|e| {
+                    PlatformError::Uinput(format!("open /dev/uinput for abs warp: {e}"))
+                })?;
+            for ev in [EV_KEY, EV_ABS, EV_SYN] {
+                ioctl_value(&file, UI_SET_EVBIT, ev as i32)?;
+            }
+            for btn in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE] {
+                ioctl_value(&file, UI_SET_KEYBIT, btn as i32)?;
+            }
+            for axis in [ABS_X, ABS_Y] {
+                ioctl_value(&file, UI_SET_ABSBIT, axis as i32)?;
+                let setup = abs_setup_bytes_res(axis, 0, ABS_POINTER_MAX as i32, 1);
+                ioctl_ptr(&file, UI_ABS_SETUP, setup.as_ptr().cast())?;
+            }
+            let dev = setup_bytes("TheKVM Virtual AbsMouse");
+            ioctl_ptr(&file, UI_DEV_SETUP, dev.as_ptr().cast())?;
+            ioctl_value(&file, UI_DEV_CREATE, 0)?;
+            Ok(Self {
+                file,
+                created_at: std::time::Instant::now(),
+                settled: false,
+            })
+        }
+
+        fn ensure_settled(&mut self) {
+            if !self.settled {
+                let elapsed = self.created_at.elapsed();
+                let target = std::time::Duration::from_millis(ABS_SETTLE_MS);
+                if elapsed < target {
+                    std::thread::sleep(target - elapsed);
+                }
+                self.settled = true;
+            }
+        }
+
+        fn warp(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), PlatformError> {
+            self.ensure_settled();
+            let ax = abs_pointer_unit(x, width);
+            let ay = abs_pointer_unit(y, height);
+            // 1-unit pre-nudge defeats the kernel evdev duplicate-value
+            // filter when warping to the same edge coordinate twice in a
+            // row (after relative motion moved the cursor away).
+            let nx = if ax > 0 { ax - 1 } else { ax + 1 };
+            let ny = if ay > 0 { ay - 1 } else { ay + 1 };
+            let mut buf = Vec::with_capacity(6 * 24);
+            for &(t, c, v) in &[
+                (EV_ABS, ABS_X, nx),
+                (EV_ABS, ABS_Y, ny),
+                (EV_SYN, 0, SYN_REPORT),
+                (EV_ABS, ABS_X, ax),
+                (EV_ABS, ABS_Y, ay),
+                (EV_SYN, 0, SYN_REPORT),
+            ] {
+                buf.extend_from_slice(&event_bytes(t, c, v));
+            }
+            self.file.write_all(&buf).map_err(io_error)
+        }
+
+        fn sync(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), PlatformError> {
+            if !self.settled {
+                if self.created_at.elapsed() < std::time::Duration::from_millis(ABS_SETTLE_MS) {
+                    return Ok(());
+                }
+                self.settled = true;
+            }
+            let ax = abs_pointer_unit(x, width);
+            let ay = abs_pointer_unit(y, height);
+            let mut buf = Vec::with_capacity(3 * 24);
+            for &(t, c, v) in &[
+                (EV_ABS, ABS_X, ax),
+                (EV_ABS, ABS_Y, ay),
+                (EV_SYN, 0, SYN_REPORT),
+            ] {
+                buf.extend_from_slice(&event_bytes(t, c, v));
+            }
+            self.file.write_all(&buf).map_err(io_error)
+        }
+    }
+
+    impl Drop for UinputAbsPointer {
+        fn drop(&mut self) {
+            unsafe { libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY) };
+        }
+    }
+
+    static ABS_POINTER: std::sync::OnceLock<std::sync::Mutex<Option<UinputAbsPointer>>> =
+        std::sync::OnceLock::new();
+
+    fn abs_pointer_slot() -> &'static std::sync::Mutex<Option<UinputAbsPointer>> {
+        ABS_POINTER.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    /// Pre-warm the process-wide `TheKVM Virtual AbsMouse` device at
+    /// daemon/capture startup so udev/libinput binds it before the first
+    /// edge crossing ever happens (zero hotplug wait on first warp).
+    pub fn prewarm_abs_pointer() {
+        if let Ok(mut slot) = abs_pointer_slot().lock() {
+            if slot.is_none() {
+                *slot = UinputAbsPointer::create().ok();
+            }
+        }
+    }
+
+    /// Warp the visible Linux cursor (Wayland and X11) to `(x, y)` on a
+    /// `width x height` screen via `TheKVM Virtual AbsMouse`.
+    pub fn warp_cursor_uinput(
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), PlatformError> {
+        if width == 0 || height == 0 {
+            return Err(PlatformError::Uinput(
+                "empty screen dims for abs warp".into(),
+            ));
+        }
+        let mut slot = abs_pointer_slot()
+            .lock()
+            .map_err(|_| PlatformError::Uinput("abs pointer lock poisoned".into()))?;
+        if slot.is_none() {
+            *slot = Some(UinputAbsPointer::create()?);
+        }
+        let result = slot
+            .as_mut()
+            .expect("just initialized")
+            .warp(x, y, width, height);
+        if result.is_err() {
+            *slot = None;
+        }
+        result
+    }
+
+    /// Lock the visible Wayland cursor to `(x, y)` during local motion
+    /// without blocking on hotplug settle.
+    pub fn sync_cursor_uinput(
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), PlatformError> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let Ok(mut slot) = abs_pointer_slot().lock() else {
+            return Ok(());
+        };
+        if slot.is_none() {
+            *slot = UinputAbsPointer::create().ok();
+        }
+        if let Some(ptr) = slot.as_mut() {
+            if ptr.sync(x, y, width, height).is_err() {
+                *slot = None;
+            }
+        }
+        Ok(())
+    }
+
     fn button_code(button: MouseButton) -> u16 {
         match button {
             MouseButton::Left => BTN_LEFT,
@@ -1078,7 +1277,9 @@ mod linux_uinput {
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-pub use linux_uinput::UinputDevice as Injector;
+pub use linux_uinput::{
+    prewarm_abs_pointer, sync_cursor_uinput, warp_cursor_uinput, UinputDevice as Injector,
+};
 
 #[cfg(target_os = "windows")]
 mod win32_inject {
