@@ -95,6 +95,22 @@ pub struct X11Capture {
     /// with the own-device set. Empty on servers without scroll
     /// classes — the button path below is untouched.
     scroll_axes: HashMap<xinput::DeviceId, Vec<ScrollAxis>>,
+    /// Per-slave-device motion semantics for XI raw reports: true when
+    /// the device's axis-0 valuator is Absolute (Xwayland pointers,
+    /// tablets, touchscreens — raw axes carry screen POSITIONS, not
+    /// deltas), false for Relative (classic Xorg mice/trackpads —
+    /// deltas). Feeding positions in as deltas would integrate screen
+    /// coords as giant flings; ignoring them drops every move. Resolved
+    /// at creation and per never-seen source (see is_own_source);
+    /// unknown sources default Relative (today's behavior). Bounded
+    /// with seen_sources.
+    motion_absolute: HashMap<xinput::DeviceId, bool>,
+    /// Last absolute pointer position per absolute-motion source (see
+    /// above): consecutive positions difference into the relative steps
+    /// the router integrates. Seeded on first sight (anchor-only,
+    /// emits nothing) so a stale position can never teleport the
+    /// cursor. Cleared with motion_absolute past the bound.
+    abs_pos: HashMap<xinput::DeviceId, (f64, f64)>,
     /// Fractional 120ths remainder per (device, scroll axis): raw
     /// valuator deltas arrive fractional, and truncating each event
     /// would eat slow scrolls whole.
@@ -335,6 +351,72 @@ fn query_scroll_axes(connection: &RustConnection) -> HashMap<xinput::DeviceId, V
     axes
 }
 
+/// Resolve which slave devices report ABSOLUTE axis-0 motion (see
+/// motion_absolute): Xwayland pointers/tablets carry screen positions in
+/// raw valuators, classic Xorg devices carry deltas. A failed query
+/// returns empty (the caller merges non-destructively), so an X outage
+/// can never flip live semantics mid-drive.
+fn query_absolute_motion_sources(connection: &RustConnection) -> HashMap<xinput::DeviceId, bool> {
+    let mut modes = HashMap::new();
+    let Ok(reply) = connection
+        .xinput_xi_query_device(0u16)
+        .map_err(|error| format!("query XInput2 valuator modes: {error}"))
+        .and_then(|cookie| {
+            cookie
+                .reply()
+                .map_err(|error| format!("read XInput2 valuator modes: {error}"))
+        })
+    else {
+        return modes;
+    };
+    for info in &reply.infos {
+        for class in &info.classes {
+            let xinput::DeviceClassData::Valuator(valuator) = &class.data else {
+                continue;
+            };
+            // Axis 0 is the pointer x: its mode names the device's motion
+            // semantics (absolute pointers report both axes absolute).
+            if valuator.number == 0 {
+                modes.insert(
+                    info.deviceid,
+                    valuator.mode == xinput::ValuatorMode::ABSOLUTE,
+                );
+            }
+        }
+    }
+    modes
+}
+
+/// A single-axis jump past this is a warp/teleport (entry placement,
+/// resolution change, device reset) — never a physical move. Absolute
+/// reports arrive per-motion-tick; no hand covers thousands of px in
+/// one tick. Re-anchor instead of flinging the peer.
+const ABSOLUTE_TELEPORT_PX: f64 = 2048.0;
+
+/// One absolute-pointer raw report as a relative step: the first
+/// sighting anchors (None — no delta exists yet), later reports
+/// difference. Warps re-anchor silently (see ABSOLUTE_TELEPORT_PX) and
+/// non-finite input keeps the old anchor. Pure for tests; fractional
+/// accumulation lives with the caller's banks.
+fn absolute_delta(last: Option<(f64, f64)>, x: f64, y: f64) -> (Option<(f64, f64)>, (f64, f64)) {
+    if !x.is_finite() || !y.is_finite() {
+        return (None, last.unwrap_or((x, y)));
+    }
+    let anchor = (x, y);
+    let Some((lx, ly)) = last else {
+        return (None, anchor);
+    };
+    let dx = x - lx;
+    let dy = y - ly;
+    if dx.abs() > ABSOLUTE_TELEPORT_PX || dy.abs() > ABSOLUTE_TELEPORT_PX {
+        return (None, anchor);
+    }
+    if dx == 0.0 && dy == 0.0 {
+        return (None, anchor);
+    }
+    (Some((dx, dy)), anchor)
+}
+
 /// Derive SmoothWheel 120ths from one raw motion's scroll valuators.
 /// Pure apart from the bank/lock maps: fractional deltas accumulate across
 /// events (slow scrolls survive), whole 120ths emit. Sign convention:
@@ -541,6 +623,10 @@ impl X11Capture {
             "X11 capture armed; own injector devices excluded from capture"
         );
         let scroll_axes = query_scroll_axes(&connection);
+        // Motion semantics per device (see motion_absolute): Xwayland
+        // absolute pointers must difference, classic devices pass deltas.
+        // Same best-effort contract as the scroll map above.
+        let motion_absolute = query_absolute_motion_sources(&connection);
         tracing::info!(
             devices = scroll_axes.len(),
             axes = scroll_axes.values().map(Vec::len).sum::<usize>(),
@@ -595,6 +681,8 @@ impl X11Capture {
             seen_sources: HashSet::new(),
             last_source_refresh: std::time::Instant::now(),
             scroll_axes,
+            motion_absolute,
+            abs_pos: HashMap::new(),
             scroll_bank: HashMap::new(),
             scroll_phase: HashMap::new(),
             diverted_seen: 0,
@@ -938,47 +1026,100 @@ impl X11Capture {
                     }
                 }
                 XI_MOTION.fetch_add(1, Ordering::Relaxed);
+                // Never-seen motion source: resolve its semantics once
+                // (a failed query keeps the Relative default — today's
+                // behavior — and the next new device retries). Merged,
+                // never flipped: a device's mode cannot change at
+                // runtime, so a live entry is never overwritten.
+                if !self.motion_absolute.contains_key(&event.sourceid) {
+                    for (id, absolute) in query_absolute_motion_sources(&self.connection) {
+                        self.motion_absolute.entry(id).or_insert(absolute);
+                    }
+                    if self.motion_absolute.len() > 512 {
+                        self.motion_absolute.clear();
+                        self.abs_pos.clear();
+                    }
+                    if self
+                        .motion_absolute
+                        .get(&event.sourceid)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        static FIRST_ABSOLUTE: std::sync::Once = std::sync::Once::new();
+                        FIRST_ABSOLUTE.call_once(|| {
+                            tracing::info!(
+                                source = event.sourceid,
+                                "x11 absolute-motion source detected; raw positions difference into crossing deltas"
+                            );
+                        });
+                    }
+                }
+                let absolute = self
+                    .motion_absolute
+                    .get(&event.sourceid)
+                    .copied()
+                    .unwrap_or(false);
                 let raw_dx = axis_value(&event.valuator_mask, &event.axisvalues_raw, 0);
                 let raw_dy = axis_value(&event.valuator_mask, &event.axisvalues_raw, 1);
-                let dx = raw_dx
-                    .map(|value| take_integer(&mut self.motion_x, value))
-                    .unwrap_or(0);
-                let dy = raw_dy
-                    .map(|value| take_integer(&mut self.motion_y, value))
-                    .unwrap_or(0);
-                if dx == 0 && dy == 0 {
-                    // Counted, not silent: raw motion that never becomes a
-                    // MouseMove can never feed the edge router — pushes die
-                    // before routing with zero journal evidence. Two shapes:
-                    // axes missing from the report (device speaks other
-                    // valuators, e.g. absolute touch axes) vs sub-pixel
-                    // banking (fractional deltas saving up). Rate-limited
-                    // INFO names which one while it continues.
-                    static ZERO_TOTAL: AtomicU64 = AtomicU64::new(0);
-                    static ZERO_NO_AXIS: AtomicU64 = AtomicU64::new(0);
-                    static ZERO_LAST_LOG: std::sync::OnceLock<
-                        std::sync::Mutex<Option<std::time::Instant>>,
-                    > = std::sync::OnceLock::new();
-                    let total = ZERO_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-                    if raw_dx.is_none() && raw_dy.is_none() {
-                        ZERO_NO_AXIS.fetch_add(1, Ordering::Relaxed);
+                // Xwayland absolute pointers (see motion_absolute): raw
+                // axes 0/1 carry screen POSITIONS. Differencing
+                // consecutive reports yields the same relative steps
+                // classic servers deliver directly; feeding positions in
+                // as deltas would integrate screen coords as giant
+                // flings, and ignoring them drops every move.
+                let (dx, dy) = if absolute {
+                    match (raw_dx, raw_dy) {
+                        (Some(x), Some(y)) => {
+                            let last = self.abs_pos.get(&event.sourceid).copied();
+                            let (delta, anchor) = absolute_delta(last, x, y);
+                            self.abs_pos.insert(event.sourceid, anchor);
+                            match delta {
+                                Some((fdx, fdy)) => (
+                                    take_integer(&mut self.motion_x, fdx),
+                                    take_integer(&mut self.motion_y, fdy),
+                                ),
+                                None => (0, 0),
+                            }
+                        }
+                        _ => (0, 0),
                     }
-                    let slot = ZERO_LAST_LOG.get_or_init(|| std::sync::Mutex::new(None));
-                    if let Ok(mut at) = slot.lock() {
-                        let now = std::time::Instant::now();
-                        if at.is_none_or(|when| {
-                            now.duration_since(when) >= std::time::Duration::from_secs(60)
-                        }) {
-                            *at = Some(now);
-                            tracing::info!(
-                                total,
-                                no_axis = ZERO_NO_AXIS.load(Ordering::Relaxed),
-                                axes_present = !(raw_dx.is_none() && raw_dy.is_none()),
-                                mask_words = event.valuator_mask.len(),
-                                banked_x = self.motion_x,
-                                banked_y = self.motion_y,
-                                "x11 raw motion carries no whole-pixel delta; edge pushes cannot cross while this is all the server delivers"
-                            );
+                } else {
+                    (
+                        raw_dx
+                            .map(|value| take_integer(&mut self.motion_x, value))
+                            .unwrap_or(0),
+                        raw_dy
+                            .map(|value| take_integer(&mut self.motion_y, value))
+                            .unwrap_or(0),
+                    )
+                };
+                if dx == 0 && dy == 0 {
+                    // Counted, but quiet when the axes are present: a
+                    // stationary absolute report or sub-pixel banking is
+                    // normal tracking, not lost motion. Axes ABSENT is the
+                    // wedge (device speaks valuators we never read) and
+                    // stays loud, rate-limited, until motion flows again.
+                    if raw_dx.is_none() && raw_dy.is_none() {
+                        static ZERO_TOTAL: AtomicU64 = AtomicU64::new(0);
+                        static ZERO_LAST_LOG: std::sync::OnceLock<
+                            std::sync::Mutex<Option<std::time::Instant>>,
+                        > = std::sync::OnceLock::new();
+                        let total = ZERO_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+                        let slot = ZERO_LAST_LOG.get_or_init(|| std::sync::Mutex::new(None));
+                        if let Ok(mut at) = slot.lock() {
+                            let now = std::time::Instant::now();
+                            if at.is_none_or(|when| {
+                                now.duration_since(when) >= std::time::Duration::from_secs(60)
+                            }) {
+                                *at = Some(now);
+                                tracing::info!(
+                                    total,
+                                    source = event.sourceid,
+                                    absolute,
+                                    mask_words = event.valuator_mask.len(),
+                                    "x11 raw motion carries no usable axes; edge pushes cannot cross while this is all the server delivers"
+                                );
+                            }
                         }
                     }
                     return None;
@@ -1650,6 +1791,42 @@ fn take_integer(remainder: &mut f64, value: f64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_reports_difference_into_relative_steps() {
+        // First sighting anchors without emitting: no delta exists yet.
+        let (delta, anchor) = absolute_delta(None, 4063.0, 990.0);
+        assert_eq!(delta, None);
+        assert_eq!(anchor, (4063.0, 990.0));
+        // A held push differences into router-sized steps.
+        let (delta, anchor) = absolute_delta(Some(anchor), 4073.0, 990.0);
+        assert_eq!(delta, Some((10.0, 0.0)));
+        assert_eq!(anchor, (4073.0, 990.0));
+        // Fractional positions survive (the caller banks them).
+        let (delta, anchor) = absolute_delta(Some(anchor), 4073.5, 990.25);
+        assert_eq!(delta, Some((0.5, 0.25)));
+        assert_eq!(anchor, (4073.5, 990.25));
+        // A stationary report is silence, not motion.
+        let (delta, anchor) = absolute_delta(Some(anchor), 4073.5, 990.25);
+        assert_eq!(delta, None);
+        assert_eq!(anchor, (4073.5, 990.25));
+    }
+
+    #[test]
+    fn absolute_warps_reanchor_instead_of_flinging() {
+        // Entry placement / resolution change: thousands of px in one
+        // report re-anchors, emitting nothing.
+        let (delta, anchor) = absolute_delta(Some((100.0, 100.0)), 4000.0, 100.0);
+        assert_eq!(delta, None);
+        assert_eq!(anchor, (4000.0, 100.0));
+        // Motion resumes from the new anchor immediately.
+        let (delta, _) = absolute_delta(Some(anchor), 4010.0, 100.0);
+        assert_eq!(delta, Some((10.0, 0.0)));
+        // Non-finite input keeps the old anchor.
+        let (delta, anchor) = absolute_delta(Some((50.0, 50.0)), f64::NAN, 50.0);
+        assert_eq!(delta, None);
+        assert_eq!(anchor, (50.0, 50.0));
+    }
 
     #[test]
     fn maps_x11_buttons_and_wheels() {

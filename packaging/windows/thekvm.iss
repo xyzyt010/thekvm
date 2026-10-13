@@ -14,7 +14,7 @@
 
 #define MyAppName "TheKVM"
 #ifndef MyAppVersion
-#define MyAppVersion "0.9.77"
+#define MyAppVersion "0.9.78"
 #endif
 #define MyAppPublisher "TheKVM project"
 #define MyAppURL "https://github.com/xyzyt010/thekvm"
