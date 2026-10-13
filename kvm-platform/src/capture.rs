@@ -111,10 +111,96 @@ pub fn note_screen_size(width: u32, height: u32) {
 /// ignores `XWarpPointer` for the visible cursor.
 #[cfg(target_os = "linux")]
 pub fn is_wayland_session() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some_and(|val| !val.is_empty())
-        || std::env::var("XDG_SESSION_TYPE")
-            .map(|val| val.eq_ignore_ascii_case("wayland"))
-            .unwrap_or(false)
+    classify_wayland_session(
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+    )
+}
+
+/// Pure session classifier behind `is_wayland_session` (ungated so it is
+/// unit-tested on every platform): any Wayland compositor — Cinnamon,
+/// Hyprland (`WAYLAND_DISPLAY=wayland-1`), Sway, GNOME — reports either
+/// a `WAYLAND_DISPLAY` socket or `XDG_SESSION_TYPE=wayland`, while X11
+/// sessions (bare Xorg, XFCE4) report neither. No per-compositor branches
+/// exist: Cinnamon, Hyprland, XFCE4 and X11 all flow through this one
+/// predicate plus the kernel-level evdev/uinput backends below it.
+pub fn classify_wayland_session(wayland_display: Option<&str>, session_type: Option<&str>) -> bool {
+    wayland_display.is_some_and(|val| !val.is_empty())
+        || session_type.is_some_and(|val| val.eq_ignore_ascii_case("wayland"))
+}
+
+/// Manual backend selection for multi-DE machines (XFCE4 one boot,
+/// Hyprland the next): `THEKVM_CAPTURE=evdev|x11|wayland|auto`
+/// (unset/empty/`auto` = automatic). A forced backend is tried FIRST and
+/// the standard session order below still runs on failure, so a wrong
+/// override degrades to the automatic choice instead of killing input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureOverride {
+    Evdev,
+    X11,
+    Wayland,
+}
+
+/// Parse `THEKVM_CAPTURE` (pure for tests): unknown values yield `None`
+/// (automatic) rather than failing the capture setup.
+pub fn parse_capture_override(raw: &str) -> Option<CaptureOverride> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "evdev" => Some(CaptureOverride::Evdev),
+        "x11" => Some(CaptureOverride::X11),
+        "wayland" => Some(CaptureOverride::Wayland),
+        _ => None,
+    }
+}
+
+/// Read the `THEKVM_CAPTURE` override from the environment.
+pub fn capture_override() -> Option<CaptureOverride> {
+    std::env::var("THEKVM_CAPTURE")
+        .ok()
+        .and_then(|raw| parse_capture_override(&raw))
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::{capture_override, classify_wayland_session, parse_capture_override};
+
+    #[test]
+    fn wayland_compositors_classify_wayland_x11_sessions_do_not() {
+        // Cinnamon on Wayland.
+        assert!(classify_wayland_session(Some("wayland-0"), Some("wayland")));
+        // Hyprland (wayland-1 socket, wayland session type).
+        assert!(classify_wayland_session(Some("wayland-1"), Some("wayland")));
+        // Sway / GNOME-variants that only set the socket.
+        assert!(classify_wayland_session(Some("wayland-0"), None));
+        // Session type alone suffices when the socket var is missing.
+        assert!(classify_wayland_session(None, Some("wayland")));
+        assert!(classify_wayland_session(None, Some("Wayland")));
+        assert!(classify_wayland_session(Some(""), Some("wayland")));
+        // XFCE4 / bare Xorg: neither signal present.
+        assert!(!classify_wayland_session(None, Some("x11")));
+        assert!(!classify_wayland_session(None, None));
+        assert!(!classify_wayland_session(Some(""), None));
+        assert!(!classify_wayland_session(Some(""), Some("x11")));
+    }
+
+    #[test]
+    fn capture_override_parses_known_backends_and_ignores_the_rest() {
+        use super::CaptureOverride;
+        assert_eq!(
+            parse_capture_override("evdev"),
+            Some(CaptureOverride::Evdev)
+        );
+        assert_eq!(parse_capture_override("X11"), Some(CaptureOverride::X11));
+        assert_eq!(
+            parse_capture_override(" wayland "),
+            Some(CaptureOverride::Wayland)
+        );
+        assert_eq!(parse_capture_override("auto"), None);
+        assert_eq!(parse_capture_override(""), None);
+        assert_eq!(parse_capture_override("hyprland"), None);
+        // Unset in the test harness environment; a set-but-unknown value
+        // must also read as automatic, never as an error.
+        let _ = capture_override;
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -323,12 +409,12 @@ pub use crate::evdev_capture::EvdevCapture as DefaultCapture;
 #[cfg(target_os = "windows")]
 pub use win32_hooks::Win32Capture as DefaultCapture;
 
-/// Select the sender-side input backend. On Linux Wayland sessions,
-/// `$DISPLAY` is rootless `Xwayland`, which cannot capture desktop-wide
-/// input or grab physical devices, so when the portal is unavailable we
-/// prefer `EvdevCapture` (`/dev/input/event*`) before falling back to
-/// `X11Capture`. On native X11 sessions `X11Capture` runs first with
-/// `EvdevCapture` as fallback.
+/// Select the sender-side input backend. Session matrix (Linux):
+/// X11 sessions (bare Xorg, XFCE4) → XInput2 raw capture, evdev fallback.
+/// ANY Wayland compositor (Cinnamon, Hyprland, Sway, GNOME) → portal, then
+/// kernel `EvdevCapture` (`/dev/input/event*`), then Xwayland fallback.
+/// `THEKVM_CAPTURE=evdev|x11|wayland` forces one backend first (for
+/// multi-DE machines); failure still falls through to the matrix below.
 pub fn create_capture(
     _prefer_wayland: bool,
     _exclusive: bool,
@@ -336,6 +422,42 @@ pub fn create_capture(
     #[cfg(target_os = "linux")]
     {
         crate::inject::prewarm_abs_pointer();
+        // Manual escape hatch for multi-DE machines: the forced backend
+        // runs first, then the standard session order below on failure.
+        match capture_override() {
+            Some(CaptureOverride::Evdev) => match DefaultCapture::create() {
+                Ok(capture) => {
+                    tracing::info!("using evdev kernel capture backend (THEKVM_CAPTURE override)");
+                    return Ok(Box::new(capture));
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "forced evdev backend unavailable; continuing automatically")
+                }
+            },
+            Some(CaptureOverride::X11) => match crate::x11_capture::X11Capture::create() {
+                Ok(capture) => {
+                    tracing::info!("using XInput2 raw capture backend (THEKVM_CAPTURE override)");
+                    return Ok(Box::new(capture));
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "forced X11 backend unavailable; continuing automatically")
+                }
+            },
+            Some(CaptureOverride::Wayland) => {
+                match crate::wayland_capture::WaylandCapture::create(_exclusive, true) {
+                    Ok(capture) => {
+                        tracing::info!(
+                            "using Wayland input-capture portal backend (THEKVM_CAPTURE override)"
+                        );
+                        return Ok(Box::new(capture));
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "forced Wayland portal unavailable; continuing automatically")
+                    }
+                }
+            }
+            None => {}
+        }
         let wayland = _prefer_wayland || is_wayland_session();
         if wayland {
             match crate::wayland_capture::WaylandCapture::create(_exclusive, true) {
