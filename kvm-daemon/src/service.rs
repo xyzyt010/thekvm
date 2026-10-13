@@ -3989,10 +3989,32 @@ fn inbound_inputs_growth(
 const INBOUND_SETTLE_MS: u64 = 1_000;
 const INBOUND_SETTLE_BURST: u64 = 20;
 
-/// Settle predicate behind the rule above: true while small growth must be
-/// absorbed into the baseline instead of yielding. Pure for tests.
-fn inbound_settle_suppressed(open_for_ms: u64, growth: u64) -> bool {
-    open_for_ms < INBOUND_SETTLE_MS && growth < INBOUND_SETTLE_BURST
+/// Absorb threshold for inbound growth while OUR drive is hot (see
+/// probe_inbound_yield): the peer's echo of our own injected motion keeps
+/// trickling for as long as we drive, not just the first second — a few
+/// events per tick with nobody at the other keyboard. While we are
+/// actively sending outbound input, only a strong counter-run proves the
+/// peer's human is pushing back through our drive. A real counter-drive
+/// (Handoff first, then sustained input) clears 10 events inside one or
+/// two 300ms ticks, so intent still pre-empts fast. Pure for tests.
+const INBOUND_HOT_DRIVE_BURST: u64 = 10;
+
+/// How recently WE must have forwarded input for our drive to count as
+/// hot (see above): continuous motion re-stamps every event, so 500ms
+/// covers any live drive without covering a parked one.
+const OUTBOUND_HOT_MS: u64 = 500;
+
+/// Absorb threshold behind the rules above: settle window first, then
+/// hot-drive stickiness, otherwise zero (the predicate decides). Pure
+/// for tests.
+fn inbound_absorb_threshold(open_for_ms: u64, outbound_hot: bool) -> u64 {
+    if open_for_ms < INBOUND_SETTLE_MS {
+        INBOUND_SETTLE_BURST
+    } else if outbound_hot {
+        INBOUND_HOT_DRIVE_BURST
+    } else {
+        0
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4050,6 +4072,12 @@ async fn probe_inbound_yield(
     // early is absorbed, never a yield; only a large burst proves the
     // peer's human is pushing back through our drive. The transfer stamp
     // doubles as the drive-open clock (stamped at every handoff commit).
+    //
+    // Hot-drive stickiness (see INBOUND_HOT_DRIVE_BURST): the echo does
+    // not stop after the first second — it trickles for as long as we
+    // keep driving. While our own outbound input is flowing, small
+    // inbound growth is still echo; a real counter-drive clears the
+    // higher bar within a tick or two and still pre-empts fast.
     let open_for_ms = last_transfer
         .map(|when| {
             std::time::Instant::now()
@@ -4058,13 +4086,17 @@ async fn probe_inbound_yield(
                 .min(u128::from(u64::MAX)) as u64
         })
         .unwrap_or(u64::MAX);
-    if inbound_settle_suppressed(open_for_ms, growth) {
+    let outbound_hot = last_outbound_input
+        .is_some_and(|when| when.elapsed() < Duration::from_millis(OUTBOUND_HOT_MS));
+    if growth < inbound_absorb_threshold(open_for_ms, outbound_hot) {
         return;
     }
-    if inbound_yield_fires(growth, !driving.is_empty()) {
+    let peer_driving = !driving.is_empty();
+    if inbound_yield_fires(growth, peer_driving) {
         let observed = kvm_platform::capture::inbound_while_driving_count();
         tracing::info!(
             growth,
+            peer_driving,
             "fresh peer input arrived while driving; yielding to the inbound drive"
         );
         yield_drive_to_inbound(
@@ -4313,6 +4345,21 @@ struct TopologyEventContext<'a> {
 /// for the Forward arm below.
 const SEND_STALL_BREAKER: u32 = 30;
 const SEND_STALL_BREAKER_MS: u64 = 2000;
+
+/// Cold-open bound for a fresh episode dial inside the Handoff arm (see
+/// the timeout there): the endpoint knock alone can run 60s on a dead
+/// address, and awaiting it inline stalls the whole drive task — no
+/// routing, no heartbeat, no probe ticks. 8s fails a dead peer fast
+/// (LAN dials land in ms; the 5s pre-warm already covers slow-but-alive
+/// peers) while the failed-episode cooldown paces redials.
+const COLD_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Parked-resume bound (see the Handoff arm): the resume replays a
+/// Handoff frame plus state on a stored stream, which is normally instant
+/// — but a half-dead park hangs the ordered writes with no timeout of
+/// their own. 3s drops the dead park and falls through to the bounded
+/// fresh open instead of wedging the drive task.
+const PARKED_RESUME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Stall-breaker predicate: trip only on sustained silence (count AND
 /// duration). Pure for tests (the arm owns the counting and clock).
@@ -4994,28 +5041,44 @@ async fn handle_topology_event(
             let mut resumed = false;
             let mut session = match take_parked_for(parked, target).await {
                 Some(parked_session) => {
-                    match resume_parked_session(
-                        parked_session,
-                        router,
-                        target,
-                        target_x,
-                        target_y,
-                        snapshot.state.clone(),
-                        Some(event),
-                        initial_clipboard.clone(),
-                        &mut *clipboard_revision,
-                        clipboard_max_bytes,
-                        &mut *sequence,
-                        captured.event_id,
+                    // BOUNDED (see PARKED_RESUME_TIMEOUT): a half-dead
+                    // parked stream would otherwise hang these ordered
+                    // writes forever, wedging the whole drive task with
+                    // no heartbeat and no probe ticks. On timeout the
+                    // park is dropped and the fresh open below (itself
+                    // bounded) redials.
+                    match tokio::time::timeout(
+                        PARKED_RESUME_TIMEOUT,
+                        resume_parked_session(
+                            parked_session,
+                            router,
+                            target,
+                            target_x,
+                            target_y,
+                            snapshot.state.clone(),
+                            Some(event),
+                            initial_clipboard.clone(),
+                            &mut *clipboard_revision,
+                            clipboard_max_bytes,
+                            &mut *sequence,
+                            captured.event_id,
+                        ),
                     )
                     .await
                     {
-                        Ok(resumed_session) => {
+                        Ok(Ok(resumed_session)) => {
                             resumed = true;
                             Some(resumed_session)
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             tracing::debug!(%error, ?target, "parked drive stream went stale; opening a fresh episode");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                ?target,
+                                "parked resume timed out; opening a fresh episode"
+                            );
                             None
                         }
                     }
@@ -5040,33 +5103,43 @@ async fn handle_topology_event(
                     park_inside(router, edge);
                     return Ok(());
                 }
-                match open_topology_session(TopologyOpen {
-                    router,
-                    identity,
-                    peers,
-                    node_name,
-                    target,
-                    target_x,
-                    target_y,
-                    state: snapshot.state,
-                    event_barrier: captured.event_id,
-                    first_event: Some(event),
-                    request_lock_screen,
-                    mode,
-                    local_geometry,
-                    clipboard_enabled,
-                    initial_clipboard,
-                    clipboard_revision,
-                    clipboard_max_bytes,
-                    sequence,
-                    dir,
-                    link_id: link.and_then(|link| link.link_id),
-                    want_udp_motion,
-                })
+                // BOUNDED cold open (see COLD_OPEN_TIMEOUT): dial_session
+                // knocks for up to 60s on a dead address, and awaiting it
+                // inline stalls this whole drive task — no routing, no
+                // heartbeat, no probe ticks — while pushes queue behind.
+                // A dead peer then reads as a minute-long freeze per push.
+                // Fail fast instead: the cooldown above paces retries and
+                // the next deliberate push redials.
+                match tokio::time::timeout(
+                    COLD_OPEN_TIMEOUT,
+                    open_topology_session(TopologyOpen {
+                        router,
+                        identity,
+                        peers,
+                        node_name,
+                        target,
+                        target_x,
+                        target_y,
+                        state: snapshot.state,
+                        event_barrier: captured.event_id,
+                        first_event: Some(event),
+                        request_lock_screen,
+                        mode,
+                        local_geometry,
+                        clipboard_enabled,
+                        initial_clipboard,
+                        clipboard_revision,
+                        clipboard_max_bytes,
+                        sequence,
+                        dir,
+                        link_id: link.and_then(|link| link.link_id),
+                        want_udp_motion,
+                    }),
+                )
                 .await
                 {
-                    Ok(opened) => session = Some(opened),
-                    Err(error) => {
+                    Ok(Ok(opened)) => session = Some(opened),
+                    Ok(Err(error)) => {
                         // A banned epoch is a deliberate remote Disconnect: end
                         // the child so the UI reports it, instead of warning
                         // locally and retrying a dead link forever.
@@ -5085,6 +5158,22 @@ async fn handle_topology_event(
                         resync_home_to_truth(router);
                         park_inside(router, edge);
                         tracing::warn!(%error, ?target, "topology target unavailable; control remains local");
+                    }
+                    Err(_) => {
+                        // Cold-open timeout (see COLD_OPEN_TIMEOUT): the
+                        // peer is unreachable, asleep, or mid-restart —
+                        // same handling as a refused dial, so one push at
+                        // a dead peer costs seconds, never a minute, and
+                        // the next deliberate push redials.
+                        *last_failed_episode = Some(std::time::Instant::now());
+                        release_suppression(capture_control, Some(&mut *suppression_requested));
+                        let _ = router.restore_local(target);
+                        resync_home_to_truth(router);
+                        park_inside(router, edge);
+                        tracing::warn!(
+                            ?target,
+                            "topology cold open timed out; control remains local"
+                        );
                     }
                 }
             }
@@ -6210,10 +6299,14 @@ fn start_capture(
                 // scrolling only worked when the mouse sat still (and
                 // "scroll after a click" only worked because the click
                 // rode the priority queue above). Overflow wheels to the
-                // bounded priority queue instead: scroll stays ordered
-                // with keys (Ctrl+wheel zoom needs it) and is never
-                // dropped by motion floods. Pointer motion itself stays
-                // lossy — the next delta supersedes a dropped one.
+                // priority queue instead — NON-BLOCKING (try_send, drop
+                // when that is full too): scroll stays ordered with keys
+                // (Ctrl+wheel zoom needs it) and is never dropped by
+                // motion floods, while a wheel flood can never queue
+                // behind keys and lag them (the next wheel supersedes a
+                // dropped one; a dropped keypress does not come back).
+                // Pointer motion itself stays lossy — the next delta
+                // supersedes a dropped one.
                 if matches!(
                     event,
                     InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }
@@ -6224,18 +6317,10 @@ fn start_capture(
                             break 'capture;
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
-                            // try_send never consumes on Full: the event
-                            // comes back and rides the bounded priority
-                            // queue instead (see above).
-                            if !capture_send_bounded(
-                                &priority_tx,
-                                returned,
-                                &thread_stop,
-                                &mut backend,
-                                &thread_exclusive,
-                            ) {
-                                break 'capture;
-                            }
+                            // try_send never consumes on Full: park the
+                            // event on the priority queue when it has room,
+                            // else drop it (flood regime — superseded).
+                            let _ = priority_tx.try_send(returned);
                         }
                     }
                     continue;
@@ -8823,13 +8908,17 @@ async fn handle_connection(
             // order on this association is deterministic (episode first,
             // lane second — episodes are served sequentially, so this
             // accept pairs with THIS episode's lane exactly). A missing
-            // lane ends the episode: serving laneless while the sender
-            // keeps writing motion into an unread stream would stall the
-            // whole association on flow control (a full drive freeze with
-            // suppression held) — and the sender has no signal to stop.
-            // Registration above already ran, so even a bailed episode
-            // stays visible in Status (recent_inbound) instead of blinding
-            // the dial-back.
+            // lane DOWNGrades the episode instead of ending it: the sender
+            // falls back to the episode stream when ITS open fails (see
+            // open_episode_stream), so a lane that never arrives means the
+            // sender is already streaming motion past us on the bidi
+            // stream — killing the episode here murders a healthy drive
+            // (the "peer closed; returned control locally" flap a second
+            // into every crossing). Only a lane the sender actually
+            // opened needs reading, and such a lane always becomes
+            // acceptable — an accept timeout then proves none was opened.
+            // Registration above already ran, so even a laneless episode
+            // stays visible in Status instead of blinding the dial-back.
             let mut motion_recv: Option<quinn::RecvStream> = if hello.motion_lane {
                 match tokio::time::timeout(Duration::from_secs(10), conn.accept_uni()).await {
                     Ok(Ok(lane)) => {
@@ -8841,12 +8930,12 @@ async fn handle_connection(
                         Some(lane)
                     }
                     Ok(Err(error)) => {
-                        tracing::warn!(%error, "motion lane accept failed; ending episode");
-                        bail!("peer negotiated a motion lane but the accept failed");
+                        tracing::warn!(%error, "motion lane accept failed; episode proceeds laneless");
+                        None
                     }
                     Err(_) => {
-                        tracing::warn!("motion lane accept timed out; ending episode");
-                        bail!("peer negotiated a motion lane but never opened it");
+                        tracing::warn!("motion lane accept timed out; episode proceeds laneless");
+                        None
                     }
                 }
             } else {
@@ -12138,18 +12227,21 @@ mod tests {
 
     #[test]
     fn inbound_settle_absorbs_echo_but_not_takeover() {
-        // The first second of a drive is its own echo (3-24 events inside
-        // half a second on real links): absorbed, never a yield.
-        assert!(inbound_settle_suppressed(0, 0));
-        assert!(inbound_settle_suppressed(300, 3));
-        assert!(inbound_settle_suppressed(500, 19));
-        // A large burst inside the window is a human pushing back: yields.
-        assert!(!inbound_settle_suppressed(300, 20));
-        assert!(!inbound_settle_suppressed(999, 100));
-        // Past the window every sustained run yields (see
-        // inbound_yield_fires); the settle no longer suppresses.
-        assert!(!inbound_settle_suppressed(1000, 5));
-        assert!(!inbound_settle_suppressed(u64::MAX, 5));
+        // Settle window: small growth absorbed (echo), bursts fire.
+        assert_eq!(inbound_absorb_threshold(0, false), 20);
+        assert_eq!(inbound_absorb_threshold(300, false), 20);
+        assert_eq!(inbound_absorb_threshold(500, false), 20);
+        assert_eq!(inbound_absorb_threshold(999, false), 20);
+        // Past the window the settle no longer suppresses on its own
+        // (hot-drive stickiness is a separate threshold below).
+        assert_eq!(inbound_absorb_threshold(1000, false), 0);
+        assert_eq!(inbound_absorb_threshold(u64::MAX, false), 0);
+        // Hot drive (our outbound flowing): echo trickles absorbed up to
+        // the higher bar, real counter-runs still fire.
+        assert_eq!(inbound_absorb_threshold(500, true), 20);
+        assert_eq!(inbound_absorb_threshold(5000, false), 0);
+        assert_eq!(inbound_absorb_threshold(5000, true), 10);
+        assert_eq!(inbound_absorb_threshold(u64::MAX, true), 10);
     }
 
     #[test]
