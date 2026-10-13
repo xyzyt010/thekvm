@@ -589,8 +589,20 @@ impl EvdevCapture {
             if self.devices.iter().any(|device| device.path == path) {
                 continue;
             }
-            if let Ok(Some(device)) = Device::open(path) {
-                self.devices.push(device);
+            // Name every skip: a silent `if let Ok` here once hid a broken
+            // ioctl encoding that rejected every physical device on Wayland
+            // sessions (see ioc) behind "no keyboard or mouse evdev devices".
+            match Device::open(path.clone()) {
+                Ok(Some(device)) => self.devices.push(device),
+                Ok(None) => tracing::debug!(
+                    device = %path.display(),
+                    "evdev node ignored (no keyboard/mouse capabilities)"
+                ),
+                Err(error) => tracing::debug!(
+                    device = %path.display(),
+                    %error,
+                    "evdev node open/capability query failed"
+                ),
             }
         }
         if self.exclusive {
@@ -1054,10 +1066,15 @@ const IOC_TYPEMASK: u32 = (1 << IOC_TYPEBITS) - 1;
 const IOC_SIZEMASK: u32 = (1 << IOC_SIZEBITS) - 1;
 
 const fn ioc(dir: u32, type_: u32, number: u32, size: usize) -> IoctlRequest {
-    ((dir << (IOC_NRBITS + IOC_TYPEBITS + IOC_SIZEBITS))
-        | ((type_ & IOC_TYPEMASK) << (IOC_NRBITS + IOC_SIZEBITS))
-        | ((number & IOC_NRMASK) << IOC_NRBITS)
-        | (((size as u32) & IOC_SIZEMASK) << (IOC_NRBITS + IOC_TYPEBITS))) as IoctlRequest
+    // Linux _IOC layout: dir[31:30] size[29:16] type[15:8] nr[7:0]
+    // (_IOC_DIRSHIFT=30, _IOC_SIZESHIFT=16, _IOC_TYPESHIFT=8,
+    // _IOC_NRSHIFT=0). The previous revision shifted type by 22 and nr
+    // by 8, so every EVIOCGBIT/EVIOCGNAME query failed with ENOTTY and
+    // no physical device ever classified as keyboard/mouse.
+    ((dir << 30)
+        | (((size as u32) & IOC_SIZEMASK) << 16)
+        | ((type_ & IOC_TYPEMASK) << 8)
+        | ((number & IOC_NRMASK) << 0)) as IoctlRequest
 }
 
 const fn eviocgbit(event_type: u32, length: usize) -> IoctlRequest {
@@ -1137,6 +1154,17 @@ mod tests {
             device.process(syn),
             vec![InputEvent::SmoothWheel { x: 0, y: 80 }]
         );
+    }
+
+    #[test]
+    fn ioctl_encoding_matches_linux_ioc_layout() {
+        // EVIOCGRAB is _IOW('E', 0x90, int): pin the whole _IOC field
+        // layout against the hardcoded constant so a shifted encoding
+        // (which once rejected every physical device) can never regress.
+        assert_eq!(ioc(1, b'E' as u32, 0x90, 4), EVIOCGRAB);
+        // EVIOCGBIT(EV_KEY=1, 96): dir READ, size 96, type 'E', nr 0x21.
+        assert_eq!(eviocgbit(1, 96), 0x8060_4521 as IoctlRequest);
+        assert_eq!(eviocgname(256), 0x8100_4506 as IoctlRequest);
     }
 
     #[test]

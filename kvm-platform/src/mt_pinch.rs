@@ -57,10 +57,12 @@ const IOC_SIZEBITS: u32 = 14;
 const IOC_READ: u32 = 2;
 
 const fn ioc(dir: u32, type_: u32, number: u32, size: usize) -> IoctlRequest {
-    ((dir << (IOC_NRBITS + IOC_TYPEBITS + IOC_SIZEBITS))
-        | ((type_ & 0xff) << (IOC_NRBITS + IOC_SIZEBITS))
-        | ((number & 0xff) << IOC_NRBITS)
-        | (((size as u32) & 0x3fff) << (IOC_NRBITS + IOC_TYPEBITS))) as IoctlRequest
+    // Linux _IOC layout: dir[31:30] size[29:16] type[15:8] nr[7:0]
+    // (see the evdev_capture twin and its regression test).
+    ((dir << 30)
+        | (((size as u32) & 0x3fff) << 16)
+        | ((type_ & 0xff) << 8)
+        | ((number & 0xff) << 0)) as IoctlRequest
 }
 
 const fn eviocgbit(event_type: u32, length: usize) -> IoctlRequest {
@@ -388,6 +390,14 @@ mod tests {
             engaged: false,
             scroll_streak: 0,
         }
+    }
+
+    #[test]
+    fn ioctl_encoding_matches_linux_ioc_layout() {
+        // _IOW('E', 0x90, int) must be 0x40044590 (the EVIOCGRAB value):
+        // pins the _IOC field layout (see the evdev_capture twin).
+        assert_eq!(ioc(1, b'E' as u32, 0x90, 4), 0x4004_4590 as IoctlRequest);
+        assert_eq!(eviocgbit(1, 96), 0x8060_4521 as IoctlRequest);
     }
 
     #[test]
