@@ -367,6 +367,7 @@ mod win32_hooks {
     static RAW_WINDOW: AtomicIsize = AtomicIsize::new(0);
     static RAW_NOLEGACY: AtomicBool = AtomicBool::new(false);
     static PTP_NOLEGACY: AtomicBool = AtomicBool::new(false);
+    static CONSUMER_NOLEGACY: AtomicBool = AtomicBool::new(false);
     /// Scroll-guard pixel window (see scroll_guard_pixel): 0 when absent.
     static GUARD_PIXEL: AtomicIsize = AtomicIsize::new(0);
     /// Cursor park point the guard pixel (and the cursor glue below) hold
@@ -379,6 +380,7 @@ mod win32_hooks {
     /// scroll_guard_pixel): deterministic platform refusals log once per
     /// process instead of hiding at debug or spamming per drive.
     static WARNED_PTP_NOLEGACY: AtomicBool = AtomicBool::new(false);
+    static WARNED_CONSUMER_NOLEGACY: AtomicBool = AtomicBool::new(false);
     static WARNED_GUARD_PIXEL: AtomicBool = AtomicBool::new(false);
     /// Private thread message (WM_APP range): wparam != 0 enables RawInput
     /// legacy suppression while driving, 0 restores normal delivery.
@@ -918,11 +920,13 @@ mod win32_hooks {
             // hook_thread), so an early drive start still holds.
             RAW_NOLEGACY.store(false, Ordering::Release);
             PTP_NOLEGACY.store(false, Ordering::Release);
+            CONSUMER_NOLEGACY.store(false, Ordering::Release);
             return;
         }
         let mouse_changed = RAW_NOLEGACY.swap(suppress, Ordering::AcqRel) != suppress;
         let ptp_changed = PTP_NOLEGACY.swap(suppress, Ordering::AcqRel) != suppress;
-        if !mouse_changed && !ptp_changed {
+        let consumer_changed = CONSUMER_NOLEGACY.swap(suppress, Ordering::AcqRel) != suppress;
+        if !mouse_changed && !ptp_changed && !consumer_changed {
             return;
         }
         if !RAW_INPUT_ACTIVE.load(Ordering::Acquire) {
@@ -931,6 +935,7 @@ mod win32_hooks {
             // the flags never claim a suppression that is not applied.
             RAW_NOLEGACY.store(false, Ordering::Release);
             PTP_NOLEGACY.store(false, Ordering::Release);
+            CONSUMER_NOLEGACY.store(false, Ordering::Release);
             return;
         }
         let hwnd = HWND(RAW_WINDOW.load(Ordering::Acquire) as *mut std::ffi::c_void);
@@ -940,6 +945,7 @@ mod win32_hooks {
             // again): un-eat, loudly, instead of returning claimed.
             RAW_NOLEGACY.store(false, Ordering::Release);
             PTP_NOLEGACY.store(false, Ordering::Release);
+            CONSUMER_NOLEGACY.store(false, Ordering::Release);
             tracing::warn!(
                 suppress,
                 "suppression window missing at toggle time; flags parked un-applied, init force-applies"
@@ -1020,6 +1026,40 @@ mod win32_hooks {
                 }
             }
         }
+        if consumer_changed {
+            // Consumer media keys never produce a hook event, so the hook
+            // swallow above cannot stop them reaching local apps: the
+            // volume would change LOCALLY while driving. NOLEGACY stops
+            // the legacy APPCOMMAND/VK synthesis; WM_INPUT keeps flowing,
+            // so remote forwarding is untouched. Best effort with the
+            // same never-lie flag discipline as the digitizer above.
+            let consumer = RAWINPUTDEVICE {
+                usUsagePage: CONSUMER_USAGE_PAGE,
+                usUsage: CONSUMER_COLLECTION,
+                dwFlags: flags,
+                hwndTarget: hwnd,
+            };
+            match unsafe {
+                RegisterRawInputDevices(
+                    std::slice::from_ref(&consumer),
+                    std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+                )
+            } {
+                Ok(_) => tracing::info!(
+                    suppress,
+                    "consumer media-key legacy delivery toggled for the drive session"
+                ),
+                Err(error) => {
+                    CONSUMER_NOLEGACY.store(false, Ordering::Release);
+                    if !WARNED_CONSUMER_NOLEGACY.swap(true, Ordering::AcqRel) {
+                        tracing::warn!(
+                            %error,
+                            "consumer media-key NOLEGACY refused by Windows; volume keys may apply locally while driving"
+                        );
+                    }
+                }
+            }
+        }
         if suppress {
             // Drive-start suppression proof: one INFO line naming every
             // layer's armed state, so the next dual-scroll report starts
@@ -1028,6 +1068,7 @@ mod win32_hooks {
                 block_local = BLOCK_LOCAL.load(Ordering::Acquire),
                 raw_nolegacy = RAW_NOLEGACY.load(Ordering::Acquire),
                 ptp_nolegacy = PTP_NOLEGACY.load(Ordering::Acquire),
+                consumer_nolegacy = CONSUMER_NOLEGACY.load(Ordering::Acquire),
                 guard_pixel = GUARD_PIXEL.load(Ordering::Acquire) != 0,
                 raw_active = RAW_INPUT_ACTIVE.load(Ordering::Acquire),
                 "local suppression armed for the drive session"
@@ -1302,6 +1343,54 @@ mod win32_hooks {
         }
     }
 
+    /// HID Consumer page (0x0C) media keys: volume up/down/mute live
+    /// here on keyboards and headsets that expose them as a Consumer
+    /// collection instead of keyboard-collection extended keys. Those
+    /// never traverse the low-level keyboard hook — the OS turns them
+    /// into WM_APPCOMMAND for the foreground app — so without the sink
+    /// below, pressing volume while driving only ever adjusts the LOCAL
+    /// volume and nothing crosses the link.
+    const CONSUMER_USAGE_PAGE: u16 = 0x0C;
+    const CONSUMER_COLLECTION: u16 = 0x01;
+    /// Consumer-page usages we forward (HID Usage Tables §15): mute,
+    /// volume increment, volume decrement.
+    const CONSUMER_MUTE: u16 = 0xE2;
+    const CONSUMER_VOLUME_UP: u16 = 0xE9;
+    const CONSUMER_VOLUME_DOWN: u16 = 0xEA;
+    /// Consumer usages currently held (usage -> last press stamp): HID
+    /// consumer reports carry the HELD set, not transitions, so press
+    /// vs repeat vs release is derived by diffing consecutive reports
+    /// from any consumer device.
+    static CONSUMER_HELD: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<u16, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    /// HID top-level collection page cache (raw handle -> (page,
+    /// usage)): keeps the per-event page peek below to one map lookup
+    /// after the first report from each device, instead of a preparsed
+    /// query on every high-rate digitizer packet.
+    type HidPageCache = std::sync::OnceLock<Mutex<Vec<(isize, (u16, u16))>>>;
+    static HID_PAGE_CACHE: HidPageCache = std::sync::OnceLock::new();
+
+    fn consumer_held() -> &'static Mutex<std::collections::HashMap<u16, std::time::Instant>> {
+        CONSUMER_HELD.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn hid_page_cache() -> &'static Mutex<Vec<(isize, (u16, u16))>> {
+        HID_PAGE_CACHE.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Consumer usage -> wire HID keyboard usage (see the volume tables
+    /// on both ends: the hook, evdev, and both injectors agree on
+    /// 0x7f/0x80/0x81). Pure for tests.
+    fn consumer_to_hid(usage: u16) -> Option<u16> {
+        match usage {
+            CONSUMER_MUTE => Some(0x7f),
+            CONSUMER_VOLUME_UP => Some(0x80),
+            CONSUMER_VOLUME_DOWN => Some(0x81),
+            _ => None,
+        }
+    }
+
     fn create_raw_input_window(module: HINSTANCE) -> Result<HWND, String> {
         // A message-only window has no visible UI and can receive RIDEV_INPUTSINK
         // messages even while another application owns the foreground window.
@@ -1350,6 +1439,27 @@ mod win32_hooks {
                 let _ = DestroyWindow(window);
                 return Err(format!("RegisterRawInputDevices failed: {error}"));
             }
+            // Consumer-page media-key sink (see CONSUMER_USAGE_PAGE):
+            // volume/mute keys that never reach the keyboard hook arrive
+            // here as WM_INPUT even while another app owns the
+            // foreground (INPUTSINK). Best-effort: absence just means
+            // consumer keys stay local (today's behavior), never a
+            // startup failure.
+            let consumer = RAWINPUTDEVICE {
+                usUsagePage: CONSUMER_USAGE_PAGE,
+                usUsage: CONSUMER_COLLECTION,
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: window,
+            };
+            if let Err(error) = RegisterRawInputDevices(
+                std::slice::from_ref(&consumer),
+                std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+            ) {
+                tracing::warn!(
+                    %error,
+                    "consumer media-key sink unavailable; volume keys stay local"
+                );
+            }
             // Precision-touchpad digitizer tap (best-effort, logged): the
             // third wheel source for gestures the mouse channel never sees.
             // A missing touchpad is normal (desktops); failure here must
@@ -1369,6 +1479,149 @@ mod win32_hooks {
             handle_raw_input(lparam);
         }
         DefWindowProcW(hwnd, message, wparam, lparam)
+    }
+
+    /// Top-level collection (usage page, usage) for one raw HID device
+    /// handle, via RIDI_PREPARSEDDATA + HidP_GetCaps (see
+    /// ptp_preparsed_via_ridi): cached per handle, so the dispatch in
+    /// handle_raw_input costs one map lookup after the first report
+    /// from each device instead of a descriptor query on every
+    /// high-rate digitizer packet.
+    fn hid_collection_page(handle: windows::Win32::Foundation::HANDLE) -> Option<(u16, u16)> {
+        use windows::Win32::Devices::HumanInterfaceDevice as hid;
+        let key = handle.0 as isize;
+        if let Ok(cache) = hid_page_cache().lock() {
+            if let Some(entry) = cache.iter().find(|(known, _)| *known == key) {
+                return Some(entry.1);
+            }
+        }
+        // The blob must outlive the preparsed pointer AND the caps call
+        // below (see ptp_preparsed_via_ridi): keep it bound here.
+        let (preparsed, _blob) = ptp_preparsed_via_ridi(key)?;
+        let mut caps = hid::HIDP_CAPS::default();
+        if unsafe { hid::HidP_GetCaps(preparsed, &mut caps) }.is_err() {
+            return None;
+        }
+        let page = (caps.UsagePage, caps.Usage);
+        if let Ok(mut cache) = hid_page_cache().lock() {
+            if cache.len() >= 16 {
+                cache.clear();
+            }
+            cache.push((key, page));
+        }
+        Some(page)
+    }
+
+    /// Fastest repeat a held consumer key re-emits while the device
+    /// keeps reporting it held: hold-to-ramp volume without flooding
+    /// the bounded priority queue (the daemon throttles repeats to
+    /// 33ms anyway; this stays coarser).
+    const CONSUMER_REPEAT_MS: u64 = 100;
+
+    /// One consumer-collection HID report: diff the reported usage set
+    /// against the held set and emit Key press/release events (see
+    /// consumer_to_hid). Reports carry the HELD set, so a usage present
+    /// in consecutive reports re-presses at CONSUMER_REPEAT_MS (hold
+    /// ramps, like a held keyboard key), and a usage that vanishes
+    /// releases. Momentary taps naturally produce press then release.
+    fn handle_consumer_input(buffer: &[u8]) {
+        use windows::Win32::Devices::HumanInterfaceDevice as hid;
+        let header_size = std::mem::size_of::<RAWINPUTHEADER>();
+        if buffer.len() < header_size + 8 {
+            return;
+        }
+        let size_hid = u32::from_le_bytes([
+            buffer[header_size],
+            buffer[header_size + 1],
+            buffer[header_size + 2],
+            buffer[header_size + 3],
+        ]) as usize;
+        let count = u32::from_le_bytes([
+            buffer[header_size + 4],
+            buffer[header_size + 5],
+            buffer[header_size + 6],
+            buffer[header_size + 7],
+        ]) as usize;
+        if !(1..=1024).contains(&size_hid) || !(1..=64).contains(&count) {
+            return;
+        }
+        let header = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const RAWINPUTHEADER) };
+        let (preparsed, _blob) = match ptp_preparsed_via_ridi(header.hDevice.0 as isize) {
+            Some(pair) => pair,
+            None => return,
+        };
+        let data_at = header_size + 8;
+        // Union of all usages pressed across every report in this
+        // packet (multi-report packets are one timestamp).
+        let mut pressed_now = std::collections::BTreeSet::new();
+        for index in 0..count {
+            let at = data_at + index * size_hid;
+            if at + size_hid > buffer.len() {
+                continue;
+            }
+            let mut report = buffer[at..at + size_hid].to_vec();
+            let mut usages = [0u16; 16];
+            let mut usage_len = usages.len() as u32;
+            if unsafe {
+                hid::HidP_GetUsages(
+                    hid::HidP_Input,
+                    CONSUMER_USAGE_PAGE,
+                    0,
+                    usages.as_mut_ptr(),
+                    &mut usage_len,
+                    preparsed,
+                    &mut report,
+                )
+            }
+            .is_err()
+            {
+                continue;
+            }
+            pressed_now.extend(usages.iter().take(usage_len as usize).copied());
+        }
+        let now = std::time::Instant::now();
+        let mut held = consumer_held()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Releases first (usages gone from every report), then presses
+        // (new or due a repeat): a tap that fits inside one packet
+        // still emits press before release because it is present here.
+        held.retain(|usage, _| {
+            if pressed_now.contains(usage) {
+                return true;
+            }
+            if let Some(wire) = consumer_to_hid(*usage) {
+                HOOK_KEY.fetch_add(1, Ordering::Relaxed);
+                send(InputEvent::Key(KeyEvent {
+                    usage: wire,
+                    pressed: false,
+                    repeat: false,
+                }));
+            }
+            false
+        });
+        for usage in pressed_now {
+            let Some(wire) = consumer_to_hid(usage) else {
+                continue;
+            };
+            match held.get(&usage) {
+                Some(last)
+                    if now.duration_since(*last).as_millis() < u128::from(CONSUMER_REPEAT_MS) =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+            held.insert(usage, now);
+            HOOK_KEY.fetch_add(1, Ordering::Relaxed);
+            send(InputEvent::Key(KeyEvent {
+                usage: wire,
+                pressed: true,
+                // The daemon tags presses-while-held as repeats (see
+                // record): held volume ramps remotely like locally.
+                repeat: false,
+            }));
+        }
     }
 
     unsafe fn handle_raw_input(lparam: LPARAM) {
@@ -1392,12 +1645,19 @@ mod win32_hooks {
         if result == u32::MAX || result as usize > buffer.len() {
             return;
         }
-        // Precision-touchpad digitizer reports (HID, not mouse): route to
-        // the PTP scroll channel before the mouse decoders (which reject
-        // non-mouse types anyway).
+        // HID reports (not mouse): precision-touchpad digitizer reports
+        // route to the PTP scroll channel, consumer-page media reports
+        // to the volume/mute channel, before the mouse decoders (which
+        // reject non-mouse types anyway).
         if buffer.len() >= std::mem::size_of::<RAWINPUTHEADER>() {
             let header = std::ptr::read_unaligned(buffer.as_ptr() as *const RAWINPUTHEADER);
             if header.dwType == RIM_TYPEHID.0 {
+                if hid_collection_page(header.hDevice).is_some_and(|(page, usage)| {
+                    page == CONSUMER_USAGE_PAGE && usage == CONSUMER_COLLECTION
+                }) {
+                    handle_consumer_input(&buffer[..result as usize]);
+                    return;
+                }
                 handle_ptp_input(&buffer[..result as usize]);
                 return;
             }
@@ -3348,6 +3608,7 @@ mod win32_hooks {
     #[cfg(test)]
     mod tests {
         use super::{hid_from_scan_code, hid_from_vk};
+        use crate::capture::win32_hooks::consumer_to_hid;
 
         #[test]
         fn distinguishes_keypad_enter_and_numeric_keypad_vk_codes() {
@@ -3413,6 +3674,19 @@ mod win32_hooks {
             assert_eq!(hid_from_vk(0xAD), Some(0x7f)); // mute
             assert_eq!(hid_from_vk(0xAF), Some(0x80)); // volume up
             assert_eq!(hid_from_vk(0xAE), Some(0x81)); // volume down
+        }
+
+        #[test]
+        fn consumer_media_maps_to_the_same_wire_usages() {
+            // Consumer-collection volume keys (headsets, laptop Fn
+            // media rows that bypass the LL hook) must land on the
+            // identical wire usages as the keyboard-collection path
+            // above, or the two hardware kinds drive different keys.
+            assert_eq!(consumer_to_hid(0xE2), Some(0x7f)); // mute
+            assert_eq!(consumer_to_hid(0xE9), Some(0x80)); // volume up
+            assert_eq!(consumer_to_hid(0xEA), Some(0x81)); // volume down
+            assert_eq!(consumer_to_hid(0xCD), None); // play/pause: not forwarded
+            assert_eq!(consumer_to_hid(0x00), None);
         }
     }
 }
