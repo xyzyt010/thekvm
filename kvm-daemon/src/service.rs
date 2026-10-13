@@ -2,8 +2,8 @@
 
 use anyhow::{bail, Context, Result};
 use kvm_core::{
-    Config, EdgeRouter, HidUsage, InputEvent, InputPacket, InputState, Mode, MouseButton,
-    RoutedEvent, ScreenId, WheelDelta,
+    ClampReason, Config, EdgeRouter, HidUsage, InputEvent, InputPacket, InputState, Mode,
+    MouseButton, RoutedEvent, ScreenId, WheelDelta,
 };
 use kvm_platform::inject::Injector;
 use kvm_protocol::pairing::{Identity, PeerBook};
@@ -2907,6 +2907,27 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     active.as_ref().map(|session| session.event_barrier),
                     captured.event.is_release(),
                 ) {
+                    // Counted, not silent: a runaway barrier (stale
+                    // teardown stamping every fresh event) reads exactly
+                    // like a dead edge — pushes vanish before the router.
+                    // The stuck-edge line carries the total; this fires at
+                    // most every 10s while drops continue.
+                    let dropped = note_barrier_drop();
+                    let slot = DROPPED_BARRIER_LOG_AT.get_or_init(|| std::sync::Mutex::new(None));
+                    if let Ok(mut at) = slot.lock() {
+                        let now = std::time::Instant::now();
+                        if at.is_none_or(|when| {
+                            now.duration_since(when) >= std::time::Duration::from_secs(10)
+                        }) {
+                            *at = Some(now);
+                            tracing::info!(
+                                dropped,
+                                event_id = captured.event_id,
+                                barrier = discarded_event_barrier,
+                                "input events dropped at the teardown barrier; pushes cannot reach the router while this continues"
+                            );
+                        }
+                    }
                     continue;
                 }
                 handle_topology_event(captured, TopologyEventContext {
@@ -4406,6 +4427,101 @@ fn event_passes_barrier(
     is_release || (event_id > discarded && session_barrier.is_none_or(|barrier| event_id > barrier))
 }
 
+/// Stuck-edge telemetry state (see [`report_stuck_edge`]): the last
+/// clamp/resync/barrier story already logged, plus when. Process-wide
+/// and lock-free enough for the per-event path: a poisoned or contended
+/// lock only skips one report, never input.
+struct StuckEdgeLog {
+    clamp: Option<(ClampReason, kvm_core::Edge, u32, u32)>,
+    resync: Option<(u32, u32, u32)>,
+    at: Option<std::time::Instant>,
+}
+
+fn stuck_edge_log() -> &'static std::sync::Mutex<StuckEdgeLog> {
+    static LOG: std::sync::OnceLock<std::sync::Mutex<StuckEdgeLog>> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        std::sync::Mutex::new(StuckEdgeLog {
+            clamp: None,
+            resync: None,
+            at: None,
+        })
+    })
+}
+
+/// Barrier-drop counter for the stuck-edge line below (events that
+/// arrive but die before routing — silent by construction).
+static DROPPED_BARRIER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one event dropped at the teardown barrier (see
+/// [`event_passes_barrier`]). Returns the process-wide total.
+fn note_barrier_drop() -> u64 {
+    DROPPED_BARRIER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Name a locally-clamped push in the journal (see [`ClampReason`]):
+/// which silent gate held it, where, and how hard the user pushes.
+/// Rate-limited (new story logs at once, a held push re-logs every
+/// 10s): normal budget accumulation stays off this line unless a push
+/// is truly stuck saving up — which is exactly the shape to see.
+/// Also carries the latest truth-resync run restart (scale mismatch
+/// eats near-edge pushes silently) and the barrier-drop count (routed
+/// input starving before the router). Call after every locally-routed
+/// motion; quiet when there is nothing new to say.
+fn report_stuck_edge(router: &EdgeRouter) {
+    let clamp = router.last_clamp().map(|stamp| {
+        (
+            stamp.reason,
+            stamp.edge,
+            stamp.cursor_x,
+            stamp.cursor_y,
+            stamp.overflow_px,
+        )
+    });
+    let resync = router
+        .last_resync_reset()
+        .map(|reset| (reset.jump_px, reset.cursor_x, reset.cursor_y));
+    let Ok(mut slot) = stuck_edge_log().lock() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let clamp_key = clamp.map(|(reason, edge, x, y, _)| (reason, edge, x, y));
+    let fresh_clamp = clamp_key.is_some_and(|key| Some(key) != slot.clamp);
+    let fresh_resync = resync.is_some_and(|reset| Some(reset) != slot.resync);
+    let due = slot
+        .at
+        .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(10));
+    let Some((reason, edge, x, y, overflow)) = clamp else {
+        return;
+    };
+    if !(fresh_clamp || fresh_resync || (due && (clamp.is_some() || resync.is_some()))) {
+        return;
+    }
+    slot.clamp = clamp_key;
+    slot.resync = resync;
+    slot.at = Some(now);
+    let gate = match reason {
+        ClampReason::Locked => "locked (ScrollLock holds all crossings)",
+        ClampReason::NoTarget => "unlinked edge (no peer arranged there)",
+        ClampReason::StartupGate => "fresh-entry gate (come inside once, then push out)",
+        ClampReason::PostReturn => "post-return refractory (pull inside, then push out)",
+        ClampReason::PushBudget => "push budget still saving up",
+    };
+    tracing::info!(
+        ?edge,
+        x,
+        y,
+        overflow_px = overflow,
+        startup_gate = router.startup_gate_held(),
+        resync_jump_px = resync.map(|reset| reset.0),
+        barrier_dropped = DROPPED_BARRIER_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        "stuck edge: push held locally ({gate})"
+    );
+}
+
+/// Process-wide barrier-drop count read by the stuck-edge line above.
+static DROPPED_BARRIER_LOG_AT: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
+    std::sync::OnceLock::new();
+
 /// Divert/echo fast path: the counters are process-wide and cumulative,
 /// so the OLD rule ("more than N since the drive started") is a
 /// one-shot trap — a short tail of the previous episode's injected
@@ -4626,6 +4742,13 @@ async fn handle_topology_event(
             // distinguishes "hook is dead" from "scrolled while local".
             if matches!(event, InputEvent::Wheel(_) | InputEvent::SmoothWheel { .. }) {
                 *local_wheel_dropped += 1;
+            }
+            // Stuck-edge telemetry (see report_stuck_edge): a push dying
+            // in a silent gate names itself here instead of reading as a
+            // dead mouse. Motion only — keys/buttons route Local by
+            // design, and wheels have their own counter above.
+            if matches!(event, InputEvent::MouseMove { .. }) {
+                report_stuck_edge(router);
             }
             // A compositor portal may have activated a barrier even when the
             // topology has no neighbor on that edge. Release it so the local
@@ -11851,6 +11974,44 @@ unsafe extern "system" fn windows_service_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stuck_edge_report_names_silent_gates_without_panicking() {
+        // Seeded at the facing edge: the first outward run clamps in the
+        // fresh-entry gate, and reporting it (twice — the second is rate
+        // limited) never panics and leaves the router usable.
+        let layout = kvm_core::Layout {
+            screens: vec![
+                kvm_core::Screen {
+                    id: kvm_core::ScreenId(1),
+                    name: "main".into(),
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    peer_fingerprint: None,
+                },
+                kvm_core::Screen {
+                    id: kvm_core::ScreenId(2),
+                    name: "right".into(),
+                    x: 1,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    peer_fingerprint: Some("peer".into()),
+                },
+            ],
+            self_screen: Some(kvm_core::ScreenId(1)),
+        };
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_local_cursor_position(1919, 540).unwrap();
+        let routed = router.route(InputEvent::MouseMove { dx: 40, dy: 0 });
+        assert!(matches!(routed, RoutedEvent::Local(_)));
+        let stamp = router.last_clamp().expect("gate clamp is reported");
+        assert_eq!(stamp.reason, ClampReason::StartupGate);
+        report_stuck_edge(&router);
+        report_stuck_edge(&router);
+    }
 
     #[test]
     fn input_capability_policy_matches_platform() {

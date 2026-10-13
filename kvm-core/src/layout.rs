@@ -502,6 +502,56 @@ pub struct EdgeRouter {
     /// Set only by ReturnHome; cleared by coming inside, by any fresh
     /// handoff, and by explicit cursor placement.
     post_return_edge: Option<Edge>,
+    /// Last silent local clamp (see [`ClampReason`]): which gate held a
+    /// would-be crossing and where. The daemon reads this after every
+    /// locally-routed motion and logs it rate-limited, so a stuck edge
+    /// names itself in the journal instead of reading as a dead mouse.
+    last_clamp: Option<ClampStamp>,
+    /// Last truth re-pin that restarted an active push run (see
+    /// RESYNC_DIVERGE_PX): the jump size and where it landed. Systematic
+    /// large jumps here mean the OS truth scale disagrees with the
+    /// captured deltas (HiDPI/transform), and every near-edge push dies
+    /// silently — the journal must show it.
+    last_resync_reset: Option<ResyncReset>,
+}
+
+/// Why one motion step stayed local instead of opening a crossing.
+/// Every variant is a SILENT clamp by default (no journal line at the
+/// call site): the daemon reports them rate-limited via
+/// [`EdgeRouter::last_clamp`], so normal accumulation
+/// ([`ClampReason::PushBudget`]) stays quiet while gates that can wedge
+/// a real push (startup, refractory, lock, unlinked edge) get named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClampReason {
+    /// Screen lock held: nothing crosses by design.
+    Locked,
+    /// The overflow edge faces no linked screen in this mode.
+    NoTarget,
+    /// Fresh-entry gate: seeded at the edge, must come inside first.
+    StartupGate,
+    /// Post-return refractory on the landing edge.
+    PostReturn,
+    /// Ordinary push-budget accumulation (not yet at EDGE_PUSH_PX).
+    PushBudget,
+}
+
+/// One recorded silent clamp: what held, which edge overflowed, by how
+/// far, and where the virtual cursor sat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClampStamp {
+    pub reason: ClampReason,
+    pub edge: Edge,
+    pub overflow_px: i64,
+    pub cursor_x: u32,
+    pub cursor_y: u32,
+}
+
+/// One recorded push-run restart by a truth re-pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResyncReset {
+    pub jump_px: u32,
+    pub cursor_x: u32,
+    pub cursor_y: u32,
 }
 
 impl EdgeRouter {
@@ -540,6 +590,8 @@ impl EdgeRouter {
             locked: false,
             startup_gate: false,
             post_return_edge: None,
+            last_clamp: None,
+            last_resync_reset: None,
         })
     }
 
@@ -718,6 +770,11 @@ impl EdgeRouter {
         self.local_cursor_y = self.cursor_y;
         self.push_edge = None;
         self.push_accum = 0;
+        // A fresh seed starts a fresh stuck-edge story: clamps and
+        // resync history from a previous life must not report against
+        // the new cursor.
+        self.last_clamp = None;
+        self.last_resync_reset = None;
         // Explicit placement is deliberate by construction: it lifts the
         // post-return refractory (a veto-park or a seed must never poison
         // the next deliberate push).
@@ -772,6 +829,16 @@ impl EdgeRouter {
         self.local_cursor_x = self.cursor_x;
         self.local_cursor_y = self.cursor_y;
         if moved > RESYNC_DIVERGE_PX {
+            // Record run restarts for the stuck-edge telemetry (see
+            // last_resync_reset): only an ACTIVE run dying matters — a
+            // pin with nothing saved up is ordinary tracking.
+            if self.push_edge.is_some() && self.push_accum != 0 {
+                self.last_resync_reset = Some(ResyncReset {
+                    jump_px: moved,
+                    cursor_x: self.cursor_x,
+                    cursor_y: self.cursor_y,
+                });
+            }
             self.push_edge = None;
             self.push_accum = 0;
         }
@@ -1096,12 +1163,24 @@ impl EdgeRouter {
         if self.locked {
             self.push_edge = None;
             self.push_accum = 0;
-            return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
+            return self.clamp_to_edge(
+                next_x,
+                next_y,
+                screen.width,
+                screen.height,
+                ClampReason::Locked,
+            );
         }
         let Some(target) = self.crossing_target(self.current_screen, edge) else {
             self.push_edge = None;
             self.push_accum = 0;
-            return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
+            return self.clamp_to_edge(
+                next_x,
+                next_y,
+                screen.width,
+                screen.height,
+                ClampReason::NoTarget,
+            );
         };
         // Fresh-entry gate (see the field): a controller seeded at the
         // edge clamps until the cursor has come inside once. Resting
@@ -1109,7 +1188,13 @@ impl EdgeRouter {
         if self.startup_gate {
             self.push_edge = None;
             self.push_accum = 0;
-            return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
+            return self.clamp_to_edge(
+                next_x,
+                next_y,
+                screen.width,
+                screen.height,
+                ClampReason::StartupGate,
+            );
         }
         // Post-return refractory (see the field): the edge a return just
         // came home through clamps until the cursor pulls back inside.
@@ -1117,7 +1202,13 @@ impl EdgeRouter {
         if self.post_return_edge == Some(edge) {
             self.push_edge = None;
             self.push_accum = 0;
-            return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
+            return self.clamp_to_edge(
+                next_x,
+                next_y,
+                screen.width,
+                screen.height,
+                ClampReason::PostReturn,
+            );
         }
         // Push-through (Deskflow jump-zone + switch-delay spirit): one
         // stray delta never crosses. The outward run on THIS edge must
@@ -1154,7 +1245,13 @@ impl EdgeRouter {
             self.push_accum = credit;
         }
         if self.push_accum < EDGE_PUSH_PX {
-            return self.clamp_to_edge(next_x, next_y, screen.width, screen.height);
+            return self.clamp_to_edge(
+                next_x,
+                next_y,
+                screen.width,
+                screen.height,
+                ClampReason::PushBudget,
+            );
         }
         self.push_edge = None;
         self.push_accum = 0;
@@ -1236,8 +1333,16 @@ impl EdgeRouter {
     /// Clamp an out-of-bounds motion back inside the current screen and
     /// report the surviving remainder as a local event (unlinked edges and
     /// the screen lock behave identically: the cursor stops, nothing
-    /// crosses).
-    fn clamp_to_edge(&mut self, next_x: i64, next_y: i64, width: u32, height: u32) -> RoutedEvent {
+    /// crosses). Records the reason (see [`ClampReason`]) for the
+    /// daemon's rate-limited stuck-edge telemetry.
+    fn clamp_to_edge(
+        &mut self,
+        next_x: i64,
+        next_y: i64,
+        width: u32,
+        height: u32,
+        reason: ClampReason,
+    ) -> RoutedEvent {
         let previous_x = self.cursor_x;
         let previous_y = self.cursor_y;
         let clamped_x = next_x.clamp(0, i64::from(width - 1));
@@ -1246,12 +1351,49 @@ impl EdgeRouter {
         self.cursor_y = clamped_y as u32;
         self.local_cursor_x = self.cursor_x;
         self.local_cursor_y = self.cursor_y;
+        // Overflow of THIS step past the attempted edge: how far past
+        // the border the step tried to go (0 when it merely approached).
+        // The stuck-edge line shows how hard the user pushes into a
+        // clamp that never opens.
+        let edge = edge_for_overflow(next_x, next_y, width, height).unwrap_or(Edge::Left);
+        let overflow_px = match edge {
+            Edge::Left => (-next_x).max(0),
+            Edge::Right => (next_x - i64::from(width.saturating_sub(1))).max(0),
+            Edge::Top => (-next_y).max(0),
+            Edge::Bottom => (next_y - i64::from(height.saturating_sub(1))).max(0),
+        };
+        self.last_clamp = Some(ClampStamp {
+            reason,
+            edge,
+            overflow_px,
+            cursor_x: self.cursor_x,
+            cursor_y: self.cursor_y,
+        });
         RoutedEvent::Local(InputEvent::MouseMove {
             dx: (clamped_x - i64::from(previous_x)).clamp(i64::from(i32::MIN), i64::from(i32::MAX))
                 as i32,
             dy: (clamped_y - i64::from(previous_y)).clamp(i64::from(i32::MIN), i64::from(i32::MAX))
                 as i32,
         })
+    }
+
+    /// The last silent local clamp, if any (see [`ClampReason`]). The
+    /// daemon reports these rate-limited; pure read, never clears.
+    pub fn last_clamp(&self) -> Option<ClampStamp> {
+        self.last_clamp
+    }
+
+    /// Whether the fresh-entry gate currently holds pushes. Reported
+    /// beside clamp lines so a StartupGate clamp reads as expected
+    /// first-push behavior rather than a wedge.
+    pub fn startup_gate_held(&self) -> bool {
+        self.startup_gate
+    }
+
+    /// The last truth re-pin that restarted an active push run, if any.
+    /// Pure read, never clears.
+    pub fn last_resync_reset(&self) -> Option<ResyncReset> {
+        self.last_resync_reset
     }
 
     pub fn return_to_local(&mut self, from: ScreenId, x: u32, y: u32) -> Result<(), String> {
@@ -1635,6 +1777,23 @@ fn saturating_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
+/// Which edge one out-of-bounds step attempted (None while inside).
+/// Shared by the local clamp telemetry and the crossing math so the
+/// stuck-edge line names the same edge the router considered.
+fn edge_for_overflow(next_x: i64, next_y: i64, width: u32, height: u32) -> Option<Edge> {
+    if next_x < 0 {
+        Some(Edge::Left)
+    } else if next_x >= i64::from(width) {
+        Some(Edge::Right)
+    } else if next_y < 0 {
+        Some(Edge::Top)
+    } else if next_y >= i64::from(height) {
+        Some(Edge::Bottom)
+    } else {
+        None
+    }
+}
+
 fn display_name(name: &str, fallback: &str) -> String {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -1728,6 +1887,61 @@ mod tests {
         router.return_to_local(ScreenId(2), 10, 20).unwrap();
         assert_eq!(router.active_remote(), None);
         assert_eq!(router.cursor_position(), (10, 20));
+    }
+
+    #[test]
+    fn silent_clamps_name_their_gate_for_the_journal() {
+        let layout = Layout {
+            screens: vec![screen(1, "main", 0, 0), screen(2, "right", 1, 0)],
+            self_screen: Some(ScreenId(1)),
+        };
+        let mut router = EdgeRouter::new(layout).unwrap();
+        // Seeded at the facing edge: the fresh-entry gate holds the
+        // very first outward run and the stamp says so.
+        router.set_local_cursor_position(1919, 540).unwrap();
+        assert!(router.startup_gate_held());
+        let result = router.route(InputEvent::MouseMove { dx: 40, dy: 0 });
+        assert!(matches!(result, RoutedEvent::Local(_)));
+        let stamp = router.last_clamp().expect("gate clamp is reported");
+        assert_eq!(stamp.reason, ClampReason::StartupGate);
+        assert_eq!(stamp.edge, Edge::Right);
+        assert!(stamp.overflow_px > 0);
+        // A fresh seed clears the story: no stale gate reports.
+        router.place_local_cursor(960, 540).unwrap();
+        assert_eq!(router.last_clamp(), None);
+        // Ordinary budget accumulation reports PushBudget, not a gate.
+        // (dx 1000 overflows the 1920 edge from mid-screen with capped
+        // single-event credit, so the run is still saving up.)
+        let result = router.route(InputEvent::MouseMove { dx: 1000, dy: 0 });
+        assert!(matches!(result, RoutedEvent::Local(_)));
+        let stamp = router.last_clamp().expect("budget clamp is reported");
+        assert_eq!(stamp.reason, ClampReason::PushBudget);
+        assert_eq!(router.last_resync_reset(), None);
+    }
+
+    #[test]
+    fn truth_resync_restarting_a_run_is_reported() {
+        let layout = Layout {
+            screens: vec![screen(1, "main", 0, 0), screen(2, "right", 1, 0)],
+            self_screen: Some(ScreenId(1)),
+        };
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.place_local_cursor(960, 540).unwrap();
+        // Start a push run toward the right edge (overflows with capped
+        // single-event credit, so the run is still saving up).
+        let result = router.route(InputEvent::MouseMove { dx: 1000, dy: 0 });
+        assert!(matches!(result, RoutedEvent::Local(_)));
+        // A far-away truth pin restarts the run AND records the jump.
+        router.resync_if_local(100, 100);
+        let reset = router.last_resync_reset().expect("run restart is reported");
+        assert!(reset.jump_px > RESYNC_DIVERGE_PX);
+        assert_eq!((reset.cursor_x, reset.cursor_y), (100, 100));
+        // A pin that barely moves records nothing.
+        router.place_local_cursor(960, 540).unwrap();
+        let result = router.route(InputEvent::MouseMove { dx: 1000, dy: 0 });
+        assert!(matches!(result, RoutedEvent::Local(_)));
+        router.resync_if_local(1918, 540);
+        assert_eq!(router.last_resync_reset(), None);
     }
 
     #[test]

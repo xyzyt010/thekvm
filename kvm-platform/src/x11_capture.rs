@@ -938,13 +938,52 @@ impl X11Capture {
                     }
                 }
                 XI_MOTION.fetch_add(1, Ordering::Relaxed);
-                let dx = axis_value(&event.valuator_mask, &event.axisvalues_raw, 0)
+                let raw_dx = axis_value(&event.valuator_mask, &event.axisvalues_raw, 0);
+                let raw_dy = axis_value(&event.valuator_mask, &event.axisvalues_raw, 1);
+                let dx = raw_dx
                     .map(|value| take_integer(&mut self.motion_x, value))
                     .unwrap_or(0);
-                let dy = axis_value(&event.valuator_mask, &event.axisvalues_raw, 1)
+                let dy = raw_dy
                     .map(|value| take_integer(&mut self.motion_y, value))
                     .unwrap_or(0);
-                (dx != 0 || dy != 0).then_some(InputEvent::MouseMove { dx, dy })
+                if dx == 0 && dy == 0 {
+                    // Counted, not silent: raw motion that never becomes a
+                    // MouseMove can never feed the edge router — pushes die
+                    // before routing with zero journal evidence. Two shapes:
+                    // axes missing from the report (device speaks other
+                    // valuators, e.g. absolute touch axes) vs sub-pixel
+                    // banking (fractional deltas saving up). Rate-limited
+                    // INFO names which one while it continues.
+                    static ZERO_TOTAL: AtomicU64 = AtomicU64::new(0);
+                    static ZERO_NO_AXIS: AtomicU64 = AtomicU64::new(0);
+                    static ZERO_LAST_LOG: std::sync::OnceLock<
+                        std::sync::Mutex<Option<std::time::Instant>>,
+                    > = std::sync::OnceLock::new();
+                    let total = ZERO_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+                    if raw_dx.is_none() && raw_dy.is_none() {
+                        ZERO_NO_AXIS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let slot = ZERO_LAST_LOG.get_or_init(|| std::sync::Mutex::new(None));
+                    if let Ok(mut at) = slot.lock() {
+                        let now = std::time::Instant::now();
+                        if at.is_none_or(|when| {
+                            now.duration_since(when) >= std::time::Duration::from_secs(60)
+                        }) {
+                            *at = Some(now);
+                            tracing::info!(
+                                total,
+                                no_axis = ZERO_NO_AXIS.load(Ordering::Relaxed),
+                                axes_present = !(raw_dx.is_none() && raw_dy.is_none()),
+                                mask_words = event.valuator_mask.len(),
+                                banked_x = self.motion_x,
+                                banked_y = self.motion_y,
+                                "x11 raw motion carries no whole-pixel delta; edge pushes cannot cross while this is all the server delivers"
+                            );
+                        }
+                    }
+                    return None;
+                }
+                Some(InputEvent::MouseMove { dx, dy })
             }
             // Grabbed-core stream (see GrabKind::Core): live ONLY while
             // core-grabbed. Core events carry no source id, so no
