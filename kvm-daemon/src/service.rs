@@ -4758,10 +4758,14 @@ async fn handle_topology_event(
                 // virtual cursor would otherwise drift from the visible
                 // one (exiting mid-screen or at a stale height). Lock the
                 // visible cursor to the router's coordinate via the
-                // kernel-level uinput absolute pointer on every local
-                // move so the visible cursor and the edge router stay 1:1.
+                // kernel-level uinput absolute pointer — but ONLY near a
+                // crossable edge. Every-move locking yanks the visible
+                // cursor against the compositor's acceleration on every
+                // motion event and reads as a glitchy local mouse;
+                // mid-screen the router needs no lock (nothing can open
+                // there), so local motion stays purely native.
                 #[cfg(target_os = "linux")]
-                if kvm_platform::capture::is_wayland_session() {
+                if kvm_platform::capture::is_wayland_session() && router.near_crossing_edge(64) {
                     let (cx, cy) = router.cursor_position();
                     if let Some(screen) = router.layout().screen(router.local_screen()) {
                         let _ = kvm_platform::inject::sync_cursor_uinput(

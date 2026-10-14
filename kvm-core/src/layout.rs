@@ -1670,11 +1670,12 @@ const RETURN_INSET_PX: u32 = 8;
 /// switch delay / double-tap (a stray event never crosses). Ours: the
 /// daemon re-pins the virtual cursor to the OS pointer so "near" can
 /// never read as "at", and overflow must accumulate to this depth on one
-/// edge streak before a Handoff fires. One firm push crosses instantly;
-/// resting noise, single stray deltas and fling tails pin at the border.
+/// edge streak before a Handoff fires. One firm push crosses instantly
+/// (even a quick 9-15px flick, the natural edge gesture); resting noise,
+/// single stray deltas and fling tails pin at the border.
 /// The streak resets the moment motion comes back inside or changes
 /// edge, so drift can never save up for a phantom crossing.
-pub const EDGE_PUSH_PX: i64 = 16;
+pub const EDGE_PUSH_PX: i64 = 8;
 /// How close (px from the exit edge) a crossing run must start for full
 /// single-event credit (see route()): pushes that begin at the border
 /// cross in one event, while a run starting further inside credits at
@@ -1924,18 +1925,18 @@ mod tests {
         router.set_edge_mode(EdgeMode::Double);
         router.set_double_style(DoubleEdgeStyle::Mirror);
         router.place_local_cursor(0, 540).unwrap();
-        // Push 10px into Left edge (< EDGE_PUSH_PX=16), then slide
-        // vertically along x=0 (dx=0, dy=4), then push 8px more: must
+        // Push 5px into Left edge (< EDGE_PUSH_PX=8), then slide
+        // vertically along x=0 (dx=0, dy=4), then push 5px more: must
         // cross instead of wiping the run on the vertical slide.
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: -10, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: -5, dy: 0 }),
             RoutedEvent::Local(_)
         ));
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: 0, dy: 4 }),
             RoutedEvent::Local(_)
         ));
-        let crossed = router.route(InputEvent::MouseMove { dx: -8, dy: 0 });
+        let crossed = router.route(InputEvent::MouseMove { dx: -5, dy: 0 });
         assert!(
             matches!(
                 crossed,
@@ -2179,9 +2180,10 @@ mod tests {
         ));
         assert_eq!(router.active_remote(), None);
         assert_eq!(router.cursor_position(), (1919, 540));
-        // Sustained pressure accumulates across events, then crosses.
+        // Sustained pressure accumulates across events, then crosses:
+        // a firm flick opens the edge at once.
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 30, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: 14, dy: 0 }),
             RoutedEvent::Handoff {
                 edge: Edge::Right,
                 ..
@@ -2200,11 +2202,11 @@ mod tests {
             RoutedEvent::Local(_)
         ));
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 10, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: 5, dy: 0 }),
             RoutedEvent::Local(_)
         ));
         assert_eq!(router.active_remote(), None);
-        // Back inside wipes the 10px run ...
+        // Back inside wipes the 5px run ...
         assert!(matches!(
             router.route(InputEvent::MouseMove { dx: -100, dy: 0 }),
             RoutedEvent::Local(_)
@@ -2234,9 +2236,9 @@ mod tests {
             router.route(InputEvent::MouseMove { dx: 959, dy: 0 }),
             RoutedEvent::Local(_)
         ));
-        // 10px run toward the right edge ...
+        // 5px run toward the right edge ...
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 10, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: 5, dy: 0 }),
             RoutedEvent::Local(_)
         ));
         // ... then all the way to the left edge: the left run starts
@@ -2413,17 +2415,17 @@ mod tests {
             RoutedEvent::Local(_)
         ));
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 10, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: 5, dy: 0 }),
             RoutedEvent::Local(_)
         ));
-        // Jump far away: cursor adopts truth, stale 10px run is gone.
+        // Jump far away: cursor adopts truth, stale 5px run is gone.
         router.resync_if_local(100, 200);
         assert_eq!(router.cursor_position(), (100, 200));
-        // Back at the edge on fresh truth: one more 10px overflow is a
-        // fresh 10px run, not 20 — stays local.
+        // Back at the edge on fresh truth: one more 5px overflow is a
+        // fresh 5px run, not 10 — stays local.
         router.resync_if_local(1919, 540);
         assert!(matches!(
-            router.route(InputEvent::MouseMove { dx: 10, dy: 0 }),
+            router.route(InputEvent::MouseMove { dx: 5, dy: 0 }),
             RoutedEvent::Local(_)
         ));
         assert_eq!(router.active_remote(), None);
