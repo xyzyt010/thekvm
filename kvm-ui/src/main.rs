@@ -3368,6 +3368,17 @@ fn should_dial_back(mode: kvm_core::Mode, ceremony_open: bool) -> bool {
     mode != kvm_core::Mode::ClientOnly && !ceremony_open
 }
 
+/// Concurrent-dial tie-break for re-epoch adoption: both stations dialed
+/// at once, so our supervised child is still alive on our epoch while an
+/// inbound session already carries the peer's fresh one. The LOWER epoch
+/// wins on BOTH sides (both polls compare the same pair), so exactly one
+/// side keeps its child and the other adopts — the link converges on one
+/// epoch instead of both sides killing each other's session forever.
+/// Pure so the determinism is unit-tested, not hoped for.
+fn keep_live_epoch(live_epoch: u64, inbound_epoch: u64) -> bool {
+    live_epoch < inbound_epoch
+}
+
 /// Seconds after a session ends during which its memory still arms the
 /// dial-back (see follow_link): covers late UI starts and slow polls
 /// without ever resurrecting ancient links (banned epochs are already
@@ -3521,40 +3532,65 @@ fn follow_link(
     if should_dial_back(status.mode, ceremony_open) {
         if let Some(link) = inbound.as_ref() {
             if let Some(new_id) = link.link_id {
-                let stale = session.lock().ok().and_then(|slot| {
-                    let current = slot.as_ref()?;
-                    match current.link_id {
-                        Some(old) if old != new_id => Some(Some(old)),
-                        None => Some(None),
-                        _ => None,
-                    }
+                // Our supervised child's liveness and epoch: a child that
+                // already exited (ban rejection, failed dial) must never
+                // block adoption of the peer's live epoch.
+                let current = session.lock().ok().and_then(|mut slot| {
+                    slot.as_mut().map(|child_session| {
+                        let alive = matches!(child_session.child.try_wait(), Ok(None));
+                        (child_session.link_id, alive)
+                    })
                 });
-                if let Some(old) = stale {
-                    if let Some(old_id) = old {
-                        ui_log(&format!(
-                            "link: peer re-epoch {old_id} -> {new_id}; adopting the fresh epoch"
-                        ));
-                        end_link(old_id);
-                    } else {
-                        ui_log(&format!(
-                            "link: adopting peer epoch {new_id} for an epoch-less child"
-                        ));
-                    }
-                    stop_session(weak, session, "Peer started a fresh link");
-                    set_status(
-                        weak,
-                        "Peer started a fresh link — redialling automatically…".into(),
-                    );
-                    spawn_dial_back(
-                        weak,
-                        session,
-                        pending,
-                        data_dir,
-                        link.address.clone(),
-                        Some(new_id),
-                    );
-                    if let Ok(mut slot) = last_attempt.lock() {
-                        *slot = Some(std::time::Instant::now());
+                // Adopt unless our child is alive on a LOWER epoch than the
+                // inbound one (see keep_live_epoch): the lower epoch wins
+                // on both sides, so a double-Connect converges on the
+                // original link instead of churning epochs forever. A dead,
+                // missing, or epoch-less child always takes the adopt path
+                // below (which no-ops when there is nothing stale).
+                let ours_lower = match current {
+                    Some((Some(old), true)) if old == new_id => None,
+                    Some((Some(old), true)) if keep_live_epoch(old, new_id) => Some(old),
+                    _ => None,
+                };
+                // Same epoch both sides: nothing stale, nothing to do.
+                let same = matches!(current, Some((Some(old), _)) if old == new_id);
+                if let Some(old) = ours_lower {
+                    ui_log(&format!(
+                        "link: keeping live epoch {old} over inbound {new_id} (double-Connect tie-break); peer adopts ours"
+                    ));
+                } else if !same {
+                    let stale = match current {
+                        Some((Some(old), _)) if old != new_id => Some(Some(old)),
+                        Some((None, _)) => Some(None),
+                        _ => None,
+                    };
+                    if let Some(old) = stale {
+                        if let Some(old_id) = old {
+                            ui_log(&format!(
+                                "link: peer re-epoch {old_id} -> {new_id}; adopting the fresh epoch"
+                            ));
+                            end_link(old_id);
+                        } else {
+                            ui_log(&format!(
+                                "link: adopting peer epoch {new_id} for an epoch-less child"
+                            ));
+                        }
+                        stop_session(weak, session, "Peer started a fresh link");
+                        set_status(
+                            weak,
+                            "Peer started a fresh link — redialling automatically…".into(),
+                        );
+                        spawn_dial_back(
+                            weak,
+                            session,
+                            pending,
+                            data_dir,
+                            link.address.clone(),
+                            Some(new_id),
+                        );
+                        if let Ok(mut slot) = last_attempt.lock() {
+                            *slot = Some(std::time::Instant::now());
+                        }
                     }
                 }
             }
@@ -5584,7 +5620,7 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dialable_host_port, edge_choice_from_index, edge_choice_index, edge_name,
+        dialable_host_port, edge_choice_from_index, edge_choice_index, edge_name, keep_live_epoch,
         mode_mismatch_guidance, pair_status_text, parse_ban_epoch, should_dial_back,
     };
     use kvm_core::{DoubleEdgeStyle, EdgeMode};
@@ -5643,6 +5679,17 @@ mod tests {
         // An open pairing ceremony is never hijacked.
         assert!(!should_dial_back(Bidirectional, true));
         assert!(!should_dial_back(ClientOnly, true));
+    }
+
+    #[test]
+    fn double_connect_tie_break_keeps_one_epoch_on_both_sides() {
+        // Lower epoch wins everywhere: the side holding it keeps its live
+        // child, the side holding the higher one adopts. Same comparison
+        // on the same pair, so concurrent Connects converge instead of
+        // both sides killing each other's session forever.
+        assert!(keep_live_epoch(100, 200));
+        assert!(!keep_live_epoch(200, 100));
+        assert!(!keep_live_epoch(100, 100));
     }
 
     #[test]
