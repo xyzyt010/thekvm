@@ -2832,14 +2832,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 // consecutively queued moves into one packet — identical
                 // final displacement, far fewer frames. Wheels stop the
                 // fold (scroll position relative to motion is preserved)
-                // and wait in the pending slot above. The fold stays small
-                // (16, about one 1000Hz frame-batch at 60fps): merging a
-                // whole burst into one giant delta makes the remote cursor
-                // jump in visible steps instead of gliding.
+                // and wait in the pending slot above. The fold stays SMALL
+                // (4: UDP carries motion fire-and-forget with no per-frame
+                // cost, so bigger folds only chunk the remote SendInput
+                // into visible steps instead of gliding).
                 let mut captured = first;
                 if let InputEvent::MouseMove { mut dx, mut dy } = captured.event {
                     let mut folded = 0u32;
-                    while folded < 16 {
+                    while folded < 4 {
                         match motion_rx.try_recv() {
                             Ok(next) => match next.event {
                                 InputEvent::MouseMove { dx: mx, dy: my } => {
@@ -4611,14 +4611,18 @@ async fn handle_topology_event(
         && router.current_screen() == router.local_screen()
         && router.active_remote().is_none()
     {
-        // Near a crossing edge every event re-pins (a 50ms-old virtual
-        // position is where phantom crossings are computed from); mid
-        // screen the throttle is plenty and keeps motion cheap.
+        // Near a crossing edge truth goes stale fastest (the virtual
+        // cursor runs ahead while the OS pointer sits pinned at the
+        // border), so re-pin more often there — but NEVER every event:
+        // a fresh X connect + query per motion event at 500-1000Hz
+        // stalls the routing task and reads as local-mouse lag near
+        // edges. 20ms near / 50ms far keeps edge truth fresh without
+        // the storm.
         let near = router.near_crossing_edge(64);
-        let due = near
-            || last_resync
-                .map(|when| when.elapsed() >= Duration::from_millis(50))
-                .unwrap_or(true);
+        let throttle_ms = if near { 20 } else { 50 };
+        let due = last_resync
+            .map(|when| when.elapsed() >= Duration::from_millis(throttle_ms))
+            .unwrap_or(true);
         if due {
             *last_resync = Some(Instant::now());
             match kvm_platform::capture::current_cursor_position() {

@@ -1,0 +1,13 @@
+mss>=9.0
+Pillow>=10.0
+pyperclip>=1.8
+psutil>=5.9
+rapidocr>=3.0; platform_machine != "ARM64"
+onnxruntime>=1.17
+reportlab>=4.0
+pynput>=1.7; sys_platform != "unknown"
+docling>=2.0
+paddleocr>=3.0
+paddlex>=3.0
+numpy>=1.24
+opencv-python-headless>=4.8
