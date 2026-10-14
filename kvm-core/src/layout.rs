@@ -502,6 +502,11 @@ pub struct EdgeRouter {
     /// Set only by ReturnHome; cleared by coming inside, by any fresh
     /// handoff, and by explicit cursor placement.
     post_return_edge: Option<Edge>,
+    /// When that refractory began (see [`POST_RETURN_HOLD_MS`]): the
+    /// gate holds pushes only for a short window after the return, so a
+    /// held shove cannot bounce the drive while a deliberate second
+    /// drag crosses in well under a second.
+    post_return_at: Option<std::time::Instant>,
     /// Last silent local clamp (see [`ClampReason`]): which gate held a
     /// would-be crossing and where. The daemon reads this after every
     /// locally-routed motion and logs it rate-limited, so a stuck edge
@@ -590,6 +595,7 @@ impl EdgeRouter {
             locked: false,
             startup_gate: false,
             post_return_edge: None,
+            post_return_at: None,
             last_clamp: None,
             last_resync_reset: None,
         })
@@ -779,6 +785,7 @@ impl EdgeRouter {
         // post-return refractory (a veto-park or a seed must never poison
         // the next deliberate push).
         self.post_return_edge = None;
+        self.post_return_at = None;
         // Arm the fresh-entry gate when the seed sits at a facing edge
         // (see the field): the first gestures after (re)start must come
         // inside before any outward run can open a crossing. Deliberate
@@ -1001,25 +1008,25 @@ impl EdgeRouter {
                         let unarmed_entry = self.entry_edge == Some(edge) && !self.return_armed;
                         // Home-facing edges return. Beyond the arranged
                         // facing edge: on a lone-peer Double link in
-                        // Mirror style BOTH horizontal edges return once
-                        // the drive has settled (armed), and the entry edge
-                        // itself always faces home for the escape hatch, so
-                        // a drive entered at either peer edge comes home
-                        // through either one — the inverse double-edge feel
-                        // (exit Left, enter Right, push Right to come home).
-                        // Unarmed drives still clamp on the second edge
-                        // (fresh-entry fling tails must never return), and
+                        // Mirror style BOTH horizontal edges face home —
+                        // that is the whole point of a double edge
+                        // (exit Left, enter Right, push Right to come
+                        // home), so no horizontal edge on the peer may
+                        // ever dead-clamp a sustained shove. The entry
+                        // edge itself still starts disarmed and clamps
+                        // fling tails (see unarmed_entry below) until the
+                        // cursor settles.
                         // Fixed styles return through the selected edge
                         // only, wherever the drive entered.
+                        let lone_double_horizontal = self.edge_mode == EdgeMode::Double
+                            && matches!(edge, Edge::Left | Edge::Right)
+                            && from != self.local_screen
+                            && self.layout.single_peer_screen().is_some();
                         let faces_home = match self.fixed_return_edge() {
                             Some(fixed) => edge == fixed,
                             None => {
                                 self.layout.neighbor_for_edge(from, edge) == Some(self.local_screen)
-                                    || ((self.return_armed || self.entry_edge == Some(edge))
-                                        && self.edge_mode == EdgeMode::Double
-                                        && matches!(edge, Edge::Left | Edge::Right)
-                                        && from != self.local_screen
-                                        && self.layout.single_peer_screen().is_some())
+                                    || lone_double_horizontal
                             }
                         };
                         if faces_home && !unarmed_entry {
@@ -1037,10 +1044,26 @@ impl EdgeRouter {
                             }
                             .max(0);
                             if self.return_edge == Some(edge) {
-                                self.return_edge_accum += overflow;
+                                // Unarmed credit cap (same spirit as the
+                                // entry-side phantom guard): one giant fling
+                                // that carries the cursor across the peer
+                                // pins at the border instead of teleporting
+                                // control home, while a sustained shove —
+                                // the deliberate gesture — still gets home.
+                                let credit = if self.return_armed {
+                                    overflow
+                                } else {
+                                    overflow.min(RETURN_PUSH_PX - 1)
+                                };
+                                self.return_edge_accum += credit;
                             } else {
+                                let credit = if self.return_armed {
+                                    overflow
+                                } else {
+                                    overflow.min(RETURN_PUSH_PX - 1)
+                                };
                                 self.return_edge = Some(edge);
-                                self.return_edge_accum = overflow;
+                                self.return_edge_accum = credit;
                                 self.return_run_since = Some(std::time::Instant::now());
                             }
                             // Sustained-pressure gate (see return_hold):
@@ -1053,7 +1076,20 @@ impl EdgeRouter {
                                     .return_run_since
                                     .is_some_and(|since| since.elapsed() >= self.return_hold);
                             let grace = self.in_handoff_grace();
-                            if self.return_edge_accum >= RETURN_EDGE_PX && held && !grace {
+                            // Armed drives return on the shallow threshold;
+                            // an UNARMED drive on a non-entry edge keeps the
+                            // deep escape-hatch budget instead, so the tail
+                            // of the fling that carried the cursor across
+                            // the peer can never snap control home. Reaching
+                            // this edge at all means the cursor already
+                            // travelled inward, so a real shove still gets
+                            // home in a handful of events.
+                            let threshold = if self.return_armed {
+                                RETURN_EDGE_PX
+                            } else {
+                                RETURN_PUSH_PX
+                            };
+                            if self.return_edge_accum >= threshold && held && !grace {
                                 // Park at the edge with the roamed height
                                 // (mapped vertical, saved edge x): a return
                                 // never lands mid-screen, nor teleports
@@ -1176,6 +1212,7 @@ impl EdgeRouter {
                 ) >= POST_RETURN_CLEAR_PX
                 {
                     self.post_return_edge = None;
+                    self.post_return_at = None;
                 }
             }
             // Comfortably inside (beyond push range of every crossable
@@ -1225,9 +1262,11 @@ impl EdgeRouter {
             );
         }
         // Post-return refractory (see the field): the edge a return just
-        // came home through clamps until the cursor pulls back inside.
-        // A held shove must never save up across the return boundary.
-        if self.post_return_edge == Some(edge) {
+        // came home through clamps until the cursor pulls back inside OR
+        // the short duration gate expires — a deliberate second drag
+        // crosses immediately, while the tail of the shove that just came
+        // home still cannot bounce the drive.
+        if self.post_return_edge == Some(edge) && self.post_return_holds() {
             self.push_edge = None;
             self.push_accum = 0;
             return self.clamp_to_edge(
@@ -1284,6 +1323,7 @@ impl EdgeRouter {
         self.push_edge = None;
         self.push_accum = 0;
         self.post_return_edge = None;
+        self.post_return_at = None;
         let target_screen = self
             .layout
             .screen(target)
@@ -1356,6 +1396,16 @@ impl EdgeRouter {
             target_y,
             event: remainder,
         }
+    }
+
+    /// Whether the post-return refractory still blocks its edge: true only
+    /// inside the short window after a return (see
+    /// [`POST_RETURN_HOLD_MS`]). The distance rule lifts the gate entirely
+    /// once the cursor comes properly back inside, so this only ever
+    /// holds while the cursor is still sitting on the landing edge.
+    fn post_return_holds(&self) -> bool {
+        self.post_return_at
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(POST_RETURN_HOLD_MS))
     }
 
     /// Clamp an out-of-bounds motion back inside the current screen and
@@ -1539,6 +1589,7 @@ impl EdgeRouter {
         // shove that just came home must clamp, or it re-opens the same
         // edge on the same motion and ping-pongs back into the peer.
         self.post_return_edge = Some(landing);
+        self.post_return_at = Some(std::time::Instant::now());
         self.return_edge = None;
         self.return_edge_accum = 0;
         self.return_run_since = None;
@@ -1584,6 +1635,7 @@ impl EdgeRouter {
         self.push_edge = None;
         self.push_accum = 0;
         self.post_return_edge = None;
+        self.post_return_at = None;
         self.return_edge = None;
         self.return_edge_accum = 0;
         self.return_run_since = None;
@@ -1610,6 +1662,7 @@ impl EdgeRouter {
             self.push_edge = None;
             self.push_accum = 0;
             self.post_return_edge = None;
+            self.post_return_at = None;
             self.return_edge = None;
             self.return_edge_accum = 0;
             self.return_run_since = None;
@@ -1632,6 +1685,7 @@ impl EdgeRouter {
         self.return_edge_accum = 0;
         self.return_run_since = None;
         self.post_return_edge = None;
+        self.post_return_at = None;
         // Peer-placed drive (see above): no entry shove of our own
         // happened, so the post-handoff grace gets its window from here
         // — the peer is free to place us anywhere, including next to the
@@ -1663,6 +1717,18 @@ const POST_RETURN_CLEAR_PX: u32 = 64;
 /// agree and the post-return refractory always engages (a return
 /// landing is near-edge by construction, never mid-screen).
 const RETURN_INSET_PX: u32 = 8;
+
+/// How long a return's landing edge keeps its refractory (ms). The
+/// refractory exists to stop ONE held shove bouncing the drive back and
+/// forth: the physical mouse is still travelling outward when control
+/// comes home, so an instant re-cross would re-open the edge on the
+/// same motion and the user would never see home. Deskflow solves the
+/// same problem with a switch delay; ours is the duration gate below
+/// plus the distance rule (POST_RETURN_CLEAR_PX), whichever lifts
+/// first. A short window keeps deliberate re-crossing sub-second (drag
+/// out, wait a beat, drag again) instead of demanding a full pull-back
+/// to the middle of the screen first.
+const POST_RETURN_HOLD_MS: u64 = 250;
 
 /// Sustained outward pressure (px of accumulated edge overflow) required
 /// to OPEN a crossing. Deskflow's half of this is the jump zone (the
@@ -2840,6 +2906,104 @@ mod tests {
             ),
             "pull-back-then-push must re-cross, got {again:?}"
         );
+    }
+
+    #[test]
+    fn post_return_refractory_expires_for_a_deliberate_second_drag() {
+        // The other half of the same fight: a refractory that only lifts
+        // on a full 64px pull-back makes the landing edge feel dead (the
+        // 0.9.83-era complaint: "much harder from the right edge"). The
+        // held-shove bounce must stay blocked, but a deliberate second
+        // drag — after the short duration gate — crosses immediately.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_edge_mode(EdgeMode::Double);
+        router.set_double_style(DoubleEdgeStyle::Mirror);
+        router.place_local_cursor(20, 540).unwrap();
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -5000, dy: 0 }),
+            RoutedEvent::Handoff {
+                edge: Edge::Left,
+                ..
+            }
+        ));
+        // Settle, then push out the peer's far (right) edge: home.
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -100, dy: 0 }),
+            RoutedEvent::Forward { .. }
+        ));
+        let home = router.route(InputEvent::MouseMove { dx: -5000, dy: 0 });
+        assert!(
+            matches!(home, RoutedEvent::ReturnHome { .. }),
+            "far-edge push of a settled drive must come home, got {home:?}"
+        );
+        assert_eq!(router.active_remote(), None);
+        // The instant re-push still clamps (no same-motion bounce) ...
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 5000, dy: 0 }),
+            RoutedEvent::Local(_)
+        ));
+        assert_eq!(router.active_remote(), None);
+        // ... but once the duration gate expires, the same drag crosses.
+        std::thread::sleep(std::time::Duration::from_millis(260));
+        let second_drag = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(
+            matches!(
+                second_drag,
+                RoutedEvent::Handoff {
+                    edge: Edge::Right,
+                    ..
+                }
+            ),
+            "a deliberate second drag must cross, got {second_drag:?}"
+        );
+    }
+
+    #[test]
+    fn double_edge_never_dead_clamps_the_far_peer_edge() {
+        // The reported hard failure: with a lone-peer Double link the
+        // cursor can reach the peer's NON-entry edge while still unarmed
+        // (one fling carries it across, so it is never observed 40px
+        // inside to arm). That edge must still face home on a sustained
+        // shove — never clamp forever. The deep budget applies while
+        // unarmed, so a fling tail cannot snap control home by itself.
+        let layout = Layout::pair_default("me", "peer", &"ab".repeat(32));
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.set_edge_mode(EdgeMode::Double);
+        router.set_double_style(DoubleEdgeStyle::Mirror);
+        // Cross into the peer through its left edge (natural adjacency).
+        let crossed = router.route(InputEvent::MouseMove { dx: 959, dy: 0 });
+        assert!(matches!(crossed, RoutedEvent::Local(_)));
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 5000, dy: 0 }),
+            RoutedEvent::Handoff {
+                edge: Edge::Right,
+                ..
+            }
+        ));
+        assert_eq!(router.active_remote(), Some(ScreenId(2)));
+        // Entry edge is the peer's left; one fling across to the peer's
+        // RIGHT edge leaves the drive unarmed (never observed inside).
+        // The fling itself pins (unarmed credit cap), but that edge is
+        // home-facing now, so the next sustained shove comes home.
+        let flung = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(
+            matches!(flung, RoutedEvent::Forward { .. }),
+            "a single unarmed fling must pin, got {flung:?}"
+        );
+        assert_eq!(router.active_remote(), Some(ScreenId(2)));
+        let shoved = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(
+            matches!(
+                shoved,
+                RoutedEvent::ReturnHome {
+                    edge: Edge::Right,
+                    ..
+                }
+            ),
+            "a sustained unarmed shove must come home, not dead-clamp, got {shoved:?}"
+        );
+        assert_eq!(router.active_remote(), None);
     }
 
     #[test]
