@@ -28,7 +28,7 @@ pub fn active_window() -> Result<RgbaImage> {
     let windows = xcap::Window::all().context("enumerate windows")?;
     let win = windows
         .into_iter()
-        .find(|w| w.is_focused())
+        .find(|w| w.is_focused().unwrap_or(false))
         .or_else(|| xcap::Window::all().ok().and_then(|mut v| v.pop()))
         .context("no window found; falling back to fullscreen")?;
     win.capture_image().context("capture window")

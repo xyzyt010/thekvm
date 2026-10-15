@@ -1,0 +1,175 @@
+import { Button, ComboBox, LineEdit, Switch, TabWidget } from "std-widgets.slint";
+
+// SnapText: freeze-pane screenshot + on-device OCR/VLM.
+export component SnapWindow inherits Window {
+    title: "SnapText";
+    min-width: 760px;
+    min-height: 600px;
+    background: #0b0e14;
+
+    in property <string> status-text: "Ready";
+    in property <bool> busy: false;
+    in-out property <int> spinner-tick: 0;
+    in-out property <string> result-text: "";
+    in-out property <string> recommend-text: "";
+    in-out property <string> hotkey-hint: "";
+    in-out property <int> engine-index: 3;
+    in-out property <[string]> engine-names: ["PP-OCRv6 server"];
+    in-out property <int> mode-index: 2;
+    in-out property <bool> auto-copy: true;
+    in-out property <string> boxes-line: "";
+    in-out property <float> conf-value: 0.0;
+    // Settings bars: supported models only (set from Rust).
+    in-out property <[string]> model-names: [];
+    in-out property <[float]> model-acc: [];
+    in-out property <[float]> model-speed: []; // 0..1 (1 = fastest)
+    in-out property <string> model-note: "";
+    in-out property <[string]> model-status: [];
+    in-out property <string> model-dl-status: "Models not checked yet — press Refresh.";
+    callback download-model(int);
+    callback download-missing();
+
+    callback capture-full();
+    callback capture-region();
+    callback capture-window();
+    callback copy-text();
+    callback save-pdf();
+    callback save-overlay();
+    callback refresh-models();
+
+    spinner := Timer {
+        interval: 90ms;
+        running: root.busy;
+        triggered => { root.spinner-tick = Math.mod(root.spinner-tick + 1, 8); }
+    }
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: 10px;
+
+        Text { text: "SnapText — on-device screenshot → text"; color: white; font-size: 17px; font-weight: 700; }
+        Text { text: root.recommend-text; color: #22c55e; font-size: 12px; wrap: word-wrap; }
+        Text { text: root.hotkey-hint; color: #9ca3af; font-size: 11px; wrap: word-wrap; }
+
+        TabWidget {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+
+            Tab {
+                title: "Capture";
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 10px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Button { text: "Capture Full"; primary: true; enabled: !root.busy; clicked => { root.capture-full(); } }
+                        Button { text: "Select Region"; enabled: !root.busy; clicked => { root.capture-region(); } }
+                        Button { text: "Capture Window"; enabled: !root.busy; clicked => { root.capture-window(); } }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text { text: "Engine:"; color: white; vertical-alignment: center; }
+                        ComboBox {
+                            model: root.engine-names;
+                            current-index <=> root.engine-index;
+                        }
+                        Text { text: "Mode:"; color: white; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["OCR", "VLM", "Auto"];
+                            current-index <=> root.mode-index;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text { text: "Auto-copy"; color: white; vertical-alignment: center; }
+                        Switch { checked <=> root.auto-copy; }
+                        Button { text: "Copy Text"; enabled: root.result-text != ""; clicked => { root.copy-text(); } }
+                        Button { text: "Save PDF"; enabled: root.result-text != ""; clicked => { root.save-pdf(); } }
+                        Button { text: "Save Overlay"; enabled: root.result-text != ""; clicked => { root.save-overlay(); } }
+                    }
+                    if root.busy : HorizontalLayout {
+                        spacing: 10px;
+                        Rectangle {
+                            width: 26px; height: 26px;
+                            Rectangle {
+                                width: 5px; height: 5px; border-radius: 2px; background: #22c55e;
+                                x: root.spinner-tick == 0 ? 20px : root.spinner-tick == 1 ? 17px : root.spinner-tick == 2 ? 10px : root.spinner-tick == 3 ? 3px : root.spinner-tick == 4 ? 0px : root.spinner-tick == 5 ? 3px : root.spinner-tick == 6 ? 10px : 17px;
+                                y: root.spinner-tick == 0 ? 10px : root.spinner-tick == 1 ? 17px : root.spinner-tick == 2 ? 20px : root.spinner-tick == 3 ? 17px : root.spinner-tick == 4 ? 10px : root.spinner-tick == 5 ? 3px : root.spinner-tick == 6 ? 0px : 3px;
+                            }
+                        }
+                        Text { text: "Recognising text…"; color: #22c55e; font-weight: 700; vertical-alignment: center; }
+                    }
+                    Text { text: root.status-text; color: #d1d5db; font-size: 12px; wrap: word-wrap; }
+                    Text { text: root.boxes-line; color: #9ca3af; font-size: 11px; }
+                    out := LineEdit {
+                        text <=> root.result-text;
+                        placeholder-text: "Recognised text appears here…";
+                    }
+                }
+            }
+
+            Tab {
+                title: "Settings";
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text { text: "Models for this device (unsupported hidden)"; color: white; font-size: 14px; font-weight: 700; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Button { text: "Refresh"; clicked => { root.refresh-models(); } }
+                        Button { text: "Download Missing"; enabled: !root.busy; clicked => { root.download-missing(); } }
+                    }
+                    Text { text: root.model-note; color: #9ca3af; font-size: 11px; wrap: word-wrap; }
+                    Text { text: root.model-dl-status; color: #fbbf24; font-size: 11px; wrap: word-wrap; }
+                    // Simple bars: accuracy green, speed blue. Widths scale 0..220px.
+                    // Each row carries its detection status + Download action:
+                    // missing models download first and only then appear in
+                    // the Capture engine list.
+                    for i in 7 : VerticalLayout {
+                        spacing: 2px;
+                        if i < root.model-names.length : HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: root.model-names[i];
+                                color: white; font-size: 12px; font-weight: 700;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "Download";
+                                enabled: !root.busy;
+                                clicked => { root.download-model(i); }
+                            }
+                        }
+                        if i < root.model-names.length : Text {
+                            text: root.model-status[i];
+                            color: #fbbf24; font-size: 10px; wrap: word-wrap;
+                        }
+                        if i < root.model-names.length : HorizontalLayout {
+                            spacing: 6px;
+                            Text { text: "acc"; color: #9ca3af; font-size: 10px; width: 34px; }
+                            Rectangle {
+                                width: 220px; height: 10px; background: #1f2937; border-radius: 3px;
+                                Rectangle {
+                                    width: (root.model-acc[i] * 220px); height: 10px;
+                                    background: #22c55e; border-radius: 3px;
+                                }
+                            }
+                        }
+                        if i < root.model-names.length : HorizontalLayout {
+                            spacing: 6px;
+                            Text { text: "spd"; color: #9ca3af; font-size: 10px; width: 34px; }
+                            Rectangle {
+                                width: 220px; height: 10px; background: #1f2937; border-radius: 3px;
+                                Rectangle {
+                                    width: (root.model-speed[i] * 220px); height: 10px;
+                                    background: #3498db; border-radius: 3px;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

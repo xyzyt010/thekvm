@@ -45,8 +45,8 @@ impl OcrResult {
 
 #[derive(Debug, Error)]
 pub enum OcrError {
-    #[error("tesseract binary not found (bundle it or `apt/dnf/pacman install tesseract`)")]
-    NoTesseract,
+    #[error("tesseract binary not found ({0})")]
+    NoTesseract(String),
     #[error("PP-OCR weights missing: {0}")]
     NoWeights(String),
     #[error("docling backend unavailable: {0}")]
@@ -118,7 +118,16 @@ fn tesseract(img: &image::RgbaImage, best: bool) -> Result<OcrResult, OcrError> 
             .arg("preserve_interword_spaces=1")
             .arg("tsv")
             .output()
-            .map_err(|_| OcrError::NoTesseract)?;
+            .map_err(|_| {
+                let found = crate::models::probe_binary("tesseract");
+                OcrError::NoTesseract(match found {
+                    Some(p) => format!("found at {} but failed to run", p.display()),
+                    None => format!(
+                        "not on PATH. Install tesseract or bundle it. {}",
+                        crate::models::path_hint("tesseract")
+                    ),
+                })
+            })?;
         if !status.status.success() {
             return Err(OcrError::Failed(
                 String::from_utf8_lossy(&status.stderr).into_owned(),
@@ -176,45 +185,31 @@ fn parse_tsv(path: &std::path::Path) -> Result<OcrResult, OcrError> {
 }
 
 fn ppocr(img: &image::RgbaImage, server: bool) -> Result<OcrResult, OcrError> {
-    // ONNX weight resolution: ~/.cache/snaptext/ppocr/{mobile,server}/.
-    // v1 preset values are fixed here so the future ort session matches the
-    // tuned Python bench (db_thresh 0.3, box_thresh 0.5, unclip 1.8).
-    let _prepped = crate::preprocess::for_ppocr(img, server);
-    let _preset = (0.3f32, 0.5f32, 1.8f32, if server { 1536 } else { 960 });
-    let cache = dirs_cache("ppocr", if server { "server" } else { "mobile" });
-    Err(OcrError::NoWeights(format!(
-        "PP-OCR {} weights not cached at {}. Ship det+rec+cls ONNX there (see core/README).",
-        if server { "v6-server" } else { "v5-mobile" },
-        cache.display()
-    )))
+    // Resolve weights across install config → cache → exe-side → device
+    // roots (rapidocr/paddle site-packages, HF hub). Found paths feed the
+    // ort sessions directly — no copy needed, no download when present.
+    let id = if server { "ppocrv6-server" } else { "ppocrv5-mobile" };
+    let s = crate::models::spec(id).ok_or_else(|| OcrError::Failed(format!("unknown {id}")))?;
+    let r = crate::models::resolve(&s);
+    if !r.present {
+        let st = crate::models::status(id).map_err(|e| OcrError::Failed(e.to_string()))?;
+        return Err(OcrError::NoWeights(crate::models::describe(&st)));
+    }
+    let mut w = crate::ppocr_onnx::load(&r, server).map_err(|e| OcrError::Failed(e.to_string()))?;
+    let boxes = crate::ppocr_onnx::run_all(&mut w, img).map_err(|e| OcrError::Failed(e.to_string()))?;
+    Ok(OcrResult::with_boxes("ppocr", boxes))
 }
 
 fn docling(img: &image::RgbaImage) -> Result<OcrResult, OcrError> {
     let _prepped = crate::preprocess::for_docling(img);
-    Err(OcrError::NoDocling(
-        "docling sidecar not bundled in v1 Rust build; use Tesseract/PP-OCR or wait for v2.".into(),
-    ))
+    let detail = crate::models::status("docling-doc")
+        .map(|st| crate::models::describe(&st))
+        .unwrap_or_else(|e| e.to_string());
+    Err(OcrError::NoDocling(detail))
 }
 
+#[allow(dead_code)]
 fn dirs_cache(a: &str, b: &str) -> std::path::PathBuf {
-    dirs::cache("snaptext", a, b)
-}
-
-mod dirs {
-    pub fn cache(app: &str, a: &str, b: &str) -> std::path::PathBuf {
-        let base = std::env::var("XDG_CACHE_HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                let mut h = std::env::var("LOCALAPPDATA")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::env::temp_dir());
-                if cfg!(windows) {
-                    h
-                } else {
-                    h = std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-                    h.join(".cache")
-                }
-            });
-        base.join(app).join(a).join(b)
-    }
+    let _ = (a, b);
+    crate::models::cache_root()
 }

@@ -1,0 +1,17 @@
+[package]
+name = "snaptext-ui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "snaptext-ui"
+path = "src/main.rs"
+
+[dependencies]
+snaptext-core = { path = "../core" }
+slint = "1.8"
+anyhow = "1"
+image = "0.25"
+
+[build-dependencies]
+slint-build = "1.8"
