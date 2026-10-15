@@ -4755,17 +4755,25 @@ async fn handle_topology_event(
                 report_stuck_edge(router);
                 // Wayland compositors expose no client pointer query and
                 // apply their own acceleration curve, so an unanchored
-                // virtual cursor would otherwise drift from the visible
-                // one (exiting mid-screen or at a stale height). Lock the
-                // visible cursor to the router's coordinate via the
-                // kernel-level uinput absolute pointer — but ONLY near a
-                // crossable edge. Every-move locking yanks the visible
-                // cursor against the compositor's acceleration on every
-                // motion event and reads as a glitchy local mouse;
-                // mid-screen the router needs no lock (nothing can open
-                // there), so local motion stays purely native.
+                // virtual cursor drifts from the visible one — and a
+                // drifted virtual cursor can never open an edge crossing
+                // (the user pushes at the visible edge while the router
+                // still believes it is mid-screen). Lock the visible
+                // cursor to the router's coordinate via the kernel-level
+                // uinput absolute pointer on every local move, so visible
+                // and router stay 1:1 and every edge fires exactly where
+                // the cursor visibly touches it. This must stay
+                // continuous, not edge-gated: any unlocked mid-screen
+                // roam re-opens the drift (acceleration compounds per
+                // event with no truth to re-pin to), and the next push
+                // dies in the dead zone between the visible edge and the
+                // lagging virtual cursor. Slow motion — where feel is
+                // judged — is nearly unaffected (acceleration is ~1:1
+                // there, so each warp is a no-op); only fast flicks run
+                // linear, which is the price of exact crossings on a
+                // truth-less platform.
                 #[cfg(target_os = "linux")]
-                if kvm_platform::capture::is_wayland_session() && router.near_crossing_edge(64) {
+                if kvm_platform::capture::is_wayland_session() {
                     let (cx, cy) = router.cursor_position();
                     if let Some(screen) = router.layout().screen(router.local_screen()) {
                         let _ = kvm_platform::inject::sync_cursor_uinput(
