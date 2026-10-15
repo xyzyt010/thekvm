@@ -173,3 +173,130 @@ export component SnapWindow inherits Window {
         }
     }
 }
+
+// Freeze-pane region selector: shows the frozen fullscreen capture 1:1,
+// user drags a rectangle (left button), releases to confirm, right-clicks
+// to cancel. Rust sizes this window (no-frame) to the capture in physical
+// pixels and maps the logical rect back with the window scale factor.
+export component RegionWindow inherits Window {
+    title: "SnapText — drag to select region";
+    no-frame: true;
+    background: #000000;
+
+    in property <image> shot;
+    in-out property <float> ax: 0;
+    in-out property <float> ay: 0;
+    in-out property <float> bx: 0;
+    in-out property <float> by: 0;
+    in-out property <bool> dragging: false;
+
+    callback region-done(float, float, float, float);
+    callback region-cancelled();
+
+    Image {
+        source: root.shot;
+        x: 0; y: 0; width: 100%; height: 100%;
+        image-fit: fill;
+    }
+    // Dim everything; the selection punches a bright bordered hole.
+    Rectangle {
+        x: 0; y: 0; width: 100%; height: 100%;
+        background: #000000;
+        opacity: 0.45;
+    }
+    if root.dragging : Rectangle {
+        x: root.ax < root.bx ? root.ax * 1px : root.bx * 1px;
+        y: root.ay < root.by ? root.ay * 1px : root.by * 1px;
+        width: (root.ax < root.bx ? root.bx - root.ax : root.ax - root.bx) * 1px;
+        height: (root.ay < root.by ? root.by - root.ay : root.ay - root.by) * 1px;
+        background: transparent;
+        border-width: 2px;
+        border-color: #00e5ff;
+    }
+    Text {
+        text: "drag to select  •  release to confirm  •  right-click to cancel";
+        color: white;
+        font-size: 13px;
+        x: 12px; y: 10px;
+    }
+    touch := TouchArea {
+        x: 0; y: 0; width: 100%; height: 100%;
+        mouse-cursor: crosshair;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left) {
+                if (event.kind == PointerEventKind.down) {
+                    root.ax = touch.mouse-x / 1px;
+                    root.ay = touch.mouse-y / 1px;
+                    root.bx = touch.mouse-x / 1px;
+                    root.by = touch.mouse-y / 1px;
+                    root.dragging = true;
+                } else if (event.kind == PointerEventKind.up) {
+                    if (root.dragging) {
+                        root.dragging = false;
+                        root.bx = touch.mouse-x / 1px;
+                        root.by = touch.mouse-y / 1px;
+                        if ((root.ax < root.bx ? root.bx - root.ax : root.ax - root.bx) > 8
+                            && (root.ay < root.by ? root.by - root.ay : root.ay - root.by) > 8) {
+                            root.region-done(
+                                root.ax < root.bx ? root.ax : root.bx,
+                                root.ay < root.by ? root.ay : root.by,
+                                root.ax < root.bx ? root.bx - root.ax : root.ax - root.bx,
+                                root.ay < root.by ? root.by - root.ay : root.ay - root.by);
+                        }
+                    }
+                }
+            } else if (event.kind == PointerEventKind.up) {
+                root.dragging = false;
+                root.region-cancelled();
+            }
+        }
+        moved => {
+            if (root.dragging) {
+                root.bx = touch.mouse-x / 1px;
+                root.by = touch.mouse-y / 1px;
+            }
+        }
+    }
+}
+
+// Small preview window: shows the captured (or region-cropped) image.
+// Nothing is recognised until the user presses Run OCR.
+export component PreviewWindow inherits Window {
+    title: "SnapText preview";
+    min-width: 460px;
+    min-height: 380px;
+    max-width: 720px;
+    max-height: 640px;
+    background: #0b0e14;
+
+    in property <image> shot;
+    in property <string> info-text: "";
+    in property <bool> busy: false;
+
+    callback run-ocr();
+    callback save-shot();
+    callback close-preview();
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+        Text {
+            text: "Preview — press Run OCR when ready";
+            color: white; font-size: 14px; font-weight: 700;
+        }
+        Image {
+            source: root.shot;
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            min-height: 220px;
+            image-fit: contain;
+        }
+        Text { text: root.info-text; color: #9ca3af; font-size: 11px; wrap: word-wrap; }
+        HorizontalLayout {
+            spacing: 10px;
+            Button { text: "Run OCR"; primary: true; enabled: !root.busy; clicked => { root.run-ocr(); } }
+            Button { text: "Save PNG"; enabled: !root.busy; clicked => { root.save-shot(); } }
+            Button { text: "Close"; clicked => { root.close-preview(); } }
+        }
+    }
+}

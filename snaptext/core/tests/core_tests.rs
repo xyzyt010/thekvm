@@ -45,6 +45,18 @@ mod tests {
     }
 
     #[test]
+    fn overlay_rect_maps_logical_to_pixels() {
+        use snaptext_core::capture::map_logical_rect;
+        // 1:1 at scale 1.
+        assert_eq!(map_logical_rect(10.0, 20.0, 100.0, 50.0, 1.0, 800, 600), (10, 20, 100, 50));
+        // HiDPI scale 1.5.
+        assert_eq!(map_logical_rect(10.0, 20.0, 100.0, 50.0, 1.5, 800, 600), (15, 30, 150, 75));
+        // Clamped to the image, never zero-sized, never out of bounds.
+        assert_eq!(map_logical_rect(-50.0, -50.0, 2000.0, 2000.0, 1.0, 800, 600), (0, 0, 800, 600));
+        assert_eq!(map_logical_rect(799.0, 599.0, 1.0, 1.0, 1.0, 800, 600), (799, 599, 1, 1));
+    }
+
+    #[test]
     fn preprocess_sizes() {
         let img = image::RgbaImage::new(320, 200);
         assert_eq!(preprocess::for_tesseract(&img).dimensions(), (640, 400));

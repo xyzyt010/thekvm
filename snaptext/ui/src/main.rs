@@ -57,9 +57,104 @@ fn main() -> anyhow::Result<()> {
         recommended: rec.model.clone(),
     }));
     refresh_models(&ui, &rec, &lists);
-    ui.set_status_text("Ready — Capture Full, Select Region (freeze + drag + pencil in v2 overlay), or Capture Window.".into());
+    ui.set_status_text("Ready — capture, then review in the preview window and press Run OCR.".into());
 
     let shot: Arc<Mutex<Option<Shot>>> = Arc::new(Mutex::new(None));
+    // Captured image awaiting the user's explicit Run OCR (never auto-run).
+    let pending: Arc<Mutex<Option<image::RgbaImage>>> = Arc::new(Mutex::new(None));
+    // Small preview window (created once, reused, shown per capture).
+    let preview = PreviewWindow::new()?;
+    let preview_w = preview.as_weak();
+    {
+        let ui_w = ui.as_weak();
+        let shot = shot.clone();
+        let pending = pending.clone();
+        let lists = lists.clone();
+        let preview_w = preview_w.clone();
+        preview.on_run_ocr(move || {
+            let img = pending.lock().unwrap().clone();
+            let Some(img) = img else {
+                if let Some(p) = preview_w.upgrade() {
+                    p.set_info_text("Nothing captured yet.".into());
+                }
+                return;
+            };
+            run_job(ui_w.clone(), preview_w.clone(), shot.clone(), lists.clone(), img);
+        });
+    }
+    {
+        let pending = pending.clone();
+        let preview_w = preview_w.clone();
+        preview.on_save_shot(move || {
+            let guard = pending.lock().unwrap();
+            let Some(img) = guard.as_ref() else { return };
+            let path = std::env::temp_dir().join("snaptext-shot.png");
+            let msg = match img.save(&path) {
+                Ok(()) => format!("Screenshot → {}", path.display()),
+                Err(e) => format!("Save failed: {e}"),
+            };
+            if let Some(p) = preview_w.upgrade() {
+                p.set_info_text(SharedString::from(msg));
+            }
+        });
+    }
+    {
+        let preview_w = preview_w.clone();
+        preview.on_close_preview(move || {
+            if let Some(p) = preview_w.upgrade() {
+                let _ = p.hide();
+            }
+        });
+    }
+
+    // Persistent freeze overlay (created once, reused per region capture) +
+    // the frozen frame it selects from.
+    let overlay = RegionWindow::new()?;
+    let overlay_w = overlay.as_weak();
+    let frozen: Arc<Mutex<Option<Arc<image::RgbaImage>>>> = Arc::new(Mutex::new(None));
+    {
+        let ui_w = ui.as_weak();
+        let pending = pending.clone();
+        let preview_w = preview_w.clone();
+        let frozen = frozen.clone();
+        let overlay_w = overlay_w.clone();
+        overlay.on_region_done(move |lx, ly, lw, lh| {
+            let (frozen_img, scale) = match (frozen.lock().unwrap().clone(), overlay_w.upgrade()) {
+                (Some(f), Some(o)) => (f, o.window().scale_factor()),
+                _ => return,
+            };
+            let (x, y, w, h) = snaptext_core::capture::map_logical_rect(
+                lx, ly, lw, lh, scale, frozen_img.width(), frozen_img.height(),
+            );
+            let crop = snaptext_core::capture::crop(&frozen_img, x, y, w, h);
+            if let Some(o) = overlay_w.upgrade() {
+                let _ = o.hide();
+            }
+            let info = format!("Region {w}×{h} at ({x},{y}) — press Run OCR when ready.");
+            *pending.lock().unwrap() = Some(crop.clone());
+            let _ = ui_w.upgrade_in_event_loop(move |u| {
+                u.set_busy(false);
+                u.set_status_text("Region selected — review in the preview window.".into());
+            });
+            let preview_w2 = preview_w.clone();
+            let _ = preview_w.upgrade_in_event_loop(move |_| {
+                show_preview(&preview_w2, &crop, info);
+            });
+        });
+    }
+    {
+        let ui_w = ui.as_weak();
+        let overlay_w = overlay_w.clone();
+        overlay.on_region_cancelled(move || {
+            if let Some(o) = overlay_w.upgrade() {
+                let _ = o.hide();
+            }
+            let _ = ui_w.upgrade_in_event_loop(move |u| {
+                u.set_busy(false);
+                u.set_status_text("Region selection cancelled.".into());
+            });
+        });
+    }
 
     // Install-time detection: probe the device once in the background and
     // persist resolved paths to models.json so later runs use set paths.
@@ -74,39 +169,58 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // --- Capture Full ---
+    // --- Capture Full / Window: capture only, show preview, wait for Run OCR.
     {
         let ui_w = ui.as_weak();
-        let shot = shot.clone();
-        let lists = lists.clone();
+        let pending = pending.clone();
+        let preview_w = preview_w.clone();
+        let overlay_w = overlay_w.clone();
+        let frozen = frozen.clone();
         ui.on_capture_full(move || {
-            let ui = ui_w.clone();
-            let shot = shot.clone();
-            run_job(ui, shot, lists.clone(), CaptureKind::Full);
+            capture_into(
+                ui_w.clone(),
+                pending.clone(),
+                preview_w.clone(),
+                overlay_w.clone(),
+                frozen.clone(),
+                CaptureKind::Full,
+            );
         });
     }
-    // --- Capture Region: v1 grabs fullscreen then crops centre-half as the
-    // selected rect; the interactive freeze+drag+pencil overlay lands in v1.1
-    // (same geometry path as Flameshot: frozen frame → rect → pipeline).
+    // --- Select Region: freeze overlay with drag-select, then preview.
     {
         let ui_w = ui.as_weak();
-        let shot = shot.clone();
-        let lists = lists.clone();
+        let pending = pending.clone();
+        let preview_w = preview_w.clone();
+        let overlay_w = overlay_w.clone();
+        let frozen = frozen.clone();
         ui.on_capture_region(move || {
-            let ui = ui_w.clone();
-            let shot = shot.clone();
-            run_job(ui, shot, lists.clone(), CaptureKind::RegionCentre);
+            capture_into(
+                ui_w.clone(),
+                pending.clone(),
+                preview_w.clone(),
+                overlay_w.clone(),
+                frozen.clone(),
+                CaptureKind::Region,
+            );
         });
     }
     // --- Capture Window (Linux direct selection / Windows focused window) ---
     {
         let ui_w = ui.as_weak();
-        let shot = shot.clone();
-        let lists = lists.clone();
+        let pending = pending.clone();
+        let preview_w = preview_w.clone();
+        let overlay_w = overlay_w.clone();
+        let frozen = frozen.clone();
         ui.on_capture_window(move || {
-            let ui = ui_w.clone();
-            let shot = shot.clone();
-            run_job(ui, shot, lists.clone(), CaptureKind::Window);
+            capture_into(
+                ui_w.clone(),
+                pending.clone(),
+                preview_w.clone(),
+                overlay_w.clone(),
+                frozen.clone(),
+                CaptureKind::Window,
+            );
         });
     }
     {
@@ -238,10 +352,152 @@ fn download_into(
 
 enum CaptureKind {
     Full,
-    RegionCentre,
+    Region,
     Window,
 }
 
+/// RgbaImage → Slint image, thumbnailed for the small preview window.
+fn slint_image(img: &image::RgbaImage, max_w: u32) -> slint::Image {
+    let (w, h) = (img.width(), img.height());
+    let small = if w > max_w {
+        let h2 = (h as f32 * max_w as f32 / w as f32) as u32;
+        image::imageops::resize(img, max_w, h2.max(1), image::imageops::FilterType::Triangle)
+    } else {
+        img.clone()
+    };
+    let (w, h) = (small.width() as u32, small.height() as u32);
+    let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+        &small.into_raw(),
+        w,
+        h,
+    );
+    slint::Image::from_rgba8(buf)
+}
+
+fn show_preview(
+    preview: &slint::Weak<PreviewWindow>,
+    img: &image::RgbaImage,
+    info: String,
+) {
+    if let Some(p) = preview.upgrade() {
+        p.set_shot(slint_image(img, 640));
+        p.set_info_text(SharedString::from(info));
+        p.set_busy(false);
+        let _ = p.show();
+    }
+}
+
+/// Capture only (no OCR): fullscreen / frozen-overlay region / window, then
+/// park the image in `pending` and open the small preview window. The user
+/// presses Run OCR explicitly — nothing is recognised automatically.
+fn capture_into(
+    ui: slint::Weak<SnapWindow>,
+    pending: Arc<Mutex<Option<image::RgbaImage>>>,
+    preview: slint::Weak<PreviewWindow>,
+    overlay: slint::Weak<RegionWindow>,
+    frozen: Arc<Mutex<Option<Arc<image::RgbaImage>>>>,
+    kind: CaptureKind,
+) {
+    if let Some(u) = ui.upgrade() {
+        u.set_busy(true);
+        u.set_status_text("Capturing…".into());
+    }
+    std::thread::spawn(move || {
+        let done_busy = || {
+            let ui = ui.clone();
+            let preview = preview.clone();
+            let _ = ui.upgrade_in_event_loop(|u| u.set_busy(false));
+            let _ = preview.upgrade_in_event_loop(|p| p.set_busy(false));
+        };
+        match kind {
+            CaptureKind::Full | CaptureKind::Window => {
+                let img = if matches!(kind, CaptureKind::Full) {
+                    snaptext_core::capture::fullscreen()
+                } else {
+                    snaptext_core::capture::active_window()
+                        .or_else(|_| snaptext_core::capture::fullscreen())
+                };
+                match img {
+                    Ok(img) => {
+                        let info = format!("{}×{} captured — press Run OCR when ready.", img.width(), img.height());
+                        *pending.lock().unwrap() = Some(img.clone());
+                        let ui = ui.clone();
+                        let _ = ui.upgrade_in_event_loop(move |u| {
+                            u.set_busy(false);
+                            u.set_status_text("Captured — review in the preview window.".into());
+                        });
+                        let preview2 = preview.clone();
+                        let _ = preview.upgrade_in_event_loop(move |_| {
+                            show_preview(&preview2, &img, info);
+                        });
+                    }
+                    Err(e) => {
+                        let msg = format!("Capture failed: {e}");
+                        let ui = ui.clone();
+                        let _ = ui.upgrade_in_event_loop(move |u| {
+                            u.set_busy(false);
+                            u.set_status_text(SharedString::from(msg));
+                        });
+                        done_busy();
+                    }
+                }
+            }
+            CaptureKind::Region => {
+                match snaptext_core::capture::fullscreen() {
+                    Ok(frozen_img) => {
+                        let ui2 = ui.clone();
+                        let overlay = overlay.clone();
+                        let frozen = frozen.clone();
+                        let _ = ui.upgrade_in_event_loop(move |_| {
+                            open_region_overlay(&ui2, &overlay, &frozen, frozen_img);
+                        });
+                    }
+                    Err(e) => {
+                        let msg = format!("Capture failed: {e}");
+                        let ui = ui.clone();
+                        let _ = ui.upgrade_in_event_loop(move |u| {
+                            u.set_busy(false);
+                            u.set_status_text(SharedString::from(msg));
+                        });
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Park the persistent freeze overlay exactly over the captured monitor with
+/// the frozen frame 1:1; drag selects, right-click cancels.
+fn open_region_overlay(
+    ui: &slint::Weak<SnapWindow>,
+    overlay: &slint::Weak<RegionWindow>,
+    frozen_slot: &Arc<Mutex<Option<Arc<image::RgbaImage>>>>,
+    frozen_img: image::RgbaImage,
+) {
+    let Some(o) = overlay.upgrade() else {
+        let _ = ui.upgrade_in_event_loop(|u| {
+            u.set_busy(false);
+            u.set_status_text("Overlay unavailable.".into());
+        });
+        return;
+    };
+    let (fw, fh) = (frozen_img.width(), frozen_img.height());
+    o.set_shot(slint_image(&frozen_img, fw));
+    // Physical size == image pixels → logical×scale maps back exactly.
+    use slint::{PhysicalPosition, PhysicalSize};
+    let (ox, oy) = snaptext_core::capture::fullscreen_origin();
+    o.window().set_position(PhysicalPosition { x: ox, y: oy });
+    o.window().set_size(PhysicalSize { width: fw, height: fh });
+    *frozen_slot.lock().unwrap() = Some(Arc::new(frozen_img));
+    let _ = o.show();
+    if let Some(u) = ui.upgrade() {
+        u.set_busy(false);
+        u.set_status_text("Drag a rectangle — release to confirm, right-click to cancel.".into());
+    }
+}
+
+/// Explicit Run OCR on an already-captured image (preview → main results +
+/// overlay back into the preview). Never called implicitly after capture.
 /// Readiness per supported model; the Capture engine list holds READY ones
 /// only, so a capture can never pick a model whose path isn't integrated.
 fn readiness(supported: &[snaptext_core::catalog::ModelEntry]) -> Vec<bool> {
@@ -338,9 +594,10 @@ fn refresh_models(
 
 fn run_job(
     ui: slint::Weak<SnapWindow>,
+    preview: slint::Weak<PreviewWindow>,
     shot: Arc<Mutex<Option<Shot>>>,
     lists: Arc<Mutex<ModelLists>>,
-    kind: CaptureKind,
+    img: image::RgbaImage,
 ) {
     // Snapshot UI choices on the UI thread, then work in background.
     let (engine_idx, mode_idx, auto_copy) = match ui.upgrade() {
@@ -354,7 +611,11 @@ fn run_job(
         .unwrap_or_else(|| "ppocrv6-server".to_string());
     if let Some(u) = ui.upgrade() {
         u.set_busy(true);
-        u.set_status_text("Capturing…".into());
+        u.set_status_text("Recognising text…".into());
+    }
+    if let Some(p) = preview.upgrade() {
+        p.set_busy(true);
+        p.set_info_text("Recognising text…".into());
     }
     std::thread::spawn(move || {
         let set_status = |msg: String| {
@@ -366,29 +627,11 @@ fn run_job(
             let _ = ui.upgrade_in_event_loop(move |u| {
                 u.set_busy(busy);
             });
+            let _ = preview.upgrade_in_event_loop(move |p| {
+                p.set_busy(busy);
+            });
         };
-        // 1. Capture.
-        let img = match kind {
-            CaptureKind::Full => snaptext_core::capture::fullscreen(),
-            CaptureKind::Window => snaptext_core::capture::active_window()
-                .or_else(|_| snaptext_core::capture::fullscreen()),
-            CaptureKind::RegionCentre => snaptext_core::capture::fullscreen().and_then(|full| {
-                let (w, h) = (full.width(), full.height());
-                snaptext_core::capture::region(w / 4, h / 4, w / 2, h / 2)
-            }),
-        };
-        let img = match img {
-            Ok(i) => i,
-            Err(e) => {
-                set_status(format!("Capture failed: {e}"));
-                finish(false);
-                return;
-            }
-        };
-        let _ = ui.upgrade_in_event_loop(|u| {
-            u.set_status_text("Recognising text…".into());
-        });
-        // 2. Recognise (paths resolved from install config → cache → device).
+        // Recognise (paths resolved from install config → cache → device).
         let engine = engine_of_id(&engine_id);
         let id = engine_id.clone();
         let outcome = if mode_idx == 1 {
@@ -416,6 +659,8 @@ fn run_job(
                 let text = result.text.clone();
                 let n = result.boxes.len();
                 let conf = result.mean_conf;
+                // Overlay render for the preview window (boxed view of results).
+                let overlaid = snaptext_core::overlay::image_with_overlay(&img, &result);
                 *shot.lock().unwrap() = Some(Shot { img, result });
                 if auto_copy && !text.is_empty() {
                     let _ = snaptext_core::clipboard::copy_text(&text);
@@ -433,9 +678,23 @@ fn run_job(
                     u.set_conf_value(conf);
                     u.set_busy(false);
                 });
+                // slint::Image is !Send: build it on the event-loop thread.
+                let _ = preview.upgrade_in_event_loop(move |p| {
+                    p.set_shot(slint_image(&overlaid, 640));
+                    p.set_busy(false);
+                    p.set_info_text(SharedString::from(format!(
+                        "{n} boxes, conf {conf:.2} — overlay shown"
+                    )));
+                });
             }
             Err(e) => {
-                set_status(format!("Recognition failed: {e}. Install the engine (Tesseract binary / PP-OCR ONNX) or pick another."));
+                let msg = format!("Recognition failed: {e}. Install the engine (Tesseract binary / PP-OCR ONNX) or pick another.");
+                let msg2 = msg.clone();
+                let _ = preview.upgrade_in_event_loop(move |p| {
+                    p.set_busy(false);
+                    p.set_info_text(SharedString::from(msg2));
+                });
+                set_status(msg);
                 finish(false);
             }
         }
