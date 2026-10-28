@@ -4246,7 +4246,7 @@ async fn yield_drive_to_inbound(
     suppression_requested: &mut bool,
     diverted: u64,
 ) {
-    let Some(session) = active.take() else {
+    let Some(mut session) = active.take() else {
         return;
     };
     let target = session.target;
@@ -4257,6 +4257,13 @@ async fn yield_drive_to_inbound(
     // this order (never a bare set_exclusive(false) either — see
     // release_suppression).
     release_suppression(capture_control, Some(&mut *suppression_requested));
+    // Parked streams keep pinging, so held state would outlive the yield
+    // (see the ReturnHome arm): release it before parking, bounded.
+    let _ = tokio::time::timeout(
+        Duration::from_millis(300),
+        write_frame(&mut session.send, &WireMessage::ReleaseAll),
+    )
+    .await;
     if let Some(stale) = parked.replace(session) {
         tokio::spawn(stale.finish());
     }
@@ -5062,6 +5069,19 @@ async fn handle_topology_event(
             // yield_drive_to_inbound): local input never waits on
             // network teardown.
             release_suppression(capture_control, Some(&mut *suppression_requested));
+            // A return parks the stream (and keeps pinging it), so any key
+            // or button still held at the crossing would stay held on the
+            // peer until the NEXT return replaces the park: the physical
+            // release is routed locally and never reaches the peer. Send
+            // ReleaseAll first, bounded, so a half-dead stream cannot gate
+            // the homecoming (suppression is already released above).
+            if let Some(session) = active.as_mut() {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    write_frame(&mut session.send, &WireMessage::ReleaseAll),
+                )
+                .await;
+            }
             if let Some(session) = active.take() {
                 if let Some(stale) = parked.replace(session) {
                     tokio::spawn(stale.finish());
@@ -9098,6 +9118,12 @@ async fn handle_connection(
             let mut seen_sequences = BTreeSet::new();
             let mut motion_sequence = MotionSequence::default();
             let mut last_activity = Instant::now();
+            // Edge return parks the episode: the driver sends ReleaseAll
+            // and keeps pinging, so this session must become explicitly
+            // IDLE (no injected state, no single-driver slot, late motion
+            // datagrams fenced) instead of reading as a live drive held
+            // open by heartbeats. The next PointerHandoff revives it.
+            let mut remote_idle = false;
             // Why this session ended, for the census line below: a bare
             // motion/wheel/smooth count cannot tell "peer went away" from
             // "we killed it", and that distinction is the whole reverse-
@@ -9205,6 +9231,11 @@ async fn handle_connection(
                                         smooth_count += 1;
                                     }
                                 }
+                                // Input after a park means the peer is
+                                // driving again even if its Handoff frame
+                                // has not landed yet (compat with drivers
+                                // that resume without one).
+                                remote_idle = false;
                                 // Live inbound-drive signal for the drive
                                 // loop's yield probe (see
                                 // snapshot_inbound_inputs): every stream
@@ -9274,6 +9305,9 @@ async fn handle_connection(
                                 // older handoffs, so only a handoff DURING
                                 // our drive fires.
                                 note_inbound_activity(&link_input_events, &link_last_input);
+                                // A handoff is the resume edge of a parked
+                                // episode: leave idle and re-claim the slot.
+                                remote_idle = false;
                                 // Lazy single-driver slot: the first handoff
                                 // on this stream claims it; a second live
                                 // driver is rejected on THIS stream (the
@@ -9415,7 +9449,22 @@ async fn handle_connection(
                                     Err(error) => tracing::warn!(%error, x, y, wire = ?screen_geometry, truthful_width = truthful.width, truthful_height = truthful.height, "receiver entry warp failed; cursor starts unplaced"),
                                 }
                             }
-                            WireMessage::ReleaseAll => injector.release_all()?,
+                            WireMessage::ReleaseAll => {
+                                injector.release_all()?;
+                                // Park (edge return) or teardown: drop every
+                                // held key/button, then stop reading as a
+                                // live drive. Releasing the permit is the
+                                // reconnect fix — a parked session used to
+                                // hold the single-driver slot forever (the
+                                // parked pings kept refreshing the lease), so
+                                // a fresh link was rejected as input_busy
+                                // while the local machine still swallowed
+                                // input. A resume re-claims it in Handoff.
+                                remote_idle = true;
+                                input_permit = None;
+                                link_driving.store(false, std::sync::atomic::Ordering::Relaxed);
+                                tracing::debug!("peer parked the drive; receiver is idle");
+                            }
                             WireMessage::Ping { nonce } => {
                                 // A Ping proves the peer app is alive on
                                 // THIS episode: refresh the input lease, or
@@ -9587,8 +9636,6 @@ async fn handle_connection(
                             end_reason = "datagram read failed";
                             let _ = error;
                         })?;
-                        last_activity = Instant::now();
-                        injector.ensure_session()?;
                         // QUIC datagrams are unordered and lossy by design: a
                         // corrupt or future-version datagram is dropped, never
                         // fatal. Killing the whole input session over one bad
@@ -9603,6 +9650,15 @@ async fn handle_connection(
                             }
                         };
                         datagrams_received += 1;
+                        // Parked: the driver is home. A datagram already in
+                        // flight when the return happened must not move the
+                        // peer's cursor, refresh the lease, or re-claim the
+                        // slot. The next PointerHandoff revives the drive.
+                        if remote_idle {
+                            continue;
+                        }
+                        last_activity = Instant::now();
+                        injector.ensure_session()?;
                         // Single-driver gate for the datagram path: the stream
                         // Handoff arm claims the slot lazily; a datagram from
                         // a second live driver must not inject motion while
@@ -9768,6 +9824,13 @@ async fn handle_connection(
                                 // MouseMove-only on this lane, sequence and
                                 // dedup state are shared across lanes, and
                                 // responses still go out on `send`.
+                                // Parked: a lane frame already in flight
+                                // when the return happened must not inject
+                                // motion after control came home. The next
+                                // Handoff revives the lane.
+                                if remote_idle {
+                                    continue;
+                                }
                                 match packet.event {
                                     InputEvent::MouseMove { .. } => motion_count += 1,
                                     InputEvent::Wheel(_) => wheel_count += 1,

@@ -852,16 +852,38 @@ mod win32_hooks {
             HOOK_THREAD_ID.store(0, Ordering::Release);
             if let Some(window) = raw_input_window {
                 ptp_unsubscribe();
-                let removal = RAWINPUTDEVICE {
-                    usUsagePage: 0x01,
-                    usUsage: 0x02,
-                    dwFlags: RIDEV_REMOVE,
-                    hwndTarget: HWND::default(),
-                };
-                let _ = RegisterRawInputDevices(
-                    std::slice::from_ref(&removal),
-                    std::mem::size_of::<RAWINPUTDEVICE>() as u32,
-                );
+                // Unregister EVERY usage this thread registered, not just
+                // the mouse: a NOLEGACY PTP/consumer registration left
+                // behind by the suppression toggle would keep altering
+                // legacy delivery (and look like a phantom hold) for the
+                // rest of the process. Individual calls: RIDEV_REMOVE for
+                // a usage that was never registered must not mask the
+                // removals that matter.
+                for device in [
+                    RAWINPUTDEVICE {
+                        usUsagePage: 0x01,
+                        usUsage: 0x02,
+                        dwFlags: RIDEV_REMOVE,
+                        hwndTarget: HWND::default(),
+                    },
+                    RAWINPUTDEVICE {
+                        usUsagePage: PTP_USAGE_PAGE,
+                        usUsage: PTP_USAGE_TOUCHPAD,
+                        dwFlags: RIDEV_REMOVE,
+                        hwndTarget: HWND::default(),
+                    },
+                    RAWINPUTDEVICE {
+                        usUsagePage: CONSUMER_USAGE_PAGE,
+                        usUsage: CONSUMER_COLLECTION,
+                        dwFlags: RIDEV_REMOVE,
+                        hwndTarget: HWND::default(),
+                    },
+                ] {
+                    let _ = RegisterRawInputDevices(
+                        std::slice::from_ref(&device),
+                        std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+                    );
+                }
                 let _ = DestroyWindow(window);
             }
         }
