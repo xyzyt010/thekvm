@@ -51,18 +51,13 @@ const DETENTS_PER_SPAN: i64 = 24;
 
 type IoctlRequest = libc::c_ulong;
 
-const IOC_NRBITS: u32 = 8;
-const IOC_TYPEBITS: u32 = 8;
-const IOC_SIZEBITS: u32 = 14;
 const IOC_READ: u32 = 2;
 
 const fn ioc(dir: u32, type_: u32, number: u32, size: usize) -> IoctlRequest {
     // Linux _IOC layout: dir[31:30] size[29:16] type[15:8] nr[7:0]
     // (see the evdev_capture twin and its regression test).
-    ((dir << 30)
-        | (((size as u32) & 0x3fff) << 16)
-        | ((type_ & 0xff) << 8)
-        | ((number & 0xff) << 0)) as IoctlRequest
+    ((dir << 30) | (((size as u32) & 0x3fff) << 16) | ((type_ & 0xff) << 8) | (number & 0xff))
+        as IoctlRequest
 }
 
 const fn eviocgbit(event_type: u32, length: usize) -> IoctlRequest {

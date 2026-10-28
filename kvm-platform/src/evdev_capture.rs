@@ -1074,7 +1074,7 @@ const fn ioc(dir: u32, type_: u32, number: u32, size: usize) -> IoctlRequest {
     ((dir << 30)
         | (((size as u32) & IOC_SIZEMASK) << 16)
         | ((type_ & IOC_TYPEMASK) << 8)
-        | ((number & IOC_NRMASK) << 0)) as IoctlRequest
+        | (number & IOC_NRMASK)) as IoctlRequest
 }
 
 const fn eviocgbit(event_type: u32, length: usize) -> IoctlRequest {
@@ -1163,8 +1163,8 @@ mod tests {
         // (which once rejected every physical device) can never regress.
         assert_eq!(ioc(1, b'E' as u32, 0x90, 4), EVIOCGRAB);
         // EVIOCGBIT(EV_KEY=1, 96): dir READ, size 96, type 'E', nr 0x21.
-        assert_eq!(eviocgbit(1, 96), 0x8060_4521 as IoctlRequest);
-        assert_eq!(eviocgname(256), 0x8100_4506 as IoctlRequest);
+        assert_eq!(eviocgbit(1, 96), 0x8060_4521u32 as IoctlRequest);
+        assert_eq!(eviocgname(256), 0x8100_4506u32 as IoctlRequest);
     }
 
     #[test]

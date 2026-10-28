@@ -159,50 +159,6 @@ pub fn capture_override() -> Option<CaptureOverride> {
         .and_then(|raw| parse_capture_override(&raw))
 }
 
-#[cfg(test)]
-mod session_tests {
-    use super::{capture_override, classify_wayland_session, parse_capture_override};
-
-    #[test]
-    fn wayland_compositors_classify_wayland_x11_sessions_do_not() {
-        // Cinnamon on Wayland.
-        assert!(classify_wayland_session(Some("wayland-0"), Some("wayland")));
-        // Hyprland (wayland-1 socket, wayland session type).
-        assert!(classify_wayland_session(Some("wayland-1"), Some("wayland")));
-        // Sway / GNOME-variants that only set the socket.
-        assert!(classify_wayland_session(Some("wayland-0"), None));
-        // Session type alone suffices when the socket var is missing.
-        assert!(classify_wayland_session(None, Some("wayland")));
-        assert!(classify_wayland_session(None, Some("Wayland")));
-        assert!(classify_wayland_session(Some(""), Some("wayland")));
-        // XFCE4 / bare Xorg: neither signal present.
-        assert!(!classify_wayland_session(None, Some("x11")));
-        assert!(!classify_wayland_session(None, None));
-        assert!(!classify_wayland_session(Some(""), None));
-        assert!(!classify_wayland_session(Some(""), Some("x11")));
-    }
-
-    #[test]
-    fn capture_override_parses_known_backends_and_ignores_the_rest() {
-        use super::CaptureOverride;
-        assert_eq!(
-            parse_capture_override("evdev"),
-            Some(CaptureOverride::Evdev)
-        );
-        assert_eq!(parse_capture_override("X11"), Some(CaptureOverride::X11));
-        assert_eq!(
-            parse_capture_override(" wayland "),
-            Some(CaptureOverride::Wayland)
-        );
-        assert_eq!(parse_capture_override("auto"), None);
-        assert_eq!(parse_capture_override(""), None);
-        assert_eq!(parse_capture_override("hyprland"), None);
-        // Unset in the test harness environment; a set-but-unknown value
-        // must also read as automatic, never as an error.
-        let _ = capture_override;
-    }
-}
-
 #[cfg(target_os = "linux")]
 pub fn warp_cursor(x: u32, y: u32) -> Result<(), PlatformError> {
     warp_cursor_on(None, x, y)
@@ -3946,5 +3902,49 @@ mod null_backend {
                 "no capture backend for this OS".into(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::{capture_override, classify_wayland_session, parse_capture_override};
+
+    #[test]
+    fn wayland_compositors_classify_wayland_x11_sessions_do_not() {
+        // Cinnamon on Wayland.
+        assert!(classify_wayland_session(Some("wayland-0"), Some("wayland")));
+        // Hyprland (wayland-1 socket, wayland session type).
+        assert!(classify_wayland_session(Some("wayland-1"), Some("wayland")));
+        // Sway / GNOME-variants that only set the socket.
+        assert!(classify_wayland_session(Some("wayland-0"), None));
+        // Session type alone suffices when the socket var is missing.
+        assert!(classify_wayland_session(None, Some("wayland")));
+        assert!(classify_wayland_session(None, Some("Wayland")));
+        assert!(classify_wayland_session(Some(""), Some("wayland")));
+        // XFCE4 / bare Xorg: neither signal present.
+        assert!(!classify_wayland_session(None, Some("x11")));
+        assert!(!classify_wayland_session(None, None));
+        assert!(!classify_wayland_session(Some(""), None));
+        assert!(!classify_wayland_session(Some(""), Some("x11")));
+    }
+
+    #[test]
+    fn capture_override_parses_known_backends_and_ignores_the_rest() {
+        use super::CaptureOverride;
+        assert_eq!(
+            parse_capture_override("evdev"),
+            Some(CaptureOverride::Evdev)
+        );
+        assert_eq!(parse_capture_override("X11"), Some(CaptureOverride::X11));
+        assert_eq!(
+            parse_capture_override(" wayland "),
+            Some(CaptureOverride::Wayland)
+        );
+        assert_eq!(parse_capture_override("auto"), None);
+        assert_eq!(parse_capture_override(""), None);
+        assert_eq!(parse_capture_override("hyprland"), None);
+        // Unset in the test harness environment; a set-but-unknown value
+        // must also read as automatic, never as an error.
+        let _ = capture_override;
     }
 }
