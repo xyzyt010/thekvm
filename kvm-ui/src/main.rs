@@ -4,6 +4,7 @@
 
 slint::include_modules!();
 
+mod child_guard;
 mod tray;
 
 use anyhow::{Context, Result};
@@ -163,6 +164,12 @@ fn main() -> Result<()> {
             }
         }));
     }
+
+    // Presence lease: the daemon lists this computer as a connectable
+    // device and accepts incoming links only while this app is alive (see
+    // spawn_presence_heartbeat). Started before any UI state so a link can
+    // never race the lease.
+    spawn_presence_heartbeat();
 
     if let Ok(config) = kvm_core::Config::load(&startup_dir.join("config.json")) {
         ui.set_lock_screen_control(config.allow_lock_screen_control);
@@ -1189,65 +1196,32 @@ fn main() -> Result<()> {
     let weak = ui.as_weak();
     let disconnect_session = session_state.clone();
     ui.on_disconnect(move || {
-        // Ban our epoch FIRST so nothing can resurrect the link while we
-        // tear it down: a stale redial (either direction) is rejected by
-        // the daemon instead of rebuilding a zombie. Trust is untouched —
+        // One daemon call ends the whole outbound link: ban the epoch,
+        // drop live inbound sessions from the peer, revoke its approvals,
+        // and tell the peer (background). Sent BEFORE the child is killed
+        // so a redial landing mid-teardown is already rejected instead of
+        // rebuilding the zombie we are tearing down. Trust is untouched —
         // the next Connect mints a fresh epoch.
-        let outbound_link = disconnect_session
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().and_then(|session| session.link_id));
-        // Ban our epoch synchronously BEFORE killing the child: the peer
-        // redials every couple of seconds, and a retry landing between the
-        // kill and the ban would rebuild the zombie we are tearing down.
-        if let Some(link_id) = outbound_link {
-            end_link(link_id);
-        }
-        // Remember the outbound peer before the child dies: its daemon
-        // gets our Disconnect delivered (NotifyPeerEnded) so THEIR side
-        // bans and drops too — one Disconnect ends the link on both
-        // computers even with no live episode to close.
-        let outbound_peer = disconnect_session.lock().ok().and_then(|slot| {
-            slot.as_ref().and_then(|session| {
-                session
-                    .link_id
-                    .map(|link_id| (session.address.clone(), link_id))
-            })
+        let outbound = disconnect_session.lock().ok().and_then(|slot| {
+            slot.as_ref()
+                .map(|session| (session.address.clone(), session.link_id))
         });
+        if let Some((address, link_id)) = outbound {
+            disconnect_link(None, Some(&address), link_id);
+        }
         stop_session(&weak, &disconnect_session, "Disconnected");
-        // Hanging up a link we never dialed needs the daemon's help: drop
-        // every live inbound session (trust untouched). The dialer's side
-        // sees its connection close and tears down with it, so one
-        // Disconnect ends the whole link on both computers.
+        // Links we never dialed have no supervised child; hang them up too
+        // (epoch ban, session drop, peer courtesy in the same call), so one
+        // Disconnect ends the whole link on both computers. The daemon
+        // reports live sessions, so this stays a single extra round-trip.
         std::thread::spawn(move || {
-            if let Some((address, link_id)) = outbound_peer {
-                if let Some(fingerprint) = fingerprint_for_address(&data_dir(), &address) {
-                    notify_peer_ended(&fingerprint, Some(link_id));
-                }
-            }
-            let sessions = match control_request(ControlRequest::Status) {
-                Ok(ControlResponse::Status(status)) => status.sessions,
-                _ => Vec::new(),
-            };
-            if let Some(link_id) = outbound_link {
-                end_link(link_id);
-            }
-            for link in &sessions {
-                if let Some(link_id) = link.link_id {
-                    end_link(link_id);
-                }
-                // Their daemon hangs up too (see above): one Disconnect
-                // ends the link on both computers.
-                notify_peer_ended(&link.fingerprint_hex, link.link_id);
-                match control_request(ControlRequest::DropSession {
-                    fingerprint_hex: link.fingerprint_hex.clone(),
-                }) {
-                    Ok(ControlResponse::SessionDropped { .. }) => ui_log(&format!(
-                        "link: dropped inbound session from {}",
-                        link.node_name
-                    )),
-                    Ok(other) => ui_log(&format!("link: drop session unexpected: {other:?}")),
-                    Err(error) => ui_log(&format!("link: drop session failed: {error:#}")),
+            if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
+                for link in &status.sessions {
+                    disconnect_link(
+                        Some(&link.fingerprint_hex),
+                        Some(&link.address),
+                        link.link_id,
+                    );
                 }
             }
         });
@@ -1912,9 +1886,10 @@ fn main() -> Result<()> {
             if !tray_alive {
                 if let Ok(mut slot) = close_session.lock() {
                     if let Some(mut session) = slot.take() {
-                        if let Some(link_id) = session.link_id {
-                            end_link(link_id);
-                        }
+                        // Bilateral hang-up before the kill, exactly like
+                        // Disconnect; the presence lease EOF then hangs up
+                        // any inbound-only links on the daemon side.
+                        disconnect_link(None, Some(&session.address), session.link_id);
                         ui_log(&format!(
                             "app closing; stopped supervised child for {}",
                             session.address
@@ -2458,7 +2433,7 @@ fn relink_with_new_settings(
     let address_notify = address.clone();
     std::thread::spawn(move || {
         if let Some(fingerprint) = fingerprint_for_address(&data_dir_notify, &address_notify) {
-            notify_peer_ended(&fingerprint, link_id);
+            notify_peer_ended(&fingerprint, Some(&address_notify), link_id);
         }
     });
     ui_log(&format!(
@@ -3033,15 +3008,21 @@ static LAST_ARRANGE_CHECK_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic
 
 /// Automatic first-time setup (at most once a minute, never overwriting an
 /// existing arrangement): when a peer is known (either book) but no screens
-/// are arranged yet, write the single canonical default — self=1, first
-/// peer=2 on the right — on EVERY machine, and link both peer books so
-/// sessions open in both directions.
+/// are arranged yet, write the single canonical default — self=1 at the
+/// origin, first peer=2 placed on a side derived from BOTH fingerprints
+/// (see reciprocal_peer_side) — and link both peer books so sessions open
+/// in both directions.
 ///
-/// Deliberately the same shape on both sides, never mirrored: the old code
-/// raced the two peer books and dealt a mirrored layout (self=2) to the
-/// dialing machine, after which every handoff in BOTH directions failed
-/// closed. Numbers are local-only now (handoffs travel by device name), so
-/// both sides numbering themselves 1 is the deterministic convention.
+/// The peer side must be reciprocal, never the same on both machines: the
+/// old code raced the two peer books and dealt a mirrored layout to the
+/// dialing machine, and a later era wrote "peer on the right" everywhere.
+/// With both machines claiming the right, each layout only describes its
+/// OWN edges, so Double+Mirror still closed the loop, but Single/Fixed
+/// crossings ran on the wrong physical edge on one machine and felt
+/// different from the other direction. Fingerprint order makes the two
+/// sides converge without coordination. Numbers are local-only (handoffs
+/// travel by device name), so both sides numbering themselves 1 is the
+/// deterministic convention.
 fn ensure_link_arrangement() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3055,6 +3036,9 @@ fn ensure_link_arrangement() {
         _ => return,
     };
     if !config.layout.screens.is_empty() {
+        // A saved arrangement exists. The one shape older builds could
+        // auto-write WRONGLY is healed here (never a custom layout).
+        heal_legacy_arrangement(&config);
         return;
     }
     // First known peer wins: daemon book, else user book. Either proves a
@@ -3071,8 +3055,14 @@ fn ensure_link_arrangement() {
     let Some(peer) = peer else {
         return;
     };
-    let layout =
+    let mut layout =
         kvm_core::Layout::pair_default(&config.device_name, &peer.name, &peer.fingerprint_hex);
+    if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
+        let side = reciprocal_peer_side(&status.fingerprint_hex, &peer.fingerprint_hex);
+        if side != kvm_core::Edge::Right {
+            let _ = layout.place_peer(&peer.fingerprint_hex, side);
+        }
+    }
     match write_arrangement(layout) {
         Ok(_) => {
             ensure_user_pin(&peer.fingerprint_hex, &peer.name, peer.address.as_deref());
@@ -3080,6 +3070,72 @@ fn ensure_link_arrangement() {
             ui_log("arrange: default arrangement saved (peer on the right), both books linked");
         }
         Err(error) => ui_log(&format!("arrange: default arrangement failed: {error:#}")),
+    }
+}
+
+/// Deterministic side for a peer: a pure function of BOTH fingerprints,
+/// so whichever machine runs its auto-arrangement first, the two always
+/// place each other on OPPOSITE sides — the only physically consistent
+/// arrangement.
+fn reciprocal_peer_side(my_fingerprint: &str, peer_fingerprint: &str) -> kvm_core::Edge {
+    if my_fingerprint.trim().to_ascii_lowercase() < peer_fingerprint.trim().to_ascii_lowercase() {
+        kvm_core::Edge::Right
+    } else {
+        kvm_core::Edge::Left
+    }
+}
+
+/// The peer fingerprint when the saved layout is exactly the legacy
+/// both-on-the-right auto pattern: two screens, self at the origin, one
+/// linked peer at x = +1. Anything else (three screens, moved self, peer
+/// placed by hand anywhere else) is user truth and returns None.
+fn legacy_auto_peer(layout: &kvm_core::Layout) -> Option<&str> {
+    if layout.screens.len() != 2 {
+        return None;
+    }
+    let me = layout.self_screen()?;
+    if me.x != 0 || me.y != 0 {
+        return None;
+    }
+    let peer = layout
+        .screens
+        .iter()
+        .find(|screen| screen.peer_fingerprint.is_some())?;
+    if peer.x != 1 || peer.y != 0 {
+        return None;
+    }
+    peer.peer_fingerprint.as_deref()
+}
+
+/// Heal the ONE contradictory arrangement older builds could auto-write:
+/// both computers placing the peer on their right (x = +1). With both
+/// saying right, one machine's facing edge leads to a peer that does not
+/// face back, and that machine pays the wrong-side path on every
+/// crossing. Only the exact legacy auto shape is touched — see
+/// legacy_auto_peer — so any arrangement the user built stays
+/// untouched. The healed side comes from fingerprint order, so both
+/// machines converge to reciprocal sides without coordinating.
+fn heal_legacy_arrangement(config: &kvm_core::Config) {
+    let Some(fingerprint) = legacy_auto_peer(&config.layout).map(str::to_owned) else {
+        return;
+    };
+    let my_fingerprint = match control_request(ControlRequest::Status) {
+        Ok(ControlResponse::Status(status)) => status.fingerprint_hex,
+        _ => return,
+    };
+    let side = reciprocal_peer_side(&my_fingerprint, &fingerprint);
+    if side == kvm_core::Edge::Right {
+        return;
+    }
+    let mut layout = config.layout.clone();
+    if layout.place_peer(&fingerprint, side).is_err() {
+        return;
+    }
+    match write_arrangement(layout) {
+        Ok(_) => ui_log(
+            "arrange: healed the legacy both-on-the-right arrangement — peer placed left by fingerprint order (sides now reciprocal)",
+        ),
+        Err(error) => ui_log(&format!("arrange: legacy arrangement heal failed: {error:#}")),
     }
 }
 
@@ -3767,8 +3823,16 @@ fn launch_child(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
+    // Parent-death guard: this child must die with the app even when the
+    // app is killed without running any cleanup (Task Manager).
+    child_guard::configure(&mut command);
     match command.spawn() {
         Ok(mut child) => {
+            if let Some(error) = child_guard::adopt(&child) {
+                ui_log(&format!(
+                    "session: parent-death guard failed ({error}); child teardown relies on the daemon lease"
+                ));
+            }
             let stderr = child.stderr.take();
             // Deliver the inherited identity, then close the pipe: the child
             // reads two hex lines and proceeds. A failed handoff is logged,
@@ -4349,10 +4413,18 @@ fn ensure_user_daemon() -> Result<()> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    command
+    // The UI-spawned daemon must die with the app too: an orphaned user
+    // daemon would keep answering as this machine with no window to stop it.
+    child_guard::configure(&mut command);
+    let child = command
         .spawn()
-        .with_context(|| format!("start {}", binary.display()))
-        .map(track_user_daemon)?;
+        .with_context(|| format!("start {}", binary.display()))?;
+    if let Some(error) = child_guard::adopt(&child) {
+        ui_log(&format!(
+            "daemon: parent-death guard failed ({error}); quit kills it explicitly"
+        ));
+    }
+    track_user_daemon(child);
     Ok(())
 }
 
@@ -4452,44 +4524,35 @@ fn kill_user_daemon() {
     }
 }
 
-/// Tray Quit: fully terminate the app. Bans our epoch plus every live
-/// inbound epoch and notifies the peer (same bilateral hangup as
-/// Disconnect, so their side drops too), kills the supervised child,
-/// kills the UI-spawned user daemon, and exits. The installed system
-/// service keeps running — it belongs to the machine, not the app.
-/// Runs on the tray watcher thread; nothing here touches the UI.
+/// Tray Quit: fully terminate the app. Ends the outbound link and every
+/// live inbound link in one daemon call each (ban + session drop + peer
+/// courtesy, so their side drops too), kills the supervised child, kills
+/// the UI-spawned user daemon, and exits. The installed system service
+/// keeps running — it belongs to the machine, not the app. Runs on the
+/// tray watcher thread; nothing here touches the UI.
 fn quit_full_terminate(session: &Arc<Mutex<Option<Session>>>) {
     ui_log("tray quit: terminating the app fully");
-    let (address, link_id) = session
-        .lock()
-        .ok()
-        .and_then(|mut slot| {
-            slot.take().map(|mut child_session| {
-                let _ = child_session.child.kill();
-                let _ = child_session.child.try_wait();
-                (child_session.address, child_session.link_id)
-            })
-        })
-        .unwrap_or_default();
-    if let Some(link_id) = link_id {
-        end_link(link_id);
+    let outbound = session.lock().ok().and_then(|slot| {
+        slot.as_ref()
+            .map(|session| (session.address.clone(), session.link_id))
+    });
+    if let Some((address, link_id)) = outbound {
+        // Same bilateral hang-up as Disconnect, before the child dies so
+        // an in-flight redial is already rejected when the child stops.
+        disconnect_link(None, Some(&address), link_id);
     }
-    if !address.is_empty() {
-        if let Some(fingerprint) = fingerprint_for_address(&data_dir(), &address) {
-            notify_peer_ended(&fingerprint, link_id);
-        }
+    if let Some(mut session) = session.lock().ok().and_then(|mut slot| slot.take()) {
+        let _ = session.child.kill();
+        let _ = session.child.try_wait();
     }
-    // Hang up links we never dialed (same bilateral rule as
-    // Disconnect): ban each live epoch, notify its peer, drop it.
+    // Hang up links we never dialed (same bilateral rule as Disconnect).
     if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
         for link in &status.sessions {
-            if let Some(link_id) = link.link_id {
-                end_link(link_id);
-            }
-            notify_peer_ended(&link.fingerprint_hex, link.link_id);
-            let _ = control_request(ControlRequest::DropSession {
-                fingerprint_hex: link.fingerprint_hex.clone(),
-            });
+            disconnect_link(
+                Some(&link.fingerprint_hex),
+                Some(&link.address),
+                link.link_id,
+            );
         }
     }
     kill_user_daemon();
@@ -4603,15 +4666,16 @@ fn end_link(link_id: u64) {
     }
 }
 
-/// Deliver our Disconnect to the peer's daemon (Disconnect path): the peer
-/// bans the epoch and drops sessions too, so one Disconnect ends the link
-/// on BOTH computers even with no live episode to close. Best effort and
-/// quiet on failure — local teardown already ended our side; an unreachable
-/// peer learns nothing and needs nothing.
-fn notify_peer_ended(fingerprint_hex: &str, link_id: Option<u64>) {
+/// Deliver our Disconnect to the peer's daemon (settings-change path): the
+/// peer bans the epoch and drops sessions too. The address override skips
+/// the peer-book lookup, which can miss when the book holds a stale entry.
+/// Best effort and quiet on failure — local teardown already ended our
+/// side; an unreachable peer learns nothing and needs nothing.
+fn notify_peer_ended(fingerprint_hex: &str, address: Option<&str>, link_id: Option<u64>) {
     match control_request(ControlRequest::NotifyPeerEnded {
         fingerprint_hex: fingerprint_hex.to_owned(),
         link_id,
+        address: address.map(str::to_owned),
     }) {
         Ok(ControlResponse::PeerNotified { .. }) => ui_log(&format!(
             "link: peer notified of disconnect ({fingerprint_hex})"
@@ -4621,101 +4685,193 @@ fn notify_peer_ended(fingerprint_hex: &str, link_id: Option<u64>) {
     }
 }
 
-fn control_request(request: ControlRequest) -> Result<ControlResponse> {
-    let runtime = runtime();
-    runtime.block_on(async move {
-        #[cfg(unix)]
-        let mut stream = {
-            // Prefer the privileged system daemon; fall back to a
-            // user-session daemon's socket so an automatically started
-            // user daemon (the no-system-service case) just works — its
-            // identity matches this UI's, so sessions dial with the
-            // right peer book. Both attempts are bounded: a wedged
-            // endpoint must fail loudly instead of freezing the caller
-            // forever with zero log evidence.
-            let system = control_data_dir().join("control.sock");
-            let system_attempt = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                tokio::net::UnixStream::connect(&system),
-            )
-            .await;
-            match system_attempt {
-                Ok(Ok(stream)) => stream,
-                system_outcome => {
-                    let user = data_dir().join("control.sock");
-                    let user_attempt = if user != system {
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(3),
-                            tokio::net::UnixStream::connect(&user),
-                        )
-                        .await
-                        .ok()
-                    } else {
-                        None
-                    };
-                    match user_attempt {
-                        Some(Ok(stream)) => {
-                            // System service unreachable, user daemon
-                            // answering: every mode/pin/identity call from
-                            // here lands in the WRONG book. Say so once —
-                            // the fix is group membership + relogin, not
-                            // another pairing attempt.
-                            if !CONTROL_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                                ui_log("control: system service unreachable, using user-session daemon — pairing/mode changes may land in the wrong book; add this user to the 'thekvm' group and log back in");
-                            }
-                            stream
-                        }
-                        _ => {
-                            return Err(match system_outcome {
-                                Ok(Err(error)) => anyhow::Error::new(error)
-                                    .context("connect daemon control socket"),
-                                Err(_) => anyhow::anyhow!(
-                                    "connect daemon control socket timed out after 3s"
-                                ),
-                                Ok(Ok(_)) => anyhow::anyhow!("unreachable control socket branch"),
-                            });
-                        }
+/// Open one control connection to the local daemon: the privileged system
+/// service first, then a user-session daemon's socket (the no-system-service
+/// case). Both attempts are bounded: a wedged endpoint must fail loudly
+/// instead of freezing the caller forever with zero log evidence.
+#[cfg(unix)]
+async fn open_control_stream() -> Result<tokio::net::UnixStream> {
+    let system = control_data_dir().join("control.sock");
+    let system_attempt = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::UnixStream::connect(&system),
+    )
+    .await;
+    match system_attempt {
+        Ok(Ok(stream)) => Ok(stream),
+        system_outcome => {
+            let user = data_dir().join("control.sock");
+            let user_attempt = if user != system {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tokio::net::UnixStream::connect(&user),
+                )
+                .await
+                .ok()
+            } else {
+                None
+            };
+            match user_attempt {
+                Some(Ok(stream)) => {
+                    // System service unreachable, user daemon answering:
+                    // every mode/pin/identity call from here lands in the
+                    // WRONG book. Say so once — the fix is group
+                    // membership + relogin, not another pairing attempt.
+                    if !CONTROL_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        ui_log("control: system service unreachable, using user-session daemon — pairing/mode changes may land in the wrong book; add this user to the 'thekvm' group and log back in");
                     }
+                    Ok(stream)
                 }
+                _ => Err(match system_outcome {
+                    Ok(Err(error)) => {
+                        anyhow::Error::new(error).context("connect daemon control socket")
+                    }
+                    Err(_) => {
+                        anyhow::anyhow!("connect daemon control socket timed out after 3s")
+                    }
+                    Ok(Ok(_)) => anyhow::anyhow!("unreachable control socket branch"),
+                }),
             }
-        };
+        }
+    }
+}
 
-        // The synchronous pipe open blocks indefinitely when no server
-        // instance is currently accepting. A single wedged open used to
-        // freeze the whole status poll forever (buttons stuck disabled with
-        // no hover) while one-shot calls kept working, so bound it: the
-        // blocking open runs on the pool and gives up after 3 seconds.
-        // Next poll retries; see the consecutive-failure backoff below.
-        #[cfg(target_os = "windows")]
-        let mut stream = {
-            let pipe = kvm_protocol::control::windows_control_pipe();
-            let opened = tokio::task::spawn_blocking(move || {
-                tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe)
-            });
-            match tokio::time::timeout(std::time::Duration::from_secs(3), opened).await {
-                Ok(Ok(Ok(stream))) => stream,
-                Ok(Ok(Err(error))) => {
-                    return Err(anyhow::Error::new(error).context("connect daemon control pipe"));
+/// Windows counterpart of the Unix resolver. The synchronous pipe open
+/// blocks indefinitely when no server instance is currently accepting, so
+/// it runs on the pool and gives up after 3 seconds. ERROR_PIPE_BUSY (231)
+/// means the daemon is between accepts — a parked long-poll or a burst of
+/// callers — so it is retried briefly instead of surfacing as a failure.
+#[cfg(target_os = "windows")]
+async fn open_control_stream() -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let pipe = kvm_protocol::control::windows_control_pipe();
+    let opened = tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1_000);
+        loop {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe) {
+                Err(error)
+                    if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                Ok(Err(join_error)) => {
-                    return Err(anyhow::anyhow!("control pipe opener failed: {join_error}"));
-                }
-                Err(_) => {
-                    return Err(anyhow::anyhow!(
-                        "control pipe open timed out after 3s (daemon not accepting)"
-                    ));
-                }
+                outcome => return outcome,
             }
-        };
+        }
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(3), opened).await {
+        Ok(Ok(Ok(stream))) => Ok(stream),
+        Ok(Ok(Err(error))) => Err(anyhow::Error::new(error).context("connect daemon control pipe")),
+        Ok(Err(join_error)) => Err(anyhow::anyhow!("control pipe opener failed: {join_error}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "control pipe open timed out after 3s (daemon not accepting)"
+        )),
+    }
+}
 
-        #[cfg(not(any(unix, target_os = "windows")))]
-        anyhow::bail!("local daemon control is not available on this operating system");
+#[cfg(not(any(unix, target_os = "windows")))]
+async fn open_control_stream() -> Result<tokio::io::DuplexStream> {
+    anyhow::bail!("local daemon control is not available on this operating system");
+}
 
+fn control_request(request: ControlRequest) -> Result<ControlResponse> {
+    runtime().block_on(async move {
+        let mut stream = open_control_stream().await?;
         write_request(&mut stream, &request).await?;
         read_response(&mut stream)
             .await?
             .context("daemon closed control connection")
     })
+}
+
+/// How often the desktop app refreshes its daemon presence lease. Must stay
+/// well under the daemon's presence TTL (12s) so a healthy app is never
+/// mistaken for a closed one.
+const PRESENCE_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Hold a daemon-side "the app is here" lease for this process's whole
+/// life. While the lease is fresh the daemon advertises this machine on the
+/// LAN and accepts new incoming links; when the app exits or is killed the
+/// connection closes (or the pings stop) and the daemon hangs up every
+/// inbound session and disappears from other computers' device lists.
+/// Runs on a dedicated thread; reconnects quietly after daemon restarts.
+fn spawn_presence_heartbeat() {
+    std::thread::Builder::new()
+        .name("thekvm-presence".into())
+        .spawn(|| {
+            let runtime = runtime();
+            let mut reported = false;
+            loop {
+                if let Err(error) = runtime.block_on(hold_presence_lease(&mut reported)) {
+                    if !reported {
+                        ui_log(&format!(
+                            "presence: daemon lease unavailable ({error:#}); retrying quietly"
+                        ));
+                        reported = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+        })
+        .ok();
+}
+
+async fn hold_presence_lease(reported: &mut bool) -> Result<()> {
+    let mut stream = open_control_stream().await?;
+    write_request(&mut stream, &ControlRequest::PresenceLease).await?;
+    match read_response(&mut stream).await? {
+        Some(ControlResponse::Applied { .. }) => {}
+        other => anyhow::bail!("daemon refused the presence lease: {other:?}"),
+    }
+    ui_log("presence: daemon lease held; this computer is discoverable and accepts links");
+    *reported = false;
+    loop {
+        tokio::time::sleep(PRESENCE_PING_INTERVAL).await;
+        write_request(&mut stream, &ControlRequest::PresencePing).await?;
+        match read_response(&mut stream).await? {
+            Some(ControlResponse::Applied { .. }) => {}
+            Some(ControlResponse::Error { message }) => {
+                anyhow::bail!("presence lease rejected: {message}")
+            }
+            other => anyhow::bail!("presence ping closed: {other:?}"),
+        }
+    }
+}
+
+/// End one whole link with a single daemon call: ban the epoch, drop live
+/// inbound sessions from the peer, revoke its link approvals, forget its
+/// recent-inbound row, and deliver our Disconnect to the peer (the daemon
+/// does the peer courtesy in the background, so an unreachable peer never
+/// delays the UI). Replaces the old EndLink + DropSession +
+/// NotifyPeerEnded orchestration, which raced itself and opened a fresh
+/// control connection per step.
+fn disconnect_link(
+    fingerprint_hex: Option<&str>,
+    address: Option<&str>,
+    link_id: Option<u64>,
+) -> bool {
+    match control_request(ControlRequest::DisconnectLink {
+        fingerprint_hex: fingerprint_hex.map(str::to_owned),
+        address: address.map(str::to_owned),
+        link_id,
+    }) {
+        Ok(ControlResponse::Disconnected { .. }) => {
+            ui_log(&format!(
+                "link: ended (fingerprint={} address={} epoch={link_id:?})",
+                fingerprint_hex.unwrap_or("-"),
+                address.unwrap_or("-"),
+            ));
+            true
+        }
+        Ok(other) => {
+            ui_log(&format!("link: disconnect unexpected: {other:?}"));
+            false
+        }
+        Err(error) => {
+            ui_log(&format!("link: disconnect failed: {error:#}"));
+            false
+        }
+    }
 }
 
 /// The daemon-owned identity for pairing and sessions (one face per
@@ -5007,13 +5163,30 @@ fn set_link_connecting(weak: &slint::Weak<AppWindow>, connecting: bool) {
 
 static SPINNER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Clipboard-sync gate shared by the relay's two threads: the daemon's
+/// config is authoritative, and the take thread refreshes this from every
+/// poll response (falling back to Status for daemons that predate the
+/// field), so the offer path obeys Settings/CLI changes without a Status
+/// round-trip per tick — the old per-tick Status call doubled idle
+/// control traffic and slowed every take behind it.
+static CLIPBOARD_SYNC_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Bumped after every successful local offer. The take path drops a peer
+/// paste it fetched across one of these (a fresh local copy wins over a
+/// paste that was already in flight), preserving the old single-thread
+/// "offered this tick, never clobber it with the stale slot" rule.
+static CLIPBOARD_OFFER_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Clipboard relay for the logged-in session.
 ///
-/// The headless service cannot read the OS clipboard, so this thread does
-/// both directions: it offers each new local copy (`ClipboardOffer`) and
-/// it applies peer pastes (`ClipboardPoll`). Local changes are offered
-/// before inbound pastes are applied, and the clipboard that was already
-/// present at startup is remembered but not offered.
+/// The headless service cannot read the OS clipboard, so the UI does both
+/// directions. One thread owns the platform clipboard: it offers each new
+/// local copy (`ClipboardOffer`) and applies peer pastes handed to it by
+/// the take thread. The take thread long-polls `ClipboardPoll`, so a peer
+/// paste lands the instant its transfer completes instead of on the next
+/// timer tick, and idle polling traffic disappears. The clipboard that was
+/// already present at startup is remembered but not offered.
 fn spawn_clipboard_relay() {
     std::thread::Builder::new()
         .name("thekvm-clipboard-relay".into())
@@ -5032,11 +5205,42 @@ fn spawn_clipboard_relay() {
             let _ = clipboard.poll_changed_image();
             let watcher = kvm_platform::clipboard::ClipboardWatcher::create().ok();
             ui_log("clipboard relay: watching local copies and peer pastes");
-            let mut last_seen_revision = 0u64;
+            // Authoritative gate at startup; the take thread refreshes it
+            // as polls answer (and via Status for older daemons).
+            let enabled_at_start = matches!(
+                control_request(ControlRequest::Status),
+                Ok(ControlResponse::Status(status)) if status.clipboard_enabled
+            );
+            CLIPBOARD_SYNC_ENABLED.store(enabled_at_start, std::sync::atomic::Ordering::Relaxed);
+            let (apply_tx, apply_rx) = std::sync::mpsc::channel::<(ClipboardKind, String)>();
+            std::thread::Builder::new()
+                .name("thekvm-clipboard-take".into())
+                .spawn(move || clipboard_take_loop(apply_tx))
+                .ok();
             let mut generation = 0u64;
             let mut last_image_poll = std::time::Instant::now();
             let mut last_offer_error = String::new();
             loop {
+                // Apply peer pastes the take thread fetched, through THIS
+                // thread's clipboard handle: one owner means applying a
+                // paste also updates the change tracking, so it can never
+                // be re-offered as a local copy (no echo).
+                while let Ok((kind, payload)) = apply_rx.try_recv() {
+                    let flavor = match kind {
+                        ClipboardKind::Text => "text",
+                        ClipboardKind::ImagePng => "image",
+                    };
+                    match apply_relay_paste(&mut clipboard, kind, &payload) {
+                        Ok(true) => ui_log(&format!(
+                            "clipboard relay: applied peer {flavor} paste ({} bytes)",
+                            payload.len()
+                        )),
+                        Ok(false) => {}
+                        Err(error) => ui_log(&format!(
+                            "clipboard relay: cannot apply peer {flavor} paste: {error:#}"
+                        )),
+                    }
+                }
                 let notice = match &watcher {
                     Some(watch) => watch.wait_notice(std::time::Duration::from_millis(100)),
                     None => {
@@ -5044,11 +5248,7 @@ fn spawn_clipboard_relay() {
                         false
                     }
                 };
-                let enabled = match control_request(ControlRequest::Status) {
-                    Ok(ControlResponse::Status(status)) => status.clipboard_enabled,
-                    _ => continue,
-                };
-                if !enabled {
+                if !CLIPBOARD_SYNC_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
                     continue;
                 }
                 let mut offered = false;
@@ -5113,81 +5313,134 @@ fn spawn_clipboard_relay() {
                     }
                 }
                 if offered {
-                    // This local copy is newer than any peer paste already
-                    // sitting in the slot. Drop that slot without applying
-                    // it, or the next tick would clobber the copy we just
-                    // offered.
-                    if let Ok(ControlResponse::ClipboardUpdate(update)) =
-                        control_request(ControlRequest::ClipboardPoll {
-                            last_seen_revision,
-                            next_index: 0,
-                        })
-                    {
-                        if update.revision > last_seen_revision {
-                            last_seen_revision = update.revision;
-                        }
-                    }
-                    continue;
-                }
-                let first = match control_request(ControlRequest::ClipboardPoll {
-                    last_seen_revision,
-                    next_index: 0,
-                }) {
-                    Ok(ControlResponse::ClipboardUpdate(update)) => update,
-                    _ => continue,
-                };
-                if first.revision == 0
-                    || first.revision == last_seen_revision
-                    || first.total_chunks == 0
-                {
-                    continue;
-                }
-                let mut chunks = vec![first.data.clone()];
-                let mut complete = first.total_chunks == 1;
-                for index in 1..first.total_chunks {
-                    match control_request(ControlRequest::ClipboardPoll {
-                        last_seen_revision,
-                        next_index: index,
-                    }) {
-                        Ok(ControlResponse::ClipboardUpdate(update))
-                            if update.revision == first.revision && update.index == index =>
-                        {
-                            chunks.push(update.data);
-                        }
-                        _ => break,
-                    }
-                    if index + 1 == first.total_chunks {
-                        complete = true;
-                    }
-                }
-                if !complete {
-                    continue;
-                }
-                let payload = chunks.concat();
-                let flavor = match first.kind {
-                    ClipboardKind::Text => "text",
-                    ClipboardKind::ImagePng => "image",
-                };
-                match apply_relay_paste(&mut clipboard, first.kind, &payload) {
-                    Ok(true) => {
-                        last_seen_revision = first.revision;
-                        ui_log(&format!(
-                            "clipboard relay: applied peer {flavor} paste ({} bytes)",
-                            payload.len()
-                        ));
-                    }
-                    Ok(false) => {
-                        last_seen_revision = first.revision;
-                    }
-                    Err(error) => {
-                        ui_log(&format!(
-                            "clipboard relay: cannot apply peer {flavor} paste: {error:#}"
-                        ));
-                    }
+                    // This local copy is newer than any peer paste the take
+                    // thread already fetched: drop those (they were in
+                    // flight before the copy) and bump the epoch so a fetch
+                    // completing right now is discarded too — the copy just
+                    // offered must never be clobbered by a stale paste.
+                    CLIPBOARD_OFFER_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    while apply_rx.try_recv().is_ok() {}
                 }
             }
         })
         .ok();
+}
+
+/// Longest single wait the take thread parks on. The daemon answers the
+/// instant a paste lands (watch channel), so this only bounds retry
+/// latency after daemon restarts — never delivery.
+const CLIPBOARD_LONG_POLL_MS: u32 = 3_000;
+
+/// Peer-paste side of the relay: no clipboard handle lives here — the
+/// paste is queued to the relay thread that owns the clipboard, so the
+/// apply still updates change tracking (no echo) and a local copy offered
+/// meanwhile wins (see CLIPBOARD_OFFER_EPOCH).
+///
+/// Waits inside the daemon (long-poll), so idle control traffic is one
+/// parked request instead of two dozen connections per second, and a
+/// peer paste starts landing in the same millisecond its transfer
+/// completes instead of on the next 100ms tick.
+fn clipboard_take_loop(apply_tx: std::sync::mpsc::Sender<(ClipboardKind, String)>) {
+    let mut last_seen_revision = 0u64;
+    let mut last_enable_check = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(10))
+        .unwrap_or_else(std::time::Instant::now);
+    loop {
+        let enabled = CLIPBOARD_SYNC_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        if !enabled {
+            // Still poll (waitless) so pastes the daemon stashed while
+            // sync was off are consumed rather than applied stale later.
+            let Some(update) = clipboard_poll_once(last_seen_revision, 0, 0) else {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            };
+            refresh_clipboard_enabled(update.enabled, &mut last_enable_check);
+            if update.revision > last_seen_revision {
+                last_seen_revision = update.revision;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        }
+        let Some(first) = clipboard_poll_once(last_seen_revision, 0, CLIPBOARD_LONG_POLL_MS) else {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        };
+        refresh_clipboard_enabled(first.enabled, &mut last_enable_check);
+        if first.revision == 0 || first.revision <= last_seen_revision || first.total_chunks == 0 {
+            continue;
+        }
+        let epoch_at_fetch = CLIPBOARD_OFFER_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        let mut chunks = vec![first.data.clone()];
+        let mut complete = first.total_chunks == 1;
+        for index in 1..first.total_chunks {
+            match clipboard_poll_once(last_seen_revision, index, 0) {
+                Some(update) if update.revision == first.revision && update.index == index => {
+                    chunks.push(update.data);
+                }
+                _ => break,
+            }
+            if index + 1 == first.total_chunks {
+                complete = true;
+            }
+        }
+        if !complete {
+            // Leave last_seen_revision untouched: the daemon still holds
+            // the slot, so the next long poll retries the assembly.
+            continue;
+        }
+        let payload = chunks.concat();
+        if CLIPBOARD_OFFER_EPOCH.load(std::sync::atomic::Ordering::Relaxed) != epoch_at_fetch {
+            // A local copy was offered while this paste was in flight;
+            // applying it would clobber that copy.
+            last_seen_revision = first.revision;
+            ui_log("clipboard relay: dropped a peer paste superseded by a local copy");
+            continue;
+        }
+        last_seen_revision = first.revision;
+        if apply_tx.send((first.kind, payload)).is_err() {
+            return;
+        }
+    }
+}
+
+/// One ClipboardPoll round-trip. None means the daemon is unreachable
+/// (shutting down, restarting) — callers back off and retry.
+fn clipboard_poll_once(
+    last_seen_revision: u64,
+    next_index: u32,
+    wait_ms: u32,
+) -> Option<kvm_protocol::control::ClipboardUpdate> {
+    match control_request(ControlRequest::ClipboardPoll {
+        last_seen_revision,
+        next_index,
+        wait_ms,
+    }) {
+        Ok(ControlResponse::ClipboardUpdate(update)) => Some(update),
+        _ => None,
+    }
+}
+
+/// Keep CLIPBOARD_SYNC_ENABLED current from poll responses; daemons that
+/// predate the `enabled` field (None) fall back to a Status refresh,
+/// rate-limited so a legacy daemon never sees the old per-tick traffic.
+fn refresh_clipboard_enabled(reported: Option<bool>, last_check: &mut std::time::Instant) {
+    match reported {
+        Some(enabled) => {
+            CLIPBOARD_SYNC_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        }
+        None => {
+            if last_check.elapsed() < std::time::Duration::from_secs(2) {
+                return;
+            }
+            *last_check = std::time::Instant::now();
+            if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
+                CLIPBOARD_SYNC_ENABLED.store(
+                    status.clipboard_enabled,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
+    }
 }
 
 /// Control-frame chunk size. Matches the daemon's clipboard chunks so an
@@ -5621,7 +5874,8 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 mod tests {
     use super::{
         dialable_host_port, edge_choice_from_index, edge_choice_index, edge_name, keep_live_epoch,
-        mode_mismatch_guidance, pair_status_text, parse_ban_epoch, should_dial_back,
+        legacy_auto_peer, mode_mismatch_guidance, pair_status_text, parse_ban_epoch,
+        reciprocal_peer_side, should_dial_back,
     };
     use kvm_core::{DoubleEdgeStyle, EdgeMode};
 
@@ -5690,6 +5944,46 @@ mod tests {
         assert!(keep_live_epoch(100, 200));
         assert!(!keep_live_epoch(200, 100));
         assert!(!keep_live_epoch(100, 100));
+    }
+
+    #[test]
+    fn peer_sides_are_reciprocal_on_both_machines() {
+        use kvm_core::Edge;
+        assert_eq!(reciprocal_peer_side("aa", "bb"), Edge::Right);
+        assert_eq!(reciprocal_peer_side("bb", "aa"), Edge::Left);
+        assert_eq!(reciprocal_peer_side("AA", "bb"), Edge::Right);
+        assert_ne!(
+            reciprocal_peer_side("AA", "bb"),
+            reciprocal_peer_side("bb", "aa"),
+            "sides must be opposite, never both right"
+        );
+    }
+
+    #[test]
+    fn legacy_auto_shape_is_detected_and_only_that_shape() {
+        let fp = "ab".repeat(32);
+        let layout = kvm_core::Layout::pair_default("me", "peer", &fp);
+        assert_eq!(legacy_auto_peer(&layout), Some(fp.as_str()));
+        let mut placed_left = layout.clone();
+        placed_left
+            .place_peer(&fp, kvm_core::Edge::Left)
+            .expect("place left");
+        assert_eq!(
+            legacy_auto_peer(&placed_left),
+            None,
+            "user-placed left is truth"
+        );
+        let mut three = layout.clone();
+        let mut extra = layout.self_screen().expect("self").clone();
+        extra.id = kvm_core::ScreenId(3);
+        extra.name = "third".into();
+        extra.x = 2;
+        three.screens.push(extra);
+        assert_eq!(
+            legacy_auto_peer(&three),
+            None,
+            "three screens is a custom layout"
+        );
     }
 
     #[test]

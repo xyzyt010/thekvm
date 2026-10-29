@@ -25,9 +25,23 @@ serde_json = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.15"
+# The supervised child must die with this process (PR_SET_PDEATHSIG) even
+# when the app is SIGKILLed from a terminal or the process monitor.
+libc = "0.2"
 
 [build-dependencies]
 slint-build = "1.8"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The tray thread must pump this thread's Win32 message queue itself
+# (tray-icon delivers clicks/menu commands through a hidden window there).
+# The job object kills every supervised child when this process dies for
+# any reason, including a Task Manager kill that runs no cleanup code.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winres = "0.1"

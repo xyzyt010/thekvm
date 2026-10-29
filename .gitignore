@@ -17,3 +17,6 @@ dist/**/thekvm-*-setup.exe
 
 # Runtime audit output is deployment-local and should not be committed.
 *.log
+
+# Separate snaptext workspace build output (committed source, untracked artifacts).
+/snaptext/target/

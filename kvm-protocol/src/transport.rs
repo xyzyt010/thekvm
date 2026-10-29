@@ -4,7 +4,7 @@ use crate::pairing::Identity;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::time::Duration;
 
-const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(2);
 const DATAGRAM_RECEIVE_BUFFER: usize = 256 * 1024;
 const DATAGRAM_SEND_BUFFER: usize = 256 * 1024;
@@ -13,9 +13,9 @@ fn input_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     // Input sessions must notice a dead peer quickly, while keep-alives keep
     // NAT/firewall state warm during idle periods such as a password prompt.
-    // The idle budget stays generous (60s): on Wi-Fi a transient stall must
-    // never tear down a healthy link — the app-level lease and the
-    // keep-alive watchdogs already reap truly dead peers much faster.
+    // The idle budget is 15s: a healthy link never goes silent that long
+    // (keep-alive every 2s), and a killed peer's leases/link must stop
+    // showing as connected near-instantly instead of lingering a minute.
     // Keep-alive is aggressive (2s) so dead peers are noticed fast and NAT
     // bindings stay warm; pointer motion itself usually keeps the path hot.
     transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(

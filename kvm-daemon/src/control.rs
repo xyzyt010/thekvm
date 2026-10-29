@@ -551,6 +551,154 @@ where
         return Ok(());
     };
     let response = match request {
+        // Persistent presence lease (see the lifecycle section in
+        // service.rs): the desktop app holds this connection for its
+        // whole life; EOF or silence means it is gone, and everything it
+        // was holding is hung up. Handled inline because it answers many
+        // frames on one connection, unlike every other request.
+        ControlRequest::PresenceLease => {
+            let id = crate::service::presence_begin();
+            write_response(
+                &mut stream,
+                &ControlResponse::Applied {
+                    restart_required: false,
+                },
+            )
+            .await?;
+            let silence_limit = crate::service::lease_silence_limit();
+            // Any other frame, EOF, read error, or silence ends the lease:
+            // the while-let condition is exactly that test.
+            while let Ok(Ok(Some(ControlRequest::PresencePing))) =
+                tokio::time::timeout(silence_limit, read_request(&mut stream)).await
+            {
+                if !crate::service::presence_touch(id) {
+                    break;
+                }
+                if write_response(
+                    &mut stream,
+                    &ControlResponse::Applied {
+                        restart_required: false,
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            if crate::service::presence_end(id) {
+                tracing::info!("desktop app gone: presence lease ended");
+                crate::service::on_ui_gone(&data_dir).await;
+            }
+            return Ok(());
+        }
+        // Persistent outbound-link lease: the supervised child's death
+        // (any cause) ends this connection and tears the whole link
+        // down, so a killed UI or Task Manager kill can never leave the
+        // peer driving a machine whose controller is gone.
+        ControlRequest::LinkLease {
+            fingerprint_hex,
+            address,
+            link_id,
+        } => {
+            if !is_fingerprint(&fingerprint_hex) {
+                write_response(
+                    &mut stream,
+                    &ControlResponse::Error {
+                        message: "peer fingerprint must contain 64 hexadecimal characters".into(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fingerprint_hex = fingerprint_hex.to_ascii_lowercase();
+            let id = crate::service::lease_begin(&fingerprint_hex, &address, link_id);
+            write_response(
+                &mut stream,
+                &ControlResponse::Applied {
+                    restart_required: false,
+                },
+            )
+            .await?;
+            let silence_limit = crate::service::lease_silence_limit();
+            // Any other frame, EOF, read error, or silence ends the lease;
+            // teardown below runs exactly once on exit.
+            while let Ok(Ok(Some(ControlRequest::LinkLeasePing))) =
+                tokio::time::timeout(silence_limit, read_request(&mut stream)).await
+            {
+                if !crate::service::lease_touch(&fingerprint_hex, link_id, id) {
+                    break;
+                }
+                if write_response(
+                    &mut stream,
+                    &ControlResponse::Applied {
+                        restart_required: false,
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            if let Some(lease) = crate::service::lease_end(&fingerprint_hex, link_id, id) {
+                tracing::info!(
+                    peer = %lease.fingerprint_hex,
+                    link_id = ?lease.link_id,
+                    "supervised link child exited; tearing the link down"
+                );
+                crate::service::teardown_link(
+                    &data_dir,
+                    Some(&lease.fingerprint_hex),
+                    Some(&lease.address),
+                    lease.link_id,
+                    "link-child-exit",
+                )
+                .await;
+            }
+            return Ok(());
+        }
+        ControlRequest::LinkLeasePing => ControlResponse::Error {
+            message: "link lease ping outside an open lease".into(),
+        },
+        ControlRequest::PresencePing => ControlResponse::Error {
+            message: "presence ping outside an open presence lease".into(),
+        },
+        ControlRequest::DisconnectLink {
+            fingerprint_hex,
+            address,
+            link_id,
+        } => {
+            // Verified facts from the child's lease first: it carries the
+            // peer fingerprint the handshake proved (never a book guess),
+            // and removing it here makes the child's later EOF a no-op
+            // instead of a second teardown.
+            let lease = crate::service::take_lease(link_id, address.as_deref());
+            let fingerprint_hex = fingerprint_hex
+                .filter(|fingerprint| is_fingerprint(fingerprint))
+                .map(|fingerprint| fingerprint.to_ascii_lowercase())
+                .or_else(|| lease.as_ref().map(|lease| lease.fingerprint_hex.clone()));
+            let address = address.or_else(|| lease.as_ref().map(|lease| lease.address.clone()));
+            let link_id = link_id.or_else(|| lease.as_ref().and_then(|lease| lease.link_id));
+            if fingerprint_hex.is_none() && address.is_none() && link_id.is_none() {
+                ControlResponse::Error {
+                    message: "disconnect needs a peer fingerprint, address, or link epoch".into(),
+                }
+            } else {
+                crate::service::teardown_link(
+                    &data_dir,
+                    fingerprint_hex.as_deref(),
+                    address.as_deref(),
+                    link_id,
+                    "disconnect",
+                )
+                .await;
+                ControlResponse::Disconnected {
+                    fingerprint_hex,
+                    link_id,
+                }
+            }
+        }
         ControlRequest::Status => {
             let current = config.read().await.clone();
             let peer_count = peers.read().await.peers.len();
@@ -585,7 +733,17 @@ where
         ControlRequest::ClipboardPoll {
             last_seen_revision,
             next_index,
-        } => crate::service::poll_inbound_clipboard(last_seen_revision, next_index),
+            wait_ms,
+        } => {
+            let clipboard_enabled = config.read().await.clipboard_enabled;
+            crate::service::await_inbound_clipboard(
+                last_seen_revision,
+                next_index,
+                wait_ms,
+                clipboard_enabled,
+            )
+            .await
+        }
         ControlRequest::ClipboardOffer {
             generation,
             kind,
@@ -795,6 +953,7 @@ where
         ControlRequest::NotifyPeerEnded {
             fingerprint_hex,
             link_id,
+            address,
         } => {
             if !is_fingerprint(&fingerprint_hex) {
                 ControlResponse::Error {
@@ -803,9 +962,21 @@ where
             } else {
                 let fingerprint_hex = fingerprint_hex.to_ascii_lowercase();
                 let book = peers.read().await;
-                match crate::service::notify_peer_ended(&book, &fingerprint_hex, link_id, &data_dir)
-                    .await
-                {
+                let notified = match address {
+                    Some(address) => {
+                        crate::service::notify_peer_ended_at(&address, link_id, &data_dir).await
+                    }
+                    None => {
+                        crate::service::notify_peer_ended(
+                            &book,
+                            &fingerprint_hex,
+                            link_id,
+                            &data_dir,
+                        )
+                        .await
+                    }
+                };
+                match notified {
                     Ok(()) => {
                         crate::service::audit_event(
                             &data_dir,

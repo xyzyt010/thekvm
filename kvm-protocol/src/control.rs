@@ -106,7 +106,59 @@ pub enum ControlRequest {
     NotifyPeerEnded {
         fingerprint_hex: String,
         link_id: Option<u64>,
+        /// Dialable peer address when the caller already knows it (an
+        /// outbound child's lease carries it). Skips the peer-book
+        /// lookup, which can miss when the book holds a stale entry.
+        #[serde(default)]
+        address: Option<String>,
     },
+    /// End one whole link from this computer in a single call: ban the
+    /// epoch, drop live inbound sessions from the peer, revoke its link
+    /// approvals, forget its recent-inbound row, and deliver our
+    /// Disconnect to the peer — everything the Disconnect button and
+    /// app quit used to orchestrate with three separate requests. Local
+    /// teardown is synchronous; the peer notification runs in the
+    /// background, so an unreachable peer never delays the UI.
+    DisconnectLink {
+        /// Peer fingerprint when known (live inbound sessions carry it).
+        #[serde(default)]
+        fingerprint_hex: Option<String>,
+        /// Dialable peer address when known (the child dialed one; the
+        /// daemon's lease record carries it too).
+        #[serde(default)]
+        address: Option<String>,
+        /// Administrative link epoch.
+        #[serde(default)]
+        link_id: Option<u64>,
+    },
+    /// Hold a daemon-side lease on one outbound link for this process's
+    /// lifetime: the supervised child opens this persistent control
+    /// connection right after its verify and keeps it open with
+    /// [`ControlRequest::LinkLeasePing`]. If the child dies for any
+    /// reason — the UI was killed, Task Manager ended it, it crashed —
+    /// the daemon sees EOF and hangs the whole link up (ban epoch, drop
+    /// sessions, tell the peer) with no help from the UI. The reply is
+    /// `Applied`.
+    LinkLease {
+        fingerprint_hex: String,
+        address: String,
+        #[serde(default)]
+        link_id: Option<u64>,
+    },
+    /// Keepalive on an open [`ControlRequest::LinkLease`] connection.
+    /// Silence past the lease window means the child is wedged (SIGSTOP,
+    /// frozen VM), and the daemon ends the link exactly as if the
+    /// process had died.
+    LinkLeasePing,
+    /// Hold a daemon-side lease on the desktop app itself for this
+    /// process's lifetime, kept alive with [`ControlRequest::PresencePing`].
+    /// While the lease is fresh this machine advertises itself on the
+    /// LAN and accepts new incoming links; when the app exits or is
+    /// killed the lease ends, so no other computer keeps listing a
+    /// device that cannot answer a link request. The reply is `Applied`.
+    PresenceLease,
+    /// Keepalive on an open [`ControlRequest::PresenceLease`] connection.
+    PresencePing,
     /// Return the daemon-owned identity (certificate + key, hex-encoded) so
     /// a UI-supervised `connect` child can wear the SAME face as the
     /// service. Without this the child loads the interactive user's files
@@ -183,6 +235,13 @@ pub enum ControlRequest {
         last_seen_revision: u64,
         /// Chunk index to take (the UI walks 0..total_chunks).
         next_index: u32,
+        /// How long the daemon may hold this request waiting for a new
+        /// paste before answering "nothing new" (milliseconds; 0 answers
+        /// at once). Long-polling lands a peer paste the instant it
+        /// arrives instead of on the next UI tick, and removes idle poll
+        /// traffic. Older daemons ignore the field and answer instantly.
+        #[serde(default)]
+        wait_ms: u32,
     },
     /// One chunk of a local copy the logged-in UI is offering to the
     /// daemon. The headless service cannot read the OS clipboard, so
@@ -227,6 +286,13 @@ pub struct ClipboardUpdate {
     /// paste without decoding first.
     pub width: u32,
     pub height: u32,
+    /// Whether clipboard sync is enabled locally, carried on every poll
+    /// so the UI needs no separate Status round-trip per tick. `None`
+    /// from older daemons that predate the field: the UI then keeps
+    /// using the last value it saw and refreshes it via Status, so a
+    /// disabled setting is never bypassed.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// Default clipboard cap for status frames from older daemons.
@@ -426,6 +492,14 @@ pub enum ControlResponse {
     },
     LinkEnded {
         link_id: u64,
+    },
+    /// One link ended locally in a single [`ControlRequest::DisconnectLink`]
+    /// call (ban + session drop + peer notify scheduled).
+    Disconnected {
+        #[serde(default)]
+        fingerprint_hex: Option<String>,
+        #[serde(default)]
+        link_id: Option<u64>,
     },
     /// The peer's daemon acknowledged our Disconnect (`NotifyPeerEnded`
     /// sent `LinkEnded` to it). Local teardown proceeds regardless.

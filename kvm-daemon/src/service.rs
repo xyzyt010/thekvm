@@ -582,6 +582,428 @@ pub(crate) fn recent_inbound_links() -> Vec<kvm_protocol::control::RecentInbound
     recent_inbound_view(&borrowed, &|link_id| link_id.is_some_and(link_ended))
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle: UI presence and outbound-link leases.
+//
+// Two leases close the "the app is gone but the link/device lives on"
+// class. The desktop UI holds a PRESENCE lease for its whole life: while
+// it is fresh this machine advertises itself on the LAN and accepts new
+// incoming links, and when it ends (app closed, killed by Task Manager,
+// crashed) every inbound session is hung up so the other computer shows
+// disconnected and stops listing a device that cannot answer. Each
+// supervised `connect` child holds a LINK lease on its daemon: if the
+// child dies by any means the daemon sees EOF and hangs that whole link
+// up (ban + drop + peer notify) with no help from the UI.
+//
+// Both are ordinary persistent control connections: EOF is delivered by
+// the kernel the instant the process dies, so no polling delay is
+// involved. Freshness (TTL) is the backstop for a process that is still
+// alive but wedged (SIGSTOP, frozen VM).
+// ---------------------------------------------------------------------------
+
+/// Presence older than this means the app is not usable, even if the
+/// socket has not reported EOF yet (wedged process). Generous: the UI
+/// pings every 2s from a dedicated thread, so a healthy app never comes
+/// close.
+pub(crate) const PRESENCE_TTL: Duration = Duration::from_secs(12);
+/// A presence/link lease connection that says nothing for this long is
+/// treated as dead. Pings are 5s (link) / 2s (presence).
+const LEASE_SILENCE_LIMIT: Duration = Duration::from_secs(45);
+
+#[derive(Debug, Clone, Copy)]
+struct PresenceRecord {
+    id: u64,
+    last_seen: Instant,
+}
+
+static UI_PRESENCE: std::sync::OnceLock<std::sync::Mutex<Option<PresenceRecord>>> =
+    std::sync::OnceLock::new();
+static PRESENCE_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn ui_presence_slot() -> &'static std::sync::Mutex<Option<PresenceRecord>> {
+    UI_PRESENCE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Pure freshness rule behind [`ui_present`]: pings within the TTL keep
+/// the app "here"; anything older (or nothing at all) does not.
+fn presence_fresh(record: Option<PresenceRecord>, now: Instant) -> bool {
+    record.is_some_and(|record| now.duration_since(record.last_seen) < PRESENCE_TTL)
+}
+
+/// Register the desktop app as present; returns the lease id the
+/// connection uses for its pings and its own teardown.
+pub(crate) fn presence_begin() -> u64 {
+    let id = PRESENCE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut slot) = ui_presence_slot().lock() {
+        *slot = Some(PresenceRecord {
+            id,
+            last_seen: Instant::now(),
+        });
+    }
+    tracing::info!("desktop app present: LAN discovery and incoming links enabled");
+    id
+}
+
+/// Refresh one presence lease. False means a newer lease replaced this
+/// one (an app restarted faster than the old socket noticed).
+pub(crate) fn presence_touch(id: u64) -> bool {
+    if let Ok(mut slot) = ui_presence_slot().lock() {
+        if let Some(record) = slot.as_mut().filter(|record| record.id == id) {
+            record.last_seen = Instant::now();
+            return true;
+        }
+    }
+    false
+}
+
+/// End one presence lease. True when this WAS the live lease — the app
+/// just went away, so callers hang up everything it was holding.
+pub(crate) fn presence_end(id: u64) -> bool {
+    if let Ok(mut slot) = ui_presence_slot().lock() {
+        if slot.is_some_and(|record| record.id == id) {
+            *slot = None;
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the desktop app is present (and fresh) right now. Gates LAN
+/// advertisement, new incoming links, and the presence janitor.
+pub(crate) fn ui_present() -> bool {
+    ui_presence_slot()
+        .lock()
+        .ok()
+        .is_some_and(|slot| presence_fresh(*slot, Instant::now()))
+}
+
+/// One live outbound-link lease: the child that owns this link is alive.
+#[derive(Debug, Clone)]
+struct OutboundLease {
+    id: u64,
+    fingerprint_hex: String,
+    address: String,
+    link_id: Option<u64>,
+    last_ping: Instant,
+}
+
+/// Facts the teardown needs, resolved from a lease record.
+#[derive(Debug, Clone)]
+pub(crate) struct LeaseInfo {
+    pub fingerprint_hex: String,
+    pub address: String,
+    pub link_id: Option<u64>,
+}
+
+/// One outbound link is identified by peer fingerprint plus the epoch of
+/// the child that opened it (None when the child predates link ids).
+type OutboundLeaseKey = (String, Option<u64>);
+
+static OUTBOUND_LEASES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<OutboundLeaseKey, OutboundLease>>,
+> = std::sync::OnceLock::new();
+static LEASE_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn outbound_lease_slot() -> &'static std::sync::Mutex<HashMap<OutboundLeaseKey, OutboundLease>> {
+    OUTBOUND_LEASES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Register the verified facts of one outbound link. A fresh child for
+/// the same peer+epoch replaces any stale record (the old connection is
+/// already gone; its EOF teardown then finds its id superseded).
+pub(crate) fn lease_begin(fingerprint_hex: &str, address: &str, link_id: Option<u64>) -> u64 {
+    let id = LEASE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut leases) = outbound_lease_slot().lock() {
+        leases.insert(
+            (fingerprint_hex.to_owned(), link_id),
+            OutboundLease {
+                id,
+                fingerprint_hex: fingerprint_hex.to_owned(),
+                address: address.to_owned(),
+                link_id,
+                last_ping: Instant::now(),
+            },
+        );
+    }
+    id
+}
+
+/// Refresh one link lease. False means the record was replaced or removed.
+pub(crate) fn lease_touch(fingerprint_hex: &str, link_id: Option<u64>, id: u64) -> bool {
+    if let Ok(mut leases) = outbound_lease_slot().lock() {
+        if let Some(record) = leases
+            .get_mut(&(fingerprint_hex.to_owned(), link_id))
+            .filter(|record| record.id == id)
+        {
+            record.last_ping = Instant::now();
+            return true;
+        }
+    }
+    false
+}
+
+/// End one link lease. Some(facts) means this connection WAS the live
+/// lease for that link and its death must tear the link down.
+pub(crate) fn lease_end(fingerprint_hex: &str, link_id: Option<u64>, id: u64) -> Option<LeaseInfo> {
+    let mut leases = outbound_lease_slot().lock().ok()?;
+    let key = (fingerprint_hex.to_owned(), link_id);
+    let record = leases.get(&key).filter(|record| record.id == id)?;
+    let info = LeaseInfo {
+        fingerprint_hex: record.fingerprint_hex.clone(),
+        address: record.address.clone(),
+        link_id: record.link_id,
+    };
+    leases.remove(&key);
+    Some(info)
+}
+
+/// Remove and return the lease matching an epoch or address (Disconnect
+/// path). Removing it here makes the child's later EOF a no-op.
+pub(crate) fn take_lease(link_id: Option<u64>, address: Option<&str>) -> Option<LeaseInfo> {
+    let mut leases = outbound_lease_slot().lock().ok()?;
+    let key = leases
+        .iter()
+        .find(|(_, record)| {
+            link_id.is_some_and(|epoch| record.link_id == Some(epoch))
+                || address.is_some_and(|address| record.address == address)
+        })
+        .map(|(key, _)| key.clone())?;
+    let record = leases.remove(&key)?;
+    Some(LeaseInfo {
+        fingerprint_hex: record.fingerprint_hex,
+        address: record.address,
+        link_id: record.link_id,
+    })
+}
+
+/// Drop one peer's recent-inbound row: after an explicit hang-up the
+/// station UI must not auto-dial the dead link back.
+fn forget_recent_inbound(fingerprint_hex: &str) {
+    if let Ok(mut seen) = last_inbound_map().lock() {
+        seen.remove(fingerprint_hex);
+    }
+}
+
+/// One-shot local hang-up shared by Disconnect, app quit, UI death, and
+/// child death (see the module comment above this section): ban the
+/// epoch, drop live inbound sessions from the peer, revoke its
+/// approvals, persist the bans, and deliver our Disconnect to the peer
+/// in the background. Idempotent: a second call for the same link only
+/// re-sends the courtesy notification. Trust is untouched.
+pub(crate) async fn teardown_link(
+    dir: &std::path::Path,
+    fingerprint_hex: Option<&str>,
+    address: Option<&str>,
+    link_id: Option<u64>,
+    reason: &str,
+) {
+    let fingerprint_hex = fingerprint_hex.map(|fingerprint| fingerprint.to_ascii_lowercase());
+    let fingerprint = fingerprint_hex.as_deref();
+    let mut dropped_session = false;
+    if let Some(fingerprint) = fingerprint {
+        dropped_session = drop_inbound_link(fingerprint);
+        crate::control::link_approvals()
+            .revoke_peer(fingerprint)
+            .await;
+        forget_recent_inbound(fingerprint);
+    }
+    if let Some(link_id) = link_id {
+        if !link_ended(link_id) {
+            end_link(link_id);
+        }
+        crate::control::link_approvals().revoke_epoch(link_id).await;
+    }
+    if link_id.is_some() || fingerprint.is_some() {
+        persist_ended_links(dir);
+    }
+    audit_event(
+        dir,
+        &format!(
+            "link-teardown reason={reason} peer={} link_id={link_id:?} session_dropped={dropped_session}",
+            fingerprint.unwrap_or("-"),
+        ),
+    );
+    if let Some(address) = address {
+        let address = address.to_owned();
+        let dir = dir.to_owned();
+        let reason = reason.to_owned();
+        // Courtesy only: local teardown is already complete, so the
+        // caller (and the UI) must never wait on a peer that may be gone.
+        tokio::spawn(async move {
+            match notify_peer_ended_at(&address, link_id, &dir).await {
+                Ok(()) => audit_event(
+                    &dir,
+                    &format!(
+                        "link-end-notified peer={address} link_id={link_id:?} reason={reason}"
+                    ),
+                ),
+                Err(error) => audit_event(
+                    &dir,
+                    &format!(
+                        "link-end-notify-failed peer={address} link_id={link_id:?} error={error:#}"
+                    ),
+                ),
+            }
+        });
+    }
+}
+
+/// The desktop app went away (lease ended or lapsed): hang up every
+/// live inbound session so no other computer keeps driving — or keeps
+/// listing — a machine whose app cannot answer. Epochs are banned like
+/// an explicit Disconnect, so a stale redial cannot resurrect them.
+pub(crate) async fn on_ui_gone(dir: &std::path::Path) {
+    let sessions = list_inbound_links();
+    if sessions.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = sessions.len(),
+        "desktop app gone: hanging up live inbound sessions"
+    );
+    for session in sessions {
+        teardown_link(
+            dir,
+            Some(&session.fingerprint_hex),
+            Some(&session.address),
+            session.link_id,
+            "ui-gone",
+        )
+        .await;
+    }
+}
+
+/// Open the local daemon control endpoint from a supervised child: the
+/// service endpoint first (THEKVM_DAEMON_DIR / system dir), then a
+/// user-session daemon (the no-system-service case), mirroring the UI's
+/// resolver. Best effort — a child that cannot reach a daemon still
+/// drives; it just has no lease backstop.
+#[cfg(unix)]
+async fn open_daemon_control_stream() -> Result<tokio::net::UnixStream> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::var("THEKVM_DAEMON_DIR") {
+        candidates.push(std::path::PathBuf::from(dir));
+    }
+    candidates.push(system_data_dir());
+    candidates.push(data_dir());
+    candidates.dedup();
+    let mut last_error: Option<anyhow::Error> = None;
+    for dir in candidates {
+        let path = dir.join("control.sock");
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::UnixStream::connect(&path),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => {
+                last_error = Some(
+                    anyhow::Error::new(error)
+                        .context(format!("connect daemon control socket {}", path.display())),
+                )
+            }
+            Err(_) => {
+                last_error = Some(anyhow::anyhow!(
+                    "connect daemon control socket {} timed out after 2s",
+                    path.display()
+                ))
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no daemon control socket found")))
+}
+
+#[cfg(target_os = "windows")]
+async fn open_daemon_control_stream() -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    let pipe = kvm_protocol::control::windows_control_pipe();
+    let opened = tokio::task::spawn_blocking(move || {
+        tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe)
+    });
+    tokio::time::timeout(Duration::from_secs(3), opened)
+        .await
+        .context("open daemon control pipe timed out after 3s")?
+        .context("control pipe opener failed")?
+        .context("open daemon control pipe")
+}
+
+/// Hold a daemon-side lease on this outbound link for this child's whole
+/// life (see `ControlRequest::LinkLease`). Spawned right after a
+/// successful verify — the first moment the peer fingerprint is proven.
+/// If this process dies for any reason the lease connection closes and
+/// the daemon hangs the link up; until then, pings every 5s prove this
+/// child is alive and reading.
+fn spawn_link_lease(fingerprint_hex: String, address: String, link_id: Option<u64>) {
+    use kvm_protocol::control::{read_response, write_request, ControlRequest, ControlResponse};
+    tokio::spawn(async move {
+        let result: Result<()> = async {
+            let mut stream = open_daemon_control_stream().await?;
+            write_request(
+                &mut stream,
+                &ControlRequest::LinkLease {
+                    fingerprint_hex: fingerprint_hex.clone(),
+                    address: address.clone(),
+                    link_id,
+                },
+            )
+            .await
+            .context("send link lease")?;
+            match read_response(&mut stream).await? {
+                Some(ControlResponse::Applied { .. }) => {}
+                other => bail!("daemon refused the link lease: {other:?}"),
+            }
+            tracing::info!(peer = %fingerprint_hex, "link lease held by the daemon");
+            let mut ping = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                Duration::from_secs(5),
+            );
+            ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ping.tick().await;
+                write_request(&mut stream, &ControlRequest::LinkLeasePing)
+                    .await
+                    .context("link lease ping write")?;
+                read_response(&mut stream)
+                    .await
+                    .context("link lease ping read")?;
+            }
+        }
+        .await;
+        // The lease ending means the daemon can no longer tear this link
+        // down on our death. Log loudly (the child keeps driving; the
+        // parent-death guards still end it with the app).
+        if let Err(error) = result {
+            tracing::warn!(peer = %address, %error, "link lease ended; this link is no longer supervised by the daemon");
+        }
+    });
+}
+
+/// Presence janitor: catches a wedged app (socket still open, pings
+/// stopped) that the EOF path cannot see, and hangs up its sessions.
+pub(crate) fn spawn_presence_janitor(dir: std::path::PathBuf) {
+    tokio::spawn(async move {
+        let mut was_present = ui_present();
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = shutdown_notifier().notified() => return,
+                _ = tick.tick() => {}
+            }
+            let present = ui_present();
+            if was_present && !present {
+                on_ui_gone(&dir).await;
+            }
+            was_present = present;
+        }
+    });
+}
+
+/// Silence limit for lease connections (see LEASE_SILENCE_LIMIT).
+pub(crate) fn lease_silence_limit() -> Duration {
+    LEASE_SILENCE_LIMIT
+}
+
 /// Persisted resting place of deliberate-Disconnect bans
 /// (`ended_links.json` beside the identity): a daemon restart must not
 /// resurrect a dead link — especially now that recently seen inbound
@@ -1631,11 +2053,22 @@ pub async fn connect(
                 // pins elsewhere can no longer misroute. Episodes dial fresh
                 // per crossing, so the handshake connection itself is done.
                 let peer_fp = peer_fingerprint(&conn)?.to_ascii_lowercase();
+                // The verify Accepted just taught us the peer's truthful
+                // dims; persist them so the NEXT child starts on them (see
+                // cached_peer_geometry) instead of config fallback.
+                if let Some(geometry) = capabilities.screen_geometry {
+                    remember_peer_geometry(&data_dir(), &peer_fp, geometry);
+                }
                 let link = TopologyLink {
                     fingerprint: peer_fp.clone(),
                     address: address.clone(),
                     link_id,
                 };
+                // Lease the verified link to the daemon BEFORE anything
+                // slow follows: from here on, this child's death (UI
+                // killed, Task Manager, crash) tears the whole link down
+                // on both sides within moments, with no UI to ask.
+                spawn_link_lease(peer_fp.clone(), address.clone(), link_id);
                 // UDP fast-path motion: when both sides negotiated it on a
                 // link with an epoch, derive the session key and arm the
                 // outbound sender. Failures fall back to the episode stream
@@ -2049,8 +2482,34 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // linked peer's screen (the supervisor adopts the live fingerprint on
     // `established`, healing ghost pins with no restart either).
     let (config, mut router) = loop {
-        let config = Config::load(&dir.join("config.json"))
+        let mut config = Config::load(&dir.join("config.json"))
             .with_context(|| format!("loading topology config from {}", dir.display()))?;
+        // Adopt the dims the last verified link heard from this peer (see
+        // remember_peer_geometry) BEFORE the first crossing exists: config
+        // fallback dims land entry insets, edge thresholds, and return
+        // heights on a screen that does not exist. Advisory only — never
+        // persisted to the user config, and a live Hello re-teaches the
+        // same values once a session opens.
+        if let Some(link) = &link {
+            if let Some((width, height)) = cached_peer_geometry(&dir, &link.fingerprint) {
+                if let Some(screen) = config.layout.screens.iter_mut().find(|screen| {
+                    screen.peer_fingerprint.as_deref() == Some(link.fingerprint.as_str())
+                }) {
+                    if screen.width != width || screen.height != height {
+                        tracing::info!(
+                            peer = %link.fingerprint,
+                            configured_width = screen.width,
+                            configured_height = screen.height,
+                            width,
+                            height,
+                            "peer geometry cache applied before the first crossing"
+                        );
+                        screen.width = width;
+                        screen.height = height;
+                    }
+                }
+            }
+        }
         let linked =
             link.as_ref().is_none_or(|link| {
                 config.layout.screens.iter().any(|screen| {
@@ -4196,17 +4655,27 @@ fn handoff_is_single_fling(event: InputEvent) -> bool {
 /// already clamped at the edge — cross instantly, so fast movement keeps
 /// working. Unqueryable platforms (Wayland) and failed reads fail OPEN:
 /// today's behavior, never a new can't-cross.
-fn phantom_handoff_veto(
+///
+/// The first truth read can itself be a frame early: the same fling that
+/// outran the pointer path also outran the OS's own position update, so a
+/// genuine edge push read 55px short and was refused twice in one live
+/// log. Truth must therefore SETTLE before it convicts: re-read for a
+/// short window and proceed as soon as the cursor sits within the slack.
+/// A true phantom (cursor physically mid-screen) keeps answering
+/// mid-screen for the whole window, so it is still refused — only the
+/// false conviction (and its punitive restore + re-push) goes away.
+async fn phantom_handoff_veto(
     router: &EdgeRouter,
     from: ScreenId,
     edge: kvm_core::Edge,
 ) -> Option<(u32, u32)> {
     const EDGE_TRUTH_SLACK_PX: i64 = 24;
-    let Ok(Some((truth_x, truth_y))) = kvm_platform::capture::current_cursor_position() else {
-        return None;
-    };
+    // One 60Hz frame is 16ms; 120ms covers driver/desktop-compositor lag
+    // without ever reading as a pause on the refused gesture.
+    const SETTLE: Duration = Duration::from_millis(120);
+    const POLL: Duration = Duration::from_millis(20);
     let screen = router.layout().screen(from)?;
-    let gap = match edge {
+    let gap_for = |truth_x: u32, truth_y: u32| match edge {
         kvm_core::Edge::Left => i64::from(truth_x),
         kvm_core::Edge::Right => {
             i64::from(screen.width.saturating_sub(1)).saturating_sub(i64::from(truth_x))
@@ -4216,15 +4685,27 @@ fn phantom_handoff_veto(
             i64::from(screen.height.saturating_sub(1)).saturating_sub(i64::from(truth_y))
         }
     };
-    if gap <= EDGE_TRUTH_SLACK_PX {
-        return None;
+    let deadline = std::time::Instant::now() + SETTLE;
+    loop {
+        let Ok(Some((truth_x, truth_y))) = kvm_platform::capture::current_cursor_position() else {
+            return None;
+        };
+        let gap = gap_for(truth_x, truth_y);
+        if gap <= EDGE_TRUTH_SLACK_PX {
+            return None;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::info!(
+                ?edge,
+                truth_gap_px = gap,
+                truth_x,
+                truth_y,
+                "phantom handoff vetoed after settling: OS cursor still mid-screen; staying local"
+            );
+            return Some((truth_x, truth_y));
+        }
+        tokio::time::sleep(POLL).await;
     }
-    tracing::info!(
-        ?edge,
-        truth_gap_px = gap,
-        "phantom handoff vetoed: OS cursor still mid-screen; staying local"
-    );
-    Some((truth_x, truth_y))
 }
 
 /// Yield the outbound drive to a concurrent inbound one: park our episode
@@ -5199,7 +5680,7 @@ async fn handle_topology_event(
             // Single query: the fling test is pure over the remainder,
             // only the veto arm touches OS truth.
             let veto = if handoff_is_single_fling(event) {
-                phantom_handoff_veto(router, from, edge)
+                phantom_handoff_veto(router, from, edge).await
             } else {
                 None
             };
@@ -7295,6 +7776,20 @@ fn clipboard_relay() -> &'static std::sync::Mutex<Option<RelayPaste>> {
     CLIPBOARD_RELAY.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Revision notifications for waiting ClipboardPoll callers: every stash
+/// wakes the long-poll so the UI applies a peer paste the moment it
+/// lands instead of on its next timer tick. The value is only a change
+/// counter; poll_inbound_clipboard re-reads the slot.
+static CLIPBOARD_RELAY_NOTIFY: std::sync::OnceLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::OnceLock::new();
+
+fn clipboard_relay_notify() -> &'static tokio::sync::watch::Sender<u64> {
+    CLIPBOARD_RELAY_NOTIFY.get_or_init(|| {
+        let (sender, _receiver) = tokio::sync::watch::channel(0);
+        sender
+    })
+}
+
 /// Slice a relay payload into poll-sized pieces: char-boundary safe
 /// for text (never splits a UTF-8 sequence), plain slices for base64
 /// (ASCII, any split point is safe). Pure for tests.
@@ -7354,6 +7849,8 @@ pub(crate) fn stash_inbound_clipboard(
             height,
         });
     }
+    // Wake any long-polling UI: the paste is ready to take now.
+    let _ = clipboard_relay_notify().send(revision);
 }
 
 /// A local copy the logged-in UI offered. `generation` is the UI's
@@ -7535,10 +8032,12 @@ async fn forward_local_clipboard_offer(
 
 /// Serve one UI take: the chunk at `next_index` when the slot holds a
 /// paste newer than `last_seen_revision`, else an empty update
-/// (revision 0) meaning "nothing new".
+/// (revision 0) meaning "nothing new". `enabled` echoes the local
+/// clipboard setting so the UI stays honest without a Status call.
 pub(crate) fn poll_inbound_clipboard(
     last_seen_revision: u64,
     next_index: u32,
+    enabled: bool,
 ) -> kvm_protocol::control::ControlResponse {
     use kvm_protocol::control::{ClipboardUpdate, ControlResponse};
     let empty = || {
@@ -7551,6 +8050,7 @@ pub(crate) fn poll_inbound_clipboard(
             data: String::new(),
             width: 0,
             height: 0,
+            enabled: Some(enabled),
         })
     };
     let Ok(slot) = clipboard_relay().lock() else {
@@ -7574,8 +8074,60 @@ pub(crate) fn poll_inbound_clipboard(
         data: data.clone(),
         width: paste.width,
         height: paste.height,
+        enabled: Some(enabled),
     })
 }
+
+/// Long-polling take (see `ControlRequest::ClipboardPoll::wait_ms`): hold
+/// the request until a paste newer than `last_seen_revision` lands, or
+/// answer "nothing new" at the deadline. Waking on the stash notify makes
+/// a peer paste land in the UI the instant the transfer completes.
+pub(crate) async fn await_inbound_clipboard(
+    last_seen_revision: u64,
+    next_index: u32,
+    wait_ms: u32,
+    enabled: bool,
+) -> kvm_protocol::control::ControlResponse {
+    use kvm_protocol::control::{ClipboardUpdate, ControlResponse};
+    let nothing_new = |response: &ControlResponse| {
+        matches!(
+            response,
+            ControlResponse::ClipboardUpdate(ClipboardUpdate { revision: 0, .. })
+        )
+    };
+    // Subscribe BEFORE the first poll: a paste landing between a poll and
+    // a late subscription would bump a version this waiter never sees and
+    // sit unnoticed until the deadline.
+    let mut notices = clipboard_relay_notify().subscribe();
+    let first = poll_inbound_clipboard(last_seen_revision, next_index, enabled);
+    let wait = std::time::Duration::from_millis(u64::from(wait_ms.min(MAX_CLIPBOARD_WAIT_MS)));
+    if !nothing_new(&first) || wait.is_zero() {
+        return first;
+    }
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, notices.changed()).await {
+            Ok(Ok(())) => {
+                let update = poll_inbound_clipboard(last_seen_revision, next_index, enabled);
+                if !nothing_new(&update) {
+                    return update;
+                }
+                // A different (already-seen) paste woke us: keep waiting
+                // for one this caller has not applied.
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    poll_inbound_clipboard(last_seen_revision, next_index, enabled)
+}
+
+/// Upper bound for [`await_inbound_clipboard`]: a wedged UI must never pin
+/// a control connection (and the take it is waiting for) indefinitely.
+const MAX_CLIPBOARD_WAIT_MS: u32 = 10_000;
 
 struct CaptureGuard {
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -8338,6 +8890,9 @@ pub async fn run() -> Result<()> {
         dir.clone(),
     );
     spawn_udp_motion_listener(udp_motion_port);
+    // Hangs up inbound sessions when the desktop app goes away in a way
+    // the presence lease cannot see (wedged process, half-open socket).
+    spawn_presence_janitor(dir.clone());
 
     #[cfg(target_os = "windows")]
     if std::env::args().any(|argument| argument == "--service") {
@@ -8504,6 +9059,14 @@ fn spawn_discovery_responder(
                 },
             };
             if kvm_protocol::discovery::is_request(&buffer[..length]) {
+                // Only a running desktop app can answer a link request
+                // (every new link needs its local approval). While the app
+                // is closed or killed this machine must vanish from other
+                // computers' device lists instead of lingering as an
+                // unconnectable ghost.
+                if !ui_present() {
+                    continue;
+                }
                 let live = kvm_core::Config::load(&dir.join("config.json"))
                     .map(|config| {
                         kvm_protocol::discovery::encode_advertisement(
@@ -8737,6 +9300,28 @@ async fn handle_connection(
             if !mode_allows_outgoing(hello.mode) {
                 reject(&mut send, "peer is configured as receiver-only").await?;
                 bail!("peer cannot initiate control from receiver-only mode");
+            }
+            // A running desktop app is required for any networked link:
+            // link approval, clipboard relay, and the outbound dial-back
+            // all live there. Refusing here (epoch-less admin paths
+            // excepted) keeps a closed app from accepting a link it can
+            // never drive or hang up — the "device looks connectable but
+            // nothing happens" ghost. The dialer retries; once the app
+            // opens, the link proceeds.
+            if hello.link_id.is_some() && !ui_present() {
+                reject(
+                    &mut send,
+                    "the TheKVM app is not running on this computer; open it there and connect again",
+                )
+                .await?;
+                audit_event(
+                    audit_dir,
+                    &format!(
+                        "session-rejected peer={peer_fingerprint} remote={} reason=local_app_not_running",
+                        conn.remote_address(),
+                    ),
+                );
+                bail!("incoming link refused: the local TheKVM app is not running");
             }
             // Per-link approval (the request+accept rule): pairing trust
             // alone never opens a link. Every fresh epoch waits for the
@@ -10961,9 +11546,21 @@ pub(crate) async fn notify_peer_ended(
         .find(|peer| peer.fingerprint_hex == fingerprint_hex)
         .and_then(|peer| peer.address.clone())
         .context("no dialable address for peer")?;
+    notify_peer_ended_at(&address, link_id, dir).await
+}
+
+/// [`notify_peer_ended`] with the address already known: an outbound
+/// child's lease carries the exact address it verified and dialed, so
+/// teardown never has to trust a possibly stale peer-book entry (or fail
+/// when the book holds none at all).
+pub(crate) async fn notify_peer_ended_at(
+    address: &str,
+    link_id: Option<u64>,
+    dir: &std::path::Path,
+) -> Result<()> {
     let identity = Identity::load_or_create(dir)?;
     let endpoint = transport::make_client_endpoint(&identity)?;
-    let addr = normalize_addr(&address)?;
+    let addr = normalize_addr(address)?;
     let connecting = endpoint.connect(addr, "thekvm").context("notify connect")?;
     // Best-effort Disconnect courtesy: 3s bounds, never the old 8s. A
     // gone peer must not stall local teardown (the UI blocks on this
@@ -11729,6 +12326,48 @@ fn publish_local_geometry(router: &EdgeRouter) {
     }
 }
 
+/// Last truthful PEER geometry heard from each verified link, keyed by the
+/// peer fingerprint. Every Hello/Accepted carries the peer's measured dims
+/// (see truthful_local_geometry), but a fresh controller child builds its
+/// router from config.json, where the peer screen can still hold fallback
+/// dims from pairing day. Persisting the last advertisement lets the next
+/// child start truthful before any session exists to re-teach it — the
+/// first crossing otherwise pays entry insets, edge thresholds, and return
+/// heights computed against a screen that does not exist.
+const PEER_GEOMETRY_CACHE: &str = "peer-geometry.json";
+
+fn remember_peer_geometry(dir: &std::path::Path, fingerprint: &str, geometry: ScreenGeometry) {
+    if !(2..=16384).contains(&geometry.width) || !(2..=16384).contains(&geometry.height) {
+        return;
+    }
+    let body = serde_json::json!({
+        "fingerprint": fingerprint.to_ascii_lowercase(),
+        "width": geometry.width,
+        "height": geometry.height,
+    })
+    .to_string();
+    if let Err(error) = std::fs::write(dir.join(PEER_GEOMETRY_CACHE), body) {
+        tracing::debug!(%error, "peer geometry cache unavailable");
+    }
+}
+
+/// Cached dims for this fingerprint, if any. A cache written for another
+/// peer never applies: dims teach a screen, not a machine class.
+fn cached_peer_geometry(dir: &std::path::Path, fingerprint: &str) -> Option<(u32, u32)> {
+    let text = std::fs::read_to_string(dir.join(PEER_GEOMETRY_CACHE)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if !value
+        .get("fingerprint")?
+        .as_str()?
+        .eq_ignore_ascii_case(fingerprint)
+    {
+        return None;
+    }
+    let width = value.get("width")?.as_u64()? as u32;
+    let height = value.get("height")?.as_u64()? as u32;
+    ((2..=16384).contains(&width) && (2..=16384).contains(&height)).then_some((width, height))
+}
+
 /// Map a pointer position between inclusive logical screen coordinate spaces.
 /// The edge coordinates are preserved (`0` maps to `0`, the last source pixel
 /// maps to the last target pixel), which avoids a one-pixel drift accumulating
@@ -12258,6 +12897,166 @@ mod tests {
         )));
         // Display-case text never matches (the matcher is lowercase-only).
         assert!(!is_link_ended_rejection(&anyhow::anyhow!("Link ended")));
+    }
+
+    #[test]
+    fn presence_lease_is_fresh_exclusive_and_ends_once() {
+        let now = Instant::now();
+        assert!(!presence_fresh(None, now));
+        // TTL: a record older than PRESENCE_TTL is stale even without EOF
+        // (the wedged-app case the janitor reaps).
+        let stale_at = now
+            .checked_sub(PRESENCE_TTL + Duration::from_millis(1))
+            .expect("monotonic clock long enough");
+        let fresh_at = now
+            .checked_sub(PRESENCE_TTL - Duration::from_secs(1))
+            .expect("monotonic clock long enough");
+        assert!(!presence_fresh(
+            Some(PresenceRecord {
+                id: 1,
+                last_seen: stale_at
+            }),
+            now
+        ));
+        assert!(presence_fresh(
+            Some(PresenceRecord {
+                id: 1,
+                last_seen: fresh_at
+            }),
+            now
+        ));
+        // One live lease at a time: an app restarted faster than the old
+        // socket noticed replaces it, and the old connection ends quietly.
+        let first = presence_begin();
+        assert!(ui_present());
+        assert!(presence_touch(first));
+        let second = presence_begin();
+        assert!(!presence_touch(first));
+        assert!(presence_touch(second));
+        assert!(!presence_end(first));
+        assert!(presence_end(second));
+        assert!(!ui_present());
+    }
+
+    #[test]
+    fn link_lease_lifecycle_is_epoch_scoped() {
+        let fingerprint = "ab".repeat(32);
+        let epoch = 0x5EED_0001_u64;
+        let first = lease_begin(&fingerprint, "192.168.1.7:42110", Some(epoch));
+        assert!(lease_touch(&fingerprint, Some(epoch), first));
+        assert!(!lease_touch(&fingerprint, Some(epoch), first + 7));
+        // A fresh child for the same peer+epoch supersedes the old record:
+        // the old connection's EOF must not tear down the new link.
+        let second = lease_begin(&fingerprint, "192.168.1.7:42110", Some(epoch));
+        assert!(!lease_touch(&fingerprint, Some(epoch), first));
+        assert!(lease_end(&fingerprint, Some(epoch), first).is_none());
+        // Disconnect resolves the verified facts and removes the record,
+        // making the child's later EOF a no-op instead of a second teardown.
+        let taken = take_lease(Some(epoch), None).expect("lease resolved by epoch");
+        assert_eq!(taken.fingerprint_hex, fingerprint);
+        assert_eq!(taken.address, "192.168.1.7:42110");
+        assert_eq!(taken.link_id, Some(epoch));
+        assert!(lease_end(&fingerprint, Some(epoch), second).is_none());
+        assert!(take_lease(Some(epoch), None).is_none());
+        assert!(lease_end(&"cd".repeat(32), Some(epoch), 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn teardown_link_bans_persists_and_is_idempotent() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("thekvm-teardown-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let epoch = 0x7E5E_0000_u64 | (nonce % 0xFFFF) as u64;
+        teardown_link(&dir, None, None, Some(epoch), "test").await;
+        assert!(link_ended(epoch));
+        let persisted = std::fs::read_to_string(dir.join("ended_links.json")).unwrap_or_default();
+        assert!(persisted.contains(&epoch.to_string()), "{persisted}");
+        // A second teardown for the same link (e.g. the child's lease EOF
+        // after Disconnect already ran) must not panic or undo the ban.
+        teardown_link(&dir, None, None, Some(epoch), "test-again").await;
+        assert!(link_ended(epoch));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn peer_geometry_cache_round_trips_and_rejects_other_peers() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("thekvm-geometry-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(cached_peer_geometry(&dir, "ab"), None);
+        remember_peer_geometry(
+            &dir,
+            "AB",
+            ScreenGeometry {
+                screen_id: 2,
+                width: 1536,
+                height: 864,
+            },
+        );
+        // Fingerprints compare case-insensitively; a cache for another
+        // peer (or a degenerate dim) never applies.
+        assert_eq!(cached_peer_geometry(&dir, "ab"), Some((1536, 864)));
+        assert_eq!(cached_peer_geometry(&dir, "cd"), None);
+        remember_peer_geometry(
+            &dir,
+            "ab",
+            ScreenGeometry {
+                screen_id: 2,
+                width: 0,
+                height: 864,
+            },
+        );
+        assert_eq!(cached_peer_geometry(&dir, "ab"), Some((1536, 864)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The UI's long-poll take must wake the instant a paste lands — the
+    /// whole point of the watch channel — not at the deadline, and it must
+    /// answer empty at the deadline when nothing arrives (so the UI can
+    /// observe settings changes and daemon restarts promptly).
+    #[tokio::test]
+    async fn clipboard_long_poll_wakes_on_stash_and_expires_quietly() {
+        use kvm_protocol::control::{ClipboardKind, ClipboardUpdate, ControlResponse};
+        let revision = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            | 1;
+        let waiting = tokio::spawn(await_inbound_clipboard(0, 0, 5_000, true));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let started = std::time::Instant::now();
+        stash_inbound_clipboard(revision, ClipboardKind::Text, "fast", 0, 0);
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .expect("long poll did not wake on the stash")
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        match answer {
+            ControlResponse::ClipboardUpdate(ClipboardUpdate {
+                revision: seen,
+                data,
+                enabled,
+                ..
+            }) => {
+                assert_eq!(seen, revision);
+                assert_eq!(data, "fast");
+                assert_eq!(enabled, Some(true));
+            }
+            other => panic!("unexpected long-poll answer: {other:?}"),
+        }
+        // Already-seen revision + short wait: empty answer at the deadline.
+        let begun = std::time::Instant::now();
+        match await_inbound_clipboard(revision, 0, 40, true).await {
+            ControlResponse::ClipboardUpdate(ClipboardUpdate { revision: 0, .. }) => {}
+            other => panic!("expected an empty update, got: {other:?}"),
+        }
+        assert!(begun.elapsed() >= std::time::Duration::from_millis(30));
     }
 
     #[test]
