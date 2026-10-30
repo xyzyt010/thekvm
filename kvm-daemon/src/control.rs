@@ -550,6 +550,19 @@ where
     let Some(request) = read_request(&mut stream).await? else {
         return Ok(());
     };
+    // Presence fallback for apps that predate the presence lease: they
+    // poll the device lists every second, and that poll is valid evidence
+    // an app is running on this machine (see service::note_ui_contact).
+    // Status is deliberately excluded — the daemon itself polls Status
+    // while a link runs, and that must never pass for a running app.
+    if matches!(
+        request,
+        ControlRequest::ListPeers
+            | ControlRequest::ListPendingPairings
+            | ControlRequest::ListPendingLinks
+    ) {
+        crate::service::note_ui_contact();
+    }
     let response = match request {
         // Persistent presence lease (see the lifecycle section in
         // service.rs): the desktop app holds this connection for its
@@ -1500,7 +1513,10 @@ async fn run_windows_server(
     tracing::info!(pipe = %pipe, "local daemon control ready");
     loop {
         let mut server_options = ServerOptions::new();
-        server_options.max_instances(16);
+        // 64, not 16: the UI poll, clipboard long-polls, lease connections
+        // and ad-hoc CLI queries can overlap, and a starved pool makes the
+        // client see ERROR_PIPE_BUSY (os error 231) until a retry lands.
+        server_options.max_instances(64);
         server_options.reject_remote_clients(true);
         server_options.write_dac(true);
         let server = server_options

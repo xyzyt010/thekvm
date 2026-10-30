@@ -1,5 +1,106 @@
 import { Button, ComboBox, LineEdit, Palette, Switch, TabWidget } from "std-widgets.slint";
 
+// ---------------------------------------------------------------------
+// Drawn controls for the nearby-devices listing. Native Button chrome is
+// platform-styled (Windows paints a blue accent squircle) and the text
+// glyphs differed per OS — the ✕ close ended up as a tofu box inside a
+// blue squircle on Windows while it looked right on Mint. These are pure
+// Slint drawing instead, so both computers render identical pixels.
+// ---------------------------------------------------------------------
+
+// Round loading animation: a 300° arc stepped by the shared spinner tick
+// (8 steps × 45°). Drawn rather than font-based for the same reason.
+component SpinnerArc inherits Rectangle {
+    in property <length> diameter: 18px;
+    in property <color> arc-color: #22c55e;
+    in property <int> tick: 0;
+    width: diameter;
+    height: diameter;
+    background: transparent;
+    // The rotation lives on the nested path: transforms on a component
+    // root are ignored by Slint.
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        stroke: arc-color;
+        stroke-width: 3px;
+        stroke-line-cap: round;
+        commands: "M 12 3 A 9 9 0 1 1 3 12";
+        transform-rotation: Math.mod(tick, 8) * 45deg;
+        transform-origin: { x: diameter / 2, y: diameter / 2 };
+    }
+}
+
+// Close (hide the card): a real cross, no button chrome.
+component CloseButton inherits Rectangle {
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    background: hit.has-hover && enabled ? #1f2937 : transparent;
+    opacity: enabled ? 1 : 0.45;
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+    accessible-role: button;
+    accessible-label: "Hide nearby devices";
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    Path {
+        x: 7px;
+        y: 7px;
+        width: 12px;
+        height: 12px;
+        viewbox-width: 12;
+        viewbox-height: 12;
+        stroke: hit.has-hover && enabled ? #e5e7eb : #9ca3af;
+        stroke-width: 1.6px;
+        stroke-line-cap: round;
+        commands: "M 1 1 L 11 11 M 11 1 L 1 11";
+    }
+}
+
+// Rescan: the refresh arrow, replaced by the round animation while a
+// scan runs, so the button itself shows the work in progress.
+component RescanButton inherits Rectangle {
+    in property <bool> scanning: false;
+    in property <bool> enabled: true;
+    in property <int> tick: 0;
+    callback clicked();
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    background: hit.has-hover && enabled && !scanning ? #1f2937 : transparent;
+    opacity: enabled ? 1 : 0.45;
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { if (root.enabled && !root.scanning) { root.clicked(); } }
+    }
+    accessible-role: button;
+    accessible-label: scanning ? "Scanning for nearby devices" : "Rescan for nearby devices";
+    accessible-action-default => { if (root.enabled && !root.scanning) { root.clicked(); } }
+    if !scanning : Path {
+        // Standard refresh shape: a circular arrow with a solid head.
+        x: 5px;
+        y: 5px;
+        width: 16px;
+        height: 16px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        fill: hit.has-hover && enabled ? #e5e7eb : #9ca3af;
+        commands: "M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-8 8s3.57 8 8 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z";
+    }
+    if scanning : SpinnerArc {
+        x: 5px;
+        y: 5px;
+        diameter: 16px;
+        tick: root.tick;
+    }
+}
+
 // TheKVM: Deskflow-simple. The Connect tab is the whole product for most
 // users: pick what this computer does, type the other computer's address,
 // press Connect. Everything advanced lives under Devices and Settings.
@@ -91,8 +192,12 @@ export component AppWindow inherits Window {
     in property <string> pairing-code: "";
     in-out property <string> discovery-text: "No LAN scan yet";
     // Nearby-devices card (top of the Connect tab): shown on startup so
-    // the LAN set is visible without hunting for the Devices tab. The ✕
-    // hides it (cancel); Scan re-shows it. Listing only — never dials.
+    // the LAN set is visible without hunting for the Devices tab. The
+    // drawn cross hides it; the drawn refresh button rescans (and shows
+    // the round animation while the scan runs), and the UI re-reveals the
+    // card when a background scan detects a NEW device, so a hidden card
+    // can never keep a nearby computer invisible. Listing only — never
+    // dials.
     in-out property <bool> discovery-card-visible: true;
     // True while a scan is in flight: the card shows the detection
     // animation instead of a dead row.
@@ -190,7 +295,7 @@ export component AppWindow inherits Window {
                             padding: 10px;
                             spacing: 8px;
                             HorizontalLayout {
-                                spacing: 8px;
+                                spacing: 6px;
                                 Text {
                                     text: "Nearby devices";
                                     color: white;
@@ -199,24 +304,20 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 Rectangle { horizontal-stretch: 1; }
-                                Button {
-                                    text: "✕";
+                                RescanButton {
+                                    scanning: root.discovery-scanning;
+                                    tick: root.spinner-tick;
+                                    clicked => { discover-lan(); }
+                                }
+                                CloseButton {
                                     clicked => { hide-discovery(); }
                                 }
                             }
                             if discovery-scanning : HorizontalLayout {
                                 spacing: 10px;
-                                Rectangle {
-                                    width: 18px;
-                                    height: 18px;
-                                    Rectangle {
-                                        width: 6px;
-                                        height: 6px;
-                                        border-radius: 3px;
-                                        background: #22c55e;
-                                        x: spinner-tick == 0 ? 12px : spinner-tick == 1 ? 9px : spinner-tick == 2 ? 6px : spinner-tick == 3 ? 2px : spinner-tick == 4 ? 0px : spinner-tick == 5 ? 2px : spinner-tick == 6 ? 6px : 9px;
-                                        y: 6px;
-                                    }
+                                SpinnerArc {
+                                    diameter: 18px;
+                                    tick: root.spinner-tick;
                                 }
                                 Text {
                                     text: "Detecting… devices appear below as they answer";
@@ -244,18 +345,31 @@ export component AppWindow inherits Window {
                                     enabled: discovered-labels.length > 0 && !session-active;
                                     clicked => { connect-discovered(root.discovered-index); }
                                 }
-                                Button {
-                                    text: "Scan";
-                                    enabled: !discovery-scanning;
-                                    clicked => { discover-lan(); }
-                                }
                             }
                             if discovered-labels.length == 0 && !discovery-scanning : Text {
-                                text: "Nothing here yet — press Scan, or wait for the automatic listing. Tapping a device dials it with approval on the other side.";
+                                text: "Nothing here yet — press the refresh button above to rescan, or wait for the automatic listing. Tapping a device dials it with approval on the other side.";
                                 color: #6b7280;
                                 font-size: 11px;
                                 wrap: word-wrap;
                             }
+                        }
+                    }
+                    // The card's rescan control lives inside the card, so
+                    // hiding it must leave a way back: this compact row
+                    // scans (and thereby re-shows the listing) without
+                    // restoring the full card.
+                    if !discovery-card-visible : HorizontalLayout {
+                        spacing: 8px;
+                        RescanButton {
+                            scanning: root.discovery-scanning;
+                            tick: root.spinner-tick;
+                            clicked => { discover-lan(); }
+                        }
+                        Text {
+                            text: "Scan for nearby devices";
+                            color: #9ca3af;
+                            font-size: 12px;
+                            vertical-alignment: center;
                         }
                     }
                     Text { text: "This computer will:"; color: white; font-size: 16px; font-weight: 700; }
@@ -541,8 +655,16 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
                     HorizontalLayout {
-                        spacing: 12px;
-                        Button { text: "Scan network"; clicked => { discover-lan(); } }
+                        spacing: 10px;
+                        Button {
+                            text: "Scan network";
+                            enabled: !discovery-scanning;
+                            clicked => { discover-lan(); }
+                        }
+                        if discovery-scanning : SpinnerArc {
+                            diameter: 16px;
+                            tick: root.spinner-tick;
+                        }
                         Text {
                             text: discovery-text;
                             color: #9ca3af;

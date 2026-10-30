@@ -619,9 +619,26 @@ struct PresenceRecord {
 static UI_PRESENCE: std::sync::OnceLock<std::sync::Mutex<Option<PresenceRecord>>> =
     std::sync::OnceLock::new();
 static PRESENCE_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Set once a real presence lease has been seen since this daemon started.
+/// Afterwards only leases count: a new app whose heartbeat thread wedges
+/// must not stay listed just because its status polling still answers.
+static PRESENCE_LEASE_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Last poll of the UI-only request trio (peers, pending pairings, pending
+/// links) from a local control client. Apps that predate the presence
+/// lease poll those every second; counting that as presence keeps the
+/// machine discoverable and linkable until the app itself is updated.
+/// Status is deliberately NOT evidence — the daemon polls Status on its
+/// own control endpoint while a link runs, and that must never fake an app.
+static LAST_UI_CONTACT: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> =
+    std::sync::OnceLock::new();
 
 fn ui_presence_slot() -> &'static std::sync::Mutex<Option<PresenceRecord>> {
     UI_PRESENCE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn last_ui_contact_slot() -> &'static std::sync::Mutex<Option<Instant>> {
+    LAST_UI_CONTACT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// Pure freshness rule behind [`ui_present`]: pings within the TTL keep
@@ -630,9 +647,25 @@ fn presence_fresh(record: Option<PresenceRecord>, now: Instant) -> bool {
     record.is_some_and(|record| now.duration_since(record.last_seen) < PRESENCE_TTL)
 }
 
+/// Pure fallback rule: without any lease ever seen, recent UI polling
+/// proves an app is running. Once a lease has been seen the fallback is
+/// off for good, so only the lease speaks for the app.
+fn legacy_presence_fresh(contact: Option<Instant>, lease_seen: bool, now: Instant) -> bool {
+    !lease_seen && contact.is_some_and(|at| now.duration_since(at) < PRESENCE_TTL)
+}
+
+/// Record one UI-only control poll as evidence of a running app (see
+/// [`legacy_presence_fresh`]). Called by the control handler.
+pub(crate) fn note_ui_contact() {
+    if let Ok(mut slot) = last_ui_contact_slot().lock() {
+        *slot = Some(Instant::now());
+    }
+}
+
 /// Register the desktop app as present; returns the lease id the
 /// connection uses for its pings and its own teardown.
 pub(crate) fn presence_begin() -> u64 {
+    PRESENCE_LEASE_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
     let id = PRESENCE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut slot) = ui_presence_slot().lock() {
         *slot = Some(PresenceRecord {
@@ -671,10 +704,17 @@ pub(crate) fn presence_end(id: u64) -> bool {
 /// Whether the desktop app is present (and fresh) right now. Gates LAN
 /// advertisement, new incoming links, and the presence janitor.
 pub(crate) fn ui_present() -> bool {
-    ui_presence_slot()
+    let now = Instant::now();
+    let leased = ui_presence_slot()
         .lock()
         .ok()
-        .is_some_and(|slot| presence_fresh(*slot, Instant::now()))
+        .is_some_and(|slot| presence_fresh(*slot, now));
+    leased
+        || legacy_presence_fresh(
+            last_ui_contact_slot().lock().ok().and_then(|slot| *slot),
+            PRESENCE_LEASE_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+            now,
+        )
 }
 
 /// One live outbound-link lease: the child that owns this link is alive.
@@ -2022,6 +2062,10 @@ pub async fn connect(
     // on a clean shutdown. The UI must only claim "Connected" after
     // `established`; anything earlier is still connecting.
     eprintln!("THEKVM_STATUS dialing {address}");
+    // Retry cadence stays 1s (fast recovery is the point), but a peer that
+    // refuses for minutes must not bury the log: warn on the first failure
+    // and then once every 30 attempts (~30s).
+    let mut retry_attempts: u64 = 0;
     loop {
         let identity = match &adopted_identity {
             Some(identity) => identity.clone(),
@@ -2131,7 +2175,10 @@ pub async fn connect(
                     eprintln!("THEKVM_STATUS ended {error:#}");
                     return Err(error);
                 }
-                tracing::warn!(%error, peer = %address, "peer unavailable; retrying");
+                retry_attempts += 1;
+                if retry_attempts == 1 || retry_attempts.is_multiple_of(30) {
+                    tracing::warn!(%error, peer = %address, attempt = retry_attempts, "peer unavailable; retrying every second");
+                }
                 eprintln!("THEKVM_STATUS waiting {error:#}");
             }
         }
@@ -12936,6 +12983,26 @@ mod tests {
         assert!(!presence_end(first));
         assert!(presence_end(second));
         assert!(!ui_present());
+    }
+
+    #[test]
+    fn legacy_ui_contact_counts_only_until_a_lease_is_seen() {
+        let now = Instant::now();
+        assert!(!legacy_presence_fresh(None, false, now));
+        let stale_at = now
+            .checked_sub(PRESENCE_TTL + Duration::from_millis(1))
+            .expect("monotonic clock long enough");
+        let fresh_at = now
+            .checked_sub(PRESENCE_TTL - Duration::from_secs(1))
+            .expect("monotonic clock long enough");
+        // An app that predates the presence lease still polls the device
+        // lists; recent polling keeps the machine discoverable across a
+        // daemon-only upgrade.
+        assert!(!legacy_presence_fresh(Some(stale_at), false, now));
+        assert!(legacy_presence_fresh(Some(fresh_at), false, now));
+        // Once ANY real lease has been seen the fallback is off for good:
+        // a wedged new app must not stay listed through its own polling.
+        assert!(!legacy_presence_fresh(Some(fresh_at), true, now));
     }
 
     #[test]

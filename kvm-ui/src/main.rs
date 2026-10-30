@@ -111,7 +111,7 @@ fn main() -> Result<()> {
     // is reserved for this lock (42110 sessions, 42111 discovery).
     // Fail-open: on exotic machines without loopback we run unguarded
     // rather than refuse to start.
-    let _instance_lock = match std::net::TcpListener::bind("127.0.0.1:42109") {
+    let instance_lock = match std::net::TcpListener::bind("127.0.0.1:42109") {
         Ok(listener) => Some(listener),
         Err(error) => {
             ui_log(&format!(
@@ -120,16 +120,35 @@ fn main() -> Result<()> {
             None
         }
     };
-    if _instance_lock.is_none() {
+    if instance_lock.is_none() {
         // Distinguish "no loopback" from "already running": a connect probe
-        // answers only when a live instance holds the port.
+        // answers only when a live instance holds the port. The running
+        // instance answers by re-showing its window (see below), so a
+        // second launch from the desktop icon never looks like a no-op now
+        // that closing the window leaves the app in the tray.
         if std::net::TcpStream::connect("127.0.0.1:42109").is_ok() {
-            ui_log("second UI instance exiting; the running one already shows everything");
+            ui_log("second UI instance: the running one re-shows its window");
             return Ok(());
         }
     }
 
     let ui = AppWindow::new()?;
+    if let Some(listener) = instance_lock {
+        let weak = ui.as_weak();
+        std::thread::Builder::new()
+            .name("thekvm-instance-lock".into())
+            .spawn(move || {
+                for _ in listener.incoming() {
+                    let weak = weak.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = weak.upgrade() {
+                            let _ = ui.window().show();
+                        }
+                    });
+                }
+            })
+            .ok();
+    }
     let pending_pair = Arc::new(Mutex::new(None::<PendingPair>));
     // Last polled inbound-link queue (see ListPendingLinks): handlers need
     // each entry's epoch to approve/deny it.
@@ -642,6 +661,10 @@ fn main() -> Result<()> {
                                         .collect::<Vec<_>>()
                                         .join("; ")
                                 ));
+                                // A newly detected computer must be visible
+                                // even if the card was hidden earlier: only
+                                // an UNCHANGED set respects the user's ✕.
+                                set_discovery_card(&weak, true);
                             }
                             store_discovered(&weak, &discovered_for_poll, found, false);
                         }
@@ -1912,7 +1935,15 @@ fn main() -> Result<()> {
         });
     }
 
-    ui.run()?;
+    // Not ui.run(): that is show() + run_event_loop() + hide(), and the
+    // hide releases Slint's last keepalive, which quits the event loop the
+    // moment the window is hidden to the tray — the app (and its supervised
+    // link child) then exits, which is exactly the bug where closing the
+    // window killed the background app. This variant holds a permanent
+    // keepalive, so hiding the window leaves the loop running until the
+    // tray Quit path calls process::exit.
+    ui.show()?;
+    slint::run_event_loop_until_quit()?;
     Ok(())
 }
 
@@ -5116,40 +5147,9 @@ fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
 /// app.slint). Set on Connect; cleared by set_session when the display
 /// settles.
 fn set_link_connecting(weak: &slint::Weak<AppWindow>, connecting: bool) {
+    SPINNER_LINK_ACTIVE.store(connecting, std::sync::atomic::Ordering::Release);
     if connecting {
-        // Start the spinner ticker (once): it steps spinner-tick every
-        // 90ms until set_session clears the flag. The Slint Timer stays
-        // out of it — a Rust ticker is version-proof and costs nothing
-        // once the flag drops.
-        if SPINNER_RUNNING
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_ok()
-        {
-            let weak = weak.clone();
-            std::thread::Builder::new()
-                .name("thekvm-link-spinner".into())
-                .spawn(move || {
-                    while SPINNER_RUNNING.load(std::sync::atomic::Ordering::Relaxed) {
-                        std::thread::sleep(std::time::Duration::from_millis(90));
-                        let _ = slint::invoke_from_event_loop({
-                            let weak = weak.clone();
-                            move || {
-                                if let Some(ui) = weak.upgrade() {
-                                    ui.set_spinner_tick((ui.get_spinner_tick() + 1) % 8);
-                                }
-                            }
-                        });
-                    }
-                })
-                .ok();
-        }
-    } else {
-        SPINNER_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+        ensure_spinner_ticker(weak);
     }
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
@@ -5161,7 +5161,66 @@ fn set_link_connecting(weak: &slint::Weak<AppWindow>, connecting: bool) {
     });
 }
 
+/// Start the shared spinner ticker if any animation needs it. The tick
+/// drives the first-connect row and the discovery rescan spinner; it
+/// stops as soon as neither is active (a tray app must not wake the
+/// event loop every 90ms forever).
+fn ensure_spinner_ticker(weak: &slint::Weak<AppWindow>) {
+    if !spinner_wanted() {
+        return;
+    }
+    if SPINNER_RUNNING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let weak = weak.clone();
+    let spawned = std::thread::Builder::new()
+        .name("thekvm-spinner".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(90));
+                let _ = slint::invoke_from_event_loop({
+                    let weak = weak.clone();
+                    move || {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.set_spinner_tick((ui.get_spinner_tick() + 1) % 8);
+                        }
+                    }
+                });
+                if !spinner_wanted() {
+                    SPINNER_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+                    // A spinner requested while this thread was winding
+                    // down found SPINNER_RUNNING still true and did not
+                    // spawn its own ticker; restart one here.
+                    if spinner_wanted() {
+                        ensure_spinner_ticker(&weak);
+                    }
+                    return;
+                }
+            }
+        });
+    if spawned.is_err() {
+        SPINNER_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn spinner_wanted() -> bool {
+    SPINNER_LINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+        || SPINNER_SCAN_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static SPINNER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SPINNER_LINK_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SPINNER_SCAN_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Clipboard-sync gate shared by the relay's two threads: the daemon's
 /// config is authoritative, and the take thread refreshes this from every
@@ -5797,6 +5856,10 @@ fn set_discovery_card(weak: &slint::Weak<AppWindow>, visible: bool) {
 }
 
 fn set_discovery_scanning(weak: &slint::Weak<AppWindow>, scanning: bool) {
+    SPINNER_SCAN_ACTIVE.store(scanning, std::sync::atomic::Ordering::Release);
+    if scanning {
+        ensure_spinner_ticker(weak);
+    }
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
