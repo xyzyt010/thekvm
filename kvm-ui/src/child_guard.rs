@@ -9,8 +9,12 @@
 //! * Windows: one process-wide job object with KILL_ON_JOB_CLOSE. The OS
 //!   closes the handle when this process dies for any reason and reaps
 //!   every member with it.
-//! * Linux: PR_SET_PDEATHSIG(SIGKILL) in `pre_exec`, plus a getppid check
-//!   that closes the race where the parent dies between fork and prctl.
+//! * Linux: a process-lifetime liveness pipe. The write end lives in a
+//!   static (so it belongs to the PROCESS, not to whichever thread called
+//!   spawn), the child inherits the read end and exits on EOF. Linux
+//!   PR_SET_PDEATHSIG is thread-scoped — tying it to a short-lived pairing
+//!   thread SIGKILLed connect children milliseconds after spawn — so it is
+//!   deliberately not used here.
 
 #[cfg(target_os = "windows")]
 pub fn configure(_command: &mut std::process::Command) {}
@@ -90,20 +94,55 @@ fn log_line(message: &str) {
 }
 
 #[cfg(target_os = "linux")]
+pub const GUARD_FD_ENV: &str = "THEKVM_GUARD_FD";
+
+#[cfg(target_os = "linux")]
+struct GuardPipe {
+    read: std::os::fd::RawFd,
+    /// Kept open for the life of this process. Leaking it is the point:
+    /// process death closes every copy, which is exactly the EOF the child
+    /// watches for. It is O_CLOEXEC so no child ever inherits it.
+    write: std::os::fd::RawFd,
+}
+
+#[cfg(target_os = "linux")]
+fn guard_pipe() -> Option<&'static GuardPipe> {
+    static PIPE: std::sync::OnceLock<Option<GuardPipe>> = std::sync::OnceLock::new();
+    PIPE.get_or_init(|| {
+        let mut fds = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            crate::ui_log(&format!(
+                "child guard: liveness pipe unavailable: {}",
+                std::io::Error::last_os_error()
+            ));
+            return None;
+        }
+        Some(GuardPipe {
+            read: fds[0],
+            write: fds[1],
+        })
+    })
+    .as_ref()
+}
+
+#[cfg(target_os = "linux")]
 pub fn configure(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
 
-    let parent = std::process::id() as libc::pid_t;
+    let Some(pipe) = guard_pipe() else {
+        return;
+    };
+    command.env(GUARD_FD_ENV, pipe.read.to_string());
+    let read = pipe.read;
+    let write = pipe.write;
     unsafe {
         command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+            // Keep the read end open across exec, but never the write end
+            // (O_CLOEXEC): a child holding a write copy would keep its own
+            // guard alive forever.
+            let _ = write;
+            if libc::fcntl(read, libc::F_SETFD, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
-            }
-            // Parent died between fork and prctl(): its death signal fired
-            // into a process that no longer exists, so exit now instead of
-            // lingering as an orphan the daemon must later reap by lease.
-            if libc::getppid() != parent {
-                libc::_exit(1);
             }
             Ok(())
         });

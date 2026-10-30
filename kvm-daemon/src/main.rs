@@ -341,8 +341,41 @@ mod tests {
     }
 }
 
+/// Linux: the UI holds the write end of a process-lifetime pipe and hands
+/// this child the read end. EOF means the UI process died (Task Manager
+/// kill, crash, logout) — never outlive it. PR_SET_PDEATHSIG cannot express
+/// that here: it is thread-scoped, and the UI starts link children from
+/// short-lived pairing threads, which killed healthy children in 5ms.
+#[cfg(target_os = "linux")]
+fn spawn_parent_liveness_guard() {
+    let Ok(fd) = std::env::var("THEKVM_GUARD_FD") else {
+        return;
+    };
+    let Ok(fd) = fd.parse::<std::os::fd::RawFd>() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        use std::os::fd::FromRawFd as _;
+        let mut pipe = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut byte = [0u8; 1];
+        loop {
+            match pipe.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"THEKVM_STATUS ended ui gone\n");
+        std::process::exit(0);
+    });
+}
+
 #[tokio::main]
 async fn async_main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    spawn_parent_liveness_guard();
     let cli = Cli::parse();
     match cli.command {
         Command::Fingerprint => service::print_fingerprint(),

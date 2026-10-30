@@ -97,6 +97,60 @@ fn mint_link_id() -> u64 {
         ^ salt.wrapping_mul(0xBF58_476D_1CE4_E5B9)
 }
 
+/// Addresses the user just hung up on locally. The daemon teardown and the
+/// child kill are asynchronous; without this, follow_link saw the still-fresh
+/// inbound record and dialled the link straight back (observed 3ms after
+/// Disconnect). Only the automatic dial-back is suppressed — a peer's fresh
+/// epoch or a manual Connect still arms normally. Entries expire so a later
+/// reconnect from either side is never blocked.
+static DIALBACK_TOMBSTONES: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+fn dialback_tombstones() -> &'static Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    DIALBACK_TOMBSTONES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Host-part key: `192.168.1.7` and `192.168.1.7:42110` are the same peer.
+/// IPv6 addresses keep their full form (more than one colon).
+fn dialback_host(address: &str) -> &str {
+    let trimmed = address.trim();
+    if trimmed.matches(':').count() == 1 {
+        trimmed.split(':').next().unwrap_or(trimmed)
+    } else {
+        trimmed
+    }
+}
+
+fn tombstone_dialback(address: &str) {
+    let key = dialback_host(address).to_ascii_lowercase();
+    if key.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = dialback_tombstones().lock() {
+        let now = std::time::Instant::now();
+        map.retain(|_, when| now.duration_since(*when) < std::time::Duration::from_secs(30));
+        map.insert(key, now);
+    }
+}
+
+fn clear_dialback_tombstone(address: &str) {
+    let key = dialback_host(address).to_ascii_lowercase();
+    if let Ok(mut map) = dialback_tombstones().lock() {
+        map.remove(&key);
+    }
+}
+
+fn dialback_suppressed(address: &str) -> bool {
+    let key = dialback_host(address).to_ascii_lowercase();
+    let Ok(mut map) = dialback_tombstones().lock() else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    map.retain(|_, when| now.duration_since(*when) < std::time::Duration::from_secs(30));
+    map.contains_key(&key)
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -598,17 +652,7 @@ fn main() -> Result<()> {
                                 let verified =
                                     session.verified.load(std::sync::atomic::Ordering::Relaxed);
                                 *slot = None;
-                                set_session(&weak, None);
-                                set_status(
-                                    &weak,
-                                    if verified {
-                                        format!("Connection to {address} ended ({status})")
-                                    } else {
-                                        format!(
-                                    "Could not establish a connection to {address} ({status}). Check the address and that the other side is waiting, then Connect again."
-                                )
-                                    },
-                                );
+                                report_session_exit(&weak, &address, verified, &status);
                             }
                             Ok(None) => {}
                             Err(error) => {
@@ -1230,6 +1274,9 @@ fn main() -> Result<()> {
                 .map(|session| (session.address.clone(), session.link_id))
         });
         if let Some((address, link_id)) = outbound {
+            // Stop follow_link from re-dialling this peer while the daemon
+            // teardown is still in flight (the exact 3ms resurrection).
+            tombstone_dialback(&address);
             disconnect_link(None, Some(&address), link_id);
         }
         stop_session(&weak, &disconnect_session, "Disconnected");
@@ -1240,6 +1287,7 @@ fn main() -> Result<()> {
         std::thread::spawn(move || {
             if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
                 for link in &status.sessions {
+                    tombstone_dialback(&link.address);
                     disconnect_link(
                         Some(&link.fingerprint_hex),
                         Some(&link.address),
@@ -2492,6 +2540,9 @@ fn start_session_flow(
     address: String,
     pairing_code: Option<String>,
 ) {
+    // A manual Connect is explicit intent: lift any Disconnect tombstone
+    // for this peer before the automatic-dial-back suppression is consulted.
+    clear_dialback_tombstone(&address);
     // Reap a dead previous session first so a stale slot can never wedge
     // reconnect behind a permanent "Already connected".
     if let Ok(mut slot) = session.lock() {
@@ -2552,79 +2603,124 @@ fn start_session_flow(
             .unwrap_or_else(|_| fallback_node_name());
         set_peer_address_field(&weak, &address);
         set_status(&weak, format!("Contacting {address}…"));
-        match pair_prepare(&address, &data_dir, &node_name, pairing_code) {
-            Ok(pair) => {
-                // Already trusted: skip the ceremony entirely.
-                if is_controller_peer_pinned(&data_dir, &pair.peer_fingerprint) {
-                    set_status(&weak, format!("Connecting to {}…", pair.peer_node_name));
-                    spawn_session(&weak, &session, &pending, &data_dir, pair.address);
-                    return;
-                }
-                let fingerprint = pair.peer_fingerprint.clone();
-                let peer_name = pair.peer_node_name.clone();
-                let code = pair.verification_code.clone();
-                // Typed-code pairing, approved by the station itself: finish
-                // immediately on the held-open channel. No compare screen
-                // ever shows (there is nothing left for either human to
-                // approve), and the misleading "approve it there too" text
-                // must never appear for this path.
-                if pair.station_pre_approved {
-                    ui_log(&format!(
-                        "pairing: station {peer_name} approved via typed code; finishing without a code screen"
-                    ));
-                    set_status(
-                        &weak,
-                        format!("{peer_name} approved automatically — finishing pairing…"),
-                    );
-                    run_pair_confirm(&weak, data_dir, &session, &pending, pair);
-                    return;
-                }
-                let generation = pair.generation;
-                let typed_code_sent = pair.typed_code_sent;
-                // Hold the pairing channel open (stored in the slot) and
-                // watch it: if the station ends the request (expiry,
-                // restart, denial-by-closure), the code screen must die
-                // with it instead of showing stale digits forever. Only
-                // this generation may clear the screen.
-                let watch_connection = pair
-                    .pairing
-                    .as_ref()
-                    .map(|channel| channel.connection.clone());
-                if let Ok(mut slot) = pending.lock() {
-                    *slot = Some(pair);
-                }
-                if let Some(watch_connection) = watch_connection {
-                    let watch_weak = weak.clone();
-                    let watch_pending = pending.clone();
-                    let watch_address = address.clone();
-                    std::thread::spawn(move || {
-                        runtime().block_on(async move {
-                            watch_connection.closed().await;
-                        });
-                        let live = watch_pending.lock().ok().is_some_and(|slot| {
-                            slot.as_ref()
-                                .is_some_and(|current| current.generation == generation)
-                        });
-                        if live {
-                            if let Ok(mut slot) = watch_pending.lock() {
-                                *slot = None;
+        let mut dial_address = address.clone();
+        let mut healed_address: Option<String> = None;
+        let pair = match pair_prepare(&dial_address, &data_dir, &node_name, pairing_code.clone()) {
+            Ok(pair) => pair,
+            Err(error) => {
+                // A trusted peer's stored LAN address goes stale when DHCP
+                // hands it a new IP. Discovery never grants trust: the retry
+                // address must advertise the fingerprint this address's
+                // pinned peer already has, and the QUIC dial still verifies
+                // that certificate before anything is trusted or saved.
+                match healed_address_for(&data_dir, &address) {
+                    Some(fresh) if fresh != address => {
+                        ui_log(&format!(
+                            "pairing: {address} did not answer ({error:#}); retrying the pinned peer at discovered {fresh}"
+                        ));
+                        dial_address = fresh.clone();
+                        healed_address = Some(fresh);
+                        set_peer_address_field(&weak, &dial_address);
+                        set_status(
+                            &weak,
+                            format!("{address} did not answer — trying the same computer at {dial_address}…"),
+                        );
+                        match pair_prepare(&dial_address, &data_dir, &node_name, pairing_code) {
+                            Ok(pair) => pair,
+                            Err(second) => {
+                                set_status(
+                                    &weak,
+                                    format!(
+                                        "Cannot reach {address} (the pinned peer at {dial_address} also failed): {second}"
+                                    ),
+                                );
+                                return;
                             }
-                            ui_log("pairing: station ended the request; code screen cleared");
-                            set_pending(&watch_weak, String::new(), String::new(), String::new());
-                            set_status(
-                                &watch_weak,
-                                format!(
-                                    "The request on {watch_address} ended before approval — press Connect again for a fresh code."
-                                ),
-                            );
                         }
-                    });
+                    }
+                    _ => {
+                        set_status(&weak, format!("Cannot reach {address}: {error}"));
+                        return;
+                    }
                 }
-                set_status(&weak, pair_status_text(&peer_name, &code, typed_code_sent));
-                set_pending(&weak, fingerprint, code, peer_name);
             }
-            Err(error) => set_status(&weak, format!("Cannot reach {address}: {error}")),
+        };
+        if healed_address.is_some() {
+            persist_healed_address(
+                &data_dir,
+                &pair.peer_fingerprint,
+                &pair.peer_node_name,
+                &pair.address,
+            );
         }
+        // Already trusted: skip the ceremony entirely.
+        if is_controller_peer_pinned(&data_dir, &pair.peer_fingerprint) {
+            set_status(&weak, format!("Connecting to {}…", pair.peer_node_name));
+            spawn_session(&weak, &session, &pending, &data_dir, pair.address);
+            return;
+        }
+        let fingerprint = pair.peer_fingerprint.clone();
+        let peer_name = pair.peer_node_name.clone();
+        let code = pair.verification_code.clone();
+        // Typed-code pairing, approved by the station itself: finish
+        // immediately on the held-open channel. No compare screen
+        // ever shows (there is nothing left for either human to
+        // approve), and the misleading "approve it there too" text
+        // must never appear for this path.
+        if pair.station_pre_approved {
+            ui_log(&format!(
+                "pairing: station {peer_name} approved via typed code; finishing without a code screen"
+            ));
+            set_status(
+                &weak,
+                format!("{peer_name} approved automatically — finishing pairing…"),
+            );
+            run_pair_confirm(&weak, data_dir, &session, &pending, pair);
+            return;
+        }
+        let generation = pair.generation;
+        let typed_code_sent = pair.typed_code_sent;
+        // Hold the pairing channel open (stored in the slot) and
+        // watch it: if the station ends the request (expiry,
+        // restart, denial-by-closure), the code screen must die
+        // with it instead of showing stale digits forever. Only
+        // this generation may clear the screen.
+        let watch_connection = pair
+            .pairing
+            .as_ref()
+            .map(|channel| channel.connection.clone());
+        if let Ok(mut slot) = pending.lock() {
+            *slot = Some(pair);
+        }
+        if let Some(watch_connection) = watch_connection {
+            let watch_weak = weak.clone();
+            let watch_pending = pending.clone();
+            let watch_address = address.clone();
+            std::thread::spawn(move || {
+                runtime().block_on(async move {
+                    watch_connection.closed().await;
+                });
+                let live = watch_pending.lock().ok().is_some_and(|slot| {
+                    slot.as_ref()
+                        .is_some_and(|current| current.generation == generation)
+                });
+                if live {
+                    if let Ok(mut slot) = watch_pending.lock() {
+                        *slot = None;
+                    }
+                    ui_log("pairing: station ended the request; code screen cleared");
+                    set_pending(&watch_weak, String::new(), String::new(), String::new());
+                    set_status(
+                        &watch_weak,
+                        format!(
+                            "The request on {watch_address} ended before approval — press Connect again for a fresh code."
+                        ),
+                    );
+                }
+            });
+        }
+        set_status(&weak, pair_status_text(&peer_name, &code, typed_code_sent));
+        set_pending(&weak, fingerprint, code, peer_name);
     });
 }
 
@@ -2913,6 +3009,57 @@ fn fingerprint_for_address(data_dir: &std::path::Path, address: &str) -> Option<
             })
         })
         .map(|peer| peer.fingerprint_hex.clone())
+}
+
+/// A trusted peer's stored LAN address goes stale when DHCP hands it a new
+/// IP, so an unresolvable dial falls back to a fresh discovery scan. Trust
+/// is never granted here: the retry address must advertise the fingerprint
+/// this address's pinned peer already has, and the caller's QUIC dial still
+/// verifies that certificate before anything is trusted or saved.
+fn healed_address_for(data_dir: &std::path::Path, stale_address: &str) -> Option<String> {
+    let fingerprint = fingerprint_for_address(data_dir, stale_address)?;
+    let found = runtime()
+        .block_on(kvm_protocol::discovery::scan(
+            std::time::Duration::from_secs(1),
+        ))
+        .unwrap_or_default();
+    found
+        .into_iter()
+        .map(|(address, advertised)| (address.to_string(), advertised))
+        .find(|(address, advertised)| {
+            advertised
+                .fingerprint_hex
+                .eq_ignore_ascii_case(&fingerprint)
+                && address != stale_address
+        })
+        .map(|(address, _)| address)
+}
+
+/// Remember a freshly discovered address for a pinned peer so the next
+/// Connect dials it directly. Called only after the new address answered
+/// with the pinned certificate, so this can never plant an unverified
+/// address in either book.
+fn persist_healed_address(
+    data_dir: &std::path::Path,
+    fingerprint: &str,
+    name: &str,
+    address: &str,
+) {
+    if let Ok(mut book) = kvm_protocol::pairing::PeerBook::load_or_create(data_dir) {
+        match book.pin_with_address(
+            name.to_owned(),
+            fingerprint.to_owned(),
+            Some(address.to_owned()),
+        ) {
+            Ok(()) => ui_log(&format!(
+                "pairing: stored discovered address {address} for pinned peer {name}"
+            )),
+            Err(error) => ui_log(&format!(
+                "pairing: storing discovered address {address} failed: {error}"
+            )),
+        }
+    }
+    pin_daemon_peer(fingerprint, name, Some(address));
 }
 
 /// Mirror ceremony trust into the DAEMON book so the reverse direction can
@@ -3714,11 +3861,18 @@ fn follow_link(
         }
         if attempt {
             if let Some(link) = inbound {
-                ui_log(&format!(
-                    "link: dialling back {} at {} for two-way edge",
-                    link.node_name, link.address
-                ));
-                spawn_dial_back(weak, session, pending, data_dir, link.address, link.link_id);
+                if dialback_suppressed(&link.address) {
+                    ui_log(&format!(
+                        "link: not dialling back {} at {} — this computer just disconnected (waiting for a fresh Connect)",
+                        link.node_name, link.address
+                    ));
+                } else {
+                    ui_log(&format!(
+                        "link: dialling back {} at {} for two-way edge",
+                        link.node_name, link.address
+                    ));
+                    spawn_dial_back(weak, session, pending, data_dir, link.address, link.link_id);
+                }
             }
         }
     }
@@ -3892,7 +4046,7 @@ fn launch_child(
                     link_id,
                 });
             }
-            set_session(weak, Some(label.clone()));
+            set_session_connecting(weak, &label);
             set_status(
                 weak,
                 format!(
@@ -4070,7 +4224,7 @@ fn relay_session_progress(
         }
         let text = match kind {
             "established" => {
-                verified.store(true, std::sync::atomic::Ordering::Relaxed);
+                set_session_connected(weak, session, verified, address);
                 // Adopt the live fingerprint for this address: the peer may
                 // have re-paired under a new identity since the screens were
                 // arranged (ghost pins misroute every handoff).
@@ -4080,7 +4234,7 @@ fn relay_session_progress(
                 )
             }
             "edge-ready" => {
-                verified.store(true, std::sync::atomic::Ordering::Relaxed);
+                set_session_connected(weak, session, verified, address);
                 set_driving(weak, String::new());
                 edge_ready_text()
             }
@@ -4171,6 +4325,27 @@ fn relay_session_progress(
                     } else {
                         format!("Connection to {address} ended ({detail})")
                     }
+                } else if detail.starts_with("peer disconnected") {
+                    // The peer's Disconnect arrived on the live association
+                    // (fast path): end our child now and say so honestly.
+                    // Guarded by address+epoch so a lagging relay can never
+                    // kill a newer link.
+                    let ended_id = detail
+                        .trim_start_matches("peer disconnected")
+                        .trim()
+                        .parse::<u64>()
+                        .ok();
+                    let ours = session.lock().ok().and_then(|slot| {
+                        slot.as_ref()
+                            .map(|current| (current.address.clone(), current.link_id))
+                    });
+                    if ours.is_some_and(|(current_address, current_id)| {
+                        current_address == address && current_id == ended_id
+                    }) {
+                        stop_session(weak, session, "Peer disconnected");
+                    }
+                    set_status(weak, "Peer disconnected — link down on both sides.".into());
+                    "Peer disconnected — link down on both sides.".into()
                 } else if let Some(guidance) = mode_mismatch_guidance(detail, address) {
                     guidance
                 } else if detail.contains("declined the link") {
@@ -4195,23 +4370,54 @@ fn relay_session_progress(
     // dial-back on the still-live inbound link. A newer supervised child
     // that is still running is never touched: try_wait reports None.
     let reaped = session.lock().ok().and_then(|mut slot| {
-        let dead = slot
-            .as_mut()
-            .and_then(|current| current.child.try_wait().ok().flatten());
-        match dead {
-            Some(status) => {
-                slot.take();
-                Some(status)
-            }
-            _ => None,
+        let ended = slot.as_mut().and_then(|current| {
+            current.child.try_wait().ok().flatten().map(|status| {
+                (
+                    current.address.clone(),
+                    current.verified.load(std::sync::atomic::Ordering::Relaxed),
+                    status,
+                )
+            })
+        });
+        if ended.is_some() {
+            slot.take();
         }
+        ended
     });
-    if let Some(status) = reaped {
+    if let Some((address, verified, status)) = reaped {
         ui_log(&format!(
             "session: child for {address} exited silently ({status}); clearing for redial"
         ));
-        set_driving(weak, String::new());
+        // A newer supervised child may already own the slot; never clear
+        // its display from this stale relay.
+        let superseded = session.lock().ok().is_some_and(|slot| slot.is_some());
+        if !superseded {
+            report_session_exit(weak, &address, verified, &status);
+        }
     }
+}
+
+/// One honest exit report for every reaper path (relay, poll loop): a child
+/// that never reported `established` was never connected, so never imply a
+/// live session dropped.
+fn report_session_exit(
+    weak: &slint::Weak<AppWindow>,
+    address: &str,
+    verified: bool,
+    status: &std::process::ExitStatus,
+) {
+    set_session(weak, None);
+    set_driving(weak, String::new());
+    set_status(
+        weak,
+        if verified {
+            format!("Connection to {address} ended ({status})")
+        } else {
+            format!(
+                "Could not establish a connection to {address} ({status}). Check the address and that the other side is waiting, then Connect again."
+            )
+        },
+    );
 }
 
 fn stop_session(
@@ -5131,13 +5337,64 @@ fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
                 match address {
                     Some(address) => {
                         ui.set_session_active(true);
+                        ui.set_session_verified(true);
                         ui.set_session_text(SharedString::from(format!("Connected to {address}")));
                     }
                     None => {
                         ui.set_session_active(false);
+                        ui.set_session_verified(false);
                         ui.set_session_text(SharedString::from("Not connected"));
                     }
                 }
+            }
+        }
+    });
+}
+
+/// Spawning a child is NOT connecting. Until the child reports a verified
+/// session the panel says Connecting (amber, spinner live) — it must never
+/// claim Connected for a process that merely started.
+fn set_session_connecting(weak: &slint::Weak<AppWindow>, address: &str) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        let address = address.to_owned();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_session_active(true);
+                ui.set_session_verified(false);
+                ui.set_session_text(SharedString::from(format!("Connecting to {address}…")));
+                ui.set_link_connecting(true);
+            }
+        }
+    });
+}
+
+/// The child reported a live, verified session. Only a relay that still
+/// owns the current session slot may paint Connected (a stale relay must
+/// never relabel a newer child).
+fn set_session_connected(
+    weak: &slint::Weak<AppWindow>,
+    session: &Arc<Mutex<Option<Session>>>,
+    verified: &Arc<std::sync::atomic::AtomicBool>,
+    address: &str,
+) {
+    verified.store(true, std::sync::atomic::Ordering::Relaxed);
+    let current = session.lock().ok().is_some_and(|slot| {
+        slot.as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.verified, verified))
+    });
+    if !current {
+        return;
+    }
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        let address = address.to_owned();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_session_active(true);
+                ui.set_session_verified(true);
+                ui.set_session_text(SharedString::from(format!("Connected to {address}")));
+                ui.set_link_connecting(false);
             }
         }
     });

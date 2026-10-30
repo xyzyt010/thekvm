@@ -406,6 +406,62 @@ impl Drop for InboundLinkGuard {
     }
 }
 
+/// Live verified associations keyed by peer fingerprint, kept apart from
+/// the inbound-session registry: a Disconnect must reach the peer even
+/// when the session task is already ending (and even when this machine
+/// only holds the peer's dial-back half). Sending `LinkEnded` on this
+/// connection reaches the peer's supervised child instantly; the cold
+/// QUIC fallback was observed taking ~7 s.
+static LIVE_PEER_CONNECTIONS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, (quinn::Connection, usize)>>,
+> = std::sync::OnceLock::new();
+
+fn live_peer_connections() -> &'static std::sync::Mutex<HashMap<String, (quinn::Connection, usize)>>
+{
+    LIVE_PEER_CONNECTIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn remember_peer_connection(fingerprint_hex: &str, conn: &quinn::Connection) {
+    let key = fingerprint_hex.to_ascii_lowercase();
+    if let Ok(mut live) = live_peer_connections().lock() {
+        if live.len() >= 16 && !live.contains_key(&key) {
+            if let Some(oldest) = live.keys().next().cloned() {
+                live.remove(&oldest);
+            }
+        }
+        live.insert(key, (conn.clone(), conn.stable_id()));
+    }
+}
+
+fn forget_peer_connection(fingerprint_hex: &str, stable_id: usize) {
+    let key = fingerprint_hex.to_ascii_lowercase();
+    if let Ok(mut live) = live_peer_connections().lock() {
+        if live.get(&key).is_some_and(|(_, id)| *id == stable_id) {
+            live.remove(&key);
+        }
+    }
+}
+
+fn live_peer_connection(fingerprint_hex: &str) -> Option<quinn::Connection> {
+    live_peer_connections().lock().ok().and_then(|live| {
+        live.get(&fingerprint_hex.to_ascii_lowercase())
+            .map(|(conn, _)| conn.clone())
+    })
+}
+
+/// Removes this association from the live map when its accept loop ends,
+/// unless a re-association already replaced it (id checked).
+struct LiveConnectionGuard {
+    fingerprint_hex: String,
+    stable_id: usize,
+}
+
+impl Drop for LiveConnectionGuard {
+    fn drop(&mut self) {
+        forget_peer_connection(&self.fingerprint_hex, self.stable_id);
+    }
+}
+
 /// Link epochs the local user ended via Disconnect. A dial carrying a
 /// banned epoch is rejected instead of served, so a stale redial can never
 /// resurrect a dead link as a zombie. Bounded: past 32 the set resets (a
@@ -839,6 +895,14 @@ pub(crate) async fn teardown_link(
 ) {
     let fingerprint_hex = fingerprint_hex.map(|fingerprint| fingerprint.to_ascii_lowercase());
     let fingerprint = fingerprint_hex.as_deref();
+    // Courtesy first, while the peer's association is still verifiably
+    // live: a new stream on the existing connection lands in milliseconds.
+    // The cold dial below is only a fallback (no live association, or a
+    // half-open one that cannot accept a stream).
+    let mut notified_live = false;
+    if let Some(fingerprint) = fingerprint {
+        notified_live = notify_peer_ended_live(fingerprint, link_id, dir).await;
+    }
     let mut dropped_session = false;
     if let Some(fingerprint) = fingerprint {
         dropped_session = drop_inbound_link(fingerprint);
@@ -863,7 +927,7 @@ pub(crate) async fn teardown_link(
             fingerprint.unwrap_or("-"),
         ),
     );
-    if let Some(address) = address {
+    if let Some(address) = address.filter(|_| !notified_live) {
         let address = address.to_owned();
         let dir = dir.to_owned();
         let reason = reason.to_owned();
@@ -2148,8 +2212,48 @@ pub async fn connect(
                 let _ = write_frame(&mut send, &WireMessage::ReleaseAll).await;
                 let _ = send.finish();
                 store_warm_link(&conn, &link.fingerprint);
+                // The peer's daemon delivers its Disconnect as LinkEnded on
+                // a fresh stream over this authenticated association (the
+                // live fast path; no cold dial). Ending the link the moment
+                // it arrives is what makes one Disconnect land on both
+                // computers instantly instead of waiting for the UI poll.
+                let peer_ended = {
+                    let conn = conn.clone();
+                    async move {
+                        loop {
+                            match conn.accept_bi().await {
+                                Ok((mut send, mut recv)) => match read_frame(&mut recv).await {
+                                    Ok(Some(WireMessage::LinkEnded { link_id })) => {
+                                        let _ = send.finish();
+                                        tracing::info!(
+                                            ?link_id,
+                                            "peer ended the link on the live association"
+                                        );
+                                        return Some(link_id);
+                                    }
+                                    _ => continue,
+                                },
+                                // The peer's child went away without a frame:
+                                // the link is just as dead.
+                                Err(_) => return None,
+                            }
+                        }
+                    }
+                };
                 eprintln!("THEKVM_STATUS established {address}");
-                let result = connect_topology(Some(link), identity).await;
+                let result = tokio::select! {
+                    result = connect_topology(Some(link), identity) => result,
+                    ended = peer_ended => {
+                        match ended {
+                            Some(ended_id) => eprintln!(
+                                "THEKVM_STATUS ended peer disconnected {}",
+                                ended_id.map(|id| id.to_string()).unwrap_or_else(|| "none".into())
+                            ),
+                            None => eprintln!("THEKVM_STATUS ended peer left"),
+                        }
+                        Ok(())
+                    }
+                };
                 // Link over: disarm the fast path so a stale key can never
                 // address the next link (which mints a fresh epoch anyway).
                 set_udp_sender(None);
@@ -4692,35 +4796,51 @@ fn handoff_is_single_fling(event: InputEvent) -> bool {
     }
 }
 
-/// Phantom-handoff veto: the 24px push budget can complete from a SINGLE
-/// in-flight flick event while the visible cursor is still mid-screen —
-/// the OS clamps the fling at the edge, but the router (integrating raw
-/// deltas that arrived after the OS pointer stopped) has already crossed.
-/// Returns the OS truth to re-pin to when the crossing must NOT commit
-/// (None = proceed): the caller restores local, re-pins, parks inside,
-/// and stays local. Genuine pushes — including fast ones, whose truth is
-/// already clamped at the edge — cross instantly, so fast movement keeps
-/// working. Unqueryable platforms (Wayland) and failed reads fail OPEN:
-/// today's behavior, never a new can't-cross.
+/// Truth-at-crossing gate: the visible pointer must actually be at the
+/// edge when a handoff commits. The router integrates raw deltas, which
+/// can run ahead of the OS pointer (input scaling, capture-vs-sprite
+/// order, warps); committing there is exactly "it exits before the cursor
+/// really reached the edge". Returns the OS truth to re-pin to when the
+/// crossing must NOT commit (None = proceed): the caller restores local,
+/// re-pins, and stays local. Unqueryable platforms (Wayland) and failed
+/// reads fail OPEN: today's behavior, never a new can't-cross.
 ///
-/// The first truth read can itself be a frame early: the same fling that
-/// outran the pointer path also outran the OS's own position update, so a
-/// genuine edge push read 55px short and was refused twice in one live
-/// log. Truth must therefore SETTLE before it convicts: re-read for a
-/// short window and proceed as soon as the cursor sits within the slack.
-/// A true phantom (cursor physically mid-screen) keeps answering
-/// mid-screen for the whole window, so it is still refused — only the
-/// false conviction (and its punitive restore + re-push) goes away.
-async fn phantom_handoff_veto(
+/// A sustained push (budget accumulated over many events) is refused on a
+/// single stale-far read with no penalty: the OS cursor is visibly inside,
+/// so the user's still-continuing push simply carries on and crosses once
+/// truth arrives at the edge. The next event retries — at 125–1000Hz that
+/// is invisible, and parking the pointer (as refusing a dead peer does)
+/// would punish a deliberate push.
+///
+/// A single giant fling is different: the same fling that outran the
+/// pointer path also outran the OS's own position update, so a genuine
+/// edge push can read 55px short (live log). Truth must therefore SETTLE
+/// before it convicts a fling: re-read for a short window and proceed as
+/// soon as the cursor sits within the fling slack. A true phantom (cursor
+/// physically mid-screen) keeps answering mid-screen for the whole
+/// window, so it is still refused — only the false conviction (and its
+/// punitive restore + re-push) goes away.
+async fn handoff_truth_veto(
     router: &EdgeRouter,
     from: ScreenId,
     edge: kvm_core::Edge,
+    single_fling: bool,
 ) -> Option<(u32, u32)> {
-    const EDGE_TRUTH_SLACK_PX: i64 = 24;
+    // Single flings get the generous settle slack (their own frame can
+    // outrun the pointer update); sustained pushes must be within the
+    // push budget of the visible edge, because there is no speed excuse
+    // for a cursor sitting mid-screen after a deliberate slide.
+    const FLING_TRUTH_SLACK_PX: i64 = 24;
+    const SUSTAINED_TRUTH_SLACK_PX: i64 = kvm_core::EDGE_PUSH_PX;
     // One 60Hz frame is 16ms; 120ms covers driver/desktop-compositor lag
     // without ever reading as a pause on the refused gesture.
     const SETTLE: Duration = Duration::from_millis(120);
     const POLL: Duration = Duration::from_millis(20);
+    let slack = if single_fling {
+        FLING_TRUTH_SLACK_PX
+    } else {
+        SUSTAINED_TRUTH_SLACK_PX
+    };
     let screen = router.layout().screen(from)?;
     let gap_for = |truth_x: u32, truth_y: u32| match edge {
         kvm_core::Edge::Left => i64::from(truth_x),
@@ -4732,22 +4852,23 @@ async fn phantom_handoff_veto(
             i64::from(screen.height.saturating_sub(1)).saturating_sub(i64::from(truth_y))
         }
     };
-    let deadline = std::time::Instant::now() + SETTLE;
+    let deadline = std::time::Instant::now() + if single_fling { SETTLE } else { Duration::ZERO };
     loop {
         let Ok(Some((truth_x, truth_y))) = kvm_platform::capture::current_cursor_position() else {
             return None;
         };
         let gap = gap_for(truth_x, truth_y);
-        if gap <= EDGE_TRUTH_SLACK_PX {
+        if gap <= slack {
             return None;
         }
         if std::time::Instant::now() >= deadline {
             tracing::info!(
                 ?edge,
+                single_fling,
                 truth_gap_px = gap,
                 truth_x,
                 truth_y,
-                "phantom handoff vetoed after settling: OS cursor still mid-screen; staying local"
+                "phantom handoff vetoed: OS cursor is not at the edge; staying local"
             );
             return Some((truth_x, truth_y));
         }
@@ -5709,34 +5830,27 @@ async fn handle_topology_event(
                 park_inside(router, edge);
                 return Ok(());
             }
-            // Phantom-handoff veto (see phantom_handoff_veto): a fast
-            // in-flight flick can satisfy the push budget while the
-            // visible cursor is still mid-screen. Truth decides — genuine
-            // pushes (truth at the edge) proceed below instantly.
-            // Sustained pushes skip the veto entirely (see
-            // handoff_is_single_fling): when the budget accumulated over
-            // many small events the user visibly leaned on the edge, and
-            // vetoing there is exactly the "push repeatedly, stuck, then
-            // finally exits" shape. Only a single giant fling can be a
-            // phantom, so only it pays the truth check.
-            // (No failed-episode gate here: the parked-stream reuse below
-            // costs one Handoff frame, never a dial, so a stall must not
-            // wedge reversals for a second. The gate lives on the cold
-            // open only, where the dial storm it prevents can start.)
-            //
-            // Single query: the fling test is pure over the remainder,
-            // only the veto arm touches OS truth.
-            let veto = if handoff_is_single_fling(event) {
-                phantom_handoff_veto(router, from, edge).await
-            } else {
-                None
-            };
+            // Truth-at-crossing gate (see handoff_truth_veto): the visible
+            // pointer must actually sit at the edge. A fast in-flight flick
+            // can satisfy the push budget while the cursor is mid-screen
+            // (settled read, 24px); a sustained push must be within the
+            // push budget of the edge and is retried by the still-moving
+            // gesture, with no punitive park. Genuine pushes proceed
+            // instantly; if the pointer truth is unavailable the gate
+            // fails open, never a new can't-cross.
+            let single_fling = handoff_is_single_fling(event);
+            let veto = handoff_truth_veto(router, from, edge, single_fling).await;
             if let Some((truth_x, truth_y)) = veto {
-                tracing::info!(?target, ?edge, truth_x, truth_y, "crossing_refused: OS pointer truth is mid-screen, flick vetoed; keep pushing deliberately to cross");
+                tracing::info!(?target, ?edge, truth_x, truth_y, single_fling, "crossing_refused: OS pointer truth is not at the edge; keep pushing deliberately to cross");
                 let _ = router.restore_local(target);
                 resync_home_to_truth(router);
                 router.resync_if_local(truth_x, truth_y);
-                park_inside(router, edge);
+                if single_fling {
+                    // A phantom flick must not re-fire on its own tail:
+                    // step the pointer inside so the next crossing is a
+                    // fresh deliberate gesture.
+                    park_inside(router, edge);
+                }
                 return Ok(());
             }
             let snapshot = capture_control.snapshot();
@@ -9262,6 +9376,13 @@ async fn handle_connection(
     local_fingerprint: String,
 ) -> Result<()> {
     let peer_fingerprint = peer_fingerprint(&conn)?;
+    // Live fast-path registry: a local Disconnect sends LinkEnded over this
+    // authenticated association instead of cold-dialling the peer.
+    remember_peer_connection(&peer_fingerprint, &conn);
+    let _live_guard = LiveConnectionGuard {
+        fingerprint_hex: peer_fingerprint.clone(),
+        stable_id: conn.stable_id(),
+    };
     // One association, many episodes (Deskflow persistent-socket parity):
     // every bidirectional stream on this connection is dispatched on its
     // own — pairing once, then one input episode per stream — so a link
@@ -10667,6 +10788,11 @@ async fn handle_connection(
                 // any) sees its episodes fail and tears down; a still-idle
                 // child learns via the peer_ended_links Status watch.
                 drop_inbound_link(&peer_fingerprint);
+                // The peer ended the link on purpose: this must never arm
+                // our station UI's automatic dial-back from `recent_inbound`
+                // (that resurrected a link the user just hung up, one poll
+                // later). A fresh manual Connect re-registers as usual.
+                forget_recent_inbound(&peer_fingerprint);
                 tracing::info!(
                     peer = %peer_fingerprint,
                     link_id = ?link_id,
@@ -11572,6 +11698,53 @@ fn load_fallback_dial(
     }
     tracing::info!("alternate local identity available for unknown-peer retry");
     Some((identity, merged))
+}
+
+/// Fast courtesy path: one `LinkEnded` frame on the peer's already
+/// authenticated association. Returns false when there is no live
+/// association or the stream cannot be opened (half-open, congested,
+/// peer child gone), so the caller falls back to the cold dial.
+async fn notify_peer_ended_live(
+    fingerprint_hex: &str,
+    link_id: Option<u64>,
+    dir: &std::path::Path,
+) -> bool {
+    let Some(conn) = live_peer_connection(fingerprint_hex) else {
+        return false;
+    };
+    let attempt = async {
+        let (mut send, _recv) = conn.open_bi().await?;
+        write_frame(&mut send, &WireMessage::LinkEnded { link_id }).await?;
+        let _ = send.finish();
+        Ok::<(), anyhow::Error>(())
+    };
+    match tokio::time::timeout(Duration::from_millis(1_500), attempt).await {
+        Ok(Ok(())) => {
+            audit_event(
+                dir,
+                &format!("link-end-notified-live peer={fingerprint_hex} link_id={link_id:?}"),
+            );
+            true
+        }
+        Ok(Err(error)) => {
+            audit_event(
+                dir,
+                &format!(
+                    "link-end-live-failed peer={fingerprint_hex} link_id={link_id:?} error={error:#}; falling back to a cold notify"
+                ),
+            );
+            false
+        }
+        Err(_) => {
+            audit_event(
+                dir,
+                &format!(
+                    "link-end-live-timeout peer={fingerprint_hex} link_id={link_id:?}; falling back to a cold notify"
+                ),
+            );
+            false
+        }
+    }
 }
 
 /// Deliver our Disconnect to the peer's daemon (see `LinkEnded`):

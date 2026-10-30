@@ -459,9 +459,21 @@ pub async fn request(_data_dir: PathBuf, request: ControlRequest) -> Result<Cont
     #[cfg(target_os = "windows")]
     let pipe = kvm_protocol::control::windows_control_pipe();
     #[cfg(target_os = "windows")]
-    let mut stream = tokio::net::windows::named_pipe::ClientOptions::new()
-        .open(&pipe)
-        .context("connect daemon control pipe")?;
+    let mut stream = {
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1_000);
+        loop {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe) {
+                Err(error)
+                    if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                outcome => break outcome.context("connect daemon control pipe")?,
+            }
+        }
+    };
 
     #[cfg(not(any(unix, target_os = "windows")))]
     {
@@ -1507,10 +1519,65 @@ async fn run_windows_server(
     revoked_peers: tokio::sync::broadcast::Sender<String>,
     pairing_approvals: PairingApprovals,
 ) -> Result<()> {
+    let pipe = kvm_protocol::control::windows_control_pipe();
+    tracing::info!(pipe = %pipe, "local daemon control ready");
+    // Four independent waiting instances. A single instance leaves the
+    // client with ERROR_PIPE_BUSY (os error 231) whenever a clipboard
+    // long-poll holds it — and a dropped Disconnect request is a link that
+    // will not hang up. The OS cap stays 64; four workers are enough to
+    // absorb poll bursts without idle waste.
+    const WORKERS: usize = 4;
+    let mut workers = Vec::with_capacity(WORKERS);
+    for worker in 0..WORKERS {
+        let data_dir = data_dir.clone();
+        let config = config.clone();
+        let peers = peers.clone();
+        let active_sessions = active_sessions.clone();
+        let fingerprint = fingerprint.clone();
+        let started = started.clone();
+        let revoked_peers = revoked_peers.clone();
+        let pairing_approvals = pairing_approvals.clone();
+        workers.push(tokio::spawn(async move {
+            if let Err(error) = windows_accept_worker(
+                data_dir,
+                config,
+                peers,
+                active_sessions,
+                fingerprint,
+                started,
+                revoked_peers,
+                pairing_approvals,
+            )
+            .await
+            {
+                tracing::warn!(%error, worker, "control pipe worker stopped");
+            }
+        }));
+    }
+    for worker in workers {
+        let _ = worker.await;
+    }
+    Ok(())
+}
+
+/// One accept loop owning one waiting pipe instance at a time. After a
+/// client connects, the handler is spawned and this loop immediately
+/// creates the next instance, so the pool never has a gap.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+async fn windows_accept_worker(
+    data_dir: PathBuf,
+    config: SharedConfig,
+    peers: SharedPeers,
+    active_sessions: Arc<AtomicUsize>,
+    fingerprint: String,
+    started: Arc<Instant>,
+    revoked_peers: tokio::sync::broadcast::Sender<String>,
+    pairing_approvals: PairingApprovals,
+) -> Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let pipe = kvm_protocol::control::windows_control_pipe();
-    tracing::info!(pipe = %pipe, "local daemon control ready");
     loop {
         let mut server_options = ServerOptions::new();
         // 64, not 16: the UI poll, clipboard long-polls, lease connections
@@ -1524,7 +1591,7 @@ async fn run_windows_server(
             .context("create daemon control named pipe")?;
         apply_control_pipe_acl(&server)?;
         tokio::select! {
-            _ = crate::service::shutdown_notifier().notified() => break,
+            _ = crate::service::shutdown_notifier().notified() => return Ok(()),
             connected = server.connect() => {
                 connected.context("connect daemon control named pipe")?;
                 let data_dir = data_dir.clone();
@@ -1543,7 +1610,6 @@ async fn run_windows_server(
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(target_os = "windows")]

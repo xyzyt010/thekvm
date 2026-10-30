@@ -809,16 +809,16 @@ impl EdgeRouter {
     /// daemon calls this from the live OS position ahead of routing local
     /// motion (throttled, and per-event near a crossing edge).
     ///
-    /// The pin restarts a push run ONLY when it actually moves the cursor
+    /// The pin corrects a push run ONLY when it actually moves the cursor
     /// (beyond RESYNC_DIVERGE_PX): a jump means the integrated position
-    /// ran away from truth (input scaling, warps, resolution change),
-    /// and overflow accumulated from a phantom position is exactly what
-    /// fires crossings the user sees as "far from any edge". But a pin
-    /// that barely moves — the normal case, truth and virtual agreeing
-    /// at the edge while the user leans into it — MUST keep the run:
-    /// wiping it here made sustained pushes uncrossable (only single
-    /// giant flings crossed), forcing the move-away-and-slam-back
-    /// gesture. That was the 0.9.5 edge regression.
+    /// ran away from truth (input scaling, warps, resolution change).
+    /// The run gives back only the inward distance the pin owes, so a pin
+    /// that barely moves — the normal case, truth and virtual agreeing at
+    /// the edge while the user leans into it — keeps the run untouched.
+    /// Wiping the run here made sustained pushes uncrossable (only single
+    /// giant flings crossed), forcing the move-away-and-slam-back gesture;
+    /// that was the 0.9.5 edge regression. Phantom overflow is now refused
+    /// where it matters, at the crossing itself (the daemon's truth gate).
     pub fn resync_if_local(&mut self, x: u32, y: u32) {
         if self.active_remote.is_some() || self.current_screen != self.local_screen {
             return;
@@ -826,8 +826,12 @@ impl EdgeRouter {
         let Some(screen) = self.layout.screen(self.local_screen) else {
             return;
         };
-        let pinned_x = x.min(screen.width - 1);
-        let pinned_y = y.min(screen.height - 1);
+        let screen_width = screen.width;
+        let screen_height = screen.height;
+        let old_x = self.cursor_x;
+        let old_y = self.cursor_y;
+        let pinned_x = x.min(screen_width - 1);
+        let pinned_y = y.min(screen_height - 1);
         let moved = pinned_x
             .abs_diff(self.cursor_x)
             .max(pinned_y.abs_diff(self.cursor_y));
@@ -836,9 +840,9 @@ impl EdgeRouter {
         self.local_cursor_x = self.cursor_x;
         self.local_cursor_y = self.cursor_y;
         if moved > RESYNC_DIVERGE_PX {
-            // Record run restarts for the stuck-edge telemetry (see
-            // last_resync_reset): only an ACTIVE run dying matters — a
-            // pin with nothing saved up is ordinary tracking.
+            // Record run corrections for the stuck-edge telemetry (see
+            // last_resync_reset): only an ACTIVE run matters — a pin with
+            // nothing saved up is ordinary tracking.
             if self.push_edge.is_some() && self.push_accum != 0 {
                 self.last_resync_reset = Some(ResyncReset {
                     jump_px: moved,
@@ -846,8 +850,27 @@ impl EdgeRouter {
                     cursor_y: self.cursor_y,
                 });
             }
-            self.push_edge = None;
-            self.push_accum = 0;
+            // Correct the push run instead of wiping it: the budget is
+            // credited in pixels of travel toward the edge, so a pin that
+            // pulls the cursor back inside owes back only that distance.
+            // Wiping was the "slide two or three times" edge crossing:
+            // on an X11 sender the integrated cursor routinely diverges a
+            // few px from pointer truth mid-push, every near-edge resync
+            // restarted the run, and only pushes that fit inside one
+            // resync window ever crossed. A pin that moves the cursor
+            // forward (truth closer to the edge) leaves the run untouched;
+            // the daemon's truth-at-crossing gate still refuses any
+            // handoff whose visible pointer is not at the edge.
+            if let Some(edge) = self.push_edge {
+                let before = distance_from_edge(edge, old_x, old_y, screen_width, screen_height);
+                let after =
+                    distance_from_edge(edge, pinned_x, pinned_y, screen_width, screen_height);
+                self.push_accum -= i64::from(after.saturating_sub(before));
+                if self.push_accum <= 0 {
+                    self.push_edge = None;
+                    self.push_accum = 0;
+                }
+            }
         }
     }
 
@@ -2062,7 +2085,7 @@ mod tests {
     }
 
     #[test]
-    fn truth_resync_restarting_a_run_is_reported() {
+    fn truth_resync_correction_is_reported() {
         let layout = Layout {
             screens: vec![screen(1, "main", 0, 0), screen(2, "right", 1, 0)],
             self_screen: Some(ScreenId(1)),
@@ -2073,9 +2096,11 @@ mod tests {
         // single-event credit, so the run is still saving up).
         let result = router.route(InputEvent::MouseMove { dx: 1000, dy: 0 });
         assert!(matches!(result, RoutedEvent::Local(_)));
-        // A far-away truth pin restarts the run AND records the jump.
+        // A far-away truth pin corrects the run AND records the jump.
         router.resync_if_local(100, 100);
-        let reset = router.last_resync_reset().expect("run restart is reported");
+        let reset = router
+            .last_resync_reset()
+            .expect("run correction is reported");
         assert!(reset.jump_px > RESYNC_DIVERGE_PX);
         assert_eq!((reset.cursor_x, reset.cursor_y), (100, 100));
         // A pin that barely moves records nothing.
@@ -2084,6 +2109,30 @@ mod tests {
         assert!(matches!(result, RoutedEvent::Local(_)));
         router.resync_if_local(1918, 540);
         assert_eq!(router.last_resync_reset(), None);
+    }
+
+    #[test]
+    fn resync_pullback_corrects_budget_instead_of_wiping_it() {
+        let layout = Layout {
+            screens: vec![screen(1, "main", 0, 0), screen(2, "right", 1, 0)],
+            self_screen: Some(ScreenId(1)),
+        };
+        let mut router = EdgeRouter::new(layout).unwrap();
+        router.place_local_cursor(1915, 540).unwrap();
+        // A 10px push toward the facing edge saves 6px of the 8px budget
+        // and clamps at the border (no crossing yet).
+        let first = router.route(InputEvent::MouseMove { dx: 10, dy: 0 });
+        assert!(matches!(first, RoutedEvent::Local(_)));
+        // Pointer truth disagrees by 3px, so the routine near-edge resync
+        // pulls the tracked cursor back inside. The run owes back those
+        // 3px and survives; wiping it here is the gesture that used to
+        // need two or three slides.
+        router.resync_if_local(1916, 540);
+        let second = router.route(InputEvent::MouseMove { dx: 10, dy: 0 });
+        assert!(
+            matches!(second, RoutedEvent::Handoff { .. }),
+            "a sustained push must survive a small truth correction, got {second:?}"
+        );
     }
 
     #[test]

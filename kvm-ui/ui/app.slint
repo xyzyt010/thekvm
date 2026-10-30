@@ -140,6 +140,9 @@ export component AppWindow inherits Window {
     in property <bool> connected: false;
     in property <string> session-text: "Not connected";
     in property <bool> session-active: false;
+    // True only after the child reported a verified session. session-active
+    // alone means "a link process exists" (Connecting OR Connected).
+    in property <bool> session-verified: false;
     in-out property <string> fingerprint: "…";
     in-out property <string> peer-list: "No trusted computers";
     in-out property <string> linked-peer-name: "";
@@ -437,7 +440,7 @@ export component AppWindow inherits Window {
                     }
                     Text {
                         text: session-text;
-                        color: session-active ? #22c55e : #9ca3af;
+                        color: session-active ? (session-verified ? #22c55e : #f59e0b) : #9ca3af;
                         font-size: 13px;
                         wrap: word-wrap;
                     }
@@ -447,7 +450,7 @@ export component AppWindow inherits Window {
                     // gated until edge-ready, so motion the moment this
                     // disappears rides the warmed stream — super smooth
                     // both directions from the very first push.
-                    if link-connecting && !session-active : HorizontalLayout {
+                    if link-connecting && !session-verified : HorizontalLayout {
                         spacing: 10px;
                         Rectangle {
                             width: 26px;

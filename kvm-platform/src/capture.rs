@@ -240,20 +240,51 @@ pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {
         return Ok(None);
     }
 
-    let (connection, screen) = x11rb::connect(None).map_err(|error| {
-        PlatformError::Capture(format!("connect to X11 for pointer query: {error}"))
-    })?;
-    let root = connection
-        .setup()
-        .roots
-        .get(screen)
-        .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?
-        .root;
-    let reply = connection
-        .query_pointer(root)
-        .map_err(|error| PlatformError::Capture(format!("query X11 pointer: {error}")))?
-        .reply()
-        .map_err(|error| PlatformError::Capture(format!("read X11 pointer: {error}")))?;
+    // One cached connection for the life of the daemon: the router polls
+    // this at 20–50Hz (near an edge) on every local motion event, and a
+    // fresh connect + auth + setup per read cost about a millisecond —
+    // enough to visibly stall the drive task on the X11 sender, which is
+    // the "little lag on the Linux side" shape. A dead server orphans the
+    // cache: the next call reconnects, so an X restart heals itself.
+    static POINTER: std::sync::OnceLock<
+        std::sync::Mutex<Option<(x11rb::rust_connection::RustConnection, u32)>>,
+    > = std::sync::OnceLock::new();
+    let slot = POINTER.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = slot
+        .lock()
+        .map_err(|_| PlatformError::Capture("X11 pointer cache poisoned".into()))?;
+    if guard.is_none() {
+        let (connection, screen) = x11rb::connect(None).map_err(|error| {
+            PlatformError::Capture(format!("connect to X11 for pointer query: {error}"))
+        })?;
+        let root = connection
+            .setup()
+            .roots
+            .get(screen)
+            .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?
+            .root;
+        *guard = Some((connection, root));
+    }
+    let reply_result = {
+        let (connection, root) = guard.as_ref().expect("X11 pointer cache was just filled");
+        connection
+            .query_pointer(*root)
+            .map_err(|error| PlatformError::Capture(format!("query X11 pointer: {error}")))
+            .and_then(|cookie| {
+                cookie
+                    .reply()
+                    .map_err(|error| PlatformError::Capture(format!("read X11 pointer: {error}")))
+            })
+    };
+    let reply = match reply_result {
+        Ok(reply) => reply,
+        Err(error) => {
+            // Drop the connection so the next call reconnects from scratch
+            // (a restarted X server invalidates both the socket and root).
+            *guard = None;
+            return Err(error);
+        }
+    };
     if reply.root_x < 0 || reply.root_y < 0 {
         return Ok(None);
     }

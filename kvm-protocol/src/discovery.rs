@@ -117,36 +117,50 @@ fn broadcast_targets() -> Vec<Ipv4Addr> {
 /// 255.255.255.255 out the wrong interface only, so a scanner hears just
 /// itself. Directed broadcasts route through the normal table and reach
 /// the real LAN. Replies are unicast and deduped by fingerprint.
+///
+/// Broadcast UDP is lossy (one dropped request or reply used to hide a
+/// device until the user pressed Scan again), so the request is repeated
+/// every round inside the same overall timeout: a device only has to answer
+/// once for the whole scan to see it.
 pub async fn scan(timeout: Duration) -> std::io::Result<Vec<(SocketAddr, Advertisement)>> {
+    const ROUNDS: u32 = 3;
     let socket = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
     socket.set_broadcast(true)?;
-    for target in broadcast_targets() {
-        let _ = socket
-            .send_to(REQUEST, SocketAddr::from((target, DISCOVERY_PORT)))
-            .await;
-    }
+    let targets = broadcast_targets();
 
     let deadline = Instant::now() + timeout;
+    let round_window = (timeout / ROUNDS).max(Duration::from_millis(150));
     let mut results = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut buffer = [0u8; 2048];
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
+    for _ in 0..ROUNDS {
+        for target in &targets {
+            let _ = socket
+                .send_to(REQUEST, SocketAddr::from((*target, DISCOVERY_PORT)))
+                .await;
         }
-        let received = tokio::time::timeout(remaining, socket.recv_from(&mut buffer)).await;
-        let Ok(Ok((length, source))) = received else {
+        let round_deadline = (Instant::now() + round_window).min(deadline);
+        loop {
+            let remaining = round_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let received = tokio::time::timeout(remaining, socket.recv_from(&mut buffer)).await;
+            let Ok(Ok((length, source))) = received else {
+                break;
+            };
+            let Ok(advertisement) = decode_advertisement(&buffer[..length]) else {
+                continue;
+            };
+            if seen.insert(advertisement.fingerprint_hex.clone()) {
+                results.push((
+                    SocketAddr::from((source.ip(), advertisement.listen_port)),
+                    advertisement,
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
             break;
-        };
-        let Ok(advertisement) = decode_advertisement(&buffer[..length]) else {
-            continue;
-        };
-        if seen.insert(advertisement.fingerprint_hex.clone()) {
-            results.push((
-                SocketAddr::from((source.ip(), advertisement.listen_port)),
-                advertisement,
-            ));
         }
     }
     Ok(results)
