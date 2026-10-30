@@ -213,6 +213,12 @@ pub struct LinkApprovals {
     paired_at: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Instant>>>,
 }
 
+/// Bound on queued link prompts. A paired device can mint a new epoch per
+/// dial, so without a cap it could park unbounded approval state (and a
+/// wall of cards) in the desktop app; real links never need more than a
+/// handful of simultaneous halves.
+const MAX_PENDING_LINKS: usize = 16;
+
 struct PendingLinkEntry {
     request: PendingLink,
     decision: oneshot::Sender<bool>,
@@ -242,6 +248,9 @@ impl LinkApprovals {
         let (decision_tx, decision_rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
+            if pending.len() >= MAX_PENDING_LINKS {
+                bail!("too many pending link approvals");
+            }
             if pending.contains_key(&key) {
                 bail!("link is already awaiting local approval");
             }
@@ -863,7 +872,24 @@ where
             } else {
                 let fingerprint_hex = fingerprint_hex.to_ascii_lowercase();
                 let link_id = link_id.unwrap_or(0);
-                if link_approvals()
+                // One minted epoch names exactly one peer. The UI's own
+                // dial-back shortcut matches on the epoch alone, so an
+                // approval carrying an epoch this machine minted for a
+                // DIFFERENT computer must never pass — otherwise any paired
+                // device that learned the epoch could ride our initiation.
+                let foreign_epoch = crate::service::outbound_epoch_owner(link_id)
+                    .is_some_and(|owner| owner != fingerprint_hex);
+                if foreign_epoch {
+                    crate::service::audit_event(
+                        &data_dir,
+                        &format!(
+                            "link-approve-refused fingerprint={fingerprint_hex} link_id={link_id} reason=epoch_owned_by_other_peer"
+                        ),
+                    );
+                    ControlResponse::Error {
+                        message: "that link epoch belongs to a different computer".into(),
+                    }
+                } else if link_approvals()
                     .decide(&fingerprint_hex, link_id, true)
                     .await
                 {
@@ -1027,10 +1053,17 @@ where
         }
         ControlRequest::ExportIdentity => {
             match kvm_protocol::pairing::Identity::load_or_create(&data_dir) {
-                Ok(identity) => ControlResponse::Identity {
-                    cert_der_hex: kvm_protocol::pairing::hex_encode(&identity.cert_der),
-                    key_der_hex: kvm_protocol::pairing::hex_encode(&identity.key_der),
-                },
+                Ok(identity) => {
+                    // Audited: the supervised child needs the daemon identity
+                    // to present the machine's one fingerprint, but handing a
+                    // private key to a local client is exactly the kind of
+                    // event a security review must be able to see afterwards.
+                    crate::service::audit_event(&data_dir, "identity-exported");
+                    ControlResponse::Identity {
+                        cert_der_hex: kvm_protocol::pairing::hex_encode(&identity.cert_der),
+                        key_der_hex: kvm_protocol::pairing::hex_encode(&identity.key_der),
+                    }
+                }
                 Err(error) => ControlResponse::Error {
                     message: format!("reading daemon identity failed: {error}"),
                 },

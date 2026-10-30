@@ -101,6 +101,139 @@ component RescanButton inherits Rectangle {
     }
 }
 
+// One computer in the arrangement strip: a small screen card. The local
+// card carries the green accent; the linked card stays neutral so the
+// pair reads as "me + them" at a glance.
+component ScreenCard inherits Rectangle {
+    in property <string> title: "THIS PC";
+    in property <string> name: "";
+    in property <bool> local: false;
+    width: 150px;
+    height: 96px;
+    background: local ? #14532d : #1c1917;
+    border-radius: 10px;
+    border-width: 2px;
+    border-color: local ? #22c55e : #57534e;
+    VerticalLayout {
+        padding: 8px;
+        alignment: center;
+        spacing: 4px;
+        Text {
+            text: title;
+            color: local ? #bbf7d0 : #d6d3d1;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 1px;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: name == "" ? "…" : name;
+            color: white;
+            font-size: 13px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+// The facing edge between the two cards: a drawn double chevron, never a
+// font glyph (the ◀ ▶ characters rendered differently per OS).
+component EdgeGlyph inherits Rectangle {
+    width: 18px;
+    height: 18px;
+    background: transparent;
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 18;
+        viewbox-height: 18;
+        stroke: #22c55e;
+        stroke-width: 2px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        commands: "M 2 3 L 8 9 L 2 15 M 9 3 L 15 9 L 9 15";
+    }
+}
+
+// One tap moves the linked screen to that side; the active side stays
+// lit, so the current arrangement is visible without a caption.
+component ChevronButton inherits Rectangle {
+    in property <bool> points-left: true;
+    in property <bool> active: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 38px;
+    height: 38px;
+    border-radius: 9px;
+    background: active ? #14532d : (hit.has-hover && enabled ? #1f2937 : transparent);
+    border-width: 1px;
+    border-color: active ? #22c55e : #374151;
+    opacity: enabled ? 1 : 0.4;
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+    accessible-role: button;
+    accessible-label: points-left ? "Move the linked computer to the left" : "Move the linked computer to the right";
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    Path {
+        x: 10px;
+        y: 10px;
+        width: 18px;
+        height: 18px;
+        viewbox-width: 18;
+        viewbox-height: 18;
+        stroke: active ? #22c55e : (hit.has-hover && enabled ? #e5e7eb : #9ca3af);
+        stroke-width: 2.4px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        commands: points-left ? "M 11 3 L 5.5 9 L 11 15" : "M 7 3 L 12.5 9 L 7 15";
+    }
+}
+
+// Interactive arrangement: this computer and the linked computer in the
+// order they physically sit. The chevrons move the linked card to that
+// side; placement persists exactly like the old buttons.
+component ArrangementStrip inherits Rectangle {
+    in property <string> local-name: "";
+    in property <string> peer-name: "";
+    in property <bool> peer-on-right: true;
+    in property <bool> enabled: false;
+    callback to-left();
+    callback to-right();
+    height: 96px;
+    background: transparent;
+    HorizontalLayout {
+        spacing: 12px;
+        alignment: center;
+        ChevronButton {
+            points-left: true;
+            active: !root.peer-on-right;
+            enabled: root.enabled;
+            clicked => { root.to-left(); }
+        }
+        if root.peer-on-right : HorizontalLayout {
+            spacing: 12px;
+            ScreenCard { title: "THIS PC"; name: root.local-name; local: true; }
+            EdgeGlyph {}
+            ScreenCard { title: "LINKED"; name: root.peer-name; }
+        }
+        if !root.peer-on-right : HorizontalLayout {
+            spacing: 12px;
+            ScreenCard { title: "LINKED"; name: root.peer-name; }
+            EdgeGlyph {}
+            ScreenCard { title: "THIS PC"; name: root.local-name; local: true; }
+        }
+        ChevronButton {
+            points-left: false;
+            active: root.peer-on-right;
+            enabled: root.enabled;
+            clicked => { root.to-right(); }
+        }
+    }
+}
+
 // TheKVM: Deskflow-simple. The Connect tab is the whole product for most
 // users: pick what this computer does, type the other computer's address,
 // press Connect. Everything advanced lives under Devices and Settings.
@@ -323,7 +456,7 @@ export component AppWindow inherits Window {
                                     tick: root.spinner-tick;
                                 }
                                 Text {
-                                    text: "Detecting… devices appear below as they answer";
+                                    text: "Scanning…";
                                     color: #6ee7b7;
                                     font-size: 12px;
                                     font-weight: 700;
@@ -350,7 +483,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             if discovered-labels.length == 0 && !discovery-scanning : Text {
-                                text: "Nothing here yet — press the refresh button above to rescan, or wait for the automatic listing. Tapping a device dials it with approval on the other side.";
+                                text: "No devices yet.";
                                 color: #6b7280;
                                 font-size: 11px;
                                 wrap: word-wrap;
@@ -410,8 +543,7 @@ export component AppWindow inherits Window {
                         wrap: word-wrap;
                     }
                     Rectangle { height: 1px; background: #262626; }
-                    Text { text: "Connect to the other computer:"; color: white; font-size: 16px; font-weight: 700; }
-                    Text { text: "Other computer's address:"; color: white; font-size: 16px; font-weight: 700; }
+                    Text { text: "Connect to the other computer"; color: white; font-size: 16px; font-weight: 700; }
                     HorizontalLayout {
                         spacing: 12px;
                         addr := LineEdit {
@@ -477,7 +609,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         Text {
-                            text: "Warming up the link — crossings unlock when ready…";
+                            text: "Warming up…";
                             color: #22c55e;
                             font-size: 13px;
                             font-weight: 700;
@@ -544,7 +676,7 @@ export component AppWindow inherits Window {
                             horizontal-alignment: center;
                         }
                         Text {
-                            text: "Compare with the code on the other computer, then confirm.";
+                            text: "Compare both codes, then confirm.";
                             color: #9ca3af;
                             font-size: 11px;
                             wrap: word-wrap;
@@ -652,7 +784,7 @@ export component AppWindow inherits Window {
                     spacing: 10px;
                     Text { text: "Find on my network"; color: white; font-size: 16px; font-weight: 700; }
                     Text {
-                        text: auto-discover ? "Nearby TheKVM computers appear below on their own. Tap one, then Connect — the other side still approves." : "Automatic listing is off (see Settings). Scan once, tap a device, then Connect — the other side still approves.";
+                        text: auto-discover ? "Nearby computers appear on their own. Tap one, then Connect — the other side approves." : "Tap Scan network, then Connect — the other side approves.";
                         color: #9ca3af;
                         font-size: 12px;
                         wrap: word-wrap;
@@ -689,59 +821,6 @@ export component AppWindow inherits Window {
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }
-                    Text { text: "Share this computer"; color: white; font-size: 16px; font-weight: 700; }
-                    Text {
-                        text: "The other computer scans this code or pastes the invite text.";
-                        color: #9ca3af;
-                        font-size: 12px;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: 16px;
-                        Rectangle {
-                            width: 200px;
-                            height: 200px;
-                            background: white;
-                            border-radius: 8px;
-                            if invite-ready : Image {
-                                x: 8px; y: 8px;
-                                width: 184px; height: 184px;
-                                source: root.invite-qr;
-                                image-fit: contain;
-                            }
-                            if !invite-ready : Text {
-                                text: "Start the app to generate the invite";
-                                color: #6b7280;
-                                font-size: 11px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-                        VerticalLayout {
-                            spacing: 8px;
-                            Text { text: "Invite text (copy from here):"; color: #9ca3af; font-size: 12px; }
-                            shown := LineEdit {
-                                text: root.invite-text;
-                                read-only: true;
-                                placeholder-text: "invite appears when the app is ready";
-                            }
-                        }
-                    }
-                    Text { text: "Connect from an invite"; color: white; font-size: 16px; font-weight: 700; }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        pasted := LineEdit {
-                            text <=> root.invite-input;
-                            placeholder-text: "paste thekvm:// invite";
-                        }
-                        Button {
-                            text: "Connect";
-                            primary: true;
-                            enabled: pasted.text != "";
-                            clicked => { pair-from-invite(pasted.text); }
-                        }
-                    }
-                    Rectangle { height: 1px; background: #262626; }
                     Text { text: "Trusted computers"; color: white; font-size: 16px; font-weight: 700; }
                     Text {
                         text: peer-list;
@@ -761,100 +840,22 @@ export component AppWindow inherits Window {
                         }
                     }
                     Rectangle { height: 1px; background: #262626; }
-                    Text { text: "Linked screens (edge control)"; color: white; font-size: 16px; font-weight: 700; }
-                    Text {
-                        text: arrangement-text;
-                        color: #9ca3af;
-                        font-size: 12px;
+                    Text { text: "Screen arrangement"; color: white; font-size: 16px; font-weight: 700; }
+                    ArrangementStrip {
+                        local-name: device-name;
+                        peer-name: linked-peer-name;
+                        peer-on-right: peer-on-right;
+                        enabled: linked-peer-name != "";
+                        to-left => { place-peer-left(); }
+                        to-right => { place-peer-right(); }
+                    }
+                    if linked-peer-name == "" : Text {
+                        text: "Pair a computer first, then tap an arrow to place it.";
+                        color: #6b7280;
+                        font-size: 11px;
                         wrap: word-wrap;
                     }
-                    // Screen icons with names: this computer and the linked
-                    // peer, placed left/right as arranged. The exit edge is
-                    // the facing edge — the outer edges do nothing.
-                    if peer-on-right : HorizontalLayout {
-                        spacing: 12px;
-                        Rectangle {
-                            width: 130px;
-                            height: 92px;
-                            background: #14532d;
-                            border-radius: 8px;
-                            border-width: 2px;
-                            border-color: #22c55e;
-                            VerticalLayout {
-                                padding: 6px;
-                                spacing: 2px;
-                                Text { text: "THIS PC"; color: #bbf7d0; font-size: 11px; font-weight: 700; horizontal-alignment: center; }
-                                Text { text: device-name == "" ? "…" : device-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
-                            }
-                        }
-                        Text { text: "▶"; color: #22c55e; font-size: 20px; font-weight: 800; vertical-alignment: center; }
-                        Rectangle {
-                            width: 130px;
-                            height: 92px;
-                            background: #1c1917;
-                            border-radius: 8px;
-                            border-width: 2px;
-                            border-color: #57534e;
-                            VerticalLayout {
-                                padding: 6px;
-                                spacing: 2px;
-                                Text { text: "LINKED"; color: #d6d3d1; font-size: 11px; font-weight: 700; horizontal-alignment: center; }
-                                Text { text: linked-peer-name == "" ? "…" : linked-peer-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
-                            }
-                        }
-                    }
-                    if !peer-on-right : HorizontalLayout {
-                        spacing: 12px;
-                        Rectangle {
-                            width: 130px;
-                            height: 92px;
-                            background: #1c1917;
-                            border-radius: 8px;
-                            border-width: 2px;
-                            border-color: #57534e;
-                            VerticalLayout {
-                                padding: 6px;
-                                spacing: 2px;
-                                Text { text: "LINKED"; color: #d6d3d1; font-size: 11px; font-weight: 700; horizontal-alignment: center; }
-                                Text { text: linked-peer-name == "" ? "…" : linked-peer-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
-                            }
-                        }
-                        Text { text: "◀"; color: #22c55e; font-size: 20px; font-weight: 800; vertical-alignment: center; }
-                        Rectangle {
-                            width: 130px;
-                            height: 92px;
-                            background: #14532d;
-                            border-radius: 8px;
-                            border-width: 2px;
-                            border-color: #22c55e;
-                            VerticalLayout {
-                                padding: 6px;
-                                spacing: 2px;
-                                Text { text: "THIS PC"; color: #bbf7d0; font-size: 11px; font-weight: 700; horizontal-alignment: center; }
-                                Text { text: device-name == "" ? "…" : device-name; color: white; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
-                            }
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Button {
-                            text: "Put on left";
-                            enabled: linked-peer-name != "";
-                            clicked => { place-peer-left(); }
-                        }
-                        Button {
-                            text: "Put on right";
-                            enabled: linked-peer-name != "";
-                            clicked => { place-peer-right(); }
-                        }
-                    }
-                    Text {
-                        text: "Place the linked screen where it physically sits. The crossing edge is the facing edge between the icons.";
-                        color: #9ca3af;
-                        font-size: 12px;
-                        wrap: word-wrap;
-                    }
-                    Text { text: "Crossing edges (two-computer link)"; color: white; font-size: 14px; font-weight: 700; }
+                    Text { text: "Crossing edges"; color: white; font-size: 14px; font-weight: 700; }
                     HorizontalLayout {
                         spacing: 12px;
                         Button {
@@ -882,7 +883,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text {
-                        text: edge-mode-index == 0 ? "Single edge: only the facing edge crosses." : edge-mode-index == 1 ? "Double inverse: exit left to enter at the right edge and back — either edge returns once settled." : edge-mode-index == 2 ? "Double fixed left: every arrival (and return) uses the left edge, no matter the exit edge." : "Double fixed right: every arrival (and return) uses the right edge, no matter the exit edge.";
+                        text: edge-mode-index == 0 ? "Single edge: only the facing edge crosses." : edge-mode-index == 1 ? "Double inverse: either horizontal edge crosses; arrivals enter at the opposite edge." : edge-mode-index == 2 ? "Double fixed left: every crossing uses the left edge." : "Double fixed right: every crossing uses the right edge.";
                         color: #9ca3af;
                         font-size: 12px;
                         wrap: word-wrap;
@@ -960,7 +961,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text {
-                        text: "When on, mouse-wheel and trackpad scrolling while driving the peer go the opposite way. Local scrolling is unchanged. Takes effect on the next Connect.";
+                        text: "Wheel and trackpad scrolling while driving the peer go the opposite way. Local scrolling is unchanged. Applies to the next Connect.";
                         color: #9ca3af;
                         font-size: 11px;
                         wrap: word-wrap;
@@ -978,7 +979,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text {
-                        text: "When on, other TheKVM computers on this network list themselves under Devices. Listing only — nothing connects without a tap and the other side's approval.";
+                        text: "Lists nearby computers under Devices. Nothing connects until you tap one and the other side approves.";
                         color: #9ca3af;
                         font-size: 11px;
                         wrap: word-wrap;
@@ -1180,7 +1181,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Text {
-                                text: "Allow once per link. Until you allow, this computer cannot be driven — and it cannot drive back either.";
+                                text: "Allow once per link. No input flows until you allow.";
                                 color: #6ee7b7;
                                 font-size: 11px;
                                 wrap: word-wrap;

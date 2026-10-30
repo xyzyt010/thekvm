@@ -2457,6 +2457,12 @@ mod win32_hooks {
             };
             (out_x as i32, out_y as i32)
         }
+
+        /// Whether this gesture has proven a pan axis. A proven scroll
+        /// owns the gesture: pinch must not steal it mid-gesture.
+        fn locked(&self) -> bool {
+            self.lock.is_some()
+        }
     }
 
     /// Spread changes past this many sensor units own the gesture: below
@@ -2466,16 +2472,10 @@ mod win32_hooks {
     /// (horizontal pans wobble most) moves the spread more than the old
     /// gates assumed, so a steady scroll owned a pinch, muted pan, and
     /// zoomed the peer instead of scrolling it — the "horizontal works a
-    /// few times then stops" shape. The common-mode guard below is the
-    /// real scroll/pinch discriminator; this gate is only the second net.
+    /// few times then stops" shape. The rate-based dominance check in
+    /// PtpPinch::feed is the real scroll/pinch discriminator; this gate
+    /// is only the second net.
     const PINCH_ENGAGE_UNITS: i64 = 192;
-    /// Common-mode dominance ratio: a frame whose midpoint step exceeds
-    /// the spread step by more than this factor is scrolling fingers,
-    /// not pinching ones (a one-finger-anchored asymmetric pinch moves
-    /// its midpoint at half the spread rate, well under this).
-    const SCROLL_DOMINANCE: i64 = 2;
-    /// Sub-this midpoint motion is sensor noise, never a scroll verdict.
-    const SCROLL_NOISE_FLOOR: i64 = 4;
     /// Sustained scroll-dominated frames while engaged hand the gesture
     /// back to pan (the fingers went back to scrolling mid-pinch).
     /// Five, not eight: a mis-engaged pinch must release a wobbly
@@ -2491,27 +2491,37 @@ mod win32_hooks {
     /// the pan accumulator's remainder discipline. Positive = fingers
     /// spreading = zoom in (matches SmoothWheel's away-positive, so the
     /// daemon renders it as Ctrl+wheel-up).
+    ///
+    /// Scroll/pinch arbitration is RATE-based (EMA of per-frame spread
+    /// and midpoint motion), never a per-frame noise floor: slow
+    /// two-finger scrolling keeps the midpoint moving by only 1–3
+    /// sensor units per report, below any absolute floor, while the
+    /// fingers slowly drift apart. That drift used to accumulate to the
+    /// engage gate and turn ordinary scrolling into zoom (live: bursts
+    /// of 30–300ms pinch engages during a drive, pan muted, the peer
+    /// zooming instead of scrolling). Dominance over the recent window
+    /// holds at every speed: scrolling is common-mode (midpoint rate ≥
+    /// spread rate), pinching is spread-dominant (midpoint near-still).
+    /// An established pan axis lock also owns the gesture: a scroll
+    /// that already proved itself can never be stolen mid-gesture.
     #[derive(Debug)]
     struct PtpPinch {
         anchor: Option<i64>,
-        /// Midpoint where the current anchor was taken: the unengaged
-        /// veto compares EXCURSIONS from here (see feed), so a drifty
-        /// close still accumulates toward the gate instead of sliding
-        /// the anchor away one vetoed frame at a time.
-        anchor_mid: Option<(i64, i64)>,
         prev: Option<i64>,
         prev_mid: Option<(i64, i64)>,
         acc: i64,
         units_per_detent: i64,
         engaged: bool,
         scroll_streak: u32,
+        /// Recent-window motion rates (sensor units per report).
+        spread_ema: f64,
+        mid_ema: f64,
     }
 
     impl PtpPinch {
         const fn new() -> Self {
             Self {
                 anchor: None,
-                anchor_mid: None,
                 prev: None,
                 prev_mid: None,
                 acc: 0,
@@ -2522,6 +2532,8 @@ mod win32_hooks {
                 units_per_detent: 400,
                 engaged: false,
                 scroll_streak: 0,
+                spread_ema: 0.0,
+                mid_ema: 0.0,
             }
         }
 
@@ -2530,17 +2542,20 @@ mod win32_hooks {
         /// count changed, or scrolling took over mid-gesture after
         /// engaging — the daemon's Ctrl-release signal). Only an engaged
         /// pinch scrolls; contact-count changes reset anchor and
-        /// remainder so lifts never jump.
-        fn feed(&mut self, contacts: &[(i32, i32)]) -> (i32, bool) {
+        /// remainder so lifts never jump. `pan_owned` is the pan
+        /// accumulator's axis-lock verdict for this gesture: a proven
+        /// scroll keeps the gesture, so late spread drift cannot zoom.
+        fn feed(&mut self, contacts: &[(i32, i32)], pan_owned: bool) -> (i32, bool) {
             if contacts.len() != 2 {
                 let ended = self.engaged;
                 self.anchor = None;
-                self.anchor_mid = None;
                 self.prev = None;
                 self.prev_mid = None;
                 self.acc = 0;
                 self.engaged = false;
                 self.scroll_streak = 0;
+                self.spread_ema = 0.0;
+                self.mid_ema = 0.0;
                 return (0, ended);
             }
             let spread = (i64::from(contacts[0].0) - i64::from(contacts[1].0)).abs()
@@ -2551,53 +2566,60 @@ mod win32_hooks {
             );
             let Some(anchor) = self.anchor else {
                 self.anchor = Some(spread);
-                self.anchor_mid = Some(mid);
                 self.prev = Some(spread);
                 self.prev_mid = Some(mid);
+                self.spread_ema = 0.0;
+                self.mid_ema = 0.0;
                 return (0, false);
             };
             let prev = self.prev.unwrap_or(spread);
-            let spread_step = spread - prev;
             let (prev_x, prev_y) = self.prev_mid.unwrap_or(mid);
-            let mid_step = (mid.0 - prev_x).abs() + (mid.1 - prev_y).abs();
+            let spread_rate = (spread - prev).unsigned_abs() as f64;
+            let mid_rate = ((mid.0 - prev_x).abs() + (mid.1 - prev_y).abs()) as f64;
             self.prev = Some(spread);
             self.prev_mid = Some(mid);
-            // Scroll-vs-pinch arbitration: a two-finger scroll moves both
-            // contacts together (large midpoint excursion, small spread
-            // excursion); a pinch changes the spread around a near-still
-            // midpoint. While UNENGAGED the veto compares EXCURSIONS from
-            // the anchor: per-frame steps misread a drifty close (small
-            // spread shrinkage plus midpoint wander per frame) as scroll
-            // and slide the anchor after it, so the gate debt never
-            // accumulates and zoom-out never engages — the stranded
-            // zoom-in shape. Excursions keep the anchor fixed through
-            // drift (a close trends away from the anchor and engages)
-            // while a traveling scroll still vetoes and slides (its
-            // midpoint runs away from the anchor). While ENGAGED the
-            // veto stays per-frame: the 5-frame scroll takeover must
-            // hand a resumed scroll back to pan fast, and excursions
-            // would delay it by the already-banked spread.
-            let vetoed = if self.engaged {
-                mid_step >= SCROLL_NOISE_FLOOR && mid_step > spread_step.abs() * SCROLL_DOMINANCE
-            } else {
-                let (anchor_mid_x, anchor_mid_y) = self.anchor_mid.unwrap_or(mid);
-                let mid_excursion = (mid.0 - anchor_mid_x).abs() + (mid.1 - anchor_mid_y).abs();
-                let spread_excursion = (spread - anchor).abs();
-                mid_excursion >= SCROLL_NOISE_FLOOR
-                    && mid_excursion > spread_excursion.saturating_mul(SCROLL_DOMINANCE)
-            };
-            // Scroll-dominated frames slide the anchor, so finger wobble
-            // during a scroll can never accumulate to the engage gate
-            // and mute pan.
-            if vetoed {
+            // ~3-report window: fast enough that a real pinch engages
+            // within a gesture, long enough that one noisy frame cannot
+            // flip the verdict.
+            self.spread_ema = self.spread_ema * 0.65 + spread_rate * 0.35;
+            self.mid_ema = self.mid_ema * 0.65 + mid_rate * 0.35;
+            // A pinch changes the spread around a near-still midpoint at
+            // a sustained rate; scrolling moves both contacts together.
+            // 1.5 (not 2.0): a one-finger-anchored pinch moves its
+            // midpoint at exactly half the spread rate, so a 2.0 gate
+            // sits at equality (float-fragile) and rejects real pinches.
+            // Scrolling still fails the ratio by a wide margin.
+            let spread_dominant = self.spread_ema >= 1.0 && self.spread_ema >= self.mid_ema * 1.5;
+            // Takeover uses the RATIO only (1-unit floor): a careful
+            // slow scroll moves the midpoint 2–3 units a report, below
+            // any higher floor, and must still hand the gesture back.
+            let scroll_dominant = self.mid_ema >= 1.0 && self.mid_ema >= self.spread_ema * 1.25;
+            // Strong per-frame common-mode motion is a scroll verdict
+            // immediately: the EMAs alone lag ~3 reports, which is
+            // invisible unengaged but would hold zoom hostage for the
+            // first frames of a resumed scroll.
+            let frame_scroll = mid_rate >= 8.0 && mid_rate >= spread_rate * 2.0;
+            if !self.engaged {
+                // Only spread-dominant motion may bank toward the gate:
+                // anything else (including slow common-mode scrolling
+                // with finger drift) slides the anchor, so drift can
+                // never accumulate into a false pinch.
+                if pan_owned || !spread_dominant {
+                    self.anchor = Some(spread);
+                    return (0, false);
+                }
+                if (spread - anchor).abs() < PINCH_ENGAGE_UNITS {
+                    return (0, false);
+                }
+                self.engaged = true;
+            }
+            if scroll_dominant || frame_scroll {
+                // Scroll takeover: sustained common-mode motion hands
+                // the gesture back to pan (which kept feeding
+                // underneath). Rate-based, so slow scrolling escapes
+                // too, not just brisk scrolling.
                 self.scroll_streak += 1;
-                self.anchor = Some(spread);
-                self.anchor_mid = Some(mid);
-                if self.engaged && self.scroll_streak >= TAKEOVER_FRAMES {
-                    // The fingers went back to scrolling mid-gesture: end
-                    // the pinch so pan (which kept feeding underneath)
-                    // resumes without a jump, instead of holding zoom
-                    // hostage until the fingers lift.
+                if self.scroll_streak >= TAKEOVER_FRAMES {
                     self.engaged = false;
                     self.scroll_streak = 0;
                     self.acc = 0;
@@ -2606,18 +2628,11 @@ mod win32_hooks {
                 return (0, false);
             }
             self.scroll_streak = 0;
-            if !self.engaged && (spread - anchor).abs() >= PINCH_ENGAGE_UNITS {
-                self.engaged = true;
-            }
-            let mut zoom = 0;
-            if self.engaged {
-                self.acc += spread - prev;
-                let units = self.units_per_detent.max(1);
-                let out = (self.acc.saturating_mul(120) / units).clamp(-120_000, 120_000);
-                self.acc -= out.saturating_mul(units) / 120;
-                zoom = out as i32;
-            }
-            (zoom, false)
+            self.acc += spread - prev;
+            let units = self.units_per_detent.max(1);
+            let out = (self.acc.saturating_mul(120) / units).clamp(-120_000, 120_000);
+            self.acc -= out.saturating_mul(units) / 120;
+            (out as i32, false)
         }
 
         /// Whether the fingers currently own a pinch (pan stays silent).
@@ -3154,7 +3169,7 @@ mod win32_hooks {
                 // pinch tap reports here too — its End releases the
                 // daemon's synthetic zoom Ctrl.
                 ptp_pan_slot().feed(&[]);
-                let (_, pinch_ended) = ptp_pinch_slot().feed(&[]);
+                let (_, pinch_ended) = ptp_pinch_slot().feed(&[], false);
                 if pinch_ended {
                     send(InputEvent::PinchEnd);
                 }
@@ -3186,8 +3201,11 @@ mod win32_hooks {
             let now = std::time::Instant::now();
             // Pinch owns engaged fingers: zoom instead of scroll (the
             // pan anchor still feeds so a post-pinch scroll never jumps).
+            // A proven pan axis owns the gesture instead — late spread
+            // drift during a scroll must never zoom the peer.
+            let pan_owned = ptp_pan_slot().locked();
             let was_pinching = ptp_pinch_slot().engaged();
-            let (zoom, pinch_ended) = ptp_pinch_slot().feed(&contacts);
+            let (zoom, pinch_ended) = ptp_pinch_slot().feed(&contacts, pan_owned);
             let pinching = ptp_pinch_slot().engaged();
             // Per-gesture verdicts (not warn-once): a pinch that never
             // engages reads as "nothing happens", and only a journal line
@@ -3366,30 +3384,30 @@ mod win32_hooks {
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
             // Anchor: spread 100.
-            assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, 0), (100, 0)], false), (0, false));
             assert!(!pinch.engaged());
             // Below the engage gate (192): still scrolling fingers.
-            assert_eq!(pinch.feed(&[(0, 0), (120, 0)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, 0), (120, 0)], false), (0, false));
             assert!(!pinch.engaged());
             // Past the gate: engaged, spread change emits zoom-in (+).
             // Anchor 100, prev 120, spread 300: acc 180 => 18 detents.
-            assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2160, false));
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)], false), (2160, false));
             assert!(pinch.engaged());
             // Fingers close: zoom-out (−).
-            assert_eq!(pinch.feed(&[(0, 0), (210, 0)]), (-1080, false));
+            assert_eq!(pinch.feed(&[(0, 0), (210, 0)], false), (-1080, false));
         }
 
         #[test]
         fn ptp_steady_two_finger_scroll_never_pinches() {
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
-            assert_eq!(pinch.feed(&[(0, 100), (0, 100)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, 100), (0, 100)], false), (0, false));
             // Pure translation, stable spread: pan's fingers, not a pinch.
-            assert_eq!(pinch.feed(&[(0, 90), (0, 90)]), (0, false));
-            assert_eq!(pinch.feed(&[(0, 80), (0, 80)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, 90), (0, 90)], false), (0, false));
+            assert_eq!(pinch.feed(&[(0, 80), (0, 80)], false), (0, false));
             assert!(!pinch.engaged());
             // Lift without engaging: no End (nothing held downstream).
-            assert_eq!(pinch.feed(&[]), (0, false));
+            assert_eq!(pinch.feed(&[], false), (0, false));
         }
 
         #[test]
@@ -3403,51 +3421,130 @@ mod win32_hooks {
             // the peer instead of scrolling it.
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
-            assert_eq!(pinch.feed(&[(0, 200), (100, 205)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, 200), (100, 205)], false), (0, false));
             for step in 1..70 {
                 let y = 200 - step * 25;
                 let jitter = if step % 2 == 0 { 4 } else { -4 };
                 let x1 = 100 + step * 2 + jitter;
-                let (zoom, ended) = pinch.feed(&[(0, y), (x1, y + 5)]);
+                let (zoom, ended) = pinch.feed(&[(0, y), (x1, y + 5)], false);
                 assert_eq!((zoom, ended), (0, false));
                 assert!(!pinch.engaged());
             }
-            assert_eq!(pinch.feed(&[]), (0, false));
+            assert_eq!(pinch.feed(&[], false), (0, false));
+        }
+
+        #[test]
+        fn ptp_slow_wandering_scroll_never_pinches() {
+            // The live failure shape: a slow two-finger scroll (2
+            // units/report common-mode, below any per-frame noise
+            // floor) while the fingers wander apart along the way.
+            // Midpoint motion dominates or matches spread drift, so
+            // the anchor keeps sliding and drift can never bank into
+            // a false pinch that mutes scrolling.
+            let mut pinch = PtpPinch::new();
+            pinch.units_per_detent = 10;
+            assert_eq!(pinch.feed(&[(0, 400), (100, 400)], false), (0, false));
+            for step in 1..=150 {
+                let y = 400 - step * 2;
+                // Spread wanders apart and back on top of the scroll.
+                let wobble = step % 40;
+                let x1 = 100 + wobble.min(20);
+                let (zoom, ended) = pinch.feed(&[(0, y), (x1, y)], false);
+                assert_eq!((zoom, ended), (0, false));
+                assert!(!pinch.engaged());
+            }
+            assert_eq!(pinch.feed(&[], false), (0, false));
+        }
+
+        #[test]
+        fn ptp_pan_lock_vetoes_pinch() {
+            // A proven pan axis owns the gesture: even sustained spread
+            // drift far past the engage gate must not steal it into
+            // zoom. Without the veto this drift (4/report) owns a
+            // pinch after ~48 reports and the peer zooms mid-scroll.
+            let mut pinch = PtpPinch::new();
+            pinch.units_per_detent = 10;
+            assert_eq!(pinch.feed(&[(0, 400), (100, 400)], false), (0, false));
+            for step in 1..=80 {
+                let y = 400 - step * 2;
+                let x1 = 100 + step * 4;
+                let (zoom, ended) = pinch.feed(&[(0, y), (x1, y)], true);
+                assert_eq!((zoom, ended), (0, false));
+                assert!(!pinch.engaged());
+            }
+            // Lift clears the gesture (and the pan lock lives in PtpPan,
+            // not here): a fresh genuine pinch still engages.
+            assert_eq!(pinch.feed(&[], false), (0, false));
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)], false), (0, false));
+            let (zoom, ended) = pinch.feed(&[(0, 0), (100, 0)], false);
+            assert!(!ended);
+            assert!(pinch.engaged());
+            assert!(zoom < 0);
+        }
+
+        #[test]
+        fn ptp_slow_scroll_releases_an_engaged_pinch() {
+            // Once engaged, a slow common-mode scroll (2/report, below
+            // the old noise floor) must still hand the gesture back:
+            // the EMAs converge and the takeover streak ends the
+            // pinch within a fraction of a second instead of holding
+            // zoom hostage for the rest of the scroll.
+            let mut pinch = PtpPinch::new();
+            pinch.units_per_detent = 10;
+            assert_eq!(pinch.feed(&[(0, 0), (100, 0)], false), (0, false));
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)], false), (2400, false));
+            assert!(pinch.engaged());
+            let mut ended_at = None;
+            for step in 1..=40 {
+                let y = -step * 2;
+                let (zoom, ended) = pinch.feed(&[(0, y), (300, y)], false);
+                assert_eq!(zoom, 0);
+                if ended {
+                    ended_at = Some(step);
+                    break;
+                }
+            }
+            let ended_at = ended_at.expect("slow scroll must release the pinch");
+            assert!(ended_at <= 20, "takeover took {ended_at} reports");
+            assert!(!pinch.engaged());
+            // Later motion is silent: nothing held downstream anymore.
+            assert_eq!(pinch.feed(&[(0, -100), (300, -100)], false), (0, false));
+            assert_eq!(pinch.feed(&[], false), (0, false));
         }
 
         #[test]
         fn ptp_drifty_close_still_engages_zoom_out() {
             // Pinch-out with midpoint wander: per-frame steps look like
-            // scroll (mid_step ~4 vs spread_step ~10), but excursions
-            // from the anchor trend apart, so the gate debt accumulates
-            // and zoom-out engages. The per-frame veto slid the anchor
-            // after the drift and the gate never tripped — zoom-in
-            // stranded with no way back.
+            // scroll (mid_step 4 vs spread_step 10), but the spread
+            // outruns the midpoint rate consistently, so the anchor
+            // holds and the excursion gate trips. Sliding the anchor on
+            // every mixed frame would lose the excursion and strand
+            // zoom-in with no way back.
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
-            assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)], false), (0, false));
             for step in 1..=19 {
                 // Spread shrinks 10/frame; midpoint wanders 4/frame.
-                let (zoom, ended) = pinch.feed(&[(step, 0), (300 - 9 * step, 0)]);
+                let (zoom, ended) = pinch.feed(&[(step, 0), (300 - 9 * step, 0)], false);
                 assert_eq!((zoom, ended), (0, false));
                 assert!(!pinch.engaged());
             }
             // Spread 300 -> 100: excursion 200 past the 192 gate.
-            let (zoom, ended) = pinch.feed(&[(20, 0), (300 - 9 * 20, 0)]);
+            let (zoom, ended) = pinch.feed(&[(20, 0), (300 - 9 * 20, 0)], false);
             assert!(!ended);
             assert!(pinch.engaged());
             assert!(zoom < 0);
             // Further closing keeps emitting zoom-out.
-            let (zoom, ended) = pinch.feed(&[(21, 0), (300 - 9 * 21, 0)]);
+            let (zoom, ended) = pinch.feed(&[(21, 0), (300 - 9 * 21, 0)], false);
             assert!(!ended);
             assert!(pinch.engaged());
             assert!(zoom < 0);
             // And further still.
-            let (zoom, ended) = pinch.feed(&[(22, 0), (300 - 9 * 22, 0)]);
+            let (zoom, ended) = pinch.feed(&[(22, 0), (300 - 9 * 22, 0)], false);
             assert!(!ended);
             assert!(zoom < 0);
             // Lift ends exactly once.
-            assert_eq!(pinch.feed(&[]), (0, true));
+            assert_eq!(pinch.feed(&[], false), (0, true));
         }
 
         #[test]
@@ -3457,17 +3554,17 @@ mod win32_hooks {
             // the excursion veto must not misread as scroll.
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
-            assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)], false), (0, false));
             for step in 1..=19 {
-                let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * step, 0)]);
+                let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * step, 0)], false);
                 assert_eq!((zoom, ended), (0, false));
                 assert!(!pinch.engaged());
             }
-            let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * 20, 0)]);
+            let (zoom, ended) = pinch.feed(&[(0, 0), (300 - 10 * 20, 0)], false);
             assert!(!ended);
             assert!(pinch.engaged());
             assert!(zoom < 0);
-            assert_eq!(pinch.feed(&[]), (0, true));
+            assert_eq!(pinch.feed(&[], false), (0, true));
         }
 
         #[test]
@@ -3475,36 +3572,36 @@ mod win32_hooks {
             // Genuine spread first: engage with a near-still midpoint.
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
-            assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
-            assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2400, false));
+            assert_eq!(pinch.feed(&[(0, 0), (100, 0)], false), (0, false));
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)], false), (2400, false));
             assert!(pinch.engaged());
             // Then the fingers go back to scrolling together: after 5
             // sustained scroll-dominated frames the pinch ends (pan kept
             // feeding underneath, so it resumes without a jump).
             for step in 1..5 {
                 let y = -step * 20;
-                assert_eq!(pinch.feed(&[(0, y), (300, y)]), (0, false));
+                assert_eq!(pinch.feed(&[(0, y), (300, y)], false), (0, false));
                 assert!(pinch.engaged());
             }
-            assert_eq!(pinch.feed(&[(0, -100), (300, -100)]), (0, true));
+            assert_eq!(pinch.feed(&[(0, -100), (300, -100)], false), (0, true));
             assert!(!pinch.engaged());
             // A later lift is silent: nothing held downstream anymore.
-            assert_eq!(pinch.feed(&[]), (0, false));
+            assert_eq!(pinch.feed(&[], false), (0, false));
         }
 
         #[test]
         fn ptp_lift_after_pinch_ends_the_gesture_once() {
             let mut pinch = PtpPinch::new();
             pinch.units_per_detent = 10;
-            assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, 0), (100, 0)], false), (0, false));
             // Spread 100 -> 300: net +200 past the 192 gate with a
             // near-still midpoint, so 20 detents of zoom-in.
-            assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2400, false));
+            assert_eq!(pinch.feed(&[(0, 0), (300, 0)], false), (2400, false));
             // Lift: End exactly once, then silence.
-            assert_eq!(pinch.feed(&[]), (0, true));
-            assert_eq!(pinch.feed(&[]), (0, false));
+            assert_eq!(pinch.feed(&[], false), (0, true));
+            assert_eq!(pinch.feed(&[], false), (0, false));
             // Re-touch anchors anew: no zoom from the gap.
-            assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, 0), (100, 0)], false), (0, false));
             assert!(!pinch.engaged());
         }
 

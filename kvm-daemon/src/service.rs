@@ -142,6 +142,85 @@ fn udp_motion_key_snapshot() -> Vec<([u8; 32], String, bool)> {
         .unwrap_or_default()
 }
 
+/// One authenticated motion delta handed from the process-wide UDP
+/// listener to the receiver episode that owns the drive. The listener
+/// does not inject: motion must flow through the SAME episode injector,
+/// remote-cursor tracker, hop accumulator, and single-driver permit as
+/// the QUIC lanes, or the tracked cursor stays pinned at the entry warp
+/// while the visible one glides — the first QUIC-fallback delta then
+/// hands off mid-screen.
+#[derive(Debug, Clone, Copy)]
+struct UdpMotionFrame {
+    sequence: u64,
+    dx: i32,
+    dy: i32,
+}
+
+type UdpMotionSink = tokio::sync::mpsc::Sender<UdpMotionFrame>;
+
+static UDP_MOTION_SINKS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, UdpMotionSink>>> =
+    std::sync::OnceLock::new();
+
+fn udp_motion_sinks() -> &'static std::sync::Mutex<HashMap<String, UdpMotionSink>> {
+    UDP_MOTION_SINKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Register the receiving episode's motion sink for one peer. The UDP
+/// listener forwards every authenticated, fresh delta for that
+/// fingerprint into this channel (capacity bounds the backlog; motion is
+/// loss-tolerant, so a full queue drops the delta rather than stalling
+/// the input loop). The guard unregisters on drop, so a dead episode can
+/// never keep swallowing its peer's motion.
+fn register_udp_motion_sink(
+    fingerprint_hex: &str,
+) -> (
+    UdpMotionSinkGuard,
+    tokio::sync::mpsc::Receiver<UdpMotionFrame>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(1024);
+    if let Ok(mut sinks) = udp_motion_sinks().lock() {
+        sinks.insert(fingerprint_hex.to_owned(), sender.clone());
+    }
+    (
+        UdpMotionSinkGuard {
+            fingerprint_hex: fingerprint_hex.to_owned(),
+            sender,
+        },
+        receiver,
+    )
+}
+
+struct UdpMotionSinkGuard {
+    fingerprint_hex: String,
+    sender: UdpMotionSink,
+}
+
+impl Drop for UdpMotionSinkGuard {
+    fn drop(&mut self) {
+        if let Ok(mut sinks) = udp_motion_sinks().lock() {
+            // Compare first: a successor episode may have replaced the
+            // entry between our registration and drop.
+            if sinks
+                .get(&self.fingerprint_hex)
+                .is_some_and(|sender| sender.same_channel(&self.sender))
+            {
+                sinks.remove(&self.fingerprint_hex);
+            }
+        }
+    }
+}
+
+/// Route one fresh UDP delta to its episode. No sink (parked or absent
+/// session) drops silently: an episode that is not driving must not move
+/// the local cursor.
+fn forward_udp_motion(fingerprint_hex: &str, frame: UdpMotionFrame) {
+    if let Ok(sinks) = udp_motion_sinks().lock() {
+        if let Some(sender) = sinks.get(fingerprint_hex) {
+            let _ = sender.try_send(frame);
+        }
+    }
+}
+
 /// Outbound UDP motion sender for this `connect` child (one link per
 /// process). Set after the QUIC verify when both sides negotiate
 /// `udp_motion`; episode drivers read it for MouseMove fast-path sends
@@ -851,6 +930,26 @@ pub(crate) fn lease_end(fingerprint_hex: &str, link_id: Option<u64>, id: u64) ->
     };
     leases.remove(&key);
     Some(info)
+}
+
+/// Fingerprint owning a live outbound lease for this epoch. A locally
+/// minted epoch names the exact peer this machine dialed, so the peer's
+/// dial-back half is authorized by our own initiation; any OTHER peer
+/// presenting the same epoch is not. None means the epoch is not ours to
+/// vouch for (a peer-initiated link, which needs the local prompt).
+pub(crate) fn outbound_epoch_owner(link_id: u64) -> Option<String> {
+    let leases = outbound_lease_slot().lock().ok()?;
+    leases
+        .values()
+        .find(|lease| lease.link_id == Some(link_id))
+        .map(|lease| lease.fingerprint_hex.clone())
+}
+
+/// True when this exact peer is the one our live supervised child dialed
+/// on this epoch. Pairing is still required separately — this only says
+/// the link is ours, not that the peer is trusted.
+pub(crate) fn outbound_epoch_live(fingerprint_hex: &str, link_id: u64) -> bool {
+    outbound_epoch_owner(link_id).is_some_and(|owner| owner.eq_ignore_ascii_case(fingerprint_hex))
 }
 
 /// Remove and return the lease matching an epoch or address (Disconnect
@@ -4841,6 +4940,12 @@ async fn handoff_truth_veto(
     } else {
         SUSTAINED_TRUTH_SLACK_PX
     };
+    // Truth must come from the desktop that receives input; a Session-0
+    // process would read a headless pointer and veto every crossing.
+    #[cfg(target_os = "windows")]
+    if !crate::windows_helper::desktop_receives_input() {
+        return None;
+    }
     let screen = router.layout().screen(from)?;
     let gap_for = |truth_x: u32, truth_y: u32| match edge {
         kvm_core::Edge::Left => i64::from(truth_x),
@@ -9251,12 +9356,14 @@ fn spawn_discovery_responder(
 }
 
 /// UDP fast-path motion listener: decrypts pointer motion sent by peers that
-/// negotiated `udp_motion` over the QUIC verify and injects it through a
-/// motion-only virtual device. Keys/buttons/clipboard stay on the reliable
-/// QUIC episode stream; motion is stateless relative deltas, so a dedicated
-/// injector here never splits held-key state. A bad packet is dropped, never
-/// fatal; a peer without a registered key (no verify, banned epoch, old
-/// version) simply has its motion ignored while its QUIC stream still works.
+/// negotiated `udp_motion` over the QUIC verify and forwards each fresh delta
+/// to the receiving episode's motion sink. It never injects: the episode
+/// applies the delta through its single injector, so remote-cursor tracking,
+/// edge-hop accumulation, the single-driver permit, and the input lease all
+/// see UDP motion exactly like motion on the QUIC lanes. A bad packet is
+/// dropped, never fatal; a peer without a registered key (no verify, banned
+/// epoch, old version) or without a live episode simply has its motion
+/// ignored while its QUIC stream still works.
 fn spawn_udp_motion_listener(port: u16) {
     tokio::spawn(async move {
         let socket = match tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
@@ -9269,10 +9376,6 @@ fn spawn_udp_motion_listener(port: u16) {
             }
         };
         tracing::info!(port, "UDP motion listener ready");
-        // Motion-only injectors, one per privilege level, owned by this
-        // single task (no sharing, no locks on the hot path).
-        let mut injector_plain: Option<ReceiverInjector> = None;
-        let mut injector_privileged: Option<ReceiverInjector> = None;
         let mut last_seq: std::collections::HashMap<[u8; 32], u64> =
             std::collections::HashMap::new();
         let mut buffer = [0u8; 2048];
@@ -9298,7 +9401,7 @@ fn spawn_udp_motion_listener(port: u16) {
                     Ok(decoded) => decoded,
                     Err(_) => continue,
                 };
-            let (key, fingerprint_hex, lock_screen_enabled) = &keys[key_index];
+            let (key, fingerprint_hex, _) = &keys[key_index];
             // Sequence dedup: UDP is unordered; old or replayed motion is
             // dropped while the next fresh delta still glides the cursor.
             // Strictly newer, or a counter wrap (fresh epoch restarts).
@@ -9316,50 +9419,18 @@ fn spawn_udp_motion_listener(port: u16) {
                     last_seq.remove(&old);
                 }
             }
-            let injector = if *lock_screen_enabled {
-                if injector_privileged.is_none() {
-                    match ReceiverInjector::create(true) {
-                        Ok(injector) => injector_privileged = Some(injector),
-                        Err(error) => {
-                            tracing::warn!(%error, "UDP motion injector unavailable");
-                            continue;
-                        }
-                    }
-                }
-                injector_privileged.as_mut().unwrap()
-            } else {
-                if injector_plain.is_none() {
-                    match ReceiverInjector::create(false) {
-                        Ok(injector) => injector_plain = Some(injector),
-                        Err(error) => {
-                            tracing::warn!(%error, "UDP motion injector unavailable");
-                            continue;
-                        }
-                    }
-                }
-                injector_plain.as_mut().unwrap()
-            };
-            if injector.ensure_session().is_err() {
-                continue;
-            }
-            if injector
-                .send(kvm_core::InputEvent::MouseMove { dx, dy })
-                .is_err()
-            {
-                continue;
-            }
-            // Same live-drive signal the QUIC stream path emits so the
-            // station UI, the idle-dual arbitration, AND the input lease
-            // see UDP motion too. Without the stamp, pure-motion driving
-            // (no clicks for 45s) looks dead to the episode lease while
-            // the cursor keeps gliding over UDP — the lease then kills
-            // the episode out from under the driver, and clicks/scrolls
-            // die with it until the next crossing re-opens the stream.
-            if let Ok(links) = inbound_link_registry().lock() {
-                if let Some((link, _)) = links.get(fingerprint_hex.as_str()) {
-                    note_inbound_activity(&link.input_events, &link.last_input);
-                }
-            }
+            // The owning episode injects this delta through its single
+            // injector and tracks it in remote_cursor/hop state. When no
+            // episode is registered (parked, ended, never drove) the
+            // delta is dropped: no sink means no authorized drive here.
+            forward_udp_motion(
+                fingerprint_hex,
+                UdpMotionFrame {
+                    sequence: seq,
+                    dx,
+                    dy,
+                },
+            );
         }
     });
 }
@@ -9493,9 +9564,10 @@ async fn handle_connection(
             }
             // Per-link approval (the request+accept rule): pairing trust
             // alone never opens a link. Every fresh epoch waits for the
-            // local human to allow it; approved epochs — and the link
-            // born from a just-completed pairing — pass silently, so
-            // retries and the dial-back on the same epoch never prompt
+            // local human to allow it; approved epochs, the link born from
+            // a just-completed pairing, and an epoch THIS machine minted
+            // for this exact peer (our own Connect's dial-back) pass
+            // silently, so retries and the reverse half never prompt
             // again. Epoch-less admin paths (fixed boot peer, CLI
             // capture) carry no epoch to approve and proceed on pairing
             // trust with an audit line — no UI exists there to ask.
@@ -9511,9 +9583,17 @@ async fn handle_connection(
                 }
                 Some(epoch) => {
                     let links = crate::control::link_approvals();
-                    if !links.is_approved(&peer_fingerprint, epoch).await
-                        && !links.recently_paired(&peer_fingerprint).await
-                    {
+                    let known = links.is_approved(&peer_fingerprint, epoch).await
+                        || links.recently_paired(&peer_fingerprint).await;
+                    // Our own Connect minted this epoch for this exact peer:
+                    // the dial-back half is authorized by the initiation this
+                    // user already performed, not by silent trust. The peer
+                    // fingerprint and epoch must BOTH match the live outbound
+                    // lease, so no other device can ride an epoch it was not
+                    // given. Pairing was already enforced above.
+                    let locally_initiated =
+                        !known && outbound_epoch_live(&peer_fingerprint, epoch);
+                    if !known && !locally_initiated {
                         // The queued address MUST be dialable: the socket's
                         // remote is an ephemeral source port, and the
                         // approving side dials this address back for its
@@ -9578,6 +9658,14 @@ async fn handle_connection(
                                 bail!("link not approved: {error:#}");
                             }
                         }
+                    } else if locally_initiated {
+                        audit_event(
+                            audit_dir,
+                            &format!(
+                                "link auto-passed peer={peer_fingerprint} remote={} link_id={epoch} reason=local_initiated_epoch",
+                                conn.remote_address(),
+                            ),
+                        );
                     }
                 }
             }
@@ -9815,16 +9903,31 @@ async fn handle_connection(
             // with an epoch, derive the session key from the authenticated
             // verify (both fingerprints + epoch) so the UDP listener can
             // decrypt motion without a second ceremony.
-            if hello.udp_motion {
-                if let Some(epoch) = hello.link_id {
-                    register_udp_motion_key(
-                        &local_fingerprint,
-                        &peer_fingerprint,
-                        epoch,
-                        lock_screen_enabled,
-                    );
-                    tracing::info!(peer = %peer_fingerprint, "udp motion key registered");
-                }
+            let udp_motion_active = hello.udp_motion && hello.link_id.is_some();
+            if let (true, Some(epoch)) = (hello.udp_motion, hello.link_id) {
+                register_udp_motion_key(
+                    &local_fingerprint,
+                    &peer_fingerprint,
+                    epoch,
+                    lock_screen_enabled,
+                );
+                tracing::info!(peer = %peer_fingerprint, "udp motion key registered");
+            }
+            // Every UDP delta for this peer is delivered into THIS
+            // episode's loop (see the select arm below), never injected
+            // from the listener: only here does motion share the single
+            // injector, the remote-cursor/hop tracking that decides edge
+            // handoffs, the single-driver permit, and the lease stamp.
+            // The guard unregisters on drop (park, end, panic).
+            let _udp_motion_guard;
+            let mut udp_motion_rx;
+            if udp_motion_active {
+                let (guard, receiver) = register_udp_motion_sink(&peer_fingerprint);
+                _udp_motion_guard = Some(guard);
+                udp_motion_rx = Some(receiver);
+            } else {
+                _udp_motion_guard = None;
+                udp_motion_rx = None;
             }
             // One face per machine: the verified live fingerprint retires
             // same-named ghosts (the service-cert vs user-cert split), so
@@ -9911,6 +10014,10 @@ async fn handle_connection(
             // with sender datagrams_sent>0 names the wire/task; the warn
             // below counts undecodable payloads separately.
             let mut datagrams_received = 0u64;
+            // Fresh deltas delivered by the UDP motion listener into this
+            // episode's sink: udp_frames=0 with sender udp_packets_sent>0
+            // names the key/sink gate instead of guessing.
+            let mut udp_frames = 0u64;
             let mut remote_screen = None;
             let mut remote_cursor = None;
             // Push-through run for the stateless receiver hop (same
@@ -10160,24 +10267,21 @@ async fn handle_connection(
                                         &peer_fingerprint,
                                         &peer_screen_geometry,
                                     );
-                                    // When UDP motion is active, pointer deltas
-                                    // arrive on the dedicated UDP listener's
-                                    // helper in relative mode; arming absolute
-                                    // mode on this stream's helper splits
-                                    // cursor state across two helpers so any
-                                    // stream fallback teleports back to the
-                                    // entry warp. Keep both helpers relative.
-                                    if hello.udp_motion {
-                                        injector.set_target_size(0, 0);
-                                    } else {
-                                        tracing::info!(
-                                            width = size.0,
-                                            height = size.1,
-                                            source,
-                                            "announcing drive target size to helpers",
-                                        );
-                                        injector.set_target_size(size.0, size.1);
-                                    }
+                                    // Arm absolute mode unconditionally: UDP
+                                    // motion now arrives in THIS episode's
+                                    // loop and rides this same injector, so
+                                    // there is no second helper to split
+                                    // cursor state with. Keeping the helper
+                                    // relative (the old UDP workaround)
+                                    // re-enabled pointer acceleration and
+                                    // let tracked and visible cursors drift.
+                                    tracing::info!(
+                                        width = size.0,
+                                        height = size.1,
+                                        source,
+                                        "announcing drive target size to helpers",
+                                    );
+                                    injector.set_target_size(size.0, size.1);
                                 }
                                 #[cfg(target_os = "linux")]
                                 kvm_platform::capture::note_screen_size(
@@ -10469,6 +10573,84 @@ async fn handle_connection(
                             break Ok(());
                         }
                     }
+                    udp_frame = async {
+                        // UDP fast-path motion delivered by the process-wide
+                        // listener (see register_udp_motion_sink). Absent
+                        // negotiation parks the arm forever; a closed
+                        // channel (listener task gone) also parks it and
+                        // motion simply stays on the QUIC lanes.
+                        match udp_motion_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let Some(frame) = udp_frame else {
+                            udp_motion_rx = None;
+                            continue;
+                        };
+                        udp_frames += 1;
+                        // Parked: a packet already in flight when the
+                        // return happened must not move the local cursor,
+                        // refresh the lease, or re-claim the slot. The
+                        // next PointerHandoff revives the sink.
+                        if remote_idle {
+                            continue;
+                        }
+                        last_activity = Instant::now();
+                        injector.ensure_session()?;
+                        // Same single-driver gate as the datagram path:
+                        // motion must never inject while this session's
+                        // clicks would die busy.
+                        if input_permit.is_none() {
+                            match input_session_slot.clone().try_acquire_owned() {
+                                Ok(permit) => input_permit = Some(permit),
+                                Err(_) => {
+                                    dropped_busy += 1;
+                                    if dropped_busy == 1 || dropped_busy.is_multiple_of(100) {
+                                        tracing::warn!(
+                                            dropped_busy,
+                                            "dropping udp motion: another input session already controls this node"
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        note_inbound_activity(&link_input_events, &link_last_input);
+                        motion_count += 1;
+                        // Identical to a QUIC MouseMove delta: remote
+                        // cursor tracking and hop accumulation run here,
+                        // so an edge HandoffRequest fires only when the
+                        // tracked cursor truly overflowed the screen.
+                        if process_remote_input(
+                            DatagramInput {
+                                sequence: frame.sequence,
+                                event: InputEvent::MouseMove {
+                                    dx: frame.dx,
+                                    dy: frame.dy,
+                                },
+                            },
+                            &config,
+                            &mut injector,
+                            &mut send,
+                            &mut remote_screen,
+                            &mut remote_cursor,
+                            &mut seen_sequences,
+                            &mut motion_sequence,
+                            peer_screen_geometry,
+                            &mut hop_edge,
+                            &mut hop_accum,
+                            &mut dropped_duplicate,
+                            &mut dropped_stale,
+                            &mut applied_motion,
+                            lock_screen_enabled,
+                        )
+                        .await?
+                        {
+                            end_reason = "peer requested the session end";
+                            break Ok(());
+                        }
+                    }
                     change = receive_clipboard(
                         &mut clipboard_agent,
                         clipboard_enabled && clipboard_agent_present,
@@ -10648,12 +10830,9 @@ async fn handle_connection(
                         // are still reaped by the QUIC idle timeout and the
                         // keep-alive watchdogs; the lease is only the last
                         // backstop for a silent-but-connected peer. UDP
-                        // motion bypasses this task's stream arms (and their
-                        // last_activity stamps) by design, so consult the
-                        // registry's UDP-fed stamp too — otherwise
-                        // pure-motion driving reads as silence here while
-                        // the cursor glides, and the lease kills the very
-                        // episode the next click needs.
+                        // motion now stamps this loop directly (the sink
+                        // arm); the registry's UDP-fed stamp stays as a
+                        // cover for a delta racing the arm.
                         let udp_fresh = registry_input_recent(&peer_fingerprint);
                         if last_activity.elapsed() > Duration::from_secs(45) && !udp_fresh {
                             end_reason = "input lease expired without activity";
@@ -10731,6 +10910,7 @@ async fn handle_connection(
                 dropped_stale,
                 dropped_busy,
                 datagrams_received,
+                udp_frames,
                 reason = end_reason,
                 error = session_result
                     .as_ref()
@@ -10875,6 +11055,73 @@ fn handle_inbound_pinch(
     Ok(())
 }
 
+/// Receiver-side edge truth gate: before a HandoffRequest commits, the
+/// OS-visible pointer must actually sit at the edge the tracked cursor
+/// overflowed. `remote_cursor` integrates raw deltas, so with a relative
+/// injector it can run ahead of the accelerated visible pointer; committing
+/// there is exactly "control leaves while the cursor is still mid-screen".
+/// The push run is NOT punished: the tracker re-pins to visible truth and
+/// the next reports retry at report rate, so a genuine edge push crosses
+/// within a frame or two instead of demanding another slide.
+///
+/// Fails OPEN on every doubt — unavailable truth (Wayland, headless
+/// service, Session-0 desktop), geometry disagreement between the
+/// configured space and session truth (edge arithmetic is meaningless
+/// then), or a pointer outside the single screen (multi-monitor, warp in
+/// flight). Returns the truth to re-pin to only when the crossing must
+/// NOT commit (None = proceed).
+fn receiver_edge_truth_veto(
+    config: &Config,
+    screen_id: ScreenId,
+    edge: kvm_core::Edge,
+) -> Option<(u32, u32)> {
+    // Mid-screen exits read hundreds of pixels off; 32 leaves generous
+    // room for one frame of visible-pointer lag while still convicting
+    // a tracker that ran away from the real cursor.
+    const TRUTH_SLACK_PX: i64 = 32;
+    let screen = config.layout.screen(screen_id)?;
+    let truthful = truthful_local_geometry(&config.layout)?;
+    if truthful.screen_id != screen_id.0
+        || (i64::from(screen.width) - i64::from(truthful.width)).abs() > 8
+        || (i64::from(screen.height) - i64::from(truthful.height)).abs() > 8
+    {
+        return None;
+    }
+    // GetCursorPos only means something when OUR thread desktop receives
+    // input: a Session-0 service would read its own headless desktop.
+    #[cfg(target_os = "windows")]
+    if !crate::windows_helper::desktop_receives_input() {
+        return None;
+    }
+    let Ok(Some((truth_x, truth_y))) = kvm_platform::capture::current_cursor_position() else {
+        return None;
+    };
+    if truth_x >= screen.width || truth_y >= screen.height {
+        return None;
+    }
+    let gap = match edge {
+        kvm_core::Edge::Left => i64::from(truth_x),
+        kvm_core::Edge::Right => {
+            i64::from(screen.width.saturating_sub(1)).saturating_sub(i64::from(truth_x))
+        }
+        kvm_core::Edge::Top => i64::from(truth_y),
+        kvm_core::Edge::Bottom => {
+            i64::from(screen.height.saturating_sub(1)).saturating_sub(i64::from(truth_y))
+        }
+    };
+    if gap <= TRUTH_SLACK_PX {
+        return None;
+    }
+    tracing::info!(
+        ?edge,
+        truth_gap_px = gap,
+        truth_x,
+        truth_y,
+        "remote handoff vetoed: OS cursor is not at the edge; staying local in this drive"
+    );
+    Some((truth_x, truth_y))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_remote_input(
     packet: DatagramInput,
@@ -10960,6 +11207,17 @@ async fn process_remote_input(
                     .layout
                     .screen(screen_id)
                     .context("remote pointer screen disappeared during handoff")?;
+                // Truth gate: never hand control back while the visible
+                // pointer is still mid-screen (see
+                // receiver_edge_truth_veto). Non-punitive on refusal:
+                // re-pin the tracker to visible truth and keep driving —
+                // the next reports retry at report rate.
+                if let Some((truth_x, truth_y)) =
+                    receiver_edge_truth_veto(config, screen_id, handoff.edge)
+                {
+                    *remote_cursor = Some((truth_x, truth_y));
+                    return Ok(false);
+                }
                 let next_x = i64::from(x) + i64::from(dx);
                 let next_y = i64::from(y) + i64::from(dy);
                 let (remainder_dx, remainder_dy) = match handoff.edge {
@@ -13199,6 +13457,26 @@ mod tests {
         assert!(lease_end(&fingerprint, Some(epoch), second).is_none());
         assert!(take_lease(Some(epoch), None).is_none());
         assert!(lease_end(&"cd".repeat(32), Some(epoch), 1).is_none());
+    }
+
+    #[test]
+    fn outbound_epoch_owner_binds_the_dialed_peer() {
+        let dialed = "5a".repeat(32);
+        let other = "5b".repeat(32);
+        let epoch = 0x5EED_0002_u64;
+        let id = lease_begin(&dialed, "192.168.1.9:42110", Some(epoch));
+        assert_eq!(
+            outbound_epoch_owner(epoch).as_deref(),
+            Some(dialed.as_str())
+        );
+        assert!(outbound_epoch_live(&dialed, epoch));
+        assert!(outbound_epoch_live(&dialed.to_ascii_uppercase(), epoch));
+        // A different paired device presenting the same epoch is not ours.
+        assert!(!outbound_epoch_live(&other, epoch));
+        assert!(!outbound_epoch_live(&dialed, epoch + 1));
+        assert!(lease_end(&dialed, Some(epoch), id).is_some());
+        assert_eq!(outbound_epoch_owner(epoch), None);
+        assert!(!outbound_epoch_live(&dialed, epoch));
     }
 
     #[tokio::test]

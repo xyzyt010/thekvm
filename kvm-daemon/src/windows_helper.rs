@@ -1072,6 +1072,15 @@ fn helper_desktop_access() -> u32 {
         | DESKTOP_JOURNALPLAYBACK.0
 }
 
+/// Whether the CALLING process's desktop currently receives input. Only
+/// then does GetCursorPos describe the user's pointer: a Session-0
+/// service reads its own headless desktop, whose (0,0)-ish answer would
+/// veto every crossing. Errors fail safe (false = no truth).
+#[cfg(target_os = "windows")]
+pub(crate) fn desktop_receives_input() -> bool {
+    current_desktop_is_input().unwrap_or(false)
+}
+
 #[cfg(target_os = "windows")]
 fn current_desktop_is_input() -> Result<bool> {
     use windows::Win32::Foundation::{BOOL, HANDLE};
