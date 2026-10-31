@@ -781,8 +781,21 @@ export component AppWindow inherits Window {
             }
         }
     }
+    changed status-text => {
+        if (root.status-text != "" && root.status-text != root.status-notice) {
+            root.status-notice = root.status-text;
+            notice-timer.restart();
+        }
+    }
+    notice-timer := Timer {
+        interval: 7s;
+        triggered => { root.status-notice = ""; }
+    }
 
-    in property <string> status-text: "Not connected";
+    in property <string> status-text: "";
+    // Transient feedback line: mirrors the latest status briefly (errors,
+    // refusals, saved settings) and then disappears, so no permanent bar.
+    in-out property <string> status-notice: "";
     in property <bool> connected: false;
     in property <string> session-text: "Not connected";
     in property <bool> session-active: false;
@@ -1575,5 +1588,18 @@ export component AppWindow inherits Window {
                 }
             }
         }
+            if status-notice != "" : Rectangle {
+                height: 28px;
+                background: #111827;
+                Text {
+                    x: 14px;
+                    width: parent.width - 28px;
+                    text: root.status-notice;
+                    color: #9ca3af;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
     }
 }
