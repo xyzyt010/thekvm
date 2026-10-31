@@ -1305,7 +1305,9 @@ export component AppWindow inherits Window {
                         selected: root.edge-mode-index;
                         applying: root.edge-applying;
                         pending-index: root.pending-edge-index;
-                        enabled: root.linked-peer-name != "";
+                        // Crossing discipline is global config: selectable
+                        // before the first pair too, not only while linked.
+                        enabled: true;
                         tick: root.spinner-tick;
                         picked(index) => {
                             root.pending-edge-index = index;
