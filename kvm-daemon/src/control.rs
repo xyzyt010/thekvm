@@ -1242,6 +1242,10 @@ where
                                 );
                             }
                             *current = updated;
+                            // Wake live episodes: edge mode/style and the
+                            // arrangement apply to running sessions without
+                            // a relink (identity fields stay frozen).
+                            crate::service::bump_config_revision();
                             ControlResponse::Applied { restart_required }
                         }
                         Err(error) => ControlResponse::Error {

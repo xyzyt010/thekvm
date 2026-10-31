@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// peer 2 (Swap sides only moves grid positions, never ids). Handoffs name
 /// screens by device name across the wire — numbers must never decide
 /// identity, because one side's numbering says nothing about the other's.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     pub screens: Vec<Screen>,
     /// Which screen is "me" (the one this config lives on).
@@ -24,7 +24,7 @@ pub struct ScreenId(pub u32);
 pub const SELF_SCREEN_ID: ScreenId = ScreenId(1);
 pub const FIRST_PEER_SCREEN_ID: ScreenId = ScreenId(2);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Screen {
     pub id: ScreenId,
     pub name: String,
@@ -708,6 +708,51 @@ impl EdgeRouter {
     /// through.
     pub fn set_double_style(&mut self, style: DoubleEdgeStyle) {
         self.double_style = style;
+    }
+
+    /// Replace the screen arrangement live (drag-and-drop placement):
+    /// subsequent crossings and returns follow the new geometry with no
+    /// relink. Measured pixel dims are carried over for every screen that
+    /// survives the edit — placement changes coordinates, never geometry
+    /// truth (the daemon adopts real screen sizes and peer-advertised
+    /// sizes after startup). Refused while a drive is active: that drive
+    /// keeps the arrangement it entered under, and the caller retries
+    /// once control is home.
+    pub fn set_layout(&mut self, mut layout: Layout) -> Result<(), String> {
+        layout.validate()?;
+        if self.active_remote.is_some() {
+            return Err("a drive is active".into());
+        }
+        if layout.screen(self.local_screen).is_none() {
+            return Err("new layout does not contain this computer's screen".into());
+        }
+        for screen in &mut layout.screens {
+            if let Some(old) = self.layout.screen(screen.id) {
+                screen.width = old.width;
+                screen.height = old.height;
+            }
+        }
+        self.layout = layout;
+        self.current_screen = self.local_screen;
+        let (width, height) = self
+            .layout
+            .screen(self.local_screen)
+            .map(|screen| (screen.width, screen.height))
+            .ok_or_else(|| "local screen is missing from the new layout".to_string())?;
+        self.cursor_x = self.cursor_x.min(width.saturating_sub(1));
+        self.cursor_y = self.cursor_y.min(height.saturating_sub(1));
+        self.local_cursor_x = self.cursor_x;
+        self.local_cursor_y = self.cursor_y;
+        self.entry_edge = None;
+        self.return_armed = false;
+        self.return_accum = 0;
+        self.return_edge = None;
+        self.return_edge_accum = 0;
+        self.push_edge = None;
+        self.push_accum = 0;
+        self.post_return_edge = None;
+        self.post_return_at = None;
+        Ok(())
     }
 
     /// Whether this drive entered through a pinned edge: Fixed modes
@@ -3531,6 +3576,59 @@ mod tests {
             )
             .expect("left edge must hand off");
         assert_eq!((hop.target_x, hop.target_y), (1887, 540));
+    }
+
+    #[test]
+    fn live_layout_change_moves_crossings_without_relink() {
+        let peer = "ab".repeat(32);
+        let mut left_layout = Layout::pair_default("me", "peer", &peer);
+        left_layout.place_peer(&peer, Edge::Left).unwrap();
+        // Default (peer on the right): the right edge is the Single edge.
+        let mut router = EdgeRouter::new(Layout::pair_default("me", "peer", &peer)).unwrap();
+        router.set_edge_mode(EdgeMode::Single);
+        router.adopt_local_screen_size(1600, 900);
+        router.place_local_cursor(1580, 450).unwrap();
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: 5000, dy: 0 }),
+            RoutedEvent::Handoff {
+                edge: Edge::Right,
+                ..
+            }
+        ));
+        // Placement cannot move the ground under an active drive.
+        assert!(router.set_layout(left_layout.clone()).is_err());
+        // A settled router applies the edit live, keeps measured dims,
+        // and crosses through the newly facing edge only.
+        let mut router = EdgeRouter::new(Layout::pair_default("me", "peer", &peer)).unwrap();
+        router.set_edge_mode(EdgeMode::Single);
+        router.adopt_local_screen_size(1600, 900);
+        router.set_layout(left_layout).unwrap();
+        assert_eq!(
+            router.layout().self_screen().map(|s| (s.width, s.height)),
+            Some((1600, 900)),
+            "placement edits must never overwrite measured geometry"
+        );
+        router.place_local_cursor(20, 450).unwrap();
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -5000, dy: 0 }),
+            RoutedEvent::Handoff {
+                edge: Edge::Left,
+                ..
+            }
+        ));
+        let peer = "ab".repeat(32);
+        let mut left_layout = Layout::pair_default("me", "peer", &peer);
+        left_layout.place_peer(&peer, Edge::Left).unwrap();
+        let mut router = EdgeRouter::new(left_layout).unwrap();
+        router.set_edge_mode(EdgeMode::Single);
+        router.place_local_cursor(1580, 540).unwrap();
+        assert!(
+            !matches!(
+                router.route(InputEvent::MouseMove { dx: 5000, dy: 0 }),
+                RoutedEvent::Handoff { .. }
+            ),
+            "the old exit edge must no longer cross in Single mode"
+        );
     }
 
     #[test]

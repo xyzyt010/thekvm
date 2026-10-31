@@ -78,6 +78,19 @@ type LinkRegistry =
 static INBOUND_LINKS: std::sync::OnceLock<LinkRegistry> = std::sync::OnceLock::new();
 static LINK_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Bumped whenever a running daemon publishes a new configuration through
+/// the local control plane. Input episodes compare this cheap atomic on
+/// their hot path and only touch the shared config lock when it moved, so
+/// edge discipline and screen placement changes apply to a LIVE session
+/// with no relink. Identity fields (name, role, transport) stay frozen per
+/// link: the peer verified this session under them.
+pub(crate) static CONFIG_REVISION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn bump_config_revision() {
+    CONFIG_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 /// UDP fast-path motion keys: derived from the authenticated QUIC verify
 /// (both fingerprints + link epoch) when a Hello negotiates `udp_motion`.
 /// The UDP listener decrypts motion with these; each entry also carries the
@@ -2717,6 +2730,102 @@ async fn run_windows_service_capture_stream(
 /// then drives ONLY that peer — MWB switches solely to connected machines.
 /// Without a link the child dials whatever the arrangement names (legacy
 /// standalone use; the desktop UI always links).
+/// Hot-apply edge mode, entry style and screen placement from config.json
+/// into a running topology child. Identity, role, transport and clipboard
+/// policy are never touched here: the peer verified this link under the
+/// identity fields, and changing them under a live handshake would break
+/// the name checks that route every handoff. A placement edit waits until
+/// no drive is active — a drive finishes under the arrangement it entered.
+/// Reports `edge-applied` on stderr so the supervising UI can end its
+/// apply spinner on truth instead of a timer.
+fn apply_live_topology_config(
+    dir: &std::path::Path,
+    config: &mut Config,
+    router: &mut EdgeRouter,
+    bytes_seen: &mut Option<Vec<u8>>,
+    pending_layout: &mut Option<kvm_core::Layout>,
+) {
+    let path = dir.join("config.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            if bytes_seen.as_deref() != Some(bytes.as_slice()) {
+                *bytes_seen = Some(bytes);
+                match Config::load(&path) {
+                    Ok(parsed) => {
+                        let mut applied = false;
+                        if parsed.edge_mode != config.edge_mode {
+                            tracing::info!(
+                                edge_mode = ?parsed.edge_mode,
+                                "topology edge mode hot-applied"
+                            );
+                            config.edge_mode = parsed.edge_mode;
+                            router.set_edge_mode(parsed.edge_mode);
+                            applied = true;
+                        }
+                        if parsed.double_edge_style != config.double_edge_style {
+                            tracing::info!(
+                                double_style = ?parsed.double_edge_style,
+                                "topology entry style hot-applied"
+                            );
+                            config.double_edge_style = parsed.double_edge_style;
+                            router.set_double_style(parsed.double_edge_style);
+                            applied = true;
+                        }
+                        if parsed.layout != config.layout {
+                            tracing::info!("topology screen placement change pending");
+                            config.layout = parsed.layout.clone();
+                            *pending_layout = Some(parsed.layout);
+                        }
+                        if applied {
+                            report_edge_applied(config);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "topology config watch skipped an unreadable file");
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            if bytes_seen.is_some() {
+                tracing::debug!(
+                    %error,
+                    "topology config watch could not read; keeping live policy"
+                );
+                *bytes_seen = None;
+            }
+        }
+    }
+    // An edit that landed while a drive was active waits here, retried on
+    // every tick until the drive finishes under the arrangement it entered.
+    if let Some(layout) = pending_layout.clone() {
+        match router.set_layout(layout) {
+            Ok(()) => {
+                tracing::info!("topology screen placement hot-applied");
+                *pending_layout = None;
+            }
+            Err(reason) => {
+                tracing::debug!(%reason, "placement change waits for the active drive to finish");
+            }
+        }
+    }
+}
+
+/// Tell the supervising UI which discipline is live, so its apply spinner
+/// ends on truth instead of a timer.
+fn report_edge_applied(config: &Config) {
+    let mode = match config.edge_mode {
+        kvm_core::EdgeMode::Single => "single",
+        kvm_core::EdgeMode::Double => "double",
+    };
+    let style = match config.double_edge_style {
+        kvm_core::DoubleEdgeStyle::Mirror => "mirror",
+        kvm_core::DoubleEdgeStyle::FixedLeft => "fixed-left",
+        kvm_core::DoubleEdgeStyle::FixedRight => "fixed-right",
+    };
+    eprintln!("THEKVM_STATUS edge-applied {mode} {style}");
+}
+
 async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Result<()> {
     let dir = data_dir();
     // Machine-readable progress for a supervising UI (which pipes stderr):
@@ -2731,7 +2840,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // restart and no extra click. A linked child additionally waits for the
     // linked peer's screen (the supervisor adopts the live fingerprint on
     // `established`, healing ghost pins with no restart either).
-    let (config, mut router) = loop {
+    let (mut config, mut router) = loop {
         let mut config = Config::load(&dir.join("config.json"))
             .with_context(|| format!("loading topology config from {}", dir.display()))?;
         // Adopt the dims the last verified link heard from this peer (see
@@ -2989,6 +3098,13 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut motion_pending: Option<CapturedEvent> = None;
     let mut keep_alive = tokio::time::interval(Duration::from_secs(5));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Live settings bridge (see apply_live_topology_config): the app mirrors
+    // its settings into this child's config.json, so Single/Double, entry
+    // style and screen placement follow a running session with no relink.
+    let mut config_watch = tokio::time::interval(Duration::from_millis(200));
+    config_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut config_bytes_seen: Option<Vec<u8>> = std::fs::read(dir.join("config.json")).ok();
+    let mut pending_layout: Option<kvm_core::Layout> = None;
     // Fast inbound-drive probe (dual-drive deadlock fix): the 5s keep-alive
     // idle check alone leaves a reverse crossing stuck for seconds ("must
     // move the Mint mouse home first"). Every 300ms while a drive is active,
@@ -3735,6 +3851,15 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                 }
                 None => clipboard_enabled = false,
             },
+            _ = config_watch.tick() => {
+                apply_live_topology_config(
+                    &dir,
+                    &mut config,
+                    &mut router,
+                    &mut config_bytes_seen,
+                    &mut pending_layout,
+                );
+            }
             _ = yield_probe.tick() => {
                 // Drive-task heartbeat (see TASK_HEARTBEAT_MS): this probe
                 // ticks every 300ms unconditionally, so the watchdog stays
@@ -9508,7 +9633,13 @@ async fn handle_connection(
                 // with a logged reason while the association loop above keeps
                 // serving later streams.
                 let stream_result: Result<()> = async {
+            let config_shared = config.clone();
             let config = local_config;
+            // Live settings bridge (see refresh_live_edge_config): the
+            // session follows edge discipline and placement edits made in
+            // the app while it runs; identity stays as verified.
+            let mut config_revision_seen =
+                CONFIG_REVISION.load(std::sync::atomic::Ordering::Acquire);
             if !peers.read().await.is_pinned(&peer_fingerprint) {
                 reject(&mut send, "peer is not paired").await?;
                 bail!("untrusted peer fingerprint {peer_fingerprint}");
@@ -10120,6 +10251,12 @@ async fn handle_connection(
                                     )?;
                                     continue;
                                 }
+                                refresh_live_edge_config(
+                                    &mut config,
+                                    &config_shared,
+                                    &mut config_revision_seen,
+                                )
+                                .await;
                                 if process_remote_input(
                                     DatagramInput {
                                         sequence: packet.sequence,
@@ -10551,6 +10688,12 @@ async fn handle_connection(
                                 smooth_count += 1;
                             }
                         }
+                        refresh_live_edge_config(
+                            &mut config,
+                            &config_shared,
+                            &mut config_revision_seen,
+                        )
+                        .await;
                         if process_remote_input(
                             packet,
                             &config,
@@ -10622,6 +10765,12 @@ async fn handle_connection(
                         // cursor tracking and hop accumulation run here,
                         // so an edge HandoffRequest fires only when the
                         // tracked cursor truly overflowed the screen.
+                        refresh_live_edge_config(
+                            &mut config,
+                            &config_shared,
+                            &mut config_revision_seen,
+                        )
+                        .await;
                         if process_remote_input(
                             DatagramInput {
                                 sequence: frame.sequence,
@@ -10789,6 +10938,12 @@ async fn handle_connection(
                                     )?;
                                     continue;
                                 }
+                                refresh_live_edge_config(
+                                    &mut config,
+                                    &config_shared,
+                                    &mut config_revision_seen,
+                                )
+                                .await;
                                 if process_remote_input(
                                     DatagramInput {
                                         sequence: packet.sequence,
@@ -11120,6 +11275,49 @@ fn receiver_edge_truth_veto(
         "remote handoff vetoed: OS cursor is not at the edge; staying local in this drive"
     );
     Some((truth_x, truth_y))
+}
+
+/// Copy the live edge-relevant fields from the shared daemon config into a
+/// running episode. Gated by CONFIG_REVISION so the shared lock is touched
+/// only after a local settings change, never per input event. Placement
+/// edits never overwrite measured geometry: dimensions this session has
+/// already learned for a screen id win over the config file's fallback.
+async fn refresh_live_edge_config(
+    config: &mut Config,
+    config_shared: &tokio::sync::RwLock<Config>,
+    revision_seen: &mut u64,
+) {
+    let revision = CONFIG_REVISION.load(std::sync::atomic::Ordering::Acquire);
+    if *revision_seen == revision {
+        return;
+    }
+    *revision_seen = revision;
+    let live = config_shared.read().await;
+    if config.edge_mode != live.edge_mode {
+        tracing::info!(
+            edge_mode = ?live.edge_mode,
+            "live edge mode applied from local settings"
+        );
+        config.edge_mode = live.edge_mode;
+    }
+    if config.double_edge_style != live.double_edge_style {
+        tracing::info!(
+            double_style = ?live.double_edge_style,
+            "live double-edge style applied from local settings"
+        );
+        config.double_edge_style = live.double_edge_style;
+    }
+    if config.layout != live.layout {
+        let mut next = live.layout.clone();
+        for screen in &mut next.screens {
+            if let Some(known) = config.layout.screen(screen.id) {
+                screen.width = known.width;
+                screen.height = known.height;
+            }
+        }
+        config.layout = next;
+        tracing::info!("live screen arrangement applied from local settings");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13965,6 +14163,91 @@ mod tests {
         });
         assert_eq!(pinch_for_send(key, true, false, &mut held), vec![key]);
         assert_eq!(pinch_for_send(key, false, false, &mut held), vec![key]);
+    }
+
+    #[test]
+    fn live_topology_config_hot_applies_mode_and_placement() {
+        use kvm_core::{Edge, EdgeMode, InputEvent, Layout, RoutedEvent};
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("thekvm-live-config-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let peer = "ab".repeat(32);
+        let mut config = Config {
+            device_name: "me".into(),
+            layout: Layout::pair_default("me", "peer", &peer),
+            edge_mode: EdgeMode::Double,
+            ..Config::default()
+        };
+        config.save(&dir.join("config.json")).unwrap();
+        let mut bytes_seen = std::fs::read(dir.join("config.json")).ok();
+        let mut router = EdgeRouter::new(config.layout.clone()).unwrap();
+        router.adopt_local_screen_size(1600, 900);
+        let mut pending = None;
+        // Unchanged file: nothing moves.
+        apply_live_topology_config(
+            &dir,
+            &mut config,
+            &mut router,
+            &mut bytes_seen,
+            &mut pending,
+        );
+        assert!(pending.is_none());
+        assert_eq!(
+            router.layout().self_screen().map(|s| (s.width, s.height)),
+            Some((1600, 900))
+        );
+        // Mid-drive: the drive keeps the arrangement it entered under.
+        router.place_local_cursor(1580, 450).unwrap();
+        let handoff = router.route(InputEvent::MouseMove { dx: 5000, dy: 0 });
+        assert!(matches!(
+            handoff,
+            RoutedEvent::Handoff {
+                edge: Edge::Right,
+                ..
+            }
+        ));
+        let target = router.active_remote().unwrap();
+        let mut updated = config.clone();
+        updated.edge_mode = EdgeMode::Single;
+        updated.layout.place_peer(&peer, Edge::Left).unwrap();
+        updated.save(&dir.join("config.json")).unwrap();
+        apply_live_topology_config(
+            &dir,
+            &mut config,
+            &mut router,
+            &mut bytes_seen,
+            &mut pending,
+        );
+        assert!(pending.is_some(), "placement waits for the active drive");
+        // Mode applied at once even mid-drive (it gates the next crossing).
+        assert_eq!(config.edge_mode, EdgeMode::Single);
+        router.restore_local(target).unwrap();
+        // The retry runs on the next tick even though the file is unchanged.
+        apply_live_topology_config(
+            &dir,
+            &mut config,
+            &mut router,
+            &mut bytes_seen,
+            &mut pending,
+        );
+        assert!(pending.is_none(), "settled router adopts the edit");
+        assert_eq!(
+            router.layout().self_screen().map(|s| (s.width, s.height)),
+            Some((1600, 900)),
+            "placement edits must never overwrite measured geometry"
+        );
+        router.place_local_cursor(20, 450).unwrap();
+        assert!(matches!(
+            router.route(InputEvent::MouseMove { dx: -5000, dy: 0 }),
+            RoutedEvent::Handoff {
+                edge: Edge::Left,
+                ..
+            }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1,35 +1,69 @@
 import { Button, ComboBox, LineEdit, Palette, Switch, TabWidget } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------
-// Drawn controls for the nearby-devices listing. Native Button chrome is
-// platform-styled (Windows paints a blue accent squircle) and the text
-// glyphs differed per OS — the ✕ close ended up as a tofu box inside a
-// blue squircle on Windows while it looked right on Mint. These are pure
-// Slint drawing instead, so both computers render identical pixels.
+// One loading language: a donut of arc + track, rotating smoothly with
+// the shared monotonic spinner tick. Every waiting state (scan, connect
+// warm-up, edge-mode apply) uses exactly this, at the size and colours
+// its context needs. Drawn rather than font-based so Windows and Linux
+// render identical pixels.
 // ---------------------------------------------------------------------
-
-// Round loading animation: a 300° arc stepped by the shared spinner tick
-// (8 steps × 45°). Drawn rather than font-based for the same reason.
 component SpinnerArc inherits Rectangle {
     in property <length> diameter: 18px;
     in property <color> arc-color: #22c55e;
+    in property <color> track-color: #14532d;
     in property <int> tick: 0;
     width: diameter;
     height: diameter;
     background: transparent;
-    // The rotation lives on the nested path: transforms on a component
-    // root are ignored by Slint.
+    // Full-circle track under the moving arc.
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        stroke: track-color;
+        stroke-width: 3.2px;
+        stroke-line-cap: round;
+        fill: transparent;
+        commands: "M 12 3 A 9 9 0 1 1 12 21 A 9 9 0 1 1 12 3";
+    }
+    // 270° arc: one step of 45° per 90ms tick, animated across the gap
+    // so the motion never stops between steps.
     Path {
         width: 100%;
         height: 100%;
         viewbox-width: 24;
         viewbox-height: 24;
         stroke: arc-color;
-        stroke-width: 3px;
+        stroke-width: 3.2px;
         stroke-line-cap: round;
+        fill: transparent;
         commands: "M 12 3 A 9 9 0 1 1 3 12";
-        transform-rotation: Math.mod(tick, 8) * 45deg;
-        transform-origin: { x: diameter / 2, y: diameter / 2 };
+        transform-rotation: root.tick * 45deg;
+        animate transform-rotation { duration: 130ms; easing: linear; }
+    }
+}
+
+// Drawn chevron (no font glyph): points down; rotates 180° when open.
+component ChevronGlyph inherits Rectangle {
+    in property <bool> open: false;
+    in property <color> glyph-color: #9ca3af;
+    width: 14px;
+    height: 14px;
+    background: transparent;
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 12;
+        viewbox-height: 12;
+        stroke: root.glyph-color;
+        stroke-width: 1.8px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        fill: transparent;
+        commands: "M 2.5 4.5 L 6 8 L 9.5 4.5";
+        transform-rotation: root.open ? 180deg : 0deg;
+        animate transform-rotation { duration: 160ms; easing: ease-out; }
     }
 }
 
@@ -63,8 +97,8 @@ component CloseButton inherits Rectangle {
     }
 }
 
-// Rescan: the refresh arrow, replaced by the round animation while a
-// scan runs, so the button itself shows the work in progress.
+// Rescan: the refresh arrow, replaced by the shared donut while a scan
+// runs, so the button itself shows the work in progress.
 component RescanButton inherits Rectangle {
     in property <bool> scanning: false;
     in property <bool> enabled: true;
@@ -101,59 +135,92 @@ component RescanButton inherits Rectangle {
     }
 }
 
-// One computer in the arrangement strip: a small screen card. The local
-// card carries the green accent; the linked card stays neutral so the
-// pair reads as "me + them" at a glance.
-component ScreenCard inherits Rectangle {
+// ---------------------------------------------------------------------
+// The arrangement is drawn as actual monitors: bezel, screen, neck and
+// base. Exit edges light green on this computer; entry edges light teal
+// on the linked one, so the crossing discipline is visible on the same
+// picture the user assembles.
+// ---------------------------------------------------------------------
+component MonitorCard inherits Rectangle {
     in property <string> title: "THIS PC";
     in property <string> name: "";
     in property <bool> local: false;
-    width: 150px;
-    height: 96px;
-    background: local ? #14532d : #1c1917;
-    border-radius: 10px;
-    border-width: 2px;
-    border-color: local ? #22c55e : #57534e;
-    VerticalLayout {
-        padding: 8px;
-        alignment: center;
-        spacing: 4px;
-        Text {
-            text: title;
-            color: local ? #bbf7d0 : #d6d3d1;
-            font-size: 10px;
-            font-weight: 700;
-            letter-spacing: 1px;
-            horizontal-alignment: center;
-        }
-        Text {
-            text: name == "" ? "…" : name;
-            color: white;
-            font-size: 13px;
-            font-weight: 700;
-            horizontal-alignment: center;
-            overflow: elide;
-        }
-    }
-}
-
-// The facing edge between the two cards: a drawn double chevron, never a
-// font glyph (the ◀ ▶ characters rendered differently per OS).
-component EdgeGlyph inherits Rectangle {
-    width: 18px;
-    height: 18px;
+    in property <bool> exit-left: false;
+    in property <bool> exit-right: false;
+    in property <bool> enter-left: false;
+    in property <bool> enter-right: false;
+    in property <bool> hovered: false;
+    in property <bool> dragging: false;
+    in property <bool> dimmed: false;
+    width: 160px;
+    height: 118px;
     background: transparent;
-    Path {
+    opacity: dimmed ? 0.55 : 1;
+    body := Rectangle {
+        y: 2px;
         width: 100%;
-        height: 100%;
-        viewbox-width: 18;
-        viewbox-height: 18;
-        stroke: #22c55e;
-        stroke-width: 2px;
-        stroke-line-cap: round;
-        stroke-line-join: round;
-        commands: "M 2 3 L 8 9 L 2 15 M 9 3 L 15 9 L 9 15";
+        height: 98px;
+        background: #17171a;
+        border-radius: 9px;
+        border-width: 1.5px;
+        border-color: root.local ? (root.hovered || root.dragging ? #4ade80 : #22c55e) : (root.hovered || root.dragging ? #a8a29e : #57534e);
+        drop-shadow-color: #00000088;
+        drop-shadow-blur: 10px;
+        drop-shadow-offset-y: 3px;
+        Rectangle {
+            x: 7px;
+            y: 7px;
+            width: parent.width - 14px;
+            height: parent.height - 18px;
+            background: root.local
+                ? @linear-gradient(180deg, #0e2a1c 0%, #08150e 100%)
+                : @linear-gradient(180deg, #141414 0%, #0a0a0a 100%);
+            border-radius: 4px;
+            // Exit bars (this computer) and entry bars (linked computer).
+            if root.exit-left : Rectangle { x: 0; y: 12px; width: 3px; height: parent.height - 24px; border-radius: 2px; background: #22c55e; }
+            if root.exit-right : Rectangle { x: parent.width - 3px; y: 12px; width: 3px; height: parent.height - 24px; border-radius: 2px; background: #22c55e; }
+            if root.enter-left : Rectangle { x: 0; y: 12px; width: 3px; height: parent.height - 24px; border-radius: 2px; background: #5eead4; }
+            if root.enter-right : Rectangle { x: parent.width - 3px; y: 12px; width: 3px; height: parent.height - 24px; border-radius: 2px; background: #5eead4; }
+            // Tiny direction chevrons beside the lit edges.
+            if root.exit-left : Path { x: 7px; y: (parent.height - 10px) / 2; width: 10px; height: 10px; viewbox-width: 10; viewbox-height: 10; stroke: #22c55e; stroke-width: 1.8px; stroke-line-cap: round; stroke-line-join: round; fill: transparent; commands: "M 8 2 L 3 5 L 8 8"; }
+            if root.exit-right : Path { x: parent.width - 17px; y: (parent.height - 10px) / 2; width: 10px; height: 10px; viewbox-width: 10; viewbox-height: 10; stroke: #22c55e; stroke-width: 1.8px; stroke-line-cap: round; stroke-line-join: round; fill: transparent; commands: "M 2 2 L 7 5 L 2 8"; }
+            if root.enter-left : Path { x: 7px; y: (parent.height - 10px) / 2; width: 10px; height: 10px; viewbox-width: 10; viewbox-height: 10; stroke: #5eead4; stroke-width: 1.8px; stroke-line-cap: round; stroke-line-join: round; fill: transparent; commands: "M 3 2 L 8 5 L 3 8"; }
+            if root.enter-right : Path { x: parent.width - 17px; y: (parent.height - 10px) / 2; width: 10px; height: 10px; viewbox-width: 10; viewbox-height: 10; stroke: #5eead4; stroke-width: 1.8px; stroke-line-cap: round; stroke-line-join: round; fill: transparent; commands: "M 8 2 L 3 5 L 8 8"; }
+            Text {
+                x: 10px;
+                y: 6px;
+                width: parent.width - 20px;
+                text: root.title;
+                color: root.local ? #6ee7b7 : #78716c;
+                font-size: 8px;
+                font-weight: 800;
+                letter-spacing: 1.2px;
+                horizontal-alignment: center;
+            }
+            Text {
+                x: 10px;
+                y: parent.height / 2 - 3px;
+                width: parent.width - 20px;
+                text: root.name == "" ? "…" : root.name;
+                color: white;
+                font-size: 12px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                overflow: elide;
+            }
+        }
+        // Power LED.
+        Rectangle {
+            x: parent.width / 2 - 2px;
+            y: parent.height - 6px;
+            width: 4px;
+            height: 4px;
+            border-radius: 2px;
+            background: root.local ? #22c55e : #44403c;
+        }
     }
+    Rectangle { x: 72px; y: 100px; width: 16px; height: 9px; background: #26262a; }
+    Rectangle { x: 56px; y: 109px; width: 48px; height: 4px; border-radius: 2px; background: #26262a; }
 }
 
 // One tap moves the linked screen to that side; the active side stays
@@ -188,49 +255,489 @@ component ChevronButton inherits Rectangle {
         stroke-width: 2.4px;
         stroke-line-cap: round;
         stroke-line-join: round;
+        fill: transparent;
         commands: points-left ? "M 11 3 L 5.5 9 L 11 15" : "M 7 3 L 12.5 9 L 7 15";
     }
 }
 
-// Interactive arrangement: this computer and the linked computer in the
-// order they physically sit. The chevrons move the linked card to that
-// side; placement persists exactly like the old buttons.
-component ArrangementStrip inherits Rectangle {
+// The mesh: this computer and the linked computer as two monitors, with
+// the exit/entry edges lit. The linked monitor is draggable: it follows
+// the pointer, a magnetic target lights up on the side it would land,
+// and releasing it there swaps the placement. Double-clicking either
+// monitor swaps too. Chevrons remain for a single precise tap.
+component ArrangementMesh inherits Rectangle {
     in property <string> local-name: "";
     in property <string> peer-name: "";
     in property <bool> peer-on-right: true;
     in property <bool> enabled: false;
+    in property <int> edge-mode: 0;
     callback to-left();
     callback to-right();
-    height: 96px;
+
+    height: 166px;
+    background: #0d1117;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: #1f2937;
+
+    property <length> margin: 52px;
+    property <length> card-w: 160px;
+    property <length> card-y: 32px;
+    property <length> card-h: 118px;
+    property <length> slot-distance: root.width - 2 * root.margin - root.card-w;
+    property <length> local-x: root.peer-on-right ? root.margin : root.width - root.margin - root.card-w;
+    property <length> peer-x: root.peer-on-right ? root.width - root.margin - root.card-w : root.margin;
+    property <length> drag-limit: root.slot-distance + 24px;
+    property <length> drag-start-abs: 0px;
+    in-out property <bool> dragging: false;
+    in-out property <length> drag-dx: 0px;
+    // A drop on the other side holds its dragged position until the
+    // placement is confirmed upstream, then snaps magnetically into the
+    // new slot — no rubber-band back to the old one first.
+    in-out property <bool> flip-pending: false;
+    in-out property <bool> flip-right: false;
+    changed peer-on-right => {
+        if (root.flip-pending && root.peer-on-right == root.flip-right) {
+            root.flip-pending = false;
+            root.drag-dx = 0px;
+        }
+    }
+    property <bool> will-land-right: root.peer-x + root.drag-dx + root.card-w / 2 > root.width / 2;
+    Timer {
+        interval: 1500ms;
+        running: root.flip-pending;
+        triggered => {
+            // The placement never landed: return the screen to truth.
+            if (root.peer-on-right != root.flip-right) {
+                root.flip-pending = false;
+                root.drag-dx = 0px;
+            }
+        }
+    }
+
+    property <bool> exit-left: root.edge-mode != 0 || !root.peer-on-right;
+    property <bool> exit-right: root.edge-mode != 0 || root.peer-on-right;
+    property <bool> enter-left: root.edge-mode == 1 || root.edge-mode == 2 || (root.edge-mode == 0 && !root.peer-on-right);
+    property <bool> enter-right: root.edge-mode == 1 || root.edge-mode == 3 || (root.edge-mode == 0 && root.peer-on-right);
+
+    // Legend + affordance hint.
+    HorizontalLayout {
+        x: 14px;
+        y: 9px;
+        width: root.width - 28px;
+        spacing: 6px;
+        Rectangle { width: 12px; height: 14px; background: transparent; Rectangle { y: 5.5px; width: 12px; height: 3px; border-radius: 1.5px; background: #22c55e; } }
+        Text { text: "Exit"; color: #9ca3af; font-size: 10px; vertical-alignment: center; }
+        Rectangle { width: 12px; height: 14px; background: transparent; Rectangle { y: 5.5px; width: 12px; height: 3px; border-radius: 1.5px; background: #5eead4; } }
+        Text { text: "Entry"; color: #9ca3af; font-size: 10px; vertical-alignment: center; }
+        Rectangle { horizontal-stretch: 1; }
+        Text { text: "drag or double-click"; color: #4b5563; font-size: 10px; vertical-alignment: center; }
+    }
+
+    // Magnetic landing slot while dragging.
+    if root.dragging : Rectangle {
+        x: root.will-land-right ? root.width - root.margin - root.card-w : root.margin;
+        y: root.card-y;
+        width: root.card-w;
+        height: root.card-h;
+        border-radius: 10px;
+        border-width: 1.5px;
+        border-color: root.will-land-right == root.peer-on-right ? #22c55e33 : #22c55e;
+        background: #22c55e10;
+    }
+
+    ChevronButton {
+        x: 7px;
+        y: root.card-y + root.card-h / 2 - 19px;
+        points-left: true;
+        active: !root.dragging && !root.peer-on-right;
+        enabled: root.enabled;
+        clicked => { root.to-left(); }
+    }
+    ChevronButton {
+        x: root.width - 45px;
+        y: root.card-y + root.card-h / 2 - 19px;
+        points-left: false;
+        active: !root.dragging && root.peer-on-right;
+        enabled: root.enabled;
+        clicked => { root.to-right(); }
+    }
+
+    local := MonitorCard {
+        x: root.local-x;
+        y: root.card-y;
+        title: "THIS PC";
+        name: root.local-name;
+        local: true;
+        exit-left: root.enabled && root.exit-left;
+        exit-right: root.enabled && root.exit-right;
+        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
+    }
+    peer := MonitorCard {
+        x: root.peer-x + (root.dragging || root.flip-pending ? root.drag-dx : 0px);
+        y: root.card-y;
+        title: "LINKED";
+        name: root.enabled ? (root.peer-name == "" ? "Linked PC" : root.peer-name) : "Not linked";
+        local: false;
+        enter-left: root.enabled && root.enter-left;
+        enter-right: root.enabled && root.enter-right;
+        hovered: drag-area.has-hover;
+        dragging: root.dragging;
+        dimmed: !root.enabled;
+        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
+    }
+    drag-area := TouchArea {
+        x: root.peer-x + (root.dragging || root.flip-pending ? root.drag-dx : 0px);
+        y: root.card-y;
+        width: root.card-w;
+        height: root.card-h;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? (root.dragging ? grabbing : grab) : default;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                root.flip-pending = false;
+                root.dragging = true;
+                root.drag-start-abs = self.absolute-position.x + self.mouse-x;
+                root.drag-dx = 0px;
+            } else if (event.kind == PointerEventKind.move && root.dragging) {
+                root.drag-dx = max(-root.drag-limit, min(root.drag-limit, (self.absolute-position.x + self.mouse-x) - root.drag-start-abs));
+            } else if ((event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) && root.dragging) {
+                root.dragging = false;
+                let want-right = root.will-land-right;
+                if (want-right != root.peer-on-right) {
+                    root.flip-pending = true;
+                    root.flip-right = want-right;
+                    if (want-right) {
+                        root.to-right();
+                    } else {
+                        root.to-left();
+                    }
+                } else {
+                    root.drag-dx = 0px;
+                }
+            }
+        }
+        double-clicked => {
+            if (root.peer-on-right) { root.to-left(); } else { root.to-right(); }
+        }
+        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
+    }
+}
+
+// Schematic crossing diagram for one discipline: green bars are exit
+// edges on this computer, teal bars are entry edges on the linked one.
+component EdgeModeDiagram inherits Rectangle {
+    in property <int> mode: 0;
+    width: 128px;
+    height: 50px;
+    background: transparent;
+    // Local monitor (left, peer shown on the right).
+    Rectangle { x: 2px; y: 4px; width: 44px; height: 30px; background: #17171a; border-radius: 4px; border-width: 1px; border-color: #22c55e; }
+    Rectangle { x: 6px; y: 8px; width: 36px; height: 22px; background: #0b1f14; border-radius: 2px; }
+    // Linked monitor.
+    Rectangle { x: 82px; y: 4px; width: 44px; height: 30px; background: #17171a; border-radius: 4px; border-width: 1px; border-color: #57534e; }
+    Rectangle { x: 86px; y: 8px; width: 36px; height: 22px; background: #101010; border-radius: 2px; }
+    // Exit edges: right always; left too for the double disciplines.
+    if root.mode != 0 : Rectangle { x: 6px; y: 10px; width: 2px; height: 18px; border-radius: 1px; background: #22c55e; }
+    Rectangle { x: 40px; y: 10px; width: 2px; height: 18px; border-radius: 1px; background: #22c55e; }
+    // Entry edges: left for single/mirror/fixed-left; right for mirror/fixed-right.
+    if root.mode != 3 : Rectangle { x: 86px; y: 10px; width: 2px; height: 18px; border-radius: 1px; background: #5eead4; }
+    if root.mode == 1 || root.mode == 3 : Rectangle { x: 120px; y: 10px; width: 2px; height: 18px; border-radius: 1px; background: #5eead4; }
+    // The crossing itself.
+    Path {
+        x: 48px;
+        y: 13px;
+        width: 74px;
+        height: 12px;
+        viewbox-width: 74;
+        viewbox-height: 12;
+        stroke: #22c55e;
+        stroke-width: 1.5px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        fill: transparent;
+        commands: root.mode == 3 ? "M 1 6 L 70 6 M 65 2 L 70 6 L 65 10" : "M 1 6 L 36 6 M 31 2 L 36 6 L 31 10";
+    }
+}
+
+component EdgeModeTile inherits Rectangle {
+    in property <int> mode: 0;
+    in property <string> label: "";
+    in property <bool> selected: false;
+    in property <bool> applying: false;
+    in property <bool> enabled: true;
+    in property <int> tick: 0;
+    callback clicked();
+    width: 150px;
+    height: 104px;
+    border-radius: 10px;
+    background: root.selected ? #0f2a1a : #111827;
+    border-width: 1.5px;
+    border-color: root.selected ? #22c55e : (hit.has-hover && root.enabled ? #4b5563 : #1f2937);
+    opacity: root.enabled ? 1 : 0.4;
+    animate background { duration: 140ms; }
+    animate border-color { duration: 140ms; }
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { if (root.enabled && !root.applying) { root.clicked(); } }
+    }
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { if (root.enabled && !root.applying) { root.clicked(); } }
+    VerticalLayout {
+        padding: 8px;
+        spacing: 5px;
+        alignment: center;
+        EdgeModeDiagram { mode: root.mode; }
+        Text {
+            text: root.label;
+            color: root.selected ? #86efac : #9ca3af;
+            font-size: 12px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+    }
+    // Selection indicator: a lit dot, mirrored by the green frame.
+    if root.selected : Rectangle {
+        x: root.width - 15px;
+        y: 9px;
+        width: 6px;
+        height: 6px;
+        border-radius: 3px;
+        background: #22c55e;
+    }
+    // Applying this discipline: the same donut as everywhere else.
+    if root.applying : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #0a0a0ad0;
+        border-radius: 10px;
+        SpinnerArc {
+            x: (root.width - 26px) / 2;
+            y: (root.height - 26px) / 2;
+            diameter: 26px;
+            tick: root.tick;
+        }
+    }
+}
+
+component EdgeModePicker inherits Rectangle {
+    in property <int> selected: 1;
+    in property <bool> applying: false;
+    in property <int> pending-index: -1;
+    in property <bool> enabled: false;
+    in property <int> tick: 0;
+    callback picked(int);
+    height: 104px;
     background: transparent;
     HorizontalLayout {
-        spacing: 12px;
+        spacing: 10px;
         alignment: center;
-        ChevronButton {
-            points-left: true;
-            active: !root.peer-on-right;
+        EdgeModeTile {
+            mode: 0;
+            label: "Single";
+            selected: root.selected == 0;
+            applying: root.applying && root.pending-index == 0;
             enabled: root.enabled;
-            clicked => { root.to-left(); }
+            tick: root.tick;
+            clicked => { root.picked(0); }
         }
-        if root.peer-on-right : HorizontalLayout {
-            spacing: 12px;
-            ScreenCard { title: "THIS PC"; name: root.local-name; local: true; }
-            EdgeGlyph {}
-            ScreenCard { title: "LINKED"; name: root.peer-name; }
-        }
-        if !root.peer-on-right : HorizontalLayout {
-            spacing: 12px;
-            ScreenCard { title: "LINKED"; name: root.peer-name; }
-            EdgeGlyph {}
-            ScreenCard { title: "THIS PC"; name: root.local-name; local: true; }
-        }
-        ChevronButton {
-            points-left: false;
-            active: root.peer-on-right;
+        EdgeModeTile {
+            mode: 1;
+            label: "Mirror";
+            selected: root.selected == 1;
+            applying: root.applying && root.pending-index == 1;
             enabled: root.enabled;
-            clicked => { root.to-right(); }
+            tick: root.tick;
+            clicked => { root.picked(1); }
         }
+        EdgeModeTile {
+            mode: 2;
+            label: "Fixed left";
+            selected: root.selected == 2;
+            applying: root.applying && root.pending-index == 2;
+            enabled: root.enabled;
+            tick: root.tick;
+            clicked => { root.picked(2); }
+        }
+        EdgeModeTile {
+            mode: 3;
+            label: "Fixed right";
+            selected: root.selected == 3;
+            applying: root.applying && root.pending-index == 3;
+            enabled: root.enabled;
+            tick: root.tick;
+            clicked => { root.picked(3); }
+        }
+    }
+}
+
+// One role option inside the dropdown popup.
+component RoleRow inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> selected: false;
+    callback picked();
+    height: 40px;
+    background: hit.has-hover ? #1f2937 : transparent;
+    border-radius: 7px;
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.picked(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        Text {
+            text: root.label;
+            color: root.selected ? #86efac : #e5e7eb;
+            font-size: 14px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        if root.selected : Path {
+            width: 12px;
+            height: 12px;
+            viewbox-width: 12;
+            viewbox-height: 12;
+            stroke: #22c55e;
+            stroke-width: 2px;
+            stroke-line-cap: round;
+            stroke-line-join: round;
+            fill: transparent;
+            commands: "M 2 6 L 5 9 L 10 3";
+        }
+    }
+}
+
+// Role selection as a proper dropdown with a drawn chevron. The popup is
+// a PopupWindow, so it floats above the tab content and closes on an
+// outside click; the chevron flips while it is open.
+component RoleDropdown inherits Rectangle {
+    in property <string> current: "Both ways";
+    in property <int> mode-index: 0;
+    in property <bool> enabled: true;
+    callback picked(int);
+    width: 230px;
+    height: 40px;
+    border-radius: 9px;
+    background: hit.has-hover || popup.is-open ? #16202c : #111827;
+    border-width: 1px;
+    border-color: popup.is-open ? #22c55e : (hit.has-hover ? #4b5563 : #374151);
+    animate background { duration: 120ms; }
+    animate border-color { duration: 120ms; }
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { popup.show(); }
+    }
+    accessible-role: combobox;
+    accessible-label: "This computer's role";
+    accessible-expanded: popup.is-open;
+    accessible-action-expand => { popup.show(); }
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 8px;
+        Text {
+            text: root.current;
+            color: white;
+            font-size: 14px;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        ChevronGlyph { open: popup.is-open; glyph-color: popup.is-open ? #22c55e : #9ca3af; }
+    }
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 6px;
+        width: root.width;
+        height: 136px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #111827;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: #374151;
+            drop-shadow-color: #000000aa;
+            drop-shadow-blur: 16px;
+            drop-shadow-offset-y: 6px;
+            VerticalLayout {
+                padding: 6px;
+                spacing: 2px;
+                alignment: start;
+                RoleRow {
+                    label: "Both ways";
+                    selected: root.mode-index == 0;
+                    picked => { popup.close(); root.picked(0); }
+                }
+                RoleRow {
+                    label: "Control other only";
+                    selected: root.mode-index == 1;
+                    picked => { popup.close(); root.picked(1); }
+                }
+                RoleRow {
+                    label: "Be controlled only";
+                    selected: root.mode-index == 2;
+                    picked => { popup.close(); root.picked(2); }
+                }
+            }
+        }
+    }
+}
+
+// Settings row: label left, switch right, nothing else.
+component SettingSwitch inherits Rectangle {
+    in property <string> label: "";
+    in-out property <bool> checked: false;
+    in property <bool> enabled: true;
+    callback toggled();
+    height: 36px;
+    HorizontalLayout {
+        spacing: 10px;
+        Text {
+            text: root.label;
+            color: root.enabled ? #d1d5db : #6b7280;
+            font-size: 14px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Switch {
+            checked <=> root.checked;
+            enabled: root.enabled;
+            toggled => { root.toggled(); }
+        }
+    }
+}
+
+// Collapsible section header for things that should stay out of sight.
+component Disclosure inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> open: false;
+    callback clicked();
+    height: 36px;
+    background: transparent;
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.clicked(); }
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: root.label;
+            color: #d1d5db;
+            font-size: 14px;
+            font-weight: 700;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        ChevronGlyph { open: root.open; glyph-color: #9ca3af; }
     }
 }
 
@@ -315,13 +822,22 @@ export component AppWindow inherits Window {
     in property <bool> auto-connect-known: false;
     in-out property <bool> auto-connect-busy: false;
     in-out property <string> auto-connect-note: "";
+    // 0 Both ways, 1 Control other only, 2 Be controlled only.
     in-out property <int> mode-index: 0;
+    // 0 Single, 1 Mirror, 2 Fixed left, 3 Fixed right.
     in-out property <int> edge-mode-index: 1;
+    // True while an edge-mode change is being applied to a live child; the
+    // pressed tile shows the donut until the child acknowledges.
+    in property <bool> edge-applying: false;
+    // Which tile was pressed last, so its donut shows (the daemon may not
+    // have applied the new selection yet when the spinner starts).
+    in-out property <int> pending-edge-index: -1;
     in property <string> role-text: "Both ways";
     in property <string> app-version: "";
     // Taskbar/dock alert: set while an incoming pairing waits, so a
     // minimized window still announces the request.
     in property <string> title-alert: "";
+    in-out property <bool> advanced-open: false;
     in-out property <string> layout-path: "";
     in-out property <string> peer-address: "";
     in-out property <string> pair-code: "";
@@ -330,13 +846,11 @@ export component AppWindow inherits Window {
     // Nearby-devices card (top of the Connect tab): shown on startup so
     // the LAN set is visible without hunting for the Devices tab. The
     // drawn cross hides it; the drawn refresh button rescans (and shows
-    // the round animation while the scan runs), and the UI re-reveals the
-    // card when a background scan detects a NEW device, so a hidden card
-    // can never keep a nearby computer invisible. Listing only — never
-    // dials.
+    // the donut while the scan runs), and the UI re-reveals the card when
+    // a background scan detects a NEW device, so a hidden card can never
+    // keep a nearby computer invisible. Listing only — never dials.
     in-out property <bool> discovery-card-visible: true;
-    // True while a scan is in flight: the card shows the detection
-    // animation instead of a dead row.
+    // True while a scan is in flight.
     in-out property <bool> discovery-scanning: false;
     // Scanned devices (label + dial address behind each row): refreshed by
     // the Scan button and, when auto-discovery is on, the background poll.
@@ -358,9 +872,9 @@ export component AppWindow inherits Window {
     // First-connect link warm-up: set when the user presses Connect (or
     // the station dials back), cleared the moment the session display
     // settles (see set_session). While set and no session is live, the
-    // Connect tab shows a small round loading spinner instead of a dead
-    // row — and crossings stay gated daemon-side until edge-ready, so
-    // the first push after the spinner is already warm and instant.
+    // Connect tab shows the donut beside the session line — and crossings
+    // stay gated daemon-side until edge-ready, so the first push after
+    // the spinner is already warm and instant.
     in property <bool> link-connecting: false;
     in-out property <int> spinner-tick: 0;
 
@@ -421,12 +935,14 @@ export component AppWindow inherits Window {
                 Flickable {
                 VerticalLayout {
                     padding: 12px;
-                    spacing: 10px;
+                    spacing: 12px;
+
+                    // ---- Nearby devices ----------------------------------
                     if discovery-card-visible : Rectangle {
                         background: #111827;
                         border-radius: 10px;
                         border-width: 1px;
-                        border-color: #374151;
+                        border-color: #1f2937;
                         VerticalLayout {
                             padding: 10px;
                             spacing: 8px;
@@ -449,31 +965,18 @@ export component AppWindow inherits Window {
                                     clicked => { hide-discovery(); }
                                 }
                             }
-                            if discovery-scanning : HorizontalLayout {
-                                spacing: 10px;
-                                SpinnerArc {
-                                    diameter: 18px;
-                                    tick: root.spinner-tick;
-                                }
-                                Text {
-                                    text: "Scanning…";
-                                    color: #6ee7b7;
-                                    font-size: 12px;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                }
-                            }
-                            if !discovery-scanning : Text {
-                                text: discovery-text;
-                                color: #9ca3af;
+                            Text {
+                                text: root.discovery-scanning ? "Scanning…" : root.discovery-text;
+                                color: root.discovery-scanning ? #6ee7b7 : #9ca3af;
                                 font-size: 12px;
                                 wrap: word-wrap;
                             }
                             if discovered-labels.length > 0 : HorizontalLayout {
-                                spacing: 12px;
+                                spacing: 10px;
                                 found2 := ComboBox {
                                     model: root.discovered-labels;
                                     current-index <=> root.discovered-index;
+                                    horizontal-stretch: 1;
                                 }
                                 Button {
                                     text: "Connect";
@@ -483,73 +986,64 @@ export component AppWindow inherits Window {
                                 }
                             }
                             if discovered-labels.length == 0 && !discovery-scanning : Text {
-                                text: "No devices yet.";
+                                text: "No devices found.";
                                 color: #6b7280;
                                 font-size: 11px;
-                                wrap: word-wrap;
                             }
                         }
                     }
                     // The card's rescan control lives inside the card, so
-                    // hiding it must leave a way back: this compact row
-                    // scans (and thereby re-shows the listing) without
-                    // restoring the full card.
-                    if !discovery-card-visible : HorizontalLayout {
-                        spacing: 8px;
+                    // hiding it must leave a way back: this compact chip
+                    // rescans and reopens the listing.
+                    if !discovery-card-visible : Rectangle {
+                        width: 34px;
+                        height: 34px;
+                        border-radius: 8px;
+                        background: #111827;
+                        border-width: 1px;
+                        border-color: #1f2937;
                         RescanButton {
+                            x: 4px;
+                            y: 4px;
                             scanning: root.discovery-scanning;
                             tick: root.spinner-tick;
-                            clicked => { discover-lan(); }
+                            clicked => {
+                                root.discovery-card-visible = true;
+                                discover-lan();
+                            }
                         }
+                    }
+
+                    // ---- Role --------------------------------------------
+                    HorizontalLayout {
+                        spacing: 10px;
                         Text {
-                            text: "Scan for nearby devices";
+                            text: "This computer";
                             color: #9ca3af;
-                            font-size: 12px;
+                            font-size: 13px;
                             vertical-alignment: center;
                         }
-                    }
-                    Text { text: "This computer will:"; color: white; font-size: 16px; font-weight: 700; }
-                    Text {
-                        text: "Current role: " + role-text;
-                        color: #22c55e;
-                        font-size: 14px;
-                        font-weight: 700;
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
+                        Rectangle { horizontal-stretch: 1; }
                         // Role selection is local configuration, not a
-                        // daemon-dependent action: these buttons are always
-                        // pressable. Gating them on daemon reachability once
-                        // made them look permanently dead (no hover, no
-                        // click, no feedback) whenever the status poll
-                        // failed, with no way to tell why.
-                        Button {
-                            text: "Control other only";
-                            clicked => { set-role(1); }
-                        }
-                        Button {
-                            text: "Be controlled only";
-                            clicked => { set-role(2); }
-                        }
-                        Button {
-                            text: "Both ways";
-                            clicked => { set-role(0); }
+                        // daemon-dependent action: the dropdown is always
+                        // pressable. Gating it once made it look permanently
+                        // dead whenever the status poll failed.
+                        RoleDropdown {
+                            current: root.role-text;
+                            mode-index: root.mode-index;
+                            picked(index) => { set-role(index); }
                         }
                     }
-                    Text {
-                        text: mode-index == 1 ? "Control other only: this computer drives the peer. The peer cannot drive back." : mode-index == 2 ? "Be controlled only: the peer drives this computer. This computer cannot drive back." : "Both ways: either computer can drive the other.";
-                        color: #9ca3af;
-                        font-size: 12px;
-                        wrap: word-wrap;
-                    }
-                    Rectangle { height: 1px; background: #262626; }
-                    Text { text: "Connect to the other computer"; color: white; font-size: 16px; font-weight: 700; }
+
+                    // ---- Connect -----------------------------------------
+                    Rectangle { height: 1px; background: #1f2937; }
                     HorizontalLayout {
-                        spacing: 12px;
+                        spacing: 10px;
                         addr := LineEdit {
                             text <=> root.peer-address;
-                            placeholder-text: "e.g. 192.168.1.7";
+                            placeholder-text: "Other computer's address";
                             enabled: !session-active;
+                            horizontal-stretch: 1;
                         }
                         if !session-active : Button {
                             text: "Connect";
@@ -562,130 +1056,84 @@ export component AppWindow inherits Window {
                             clicked => { disconnect(); }
                         }
                     }
+                    code-field := LineEdit {
+                        text <=> root.pair-code;
+                        placeholder-text: "Pairing code (optional)";
+                        enabled: !session-active;
+                    }
+                    // Live session state: donut while the link warms up, a
+                    // green dot only once the session is verified.
                     HorizontalLayout {
-                        spacing: 12px;
-                        code-field := LineEdit {
-                            text <=> root.pair-code;
-                            placeholder-text: "6-digit code from the other computer (optional)";
-                            enabled: !session-active;
+                        spacing: 9px;
+                        if link-connecting && !session-verified : SpinnerArc {
+                            diameter: 16px;
+                            tick: root.spinner-tick;
                         }
-                    }
-                    Text {
-                        text: session-text;
-                        color: session-active ? (session-verified ? #22c55e : #f59e0b) : #9ca3af;
-                        font-size: 13px;
-                        wrap: word-wrap;
-                    }
-                    // First-connect loading animation: a small round
-                    // orbiting dot while the link warms up (pre-warm dial
-                    // + caps + UDP arming, daemon-side). Crossings stay
-                    // gated until edge-ready, so motion the moment this
-                    // disappears rides the warmed stream — super smooth
-                    // both directions from the very first push.
-                    if link-connecting && !session-verified : HorizontalLayout {
-                        spacing: 10px;
-                        Rectangle {
-                            width: 26px;
-                            height: 26px;
-                            // Static gradient ring: the round shape reads
-                            // even between ticks.
-                            Rectangle { x: 21px; y: 11px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
-                            Rectangle { x: 18px; y: 18px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
-                            Rectangle { x: 11px; y: 21px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
-                            Rectangle { x: 4px; y: 18px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
-                            Rectangle { x: 1px; y: 11px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
-                            Rectangle { x: 4px; y: 4px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
-                            Rectangle { x: 11px; y: 1px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
-                            Rectangle { x: 18px; y: 4px; width: 4px; height: 4px; border-radius: 2px; background: #14532d; }
-                            // The orbiting bright dot: 8 positions stepping
-                            // with the timer (~0.7s per orbit).
-                            Rectangle {
-                                width: 4px;
-                                height: 4px;
-                                border-radius: 2px;
-                                background: #22c55e;
-                                x: spinner-tick == 0 ? 21px : spinner-tick == 1 ? 18px : spinner-tick == 2 ? 11px : spinner-tick == 3 ? 4px : spinner-tick == 4 ? 1px : spinner-tick == 5 ? 4px : spinner-tick == 6 ? 11px : 18px;
-                                y: spinner-tick == 0 ? 11px : spinner-tick == 1 ? 18px : spinner-tick == 2 ? 21px : spinner-tick == 3 ? 18px : spinner-tick == 4 ? 11px : spinner-tick == 5 ? 4px : spinner-tick == 6 ? 1px : 4px;
-                            }
+                        if session-verified : Rectangle {
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: #22c55e;
                         }
                         Text {
-                            text: "Warming up…";
-                            color: #22c55e;
+                            text: session-text;
+                            color: session-active ? (session-verified ? #22c55e : #f59e0b) : #9ca3af;
                             font-size: 13px;
-                            font-weight: 700;
                             vertical-alignment: center;
                             wrap: word-wrap;
+                            horizontal-stretch: 1;
                         }
                     }
-                    Rectangle { height: 1px; background: #262626; }
-                    Text {
-                        text: "Your pairing code — the other computer types this to pair:";
-                        color: white;
-                        font-size: 16px;
-                        font-weight: 700;
-                    }
-                    Text {
-                        text: pairing-code == "" ? "starting…" : pairing-code;
-                        color: #22c55e;
-                        font-size: 32px;
-                        font-weight: 800;
-                        letter-spacing: 6px;
-                        horizontal-alignment: center;
-                    }
-                    Text {
-                        text: "Rotates every 30 minutes.";
-                        color: #9ca3af;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
-                    Rectangle { height: 1px; background: #262626; }
                     if driving-text != "" : Text {
                         text: driving-text;
                         color: #22c55e;
-                        font-size: 13px;
+                        font-size: 12px;
                         font-weight: 700;
-                        wrap: word-wrap;
                     }
-                    Rectangle { height: 1px; background: #262626; }
-                    if !connected : Button {
-                        text: "Start background service";
-                        clicked => { start-daemon(); }
+
+                    // ---- Pairing code ------------------------------------
+                    Rectangle { height: 1px; background: #1f2937; }
+                    HorizontalLayout {
+                        Text {
+                            text: "Pairing code";
+                            color: #9ca3af;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text {
+                            text: root.pairing-code == "" ? "…" : root.pairing-code;
+                            color: #22c55e;
+                            font-size: 24px;
+                            font-weight: 800;
+                            letter-spacing: 5px;
+                            vertical-alignment: center;
+                        }
                     }
-                    Rectangle { height: 1px; background: #262626; }
+
+                    // ---- Pairing ceremonies ------------------------------
                     if pending-verification-code != "" : VerticalLayout {
                         spacing: 6px;
                         Text {
-                            text: "OUTGOING — you are calling the other computer:";
+                            text: "Does " + (pending-peer-name == "" ? "the other computer" : pending-peer-name) + " show this code?";
                             color: #f59e0b;
-                            font-size: 12px;
-                            font-weight: 700;
-                        }
-                        Text {
-                            text: "Does " + (pending-peer-name == "" ? "the other computer" : pending-peer-name) + " show this same code?";
-                            color: white;
-                            font-size: 15px;
+                            font-size: 13px;
                             font-weight: 700;
                             wrap: word-wrap;
                         }
                         Text {
                             text: pending-verification-code;
                             color: #22c55e;
-                            font-size: 32px;
+                            font-size: 28px;
                             font-weight: 800;
                             letter-spacing: 6px;
                             horizontal-alignment: center;
-                        }
-                        Text {
-                            text: "Compare both codes, then confirm.";
-                            color: #9ca3af;
-                            font-size: 11px;
-                            wrap: word-wrap;
                         }
                         HorizontalLayout {
                             spacing: 12px;
                             alignment: center;
                             Button {
-                                text: "Codes match — connect";
+                                text: "Codes match";
                                 primary: true;
                                 clicked => { confirm-pairing(); }
                             }
@@ -705,22 +1153,16 @@ export component AppWindow inherits Window {
                         // deadlock with both users staring at unanswerable
                         // code screens until everything timed out.
                         Text {
-                            text: "INCOMING — the other computer is calling you:";
+                            text: "Incoming pairing · " + incoming-pairing;
                             color: #f59e0b;
-                            font-size: 12px;
-                            font-weight: 700;
-                        }
-                        Text {
-                            text: "A computer wants to connect: " + incoming-pairing;
-                            color: white;
-                            font-size: 15px;
+                            font-size: 13px;
                             font-weight: 700;
                             wrap: word-wrap;
                         }
                         if incoming-verification-code != "" : Text {
                             text: incoming-verification-code;
                             color: #22c55e;
-                            font-size: 32px;
+                            font-size: 28px;
                             font-weight: 800;
                             letter-spacing: 6px;
                             horizontal-alignment: center;
@@ -746,15 +1188,9 @@ export component AppWindow inherits Window {
                         // (Allow once per link — retries and the dial-back
                         // on the same link never ask again).
                         Text {
-                            text: "INCOMING link — a paired computer wants to drive:";
+                            text: "Link request · " + incoming-link;
                             color: #6ee7b7;
-                            font-size: 12px;
-                            font-weight: 700;
-                        }
-                        Text {
-                            text: incoming-link + " is calling. Allow it to connect and drive this computer.";
-                            color: white;
-                            font-size: 15px;
+                            font-size: 13px;
                             font-weight: 700;
                             wrap: word-wrap;
                         }
@@ -762,7 +1198,7 @@ export component AppWindow inherits Window {
                             spacing: 12px;
                             alignment: center;
                             Button {
-                                text: "Allow link";
+                                text: "Allow";
                                 primary: true;
                                 clicked => { approve-incoming-link(incoming-link-fingerprint); }
                             }
@@ -771,6 +1207,11 @@ export component AppWindow inherits Window {
                                 clicked => { reject-incoming-link(incoming-link-fingerprint); }
                             }
                         }
+                    }
+
+                    if !connected : Button {
+                        text: "Start background service";
+                        clicked => { start-daemon(); }
                     }
                 }
                 }
@@ -781,37 +1222,35 @@ export component AppWindow inherits Window {
                 Flickable {
                 VerticalLayout {
                     padding: 12px;
-                    spacing: 10px;
-                    Text { text: "Find on my network"; color: white; font-size: 16px; font-weight: 700; }
-                    Text {
-                        text: auto-discover ? "Nearby computers appear on their own. Tap one, then Connect — the other side approves." : "Tap Scan network, then Connect — the other side approves.";
-                        color: #9ca3af;
-                        font-size: 12px;
-                        wrap: word-wrap;
-                    }
+                    spacing: 12px;
+
+                    // ---- Computers ---------------------------------------
                     HorizontalLayout {
                         spacing: 10px;
+                        Text {
+                            text: "Computers";
+                            color: white;
+                            font-size: 16px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        if discovery-scanning : SpinnerArc {
+                            diameter: 14px;
+                            tick: root.spinner-tick;
+                        }
                         Button {
-                            text: "Scan network";
+                            text: "Scan";
                             enabled: !discovery-scanning;
                             clicked => { discover-lan(); }
                         }
-                        if discovery-scanning : SpinnerArc {
-                            diameter: 16px;
-                            tick: root.spinner-tick;
-                        }
-                        Text {
-                            text: discovery-text;
-                            color: #9ca3af;
-                            font-size: 11px;
-                            vertical-alignment: center;
-                        }
                     }
                     if discovered-labels.length > 0 : HorizontalLayout {
-                        spacing: 12px;
+                        spacing: 10px;
                         found := ComboBox {
                             model: root.discovered-labels;
                             current-index <=> root.discovered-index;
+                            horizontal-stretch: 1;
                         }
                         Button {
                             text: "Connect";
@@ -820,80 +1259,64 @@ export component AppWindow inherits Window {
                             clicked => { connect-discovered(root.discovered-index); }
                         }
                     }
-                    Rectangle { height: 1px; background: #262626; }
-                    Text { text: "Trusted computers"; color: white; font-size: 16px; font-weight: 700; }
                     Text {
                         text: peer-list;
-                        color: #9ca3af;
-                        font-size: 11px;
+                        color: #d1d5db;
+                        font-size: 12px;
+                        wrap: word-wrap;
                     }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        revoke := LineEdit {
-                            text <=> root.revoke-fingerprint;
-                            placeholder-text: "fingerprint to remove";
-                        }
-                        Button {
-                            text: "Remove";
-                            enabled: revoke.text != "";
-                            clicked => { revoke-peer(revoke.text); }
-                        }
-                    }
-                    Rectangle { height: 1px; background: #262626; }
-                    Text { text: "Screen arrangement"; color: white; font-size: 16px; font-weight: 700; }
-                    ArrangementStrip {
-                        local-name: device-name;
-                        peer-name: linked-peer-name;
-                        peer-on-right: peer-on-right;
-                        enabled: linked-peer-name != "";
+
+                    Rectangle { height: 1px; background: #1f2937; }
+
+                    // ---- Arrangement -------------------------------------
+                    Text { text: "Screen arrangement"; color: white; font-size: 14px; font-weight: 700; }
+                    ArrangementMesh {
+                        local-name: root.device-name;
+                        peer-name: root.linked-peer-name;
+                        peer-on-right: root.peer-on-right;
+                        enabled: root.linked-peer-name != "";
+                        edge-mode: root.edge-mode-index;
                         to-left => { place-peer-left(); }
                         to-right => { place-peer-right(); }
                     }
-                    if linked-peer-name == "" : Text {
-                        text: "Pair a computer first, then tap an arrow to place it.";
-                        color: #6b7280;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
-                    Text { text: "Crossing edges"; color: white; font-size: 14px; font-weight: 700; }
+
+                    Rectangle { height: 1px; background: #1f2937; }
+
+                    // ---- Crossing edges ----------------------------------
                     HorizontalLayout {
-                        spacing: 12px;
-                        Button {
-                            text: "Single edge";
-                            enabled: linked-peer-name != "";
-                            clicked => { set-edge-mode(0); }
+                        spacing: 10px;
+                        Text {
+                            text: "Crossing edges";
+                            color: white;
+                            font-size: 14px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
                         }
-                        Button {
-                            text: "Double inverse";
-                            enabled: linked-peer-name != "";
-                            clicked => { set-edge-mode(1); }
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Button {
-                            text: "Double fixed left";
-                            enabled: linked-peer-name != "";
-                            clicked => { set-edge-mode(2); }
-                        }
-                        Button {
-                            text: "Double fixed right";
-                            enabled: linked-peer-name != "";
-                            clicked => { set-edge-mode(3); }
+                        Text {
+                            text: root.edge-mode-index == 0 ? "Single" : root.edge-mode-index == 1 ? "Mirror" : root.edge-mode-index == 2 ? "Fixed left" : "Fixed right";
+                            color: #22c55e;
+                            font-size: 12px;
+                            font-weight: 700;
+                            vertical-alignment: center;
                         }
                     }
-                    Text {
-                        text: edge-mode-index == 0 ? "Single edge: only the facing edge crosses." : edge-mode-index == 1 ? "Double inverse: either horizontal edge crosses; arrivals enter at the opposite edge." : edge-mode-index == 2 ? "Double fixed left: every crossing uses the left edge." : "Double fixed right: every crossing uses the right edge.";
-                        color: #9ca3af;
-                        font-size: 12px;
-                        wrap: word-wrap;
+                    EdgeModePicker {
+                        selected: root.edge-mode-index;
+                        applying: root.edge-applying;
+                        pending-index: root.pending-edge-index;
+                        enabled: root.linked-peer-name != "";
+                        tick: root.spinner-tick;
+                        picked(index) => {
+                            root.pending-edge-index = index;
+                            set-edge-mode(index);
+                        }
                     }
                     if driving-text != "" : Text {
                         text: driving-text;
                         color: #22c55e;
-                        font-size: 13px;
+                        font-size: 12px;
                         font-weight: 700;
-                        wrap: word-wrap;
                     }
                 }
                 }
@@ -904,18 +1327,21 @@ export component AppWindow inherits Window {
                 Flickable {
                 VerticalLayout {
                     padding: 12px;
-                    spacing: 10px;
-                    Text { text: "Computer name"; color: white; font-size: 16px; font-weight: 700; }
-                    Text {
-                        text: "The name nearby computers see.";
-                        color: #9ca3af;
-                        font-size: 12px;
-                    }
+                    spacing: 4px;
+
                     HorizontalLayout {
-                        spacing: 12px;
+                        spacing: 10px;
+                        Text {
+                            text: "Computer name";
+                            color: #d1d5db;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
                         name := LineEdit {
                             text <=> root.device-name;
                             placeholder-text: "friendly name";
+                            width: 230px;
                         }
                         Button {
                             text: "Save";
@@ -923,160 +1349,132 @@ export component AppWindow inherits Window {
                             clicked => { apply-config(lock-screen-control, mode-index, name.text, auto-connect-address, clipboard-enabled, root.clipboard-max-mb); }
                         }
                     }
-                    Rectangle { height: 1px; background: #262626; }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Text {
-                            text: "Control login and lock screens";
-                            color: #d1d5db;
-                            vertical-alignment: center;
-                        }
-                        Switch {
-                            checked <=> root.lock-screen-control;
-                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb); }
-                        }
+                    SettingSwitch {
+                        label: "Control login and lock screens";
+                        checked <=> root.lock-screen-control;
+                        toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb); }
                     }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Text {
-                            text: "Sync text clipboard";
-                            color: #d1d5db;
-                            vertical-alignment: center;
-                        }
-                        Switch {
-                            checked <=> root.clipboard-enabled;
-                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
-                        }
+                    SettingSwitch {
+                        label: "Sync text clipboard";
+                        checked <=> root.clipboard-enabled;
+                        toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
                     }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Text {
-                            text: "Reverse scroll on the other computer (mouse + trackpad)";
-                            color: #d1d5db;
-                            vertical-alignment: center;
-                        }
-                        Switch {
-                            checked <=> root.reverse-scroll;
-                            toggled => { root.set-reverse-scroll(root.reverse-scroll); }
-                        }
+                    SettingSwitch {
+                        label: "Reverse scroll on the other computer";
+                        checked <=> root.reverse-scroll;
+                        toggled => { root.set-reverse-scroll(root.reverse-scroll); }
                     }
-                    Text {
-                        text: "Wheel and trackpad scrolling while driving the peer go the opposite way. Local scrolling is unchanged. Applies to the next Connect.";
-                        color: #9ca3af;
+                    SettingSwitch {
+                        label: "Find nearby computers";
+                        checked <=> root.auto-discover;
+                        toggled => { root.apply-auto-discover(root.auto-discover); }
+                    }
+                    SettingSwitch {
+                        label: "Start when I log in";
+                        enabled: root.autostart-supported && !root.autostart-busy;
+                        checked <=> root.autostart-enabled;
+                        toggled => { root.apply-autostart(root.autostart-enabled); }
+                    }
+                    if autostart-note != "" : Text {
+                        text: autostart-note;
+                        color: #fbbf24;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    SettingSwitch {
+                        label: "Reconnect at startup";
+                        enabled: root.auto-connect-known && !root.auto-connect-busy;
+                        checked <=> root.auto-connect-on-start;
+                        toggled => { root.apply-auto-connect(root.auto-connect-on-start); }
+                    }
+                    if auto-connect-note != "" : Text {
+                        text: auto-connect-note;
+                        color: #fbbf24;
                         font-size: 11px;
                         wrap: word-wrap;
                     }
                     HorizontalLayout {
-                        spacing: 12px;
+                        spacing: 10px;
+                        height: 36px;
                         Text {
-                            text: "Find nearby computers automatically";
+                            text: "Clipboard limit (MB)";
                             color: #d1d5db;
+                            font-size: 14px;
                             vertical-alignment: center;
-                        }
-                        Switch {
-                            checked <=> root.auto-discover;
-                            toggled => { root.apply-auto-discover(root.auto-discover); }
-                        }
-                    }
-                    Text {
-                        text: "Lists nearby computers under Devices. Nothing connects until you tap one and the other side approves.";
-                        color: #9ca3af;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Text {
-                            text: "Start TheKVM when I log in";
-                            color: #d1d5db;
-                            vertical-alignment: center;
-                        }
-                        Switch {
-                            enabled: root.autostart-supported && !root.autostart-busy;
-                            checked <=> root.autostart-enabled;
-                            toggled => { root.apply-autostart(root.autostart-enabled); }
-                        }
-                    }
-                    Text {
-                        text: root.autostart-note;
-                        color: #9ca3af;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Text {
-                            text: "Reconnect to the last computer at startup";
-                            color: #d1d5db;
-                            vertical-alignment: center;
-                        }
-                        Switch {
-                            enabled: root.auto-connect-known && !root.auto-connect-busy;
-                            checked <=> root.auto-connect-on-start;
-                            toggled => { root.apply-auto-connect(root.auto-connect-on-start); }
-                        }
-                    }
-                    Text {
-                        text: root.auto-connect-note;
-                        color: #9ca3af;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Text {
-                            text: "Largest paste to sync (MB, 1-16)";
-                            color: #d1d5db;
-                            vertical-alignment: center;
+                            horizontal-stretch: 1;
                         }
                         clipboard-max := LineEdit {
                             text <=> root.clipboard-max-mb;
                             placeholder-text: "2";
+                            width: 64px;
                         }
                         Button {
                             text: "Save";
                             clicked => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
                         }
                     }
-                    Rectangle { height: 1px; background: #262626; }
-                    Text {
-                        text: "Reconnect at startup (optional)";
-                        color: white;
-                        font-size: 16px;
-                        font-weight: 700;
+
+                    Rectangle { height: 1px; background: #1f2937; }
+                    Disclosure {
+                        label: "Advanced";
+                        open: root.advanced-open;
+                        clicked => { root.advanced-open = !root.advanced-open; }
                     }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        startup := LineEdit {
-                            text <=> root.auto-connect-address;
-                            placeholder-text: "computer IP or hostname:42110";
+                    if advanced-open : VerticalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Fingerprint";
+                            color: #6b7280;
+                            font-size: 11px;
+                        }
+                        Text {
+                            text: fingerprint;
+                            color: #f87171;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            revoke := LineEdit {
+                                text <=> root.revoke-fingerprint;
+                                placeholder-text: "Fingerprint to remove";
+                                horizontal-stretch: 1;
+                            }
+                            Button {
+                                text: "Remove";
+                                enabled: revoke.text != "";
+                                clicked => { revoke-peer(revoke.text); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            startup := LineEdit {
+                                text <=> root.auto-connect-address;
+                                placeholder-text: "Startup address";
+                                horizontal-stretch: 1;
+                            }
+                            Button {
+                                text: "Save";
+                                clicked => { apply-config(lock-screen-control, mode-index, device-name, startup.text, clipboard-enabled, root.clipboard-max-mb); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            path := LineEdit {
+                                text <=> root.layout-path;
+                                placeholder-text: "Layout file";
+                                horizontal-stretch: 1;
+                            }
+                            Button {
+                                text: "Import";
+                                enabled: path.text != "";
+                                clicked => { import-layout(path.text); }
+                            }
                         }
                         Button {
-                            text: "Save";
-                            clicked => { apply-config(lock-screen-control, mode-index, device-name, startup.text, clipboard-enabled, root.clipboard-max-mb); }
+                            text: "Open log folder";
+                            clicked => { open-log-folder(); }
                         }
-                    }
-                    Rectangle { height: 1px; background: #262626; }
-                    Text { text: "Screen layout file"; color: white; font-size: 16px; font-weight: 700; }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        path := LineEdit {
-                            text <=> root.layout-path;
-                            placeholder-text: "path to layout.json";
-                        }
-                        Button {
-                            text: "Import";
-                            enabled: path.text != "";
-                            clicked => { import-layout(path.text); }
-                        }
-                    }
-                    Rectangle { height: 1px; background: #262626; }
-                    Text { text: "This computer's fingerprint:"; color: #9ca3af; font-size: 12px; }
-                    Text { text: fingerprint; color: #ef4444; font-size: 12px; }
-                    Rectangle { height: 1px; background: #262626; }
-                    Button {
-                        text: "Open log folder";
-                        clicked => { open-log-folder(); }
                     }
                 }
                 }
@@ -1107,39 +1505,26 @@ export component AppWindow inherits Window {
                         drop-shadow-color: #000000aa;
                         drop-shadow-blur: 18px;
                         drop-shadow-offset-y: 6px;
-                        VerticalLayout {
+                        HorizontalLayout {
                             padding: 10px;
-                            spacing: 6px;
+                            spacing: 10px;
                             Text {
-                                text: "Pairing request — allow this computer to pair?";
+                                text: "Pairing request · " + incoming-pairing + (incoming-verification-code == "" ? "" : " · code " + incoming-verification-code);
                                 color: #fde68a;
-                                font-size: 12px;
+                                font-size: 13px;
                                 font-weight: 700;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
                             }
-                            HorizontalLayout {
-                                spacing: 12px;
-                                Text {
-                                    text: incoming-pairing + " · code " + incoming-verification-code;
-                                    color: white;
-                                    font-size: 15px;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                                Button {
-                                    text: "Allow";
-                                    primary: true;
-                                    clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
-                                }
-                                Button {
-                                    text: "Deny";
-                                    clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
-                                }
+                            Button {
+                                text: "Allow";
+                                primary: true;
+                                clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
                             }
-                            Text {
-                                text: "Full details under the Connect tab. No input flows until you allow.";
-                                color: #fcd34d;
-                                font-size: 11px;
+                            Button {
+                                text: "Deny";
+                                clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
                             }
                         }
                     }
@@ -1151,40 +1536,26 @@ export component AppWindow inherits Window {
                         drop-shadow-color: #000000aa;
                         drop-shadow-blur: 18px;
                         drop-shadow-offset-y: 6px;
-                        VerticalLayout {
+                        HorizontalLayout {
                             padding: 10px;
-                            spacing: 6px;
+                            spacing: 10px;
                             Text {
-                                text: "Connection request — a paired computer wants to drive this one";
+                                text: "Link request · " + incoming-link;
                                 color: #a7f3d0;
-                                font-size: 12px;
+                                font-size: 13px;
                                 font-weight: 700;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
                             }
-                            HorizontalLayout {
-                                spacing: 12px;
-                                Text {
-                                    text: incoming-link;
-                                    color: white;
-                                    font-size: 15px;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                                Button {
-                                    text: "Allow";
-                                    primary: true;
-                                    clicked => { approve-incoming-link(incoming-link-fingerprint); }
-                                }
-                                Button {
-                                    text: "Deny";
-                                    clicked => { reject-incoming-link(incoming-link-fingerprint); }
-                                }
+                            Button {
+                                text: "Allow";
+                                primary: true;
+                                clicked => { approve-incoming-link(incoming-link-fingerprint); }
                             }
-                            Text {
-                                text: "Allow once per link. No input flows until you allow.";
-                                color: #6ee7b7;
-                                font-size: 11px;
-                                wrap: word-wrap;
+                            Button {
+                                text: "Deny";
+                                clicked => { reject-incoming-link(incoming-link-fingerprint); }
                             }
                         }
                     }

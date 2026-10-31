@@ -1055,32 +1055,28 @@ fn main() -> Result<()> {
 
     let weak = ui.as_weak();
     let edge_session = session_state.clone();
-    let edge_pending = pending_pair.clone();
-    let edge_dir = startup_dir.clone();
-    let edge_inbound = last_inbound.clone();
     ui.on_set_edge_mode(move |index| {
         let weak = weak.clone();
         let edge_session = edge_session.clone();
-        let edge_pending = edge_pending.clone();
-        let edge_dir = edge_dir.clone();
-        let edge_inbound = edge_inbound.clone();
         let (requested_mode, requested_style) = edge_choice_from_index(index);
         ui_log(&format!(
             "edge button pressed: {}",
             edge_choice_name(requested_mode, requested_style)
         ));
-        set_status(&weak, "Applying edge crossing…".into());
+        set_edge_applying(&weak, true);
         std::thread::spawn(move || {
             // Read-modify-write so the toggle only ever changes the edge
             // discipline, never anything else.
             let current = match control_request(ControlRequest::GetConfig) {
                 Ok(ControlResponse::Config(config)) => config,
                 Ok(other) => {
+                    set_edge_applying(&weak, false);
                     ui_log(&format!("edge change: cannot read settings: {other:?}"));
                     set_status(&weak, format!("Cannot read settings: {other:?}"));
                     return;
                 }
                 Err(error) => {
+                    set_edge_applying(&weak, false);
                     ui_log(&format!("edge change: settings unreadable: {error:#}"));
                     set_status(
                         &weak,
@@ -1125,31 +1121,24 @@ fn main() -> Result<()> {
                     ));
                     set_edge_mode_display(&weak, requested_mode, requested_style);
                     refresh_arrangement(&weak, child_running(&edge_session));
-                    // The running child routed under the old discipline:
-                    // re-link at once under the new one (spinner shows
-                    // the progress) instead of stranding a dead line.
-                    relink_with_new_settings(
-                        &weak,
-                        &edge_session,
-                        &edge_pending,
-                        &edge_dir,
-                        &edge_inbound,
-                        format!(
-                            "Edge crossing set: {}.",
-                            edge_choice_name(requested_mode, requested_style)
-                        ),
-                        current.mode != Mode::ClientOnly,
-                    );
+                    // Live apply: the supervised child re-reads config.json
+                    // and applies the discipline to its next handoff, so no
+                    // relink is needed. The tile's donut ends on the child's
+                    // `edge-applied` ack (relay) or on this timeout.
+                    schedule_edge_applying_timeout(&weak, child_running(&edge_session));
                 }
                 Ok(ControlResponse::Error { message }) => {
+                    set_edge_applying(&weak, false);
                     ui_log(&format!("edge change refused: {message}"));
                     set_status(&weak, message)
                 }
                 Ok(other) => {
+                    set_edge_applying(&weak, false);
                     ui_log(&format!("edge change unexpected: {other:?}"));
                     set_status(&weak, format!("Unexpected daemon response: {other:?}"))
                 }
                 Err(error) => {
+                    set_edge_applying(&weak, false);
                     ui_log(&format!("edge change failed: {error}"));
                     set_status(&weak, format!("Cannot set edge crossing: {error}"))
                 }
@@ -2197,15 +2186,20 @@ fn set_peer_list(weak: &slint::Weak<AppWindow>, peers: Vec<kvm_protocol::pairing
     let text = if peers.is_empty() {
         "No trusted peers".to_owned()
     } else {
+        // Names and addresses only: the fingerprint is an implementation
+        // detail, kept behind Settings > Advanced.
         peers
             .iter()
             .map(|peer| {
-                format!(
-                    "{} · {} · {}",
-                    peer.name,
-                    peer.address.as_deref().unwrap_or("address unknown"),
-                    peer.fingerprint_hex
-                )
+                let name = if peer.name.trim().is_empty() {
+                    "Unnamed computer"
+                } else {
+                    peer.name.trim()
+                };
+                match peer.address.as_deref() {
+                    Some(address) if !address.is_empty() => format!("{name} · {address}"),
+                    _ => name.to_owned(),
+                }
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -4223,6 +4217,13 @@ fn relay_session_progress(
             not_paired_streak = 0;
         }
         let text = match kind {
+            "edge-applied" => {
+                // The child hot-applied the discipline from config.json:
+                // end the tile donut on this truth instead of a timer.
+                set_edge_applying(weak, false);
+                ui_log(&format!("link: edge crossing live ({detail})"));
+                continue;
+            }
             "established" => {
                 set_session_connected(weak, session, verified, address);
                 // Adopt the live fingerprint for this address: the peer may
@@ -5447,7 +5448,10 @@ fn ensure_spinner_ticker(weak: &slint::Weak<AppWindow>) {
                     let weak = weak.clone();
                     move || {
                         if let Some(ui) = weak.upgrade() {
-                            ui.set_spinner_tick((ui.get_spinner_tick() + 1) % 8);
+                            // Monotonic: the donut rotates by this tick, so
+                            // wrapping would spin 315° backwards once per
+                            // orbit.
+                            ui.set_spinner_tick(ui.get_spinner_tick().wrapping_add(1));
                         }
                     }
                 });
@@ -5471,6 +5475,7 @@ fn ensure_spinner_ticker(weak: &slint::Weak<AppWindow>) {
 fn spinner_wanted() -> bool {
     SPINNER_LINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
         || SPINNER_SCAN_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+        || SPINNER_EDGE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static SPINNER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -5478,6 +5483,45 @@ static SPINNER_LINK_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static SPINNER_SCAN_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Set while an edge-mode change is being applied to a live session (the
+/// tile shows the donut until the child acknowledges on stderr).
+static SPINNER_EDGE_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Show/hide the donut on the pressed edge-mode tile. The spinner ticker
+/// runs whenever any donut is visible.
+fn set_edge_applying(weak: &slint::Weak<AppWindow>, applying: bool) {
+    SPINNER_EDGE_ACTIVE.store(applying, std::sync::atomic::Ordering::Release);
+    if applying {
+        ensure_spinner_ticker(weak);
+    }
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_edge_applying(applying);
+            }
+        }
+    });
+}
+
+/// End the tile donut on truth (the child's `edge-applied` ack) with a
+/// bounded fallback: 2.5s with a live child, 400ms with none running.
+fn schedule_edge_applying_timeout(weak: &slint::Weak<AppWindow>, live_child: bool) {
+    let weak = weak.clone();
+    let _ = std::thread::Builder::new()
+        .name("thekvm-edge-ack".into())
+        .spawn(move || {
+            let steps = if live_child { 50 } else { 8 };
+            for _ in 0..steps {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if !SPINNER_EDGE_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+            }
+            set_edge_applying(&weak, false);
+        });
+}
 
 /// Clipboard-sync gate shared by the relay's two threads: the daemon's
 /// config is authoritative, and the take thread refreshes this from every
