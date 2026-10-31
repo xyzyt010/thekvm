@@ -2204,11 +2204,24 @@ fn set_peer_list(weak: &slint::Weak<AppWindow>, peers: Vec<kvm_protocol::pairing
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let advanced = peers
+        .iter()
+        .map(|peer| {
+            let name = if peer.name.trim().is_empty() {
+                "Unnamed computer"
+            } else {
+                peer.name.trim()
+            };
+            format!("{name} · {}", peer.fingerprint_hex)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
                 ui.set_peer_list(SharedString::from(text));
+                ui.set_trusted_peers_advanced(SharedString::from(advanced));
             }
         }
     });

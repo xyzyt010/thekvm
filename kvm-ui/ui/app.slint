@@ -857,6 +857,8 @@ export component AppWindow inherits Window {
     // minimized window still announces the request.
     in property <string> title-alert: "";
     in-out property <bool> advanced-open: false;
+    // Trusted peers with their fingerprints, shown only inside Advanced.
+    in-out property <string> trusted-peers-advanced: "";
     in-out property <string> layout-path: "";
     in-out property <string> peer-address: "";
     in-out property <string> pair-code: "";
@@ -1452,6 +1454,17 @@ export component AppWindow inherits Window {
                             text: fingerprint;
                             color: #f87171;
                             font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        if trusted-peers-advanced != "" : Text {
+                            text: "Trusted computers";
+                            color: #6b7280;
+                            font-size: 11px;
+                        }
+                        if trusted-peers-advanced != "" : Text {
+                            text: trusted-peers-advanced;
+                            color: #9ca3af;
+                            font-size: 10px;
                             wrap: word-wrap;
                         }
                         HorizontalLayout {
