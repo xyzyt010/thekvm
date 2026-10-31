@@ -628,7 +628,13 @@ component RoleDropdown inherits Rectangle {
     animate border-color { duration: 120ms; }
     hit := TouchArea {
         mouse-cursor: pointer;
-        clicked => { popup.show(); }
+        clicked => {
+            if (popup.is-open) {
+                popup.close();
+            } else {
+                popup.show();
+            }
+        }
     }
     accessible-role: combobox;
     accessible-label: "This computer's role";
