@@ -100,6 +100,7 @@ pub(crate) fn bump_config_revision() {
 struct UdpMotionKey {
     key: [u8; 32],
     fingerprint_hex: String,
+    #[allow(dead_code)]
     lock_screen_enabled: bool,
     last_seen: std::time::Instant,
 }
@@ -136,23 +137,36 @@ pub(crate) fn register_udp_motion_key(
     key
 }
 
-/// Snapshot of motion keys for the UDP listener decrypt ring.
-fn udp_motion_key_snapshot() -> Vec<([u8; 32], String, bool)> {
-    udp_motion_keys()
-        .lock()
-        .ok()
-        .map(|keys| {
-            keys.iter()
-                .map(|entry| {
-                    (
-                        entry.key,
-                        entry.fingerprint_hex.clone(),
-                        entry.lock_screen_enabled,
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// Decrypt one UDP motion datagram against the active key ring in-place,
+/// refreshing `last_seen` on the matching key so long sessions (>15 min)
+/// never expire their motion key, and avoiding per-packet Vec/String
+/// allocations.
+fn decode_udp_motion_from_keyring(datagram: &[u8]) -> Option<([u8; 32], String, UdpMotionFrame)> {
+    let mut keys = udp_motion_keys().lock().ok()?;
+    if keys.is_empty() {
+        return None;
+    }
+    // Check from newest/most-recently-used to oldest: the active session key
+    // is normally at the back, so it matches on the very first attempt.
+    for index in (0..keys.len()).rev() {
+        let key = keys[index].key;
+        if let Ok((_, seq, dx, dy)) =
+            kvm_protocol::udp::decode_motion_packet(std::slice::from_ref(&key), datagram)
+        {
+            keys[index].last_seen = std::time::Instant::now();
+            let fp = keys[index].fingerprint_hex.clone();
+            return Some((
+                key,
+                fp,
+                UdpMotionFrame {
+                    sequence: seq,
+                    dx,
+                    dy,
+                },
+            ));
+        }
+    }
+    None
 }
 
 /// One authenticated motion delta handed from the process-wide UDP
@@ -1068,6 +1082,7 @@ pub(crate) async fn teardown_link(
 /// live inbound session so no other computer keeps driving — or keeps
 /// listing — a machine whose app cannot answer. Epochs are banned like
 /// an explicit Disconnect, so a stale redial cannot resurrect them.
+#[allow(dead_code)]
 pub(crate) async fn on_ui_gone(dir: &std::path::Path) {
     let sessions = list_inbound_links();
     if sessions.is_empty() {
@@ -1194,12 +1209,13 @@ fn spawn_link_lease(fingerprint_hex: String, address: String, link_id: Option<u6
     });
 }
 
-/// Presence janitor: catches a wedged app (socket still open, pings
-/// stopped) that the EOF path cannot see, and hangs up its sessions.
-pub(crate) fn spawn_presence_janitor(dir: std::path::PathBuf) {
+/// Presence janitor: tracks when the desktop app presence transitions
+/// without banning or dropping links (so lockscreen/reboot/relaunch keep
+/// links alive).
+pub(crate) fn spawn_presence_janitor(_dir: std::path::PathBuf) {
     tokio::spawn(async move {
         let mut was_present = ui_present();
-        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -1208,7 +1224,7 @@ pub(crate) fn spawn_presence_janitor(dir: std::path::PathBuf) {
             }
             let present = ui_present();
             if was_present && !present {
-                on_ui_gone(&dir).await;
+                tracing::debug!("desktop app presence lease lapsed");
             }
             was_present = present;
         }
@@ -1778,6 +1794,13 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
             reverse_scroll,
             auto_discover,
             double_edge_style,
+            auto_connect_enabled: if clear_auto_connect {
+                Some(false)
+            } else if auto_connect_address.is_some() {
+                Some(true)
+            } else {
+                None
+            },
         },
     )
     .await
@@ -1819,8 +1842,10 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     }
     if clear_auto_connect {
         config.auto_connect_address = None;
+        config.auto_connect_enabled = false;
     } else if let Some(address) = auto_connect_address {
         config.auto_connect_address = Some(address.trim().to_owned());
+        config.auto_connect_enabled = true;
     }
     if let Some(enabled) = clipboard_enabled {
         config.clipboard_enabled = enabled;
@@ -2212,43 +2237,304 @@ async fn read_identity_stdin() -> Result<Identity> {
     Identity::from_der(cert_der, key_der).context("adopt daemon identity")
 }
 
+static SUPERVISED_BY_UI: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn mint_epoch_id() -> u64 {
+    static SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let salt = SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    nanos
+        ^ ((std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        ^ salt.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+}
+
+/// Merge the local user peer book and the system daemon peer book so address
+/// healing and trust resolution always see the union of pinned peers.
+fn load_merged_peer_book(dir: &std::path::Path) -> PeerBook {
+    let mut merged = PeerBook::load_or_create(dir).unwrap_or_default();
+    let sys_dir = system_data_dir();
+    if sys_dir != dir {
+        if let Ok(sys_book) = PeerBook::load_or_create(&sys_dir) {
+            for peer in sys_book.peers {
+                if !merged.is_pinned(&peer.fingerprint_hex) {
+                    merged.peers.push(peer);
+                } else if peer.address.is_some() {
+                    if let Some(existing) = merged
+                        .peers
+                        .iter_mut()
+                        .find(|p| p.fingerprint_hex == peer.fingerprint_hex)
+                    {
+                        if existing.address.is_none() {
+                            existing.address = peer.address;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Persist a verified peer address across both local state files and the
+/// running daemon (via `PinPeer` / `SetConfig`), so future startups and
+/// re-connections dial the healed IP immediately.
+async fn persist_verified_auto_connect(dir: &std::path::Path, fingerprint: &str, address: &str) {
+    note_peer_address(dir, fingerprint, address);
+    let sys_dir = system_data_dir();
+    if sys_dir != dir {
+        note_peer_address(&sys_dir, fingerprint, address);
+    }
+    let peer_name = load_merged_peer_book(dir)
+        .peers
+        .into_iter()
+        .find(|p| p.fingerprint_hex.eq_ignore_ascii_case(fingerprint))
+        .map(|p| p.name)
+        .filter(|n| !n.trim().is_empty());
+    if let Ok(mut config) = load_local_config() {
+        if config.auto_connect_enabled
+            && config.mode != Mode::ClientOnly
+            && config.auto_connect_address.as_deref() != Some(address)
+        {
+            config.auto_connect_address = Some(address.to_owned());
+            let _ = config.save(&dir.join("config.json"));
+        }
+    }
+    for candidate_dir in daemon_control_candidates(dir) {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            crate::control::request(
+                candidate_dir,
+                kvm_protocol::control::ControlRequest::PinPeer {
+                    fingerprint_hex: fingerprint.to_owned(),
+                    node_name: peer_name.clone(),
+                    address: Some(address.to_owned()),
+                },
+            ),
+        )
+        .await;
+    }
+}
+
+/// Heal a stale or missing peer address using history-based peer identity
+/// (pinned certificate `fingerprint_hex` + `name` from `PeerBook`):
+/// 1. Live or recent inbound session on our daemon from the pinned peer,
+/// 2. LAN discovery scan (subnet broadcast + `/24` unicast sweep) matched by
+///    pinned `fingerprint_hex` (or `node_name` + pinned `fingerprint_hex`),
+/// 3. OS hostname / mDNS / DNS resolution (`<name>:42110` and `<name>.local:42110`).
+async fn heal_peer_address(
+    dir: &std::path::Path,
+    peers: &PeerBook,
+    current_address: &str,
+) -> Option<String> {
+    let host = current_address
+        .split(':')
+        .next()
+        .unwrap_or(current_address)
+        .trim();
+    // Identify which pinned peer(s) we are trying to reach.
+    let target_peer = peers
+        .peers
+        .iter()
+        .find(|p| p.address.as_deref() == Some(current_address))
+        .or_else(|| {
+            peers.peers.iter().find(|p| {
+                p.address
+                    .as_deref()
+                    .is_some_and(|stored| stored.split(':').next() == Some(host))
+            })
+        })
+        .or_else(|| peers.peers.first());
+    let target_fp = target_peer.map(|p| p.fingerprint_hex.as_str());
+    let target_name = target_peer.map(|p| p.name.as_str());
+
+    let matches_target = |fp: &str, name: &str| -> bool {
+        if let Some(wanted_fp) = target_fp {
+            if fp.eq_ignore_ascii_case(wanted_fp) {
+                return true;
+            }
+        }
+        if let Some(wanted_name) = target_name {
+            if !wanted_name.is_empty()
+                && name.eq_ignore_ascii_case(wanted_name)
+                && peers.is_pinned(fp)
+            {
+                return true;
+            }
+        }
+        peers.is_pinned(fp)
+    };
+
+    // 1. Check in-process inbound registries and running daemon Status.
+    for session in list_inbound_links() {
+        if matches_target(&session.fingerprint_hex, &session.node_name)
+            && !session.address.is_empty()
+            && session.address != current_address
+        {
+            return Some(session.address);
+        }
+    }
+    for recent in recent_inbound_links() {
+        if matches_target(&recent.fingerprint_hex, &recent.node_name)
+            && !recent.address.is_empty()
+            && recent.address != current_address
+        {
+            return Some(recent.address);
+        }
+    }
+    for candidate_dir in daemon_control_candidates(dir) {
+        if let Ok(Ok(kvm_protocol::control::ControlResponse::Status(status))) = tokio::time::timeout(
+            Duration::from_millis(300),
+            crate::control::request(
+                candidate_dir,
+                kvm_protocol::control::ControlRequest::Status,
+            ),
+        )
+        .await
+        {
+            for session in &status.sessions {
+                if matches_target(&session.fingerprint_hex, &session.node_name)
+                    && !session.address.is_empty()
+                    && session.address != current_address
+                {
+                    return Some(session.address.clone());
+                }
+            }
+            for recent in &status.recent_inbound {
+                if matches_target(&recent.fingerprint_hex, &recent.node_name)
+                    && !recent.address.is_empty()
+                    && recent.address != current_address
+                {
+                    return Some(recent.address.clone());
+                }
+            }
+        }
+    }
+
+    // 2. Active LAN discovery scan (broadcast + /24 unicast sweep).
+    if let Ok(found) = kvm_protocol::discovery::scan(Duration::from_millis(750)).await {
+        // Exact target fingerprint match first.
+        if let Some(wanted_fp) = target_fp {
+            if let Some((addr, _)) = found.iter().find(|(addr, adv)| {
+                adv.fingerprint_hex.eq_ignore_ascii_case(wanted_fp)
+                    && addr.to_string() != current_address
+            }) {
+                return Some(addr.to_string());
+            }
+        }
+        // Target name + pinned fingerprint match next, then any pinned peer.
+        if let Some((addr, _)) = found.iter().find(|(addr, adv)| {
+            matches_target(&adv.fingerprint_hex, &adv.node_name)
+                && addr.to_string() != current_address
+        }) {
+            return Some(addr.to_string());
+        }
+    }
+
+    // 3. History-based hostname / mDNS resolution (`<name>:42110`, `<name>.local:42110`).
+    let mut candidate_names = Vec::new();
+    if let Some(name) = target_name.filter(|n| !n.trim().is_empty()) {
+        candidate_names.push(name.trim().to_owned());
+    }
+    for peer in &peers.peers {
+        let n = peer.name.trim();
+        if !n.is_empty() && !candidate_names.iter().any(|c| c.eq_ignore_ascii_case(n)) {
+            candidate_names.push(n.to_owned());
+        }
+    }
+    for name in candidate_names {
+        for host_query in [
+            format!("{name}:{DEFAULT_PORT}"),
+            format!("{name}.local:{DEFAULT_PORT}"),
+        ] {
+            let resolved = tokio::task::spawn_blocking(move || {
+                use std::net::ToSocketAddrs;
+                host_query.to_socket_addrs().ok().and_then(|addrs| {
+                    addrs
+                        .filter(|a| a.is_ipv4() && !a.ip().is_loopback() && !a.ip().is_unspecified())
+                        .next()
+                })
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(addr) = resolved {
+                let addr_str = addr.to_string();
+                if addr_str != current_address {
+                    return Some(addr_str);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 pub async fn connect(
     address: Option<&str>,
     link_id: Option<u64>,
     identity_stdin: bool,
 ) -> Result<()> {
-    let Some(address) = address else {
-        let identity = Identity::load_or_create(&data_dir())?;
-        return connect_topology(None, identity).await;
-    };
-    let address = address.to_owned();
-    // One face per machine: with `--identity-stdin` the supervising UI
-    // hands us the daemon-owned identity (two hex lines on stdin), so this
-    // child presents the SAME fingerprint as the service. Read once, before
-    // the retry loop — a truncated pipe fails here, never as a mystery TLS
-    // error mid-link. Without the flag (manual/legacy use) the local files
-    // apply exactly as before.
+    SUPERVISED_BY_UI.store(identity_stdin, std::sync::atomic::Ordering::Relaxed);
     let adopted_identity = if identity_stdin {
         Some(read_identity_stdin().await?)
     } else {
         None
     };
-    // Machine-readable progress for a supervising UI (which pipes stderr):
-    // dialing -> waiting <reason> (retries) -> established <peer>, and ended
-    // on a clean shutdown. The UI must only claim "Connected" after
-    // `established`; anything earlier is still connecting.
+    let dir = data_dir();
+    let initial_address = address
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            load_local_config()
+                .ok()
+                .and_then(|c| c.auto_connect_address)
+                .filter(|a| !a.trim().is_empty())
+        })
+        .or_else(|| {
+            load_merged_peer_book(&dir)
+                .peers
+                .into_iter()
+                .find_map(|p| p.address)
+                .filter(|a| !a.trim().is_empty())
+        });
+    let mut address = match initial_address {
+        Some(addr) => addr,
+        None => {
+            let peers = load_merged_peer_book(&dir);
+            if peers.peers.is_empty() {
+                let identity = match &adopted_identity {
+                    Some(id) => id.clone(),
+                    None => Identity::load_or_create(&dir)?,
+                };
+                return connect_topology(None, identity).await;
+            }
+            // Pinned peer exists without a stored IP: start with a placeholder
+            // and let `heal_peer_address` resolve it on the first iteration.
+            format!("0.0.0.0:{DEFAULT_PORT}")
+        }
+    };
+    let mut link_id = Some(link_id.unwrap_or_else(mint_epoch_id));
     eprintln!("THEKVM_STATUS dialing {address}");
-    // Retry cadence stays 1s (fast recovery is the point), but a peer that
-    // refuses for minutes must not bury the log: warn on the first failure
-    // and then once every 30 attempts (~30s).
     let mut retry_attempts: u64 = 0;
     loop {
         let identity = match &adopted_identity {
             Some(identity) => identity.clone(),
-            None => Identity::load_or_create(&data_dir())?,
+            None => Identity::load_or_create(&dir)?,
         };
-        let peers = PeerBook::load_or_create(&data_dir())?;
+        let peers = load_merged_peer_book(&dir);
         let config = load_local_config()?;
+        if address.starts_with("0.0.0.0:") {
+            if let Some(fresh) = heal_peer_address(&dir, &peers, &address).await {
+                tracing::info!(healed = %fresh, "resolved pinned peer address via discovery/history");
+                address = fresh;
+                eprintln!("THEKVM_STATUS dialing {address}");
+            }
+        }
         let dial_started = std::time::Instant::now();
         match dial_session(
             &identity,
@@ -2264,35 +2550,23 @@ pub async fn connect(
                 udp_motion: true, // UDP cemented: every dial offers motion fast path
             },
             None,
-            &data_dir(),
+            &dir,
         )
         .await
         {
             Ok((conn, mut send, _recv, _motion_send, capabilities)) => {
-                // Verified logical link: this is the LIVE fingerprint — ghost
-                // pins elsewhere can no longer misroute. Episodes dial fresh
-                // per crossing, so the handshake connection itself is done.
+                retry_attempts = 0;
                 let peer_fp = peer_fingerprint(&conn)?.to_ascii_lowercase();
-                // The verify Accepted just taught us the peer's truthful
-                // dims; persist them so the NEXT child starts on them (see
-                // cached_peer_geometry) instead of config fallback.
                 if let Some(geometry) = capabilities.screen_geometry {
-                    remember_peer_geometry(&data_dir(), &peer_fp, geometry);
+                    remember_peer_geometry(&dir, &peer_fp, geometry);
                 }
+                persist_verified_auto_connect(&dir, &peer_fp, &address).await;
                 let link = TopologyLink {
                     fingerprint: peer_fp.clone(),
                     address: address.clone(),
                     link_id,
                 };
-                // Lease the verified link to the daemon BEFORE anything
-                // slow follows: from here on, this child's death (UI
-                // killed, Task Manager, crash) tears the whole link down
-                // on both sides within moments, with no UI to ask.
                 spawn_link_lease(peer_fp.clone(), address.clone(), link_id);
-                // UDP fast-path motion: when both sides negotiated it on a
-                // link with an epoch, derive the session key and arm the
-                // outbound sender. Failures fall back to the episode stream
-                // per packet, so a blocked UDP port never breaks the link.
                 if capabilities.udp_motion {
                     if let Some(epoch) = link_id {
                         let key = kvm_protocol::udp::derive_udp_key(
@@ -2314,79 +2588,94 @@ pub async fn connect(
                     elapsed_ms = dial_started.elapsed().as_millis() as u64,
                     "linked input session",
                 );
-                // Deskflow-class first crossing: keep the verified QUIC
-                // association warm (transport keep-alive holds it across
-                // idle) instead of dropping it, so the first edge crossing
-                // opens a stream on a live connection — milliseconds, not a
-                // cold handshake. The verify stream itself closes gracefully
-                // (ReleaseAll + FIN) so the peer's session — and its input
-                // permit — ends cleanly instead of lingering into the lease.
                 let _ = write_frame(&mut send, &WireMessage::ReleaseAll).await;
                 let _ = send.finish();
                 store_warm_link(&conn, &link.fingerprint);
-                // The peer's daemon delivers its Disconnect as LinkEnded on
-                // a fresh stream over this authenticated association (the
-                // live fast path; no cold dial). Ending the link the moment
-                // it arrives is what makes one Disconnect land on both
-                // computers instantly instead of waiting for the UI poll.
+                let active_epoch = link_id;
                 let peer_ended = {
                     let conn = conn.clone();
                     async move {
                         loop {
                             match conn.accept_bi().await {
                                 Ok((mut send, mut recv)) => match read_frame(&mut recv).await {
-                                    Ok(Some(WireMessage::LinkEnded { link_id })) => {
+                                    Ok(Some(WireMessage::LinkEnded { link_id: ended_id })) => {
                                         let _ = send.finish();
+                                        // Ignore LinkEnded frames for a different
+                                        // (superseded) epoch during double-Connect tie-break.
+                                        if ended_id.is_some()
+                                            && active_epoch.is_some()
+                                            && ended_id != active_epoch
+                                        {
+                                            continue;
+                                        }
                                         tracing::info!(
-                                            ?link_id,
+                                            ?ended_id,
                                             "peer ended the link on the live association"
                                         );
-                                        return Some(link_id);
+                                        return Some(ended_id);
                                     }
                                     _ => continue,
                                 },
-                                // The peer's child went away without a frame:
-                                // the link is just as dead.
                                 Err(_) => return None,
                             }
                         }
                     }
                 };
                 eprintln!("THEKVM_STATUS established {address}");
-                let result = tokio::select! {
-                    result = connect_topology(Some(link), identity) => result,
-                    ended = peer_ended => {
-                        match ended {
-                            Some(ended_id) => eprintln!(
-                                "THEKVM_STATUS ended peer disconnected {}",
-                                ended_id.map(|id| id.to_string()).unwrap_or_else(|| "none".into())
-                            ),
-                            None => eprintln!("THEKVM_STATUS ended peer left"),
-                        }
-                        Ok(())
-                    }
+                let outcome = tokio::select! {
+                    result = connect_topology(Some(link), identity) => EitherOutcome::Topology(result),
+                    ended = peer_ended => EitherOutcome::PeerEnded(ended),
                 };
-                // Link over: disarm the fast path so a stale key can never
-                // address the next link (which mints a fresh epoch anyway).
                 set_udp_sender(None);
-                return result;
+                enum EitherOutcome {
+                    Topology(Result<()>),
+                    PeerEnded(Option<Option<u64>>),
+                }
+                match outcome {
+                    EitherOutcome::PeerEnded(Some(ended_id)) => {
+                        eprintln!(
+                            "THEKVM_STATUS ended peer disconnected {}",
+                            ended_id
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "none".into())
+                        );
+                        return Ok(());
+                    }
+                    EitherOutcome::PeerEnded(None) => {
+                        // The peer rebooted, shut down, locked/unlocked, or its
+                        // network blipped (no explicit LinkEnded was sent).
+                        // Stay alive and auto-reconnect as soon as it returns!
+                        tracing::info!(
+                            peer = %address,
+                            "peer connection closed (reboot or network drop); waiting to auto-reconnect"
+                        );
+                        eprintln!(
+                            "THEKVM_STATUS waiting peer restarting or offline — reconnecting automatically…"
+                        );
+                        link_id = Some(mint_epoch_id());
+                    }
+                    EitherOutcome::Topology(Ok(())) => return Ok(()),
+                    EitherOutcome::Topology(Err(error)) => {
+                        if is_link_ended_rejection(&error) && link_id.is_some_and(link_ended) {
+                            eprintln!("THEKVM_STATUS {}", ban_ended_status(link_id));
+                            return Err(error);
+                        }
+                        tracing::warn!(%error, peer = %address, "topology loop exited with error; auto-reconnecting");
+                        eprintln!("THEKVM_STATUS waiting {error:#}");
+                        link_id = Some(mint_epoch_id());
+                    }
+                }
             }
             Err(error) => {
-                // A banned epoch is a deliberate remote Disconnect, not an
-                // outage: exit nonzero instead of retrying forever, or the
-                // dead link resurrects as a zombie the moment the peer comes
-                // back. The ban status names the dead epoch for the UI's
-                // auto-redial.
                 if is_link_ended_rejection(&error) {
-                    eprintln!("THEKVM_STATUS {}", ban_ended_status(link_id));
-                    return Err(error);
+                    if link_id.is_some_and(link_ended) {
+                        eprintln!("THEKVM_STATUS {}", ban_ended_status(link_id));
+                        return Err(error);
+                    }
+                    // Remote ban from an earlier epoch before restart: mint a
+                    // fresh epoch and retry automatically.
+                    link_id = Some(mint_epoch_id());
                 }
-                // A declined (or denial-frozen) link is a deliberate human
-                // answer, not an outage: exit like a ban instead of
-                // retrying the same epoch forever — every retry would
-                // re-ring the peer and re-pop the approval it just
-                // denied. The UI shows "rejected"; a fresh Connect asks
-                // again with a new epoch.
                 if is_link_declined_rejection(&error) {
                     eprintln!("THEKVM_STATUS ended {error:#}");
                     return Err(error);
@@ -2396,6 +2685,17 @@ pub async fn connect(
                     tracing::warn!(%error, peer = %address, attempt = retry_attempts, "peer unavailable; retrying every second");
                 }
                 eprintln!("THEKVM_STATUS waiting {error:#}");
+                // Heal changed local IP via discovery / history-based name + pinned key.
+                if let Some(fresh) = heal_peer_address(&dir, &peers, &address).await {
+                    tracing::info!(
+                        old = %address,
+                        fresh = %fresh,
+                        "healed peer IP address via discovery/history; switching target"
+                    );
+                    address = fresh;
+                    eprintln!("THEKVM_STATUS dialing {address}");
+                    continue;
+                }
             }
         }
 
@@ -2449,7 +2749,14 @@ async fn run_windows_service_controller(
         };
         let mut state = CapturedState::default();
 
+        let mut address = address.clone();
         loop {
+            if ui_present() {
+                // Yield to the logged-in desktop UI's topology child and drop
+                // `ServiceCaptureProxy` so no duplicate low-level hooks remain.
+                let _ = capture.set_exclusive(false);
+                return Ok(());
+            }
             let peer_book = peers.read().await.clone();
             match connect_input(
                 &identity,
@@ -2470,6 +2777,7 @@ async fn run_windows_service_controller(
             {
                 Ok((connection, mut send, recv, motion_send, capabilities)) => {
                     let peer_fingerprint = peer_fingerprint(&connection)?;
+                    note_peer_address(&data_dir(), &peer_fingerprint, &address);
                     let snapshot = state.snapshot();
                     send_state_sync(&mut send, snapshot.state).await?;
                     capture.set_exclusive(true)?;
@@ -2510,6 +2818,10 @@ async fn run_windows_service_controller(
                 }
                 Err(error) => {
                     tracing::warn!(%error, peer = %address, "Windows service peer unavailable; retrying");
+                    if let Some(fresh) = heal_peer_address(&data_dir(), &peer_book, &address).await {
+                        tracing::info!(old = %address, fresh = %fresh, "Windows service controller healed peer IP");
+                        address = fresh;
+                    }
                 }
             }
 
@@ -2693,6 +3005,9 @@ async fn run_windows_service_capture_stream(
                 }
             }
             _ = session_check.tick() => {
+                if ui_present() {
+                    break Ok(());
+                }
                 if capture.session_changed() {
                     break Err(anyhow::anyhow!("interactive Windows session changed"));
                 }
@@ -2893,7 +3208,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
             }
         }
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("THEKVM_STATUS ended interrupted");
                 return Ok(());
@@ -3101,20 +3416,14 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // Live settings bridge (see apply_live_topology_config): the app mirrors
     // its settings into this child's config.json, so Single/Double, entry
     // style and screen placement follow a running session with no relink.
-    let mut config_watch = tokio::time::interval(Duration::from_millis(200));
+    let mut config_watch = tokio::time::interval(Duration::from_millis(500));
     config_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut config_bytes_seen: Option<Vec<u8>> = std::fs::read(dir.join("config.json")).ok();
+    let config_path = dir.join("config.json");
+    let mut config_meta_seen: Option<(std::time::SystemTime, u64)> = std::fs::metadata(&config_path)
+        .ok()
+        .and_then(|m| Some((m.modified().ok()?, m.len())));
+    let mut config_bytes_seen: Option<Vec<u8>> = std::fs::read(&config_path).ok();
     let mut pending_layout: Option<kvm_core::Layout> = None;
-    // Fast inbound-drive probe (dual-drive deadlock fix): the 5s keep-alive
-    // idle check alone leaves a reverse crossing stuck for seconds ("must
-    // move the Mint mouse home first"). Every 300ms while a drive is active,
-    // check the cheap divert/echo counter AND fresh inbound INPUT ACTIVITY
-    // from the local control endpoint (which works under an X11 Core grab
-    // and for motion-only Windows drives where the counters never grow).
-    // Activity means ADVANCING input events, never mere session existence:
-    // the two-way-edge dial-back stays open persistently, so existence
-    // would yield every crossing instantly. Best effort: a missing
-    // socket simply yields no signal.
     let mut yield_probe = tokio::time::interval(Duration::from_millis(300));
     yield_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let control_dirs = daemon_control_candidates(&dir);
@@ -3122,11 +3431,25 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     // probes must never await control sockets on their hot path.
     let inbound_cache: InboundCache =
         std::sync::Arc::new(std::sync::Mutex::new(InboundSnapshot::default()));
-    spawn_inbound_poller(inbound_cache.clone(), control_dirs);
+    let inbound_poller_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inbound_poller_wake = std::sync::Arc::new(tokio::sync::Notify::new());
+    spawn_inbound_poller(
+        inbound_cache.clone(),
+        control_dirs,
+        inbound_poller_active.clone(),
+        inbound_poller_wake.clone(),
+    );
 
     tracing::info!(screen = ?router.current_screen(), version = env!("CARGO_PKG_VERSION"), "topology capture ready; move to a configured screen edge");
     eprintln!("THEKVM_STATUS edge-ready");
     loop {
+        let drive_is_active = active.is_some();
+        if inbound_poller_active.swap(drive_is_active, std::sync::atomic::Ordering::Relaxed)
+            != drive_is_active
+            && drive_is_active
+        {
+            inbound_poller_wake.notify_one();
+        }
         tokio::select! {
             biased;
             signal = async {
@@ -3811,7 +4134,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             latest_image = Some(paste.clone());
                         }
                     }
-                    let Some(session) = active.as_mut().filter(|session| session.clipboard_enabled) else {
+                    let is_active = active.is_some();
+                    let Some(session) = active
+                        .as_mut()
+                        .or(parked.as_mut())
+                        .filter(|session| session.clipboard_enabled)
+                    else {
                         continue;
                     };
                     match send_clipboard_change(
@@ -3825,42 +4153,49 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         Ok(Some((revision, _))) => clipboard_revision = revision,
                         Ok(None) => {}
                         Err(error) => {
-                        // Like a failed input send: the episode ends, the
-                        // child lives on for the next crossing.
-                        tracing::warn!(%error, "topology clipboard send failed; control is local");
-                        let session = active.take().expect("active session exists");
-                        let target = session.target;
-                        tokio::spawn(session.finish());
-                        // The association itself is suspect: drop the park
-                        // too, so the next push redials instead of
-                        // resuming a dead stream.
-                        if let Some(stale) = parked.take() {
-                            tokio::spawn(stale.finish());
-                        }
-                        release_suppression(&capture_control, Some(&mut suppression_requested));
-                        discarded_event_barrier = discarded_event_barrier
-                            .max(capture_control.snapshot().last_event_id);
-                        let _ = router.restore_local(target);
-                        resync_home_to_truth(&mut router);
-                        let (x, y) = router.cursor_position();
-                        let _ = capture_control.warp_cursor(x, y);
-                        last_failed_episode = Some(std::time::Instant::now());
-                        eprintln!("THEKVM_STATUS local");
+                            if is_active {
+                                // Like a failed input send: the episode ends, the
+                                // child lives on for the next crossing.
+                                tracing::warn!(%error, "topology clipboard send failed; control is local");
+                                let session = active.take().expect("active session exists");
+                                let target = session.target;
+                                tokio::spawn(session.finish());
+                                if let Some(stale) = parked.take() {
+                                    tokio::spawn(stale.finish());
+                                }
+                                release_suppression(&capture_control, Some(&mut suppression_requested));
+                                discarded_event_barrier = discarded_event_barrier
+                                    .max(capture_control.snapshot().last_event_id);
+                                let _ = router.restore_local(target);
+                                resync_home_to_truth(&mut router);
+                                let (x, y) = router.cursor_position();
+                                let _ = capture_control.warp_cursor(x, y);
+                                last_failed_episode = Some(std::time::Instant::now());
+                                eprintln!("THEKVM_STATUS local");
+                            } else if let Some(stale) = parked.take() {
+                                tokio::spawn(stale.finish());
+                            }
                         }
                     }
                 }
                 None => clipboard_enabled = false,
             },
             _ = config_watch.tick() => {
-                apply_live_topology_config(
-                    &dir,
-                    &mut config,
-                    &mut router,
-                    &mut config_bytes_seen,
-                    &mut pending_layout,
-                );
+                let current_meta = std::fs::metadata(&config_path)
+                    .ok()
+                    .and_then(|m| Some((m.modified().ok()?, m.len())));
+                if current_meta.is_none() || current_meta != config_meta_seen || pending_layout.is_some() {
+                    config_meta_seen = current_meta;
+                    apply_live_topology_config(
+                        &dir,
+                        &mut config,
+                        &mut router,
+                        &mut config_bytes_seen,
+                        &mut pending_layout,
+                    );
+                }
             }
-            _ = yield_probe.tick() => {
+            _ = yield_probe.tick(), if active.is_some() => {
                 // Drive-task heartbeat (see TASK_HEARTBEAT_MS): this probe
                 // ticks every 300ms unconditionally, so the watchdog stays
                 // quiet on any live task — even an idle one.
@@ -4763,15 +5098,25 @@ struct InboundSnapshot {
 type InboundCache = std::sync::Arc<std::sync::Mutex<InboundSnapshot>>;
 
 /// Spawn the background poller for `control_dirs`, refreshing `cache`
-/// every 300ms until the process ends. Best-effort per candidate, as
-/// before — a missing socket simply contributes nothing, and a poisoned
-/// lock just skips one refresh.
-fn spawn_inbound_poller(cache: InboundCache, control_dirs: Vec<std::path::PathBuf>) {
+/// every 300ms while a drive is active, and sleeping at 0% CPU when local.
+fn spawn_inbound_poller(
+    cache: InboundCache,
+    control_dirs: Vec<std::path::PathBuf>,
+    active_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wake: std::sync::Arc<tokio::sync::Notify>,
+) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(300));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tick.tick().await;
+            if !active_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                wake.notified().await;
+            } else {
+                tick.tick().await;
+            }
+            if !active_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
             let (totals, driving) = snapshot_inbound_inputs(&control_dirs).await;
             if let Ok(mut slot) = cache.lock() {
                 slot.totals = totals;
@@ -7050,24 +7395,38 @@ async fn cold_topology_dial(
     SessionCapabilities,
     String,
 )> {
-    let address = resolve_peer_address(peers, fingerprint, peer_name)?;
-    match dial_session(identity, peers, &address, policy, Some(fingerprint), dir).await {
+    let merged = load_merged_peer_book(dir);
+    let book_ref = if merged.peers.is_empty() {
+        peers
+    } else {
+        &merged
+    };
+    let address = resolve_peer_address(book_ref, fingerprint, peer_name)
+        .or_else(|_| live_fallback.clone().context("target screen peer has no saved address"))?;
+    match dial_session(identity, book_ref, &address, policy, Some(fingerprint), dir).await {
         Ok((conn, send, recv, motion_send, capabilities)) => {
             Ok((conn, send, recv, motion_send, capabilities, address))
         }
         Err(first) => {
-            // Stale book after a DHCP move: the live association (when
-            // one exists) is by definition reachable — retry there once
-            // instead of failing after a 60s knock on a dead address.
-            // dial_session records the winner, so the book heals either
-            // way and the next dial goes straight there.
-            let Some(live) = live_fallback.filter(|live| *live != address) else {
-                return Err(first);
-            };
-            tracing::info!(%first, book = %address, live = %live, "cold dial failed; retrying on the live association address");
-            let (conn, send, recv, motion_send, capabilities) =
-                dial_session(identity, peers, &live, policy, Some(fingerprint), dir).await?;
-            Ok((conn, send, recv, motion_send, capabilities, live))
+            // Stale book after a DHCP move: try the live association address
+            // first, then active LAN discovery / history-based IP healing.
+            if let Some(live) = live_fallback.filter(|live| *live != address) {
+                tracing::info!(%first, book = %address, live = %live, "cold dial failed; retrying on the live association address");
+                if let Ok((conn, send, recv, motion_send, capabilities)) =
+                    dial_session(identity, book_ref, &live, policy, Some(fingerprint), dir).await
+                {
+                    return Ok((conn, send, recv, motion_send, capabilities, live));
+                }
+            }
+            if let Some(healed) = heal_peer_address(dir, book_ref, &address).await {
+                tracing::info!(%first, book = %address, healed = %healed, "cold dial failed; retrying on healed peer IP");
+                let (conn, send, recv, motion_send, capabilities) =
+                    dial_session(identity, book_ref, &healed, policy, Some(fingerprint), dir)
+                        .await?;
+                persist_verified_auto_connect(dir, fingerprint, &healed).await;
+                return Ok((conn, send, recv, motion_send, capabilities, healed));
+            }
+            Err(first)
         }
     }
 }
@@ -7469,6 +7828,7 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                 // Image polls copy megabytes per call: gated to ownership
                 // changes or a 2s cadence (see the loop), never per tick.
                 let mut last_image_poll: Option<std::time::Instant> = None;
+                let mut first_pass = true;
                 while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
                     while let Ok(change) = command_rx.try_recv() {
                         match change {
@@ -7502,16 +7862,25 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                     // moment the user copies (XFixes on X11,
                     // WM_CLIPBOARDUPDATE on Windows), so a copy races the
                     // next drive handoff by milliseconds, not a 250ms poll
-                    // quantum. Absent (headless session, unsupported
-                    // compositor) the timed poll below still carries it —
-                    // events are a latency fast path, never a dependency.
-                    let notice = match &watcher {
-                        Some(watch) => {
-                            watch.wait_notice(Duration::from_millis(500))
-                        }
-                        None => {
-                            std::thread::sleep(Duration::from_millis(250));
-                            false
+                    // quantum. When the OS event watcher is active, skip
+                    // polling X11/Win32 clipboard contents on timeouts so
+                    // idle CPU and X11 selection traffic stay at zero.
+                    let notice = if first_pass {
+                        first_pass = false;
+                        false
+                    } else {
+                        match &watcher {
+                            Some(watch) => {
+                                let notified = watch.wait_notice(Duration::from_millis(1000));
+                                if !notified {
+                                    continue;
+                                }
+                                true
+                            }
+                            None => {
+                                std::thread::sleep(Duration::from_millis(500));
+                                false
+                            }
                         }
                     };
                     match clipboard.poll_user_text(notice) {
@@ -8208,6 +8577,23 @@ fn split_relay_payload(payload: &str, is_text: bool) -> Vec<String> {
     chunks
 }
 
+fn next_relay_revision(requested: u64) -> u64 {
+    static RELAY_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut current = RELAY_REVISION.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(1).max(requested);
+        match RELAY_REVISION.compare_exchange_weak(
+            current,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Stash one fully-received peer paste for UI take. Called for every
 /// paste (agent or not): when a session agent applied it directly the
 /// UI's equality check makes the take a no-op, and when headless the
@@ -8219,6 +8605,7 @@ pub(crate) fn stash_inbound_clipboard(
     width: u32,
     height: u32,
 ) {
+    let revision = next_relay_revision(revision);
     let chunks = split_relay_payload(
         payload,
         matches!(kind, kvm_protocol::control::ClipboardKind::Text),
@@ -8234,7 +8621,7 @@ pub(crate) fn stash_inbound_clipboard(
         *slot = Some(RelayPaste {
             revision,
             kind,
-            chunks,
+            chunks: chunks.clone(),
             total_bytes,
             width,
             height,
@@ -8242,6 +8629,46 @@ pub(crate) fn stash_inbound_clipboard(
     }
     // Wake any long-polling UI: the paste is ready to take now.
     let _ = clipboard_relay_notify().send(revision);
+
+    // If this process is a supervised `connect` child, also push the paste
+    // over local control IPC (`ClipboardStash`) to the `serve` daemon so the
+    // UI's `ClipboardPoll` long-poll receives pastes that arrived on the
+    // outbound episode stream.
+    if SUPERVISED_BY_UI.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let total_chunks = chunks.len() as u32;
+            let dirs = daemon_control_candidates(&data_dir());
+            handle.spawn(async move {
+                for dir in dirs {
+                    let mut all_ok = true;
+                    for (index, data) in chunks.iter().enumerate() {
+                        let req = kvm_protocol::control::ControlRequest::ClipboardStash {
+                            generation: revision,
+                            kind,
+                            total_chunks,
+                            index: index as u32,
+                            data: data.clone(),
+                            width,
+                            height,
+                        };
+                        if tokio::time::timeout(
+                            Duration::from_millis(500),
+                            crate::control::request(dir.clone(), req),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                    if all_ok {
+                        break;
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// A local copy the logged-in UI offered. `generation` is the UI's
@@ -8352,6 +8779,56 @@ fn offer_assembly() -> &'static std::sync::Mutex<OfferAssembly> {
     OFFER_ASSEMBLY.get_or_init(|| std::sync::Mutex::new(OfferAssembly::default()))
 }
 
+static STASH_ASSEMBLY: std::sync::OnceLock<std::sync::Mutex<OfferAssembly>> =
+    std::sync::OnceLock::new();
+
+fn stash_assembly() -> &'static std::sync::Mutex<OfferAssembly> {
+    STASH_ASSEMBLY.get_or_init(|| std::sync::Mutex::new(OfferAssembly::default()))
+}
+
+/// Accept one chunk of an inbound peer paste forwarded by a supervised
+/// `connect` child, and stash the finished paste into `CLIPBOARD_RELAY`.
+pub(crate) fn submit_inbound_clipboard_stash_chunk(
+    generation: u64,
+    kind: kvm_protocol::control::ClipboardKind,
+    total_chunks: u32,
+    index: u32,
+    data: String,
+    width: u32,
+    height: u32,
+) -> kvm_protocol::control::ControlResponse {
+    use kvm_protocol::control::ControlResponse;
+    let mut assembly = match stash_assembly().lock() {
+        Ok(assembly) => assembly,
+        Err(_) => {
+            return ControlResponse::Error {
+                message: "clipboard stash lock poisoned".into(),
+            };
+        }
+    };
+    match assembly.push(generation, kind, total_chunks, index, data, width, height) {
+        Ok(Some(stashed)) => {
+            drop(assembly);
+            stash_inbound_clipboard(
+                stashed.generation,
+                stashed.kind,
+                &stashed.payload,
+                stashed.width,
+                stashed.height,
+            );
+            ControlResponse::Applied {
+                restart_required: false,
+            }
+        }
+        Ok(None) => ControlResponse::Applied {
+            restart_required: false,
+        },
+        Err(message) => ControlResponse::Error {
+            message: message.into(),
+        },
+    }
+}
+
 /// Accept one chunk of a UI-offered local copy. A finished generation is
 /// published for every live episode (serve and direct capture) to forward.
 pub(crate) fn submit_local_clipboard_chunk(
@@ -8450,7 +8927,7 @@ pub(crate) fn poll_inbound_clipboard(
     let Some(paste) = slot.as_ref() else {
         return empty();
     };
-    if paste.revision == 0 || paste.revision == last_seen_revision {
+    if paste.revision == 0 || paste.revision <= last_seen_revision {
         return empty();
     }
     let Some(data) = paste.chunks.get(next_index as usize) else {
@@ -9265,6 +9742,39 @@ pub async fn run() -> Result<()> {
     tracing::info!(fingerprint = %fingerprint, port = listen_port, "starting daemon");
     tracing::info!(mode = ?config.mode, device = %config.device_name, "loaded daemon config");
     let peers = PeerBook::load_or_create(&dir).context("loading peer book")?;
+    // Default-on auto-connect: if `auto_connect_address` is not yet populated
+    // in `config.json` but a paired peer already exists in `peers.json`, adopt
+    // its address and ensure a valid two-screen layout exists so startup and
+    // lockscreen auto-connect work out of the box.
+    if config.auto_connect_enabled && config.mode != Mode::ClientOnly {
+        let mut config_dirty = false;
+        if config.auto_connect_address.is_none() {
+            if let Some(addr) = peers
+                .peers
+                .iter()
+                .find_map(|p| p.address.as_deref())
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+            {
+                config.auto_connect_address = Some(addr.to_owned());
+                config_dirty = true;
+            }
+        }
+        if config.layout.screens.len() < 2 {
+            if let Some(peer) = peers.peers.first() {
+                config.layout = kvm_core::Layout::pair_default(
+                    &config.device_name,
+                    &peer.name,
+                    &peer.fingerprint_hex,
+                );
+                config_dirty = true;
+            }
+        }
+        if config_dirty {
+            let _ = config.save(&config_path);
+        }
+    }
+    let allow_lock_screen = config.allow_lock_screen_control;
     let peers = Arc::new(tokio::sync::RwLock::new(peers));
     let configured_node_name = config.device_name.clone();
     let config = Arc::new(tokio::sync::RwLock::new(config));
@@ -9281,35 +9791,148 @@ pub async fn run() -> Result<()> {
         dir.clone(),
     );
     spawn_udp_motion_listener(udp_motion_port);
-    // Hangs up inbound sessions when the desktop app goes away in a way
-    // the presence lease cannot see (wedged process, half-open socket).
     spawn_presence_janitor(dir.clone());
+
+    // Pre-warm receiver input devices/helpers in the background at service
+    // startup so the very first incoming `Hello` pays zero setup latency.
+    tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        if std::env::args().any(|argument| argument == "--service") {
+            crate::windows_helper::prewarm_input_helpers(allow_lock_screen);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = allow_lock_screen;
+            let _ = kvm_platform::inject::Injector::create();
+        }
+    });
 
     #[cfg(target_os = "windows")]
     if std::env::args().any(|argument| argument == "--service") {
-        let controller_config = config.read().await.clone();
-        if let Some(address) = controller_config.auto_connect_address {
-            let controller_identity = identity.clone();
-            let controller_peers = peers.clone();
-            let controller_revoked_peers = revoked_peers.clone();
-            tokio::spawn(async move {
-                if let Err(error) = run_windows_service_controller(
-                    controller_identity,
-                    controller_peers,
-                    controller_revoked_peers,
-                    address,
-                    controller_config.device_name.clone(),
-                    controller_config.allow_lock_screen_control,
-                    controller_config.mode,
-                    local_screen_geometry(&controller_config.layout),
-                    controller_config.reverse_scroll,
-                )
-                .await
-                {
-                    tracing::warn!(%error, "Windows service controller stopped");
+        let controller_identity = identity.clone();
+        let controller_peers = peers.clone();
+        let controller_config_lock = config.clone();
+        let controller_revoked_peers = revoked_peers.clone();
+        tokio::spawn(async move {
+            // Wait 8s at service start so an already-logged-in desktop UI
+            // registers its `PresenceLease` before we spawn capture helpers.
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            loop {
+                if ui_present() {
+                    tokio::select! {
+                        _ = shutdown_notifier().notified() => return,
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                    }
                 }
-            });
-        }
+                let cfg = controller_config_lock.read().await.clone();
+                let book = controller_peers.read().await.clone();
+                let target_addr = if cfg.auto_connect_enabled && mode_allows_outgoing(cfg.mode) {
+                    cfg.auto_connect_address
+                        .clone()
+                        .filter(|a| !a.trim().is_empty())
+                        .or_else(|| {
+                            book.peers
+                                .iter()
+                                .find_map(|p| p.address.clone())
+                                .filter(|a| !a.trim().is_empty())
+                        })
+                        .or_else(|| {
+                            (!book.peers.is_empty()).then(|| format!("0.0.0.0:{DEFAULT_PORT}"))
+                        })
+                } else {
+                    None
+                };
+                if let Some(address) = target_addr {
+                    if let Err(error) = run_windows_service_controller(
+                        controller_identity.clone(),
+                        controller_peers.clone(),
+                        controller_revoked_peers.clone(),
+                        address,
+                        cfg.device_name.clone(),
+                        cfg.allow_lock_screen_control,
+                        cfg.mode,
+                        local_screen_geometry(&cfg.layout),
+                        cfg.reverse_scroll,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, "Windows service controller stopped");
+                    }
+                }
+                tokio::select! {
+                    _ = shutdown_notifier().notified() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let prelogin_peers = peers.clone();
+        let prelogin_config = config.clone();
+        let prelogin_dir = dir.clone();
+        tokio::spawn(async move {
+            let mut child_proc: Option<std::process::Child> = None;
+            // Wait 3s at boot before starting pre-login capture so an
+            // already-logging-in desktop UI can claim presence first.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            loop {
+                tokio::select! {
+                    _ = shutdown_notifier().notified() => {
+                        if let Some(mut c) = child_proc.take() {
+                            let _ = c.kill();
+                            let _ = c.wait();
+                        }
+                        return;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
+                let present = ui_present();
+                let cfg = prelogin_config.read().await.clone();
+                let book = prelogin_peers.read().await.clone();
+                let should_run = !present
+                    && cfg.auto_connect_enabled
+                    && cfg.allow_lock_screen_control
+                    && mode_allows_outgoing(cfg.mode)
+                    && (cfg.auto_connect_address.is_some() || !book.peers.is_empty());
+                if !should_run {
+                    if let Some(mut c) = child_proc.take() {
+                        tracing::info!("stopping pre-login auto-connect child (desktop UI present or disabled)");
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+                    continue;
+                }
+                if let Some(c) = child_proc.as_mut() {
+                    if let Ok(Some(_)) = c.try_wait() {
+                        child_proc = None;
+                    }
+                }
+                if child_proc.is_none() {
+                    if let Ok(exe) = std::env::current_exe() {
+                        let mut cmd = std::process::Command::new(exe);
+                        cmd.arg("connect")
+                            .env("THEKVM_DATA_DIR", &prelogin_dir)
+                            .env("THEKVM_DAEMON_DIR", &prelogin_dir)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null());
+                        if let Some(addr) = cfg
+                            .auto_connect_address
+                            .as_deref()
+                            .filter(|a| !a.trim().is_empty())
+                        {
+                            cmd.arg(addr);
+                        }
+                        if let Ok(spawned) = cmd.spawn() {
+                            tracing::info!("started pre-login lockscreen auto-connect child");
+                            child_proc = Some(spawned);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     let control_config = config.clone();
@@ -9450,14 +10073,6 @@ fn spawn_discovery_responder(
                 },
             };
             if kvm_protocol::discovery::is_request(&buffer[..length]) {
-                // Only a running desktop app can answer a link request
-                // (every new link needs its local approval). While the app
-                // is closed or killed this machine must vanish from other
-                // computers' device lists instead of lingering as an
-                // unconnectable ghost.
-                if !ui_present() {
-                    continue;
-                }
                 let live = kvm_core::Config::load(&dir.join("config.json"))
                     .map(|config| {
                         kvm_protocol::discovery::encode_advertisement(
@@ -9516,28 +10131,22 @@ fn spawn_udp_motion_listener(port: u16) {
                 },
             };
             let datagram = &buffer[..length];
-            let keys = udp_motion_key_snapshot();
-            if keys.is_empty() {
+            let Some((key, fingerprint_hex, frame)) = decode_udp_motion_from_keyring(datagram)
+            else {
                 continue;
-            }
-            let key_bytes: Vec<[u8; 32]> = keys.iter().map(|(key, _, _)| *key).collect();
-            let (key_index, seq, dx, dy) =
-                match kvm_protocol::udp::decode_motion_packet(&key_bytes, datagram) {
-                    Ok(decoded) => decoded,
-                    Err(_) => continue,
-                };
-            let (key, fingerprint_hex, _) = &keys[key_index];
+            };
+            let seq = frame.sequence;
             // Sequence dedup: UDP is unordered; old or replayed motion is
             // dropped while the next fresh delta still glides the cursor.
             // Strictly newer, or a counter wrap (fresh epoch restarts).
-            let accept = match last_seq.get(key) {
+            let accept = match last_seq.get(&key) {
                 None => true,
                 Some(last) => seq > *last || (*last > u64::MAX - 4096 && seq < 4096),
             };
             if !accept {
                 continue;
             }
-            last_seq.insert(*key, seq);
+            last_seq.insert(key, seq);
             if last_seq.len() > 128 {
                 // Bounded: drop an arbitrary stale entry.
                 if let Some(old) = last_seq.keys().next().copied() {
@@ -9548,14 +10157,7 @@ fn spawn_udp_motion_listener(port: u16) {
             // injector and tracks it in remote_cursor/hop state. When no
             // episode is registered (parked, ended, never drove) the
             // delta is dropped: no sink means no authorized drive here.
-            forward_udp_motion(
-                fingerprint_hex,
-                UdpMotionFrame {
-                    sequence: seq,
-                    dx,
-                    dy,
-                },
-            );
+            forward_udp_motion(&fingerprint_hex, frame);
         }
     });
 }
@@ -9671,37 +10273,11 @@ async fn handle_connection(
                 reject(&mut send, "peer is configured as receiver-only").await?;
                 bail!("peer cannot initiate control from receiver-only mode");
             }
-            // A running desktop app is required for any networked link:
-            // link approval, clipboard relay, and the outbound dial-back
-            // all live there. Refusing here (epoch-less admin paths
-            // excepted) keeps a closed app from accepting a link it can
-            // never drive or hang up — the "device looks connectable but
-            // nothing happens" ghost. The dialer retries; once the app
-            // opens, the link proceeds.
-            if hello.link_id.is_some() && !ui_present() {
-                reject(
-                    &mut send,
-                    "the TheKVM app is not running on this computer; open it there and connect again",
-                )
-                .await?;
-                audit_event(
-                    audit_dir,
-                    &format!(
-                        "session-rejected peer={peer_fingerprint} remote={} reason=local_app_not_running",
-                        conn.remote_address(),
-                    ),
-                );
-                bail!("incoming link refused: the local TheKVM app is not running");
-            }
-            // Per-link approval (the request+accept rule): pairing trust
-            // alone never opens a link. Every fresh epoch waits for the
-            // local human to allow it; approved epochs, the link born from
-            // a just-completed pairing, and an epoch THIS machine minted
-            // for this exact peer (our own Connect's dial-back) pass
-            // silently, so retries and the reverse half never prompt
-            // again. Epoch-less admin paths (fixed boot peer, CLI
-            // capture) carry no epoch to approve and proceed on pairing
-            // trust with an audit line — no UI exists there to ask.
+            // Pinned peers are cryptographically verified by their pinned TLS
+            // certificate (`peer_fingerprint` checked above). When `auto_connect_enabled`
+            // is true (the default), paired peers connect automatically across
+            // restarts, shutdowns, and pre-login lockscreens without needing the
+            // desktop app open or a second manual prompt.
             match hello.link_id {
                 None => {
                     audit_event(
@@ -9714,16 +10290,26 @@ async fn handle_connection(
                 }
                 Some(epoch) => {
                     let links = crate::control::link_approvals();
-                    let known = links.is_approved(&peer_fingerprint, epoch).await
+                    let known = config.auto_connect_enabled
+                        || links.is_approved(&peer_fingerprint, epoch).await
                         || links.recently_paired(&peer_fingerprint).await;
-                    // Our own Connect minted this epoch for this exact peer:
-                    // the dial-back half is authorized by the initiation this
-                    // user already performed, not by silent trust. The peer
-                    // fingerprint and epoch must BOTH match the live outbound
-                    // lease, so no other device can ride an epoch it was not
-                    // given. Pairing was already enforced above.
                     let locally_initiated =
                         !known && outbound_epoch_live(&peer_fingerprint, epoch);
+                    if !known && !locally_initiated && !ui_present() {
+                        reject(
+                            &mut send,
+                            "the TheKVM app is not running on this computer; open it there and connect again",
+                        )
+                        .await?;
+                        audit_event(
+                            audit_dir,
+                            &format!(
+                                "session-rejected peer={peer_fingerprint} remote={} reason=local_app_not_running",
+                                conn.remote_address(),
+                            ),
+                        );
+                        bail!("incoming link refused: the local TheKVM app is not running");
+                    }
                     if !known && !locally_initiated {
                         // The queued address MUST be dialable: the socket's
                         // remote is an ephemeral source port, and the
@@ -10011,7 +10597,68 @@ async fn handle_connection(
             // control never worked), so prefer the peer book's saved
             // daemon address and otherwise the inbound IP on the standard
             // daemon port.
-            let peer_book = peers.read().await;
+            let dialable = {
+                let peer_book = peers.read().await;
+                dialable_peer_address(
+                    &peer_book,
+                    &peer_fingerprint,
+                    &hello.node_name,
+                    conn.remote_address(),
+                )
+            };
+            {
+                let mut peer_book = peers.write().await;
+                let need_update = peer_book
+                    .peers
+                    .iter()
+                    .find(|p| p.fingerprint_hex == peer_fingerprint)
+                    .is_none_or(|p| {
+                        p.address.as_deref() != Some(dialable.as_str())
+                            || (!hello.node_name.trim().is_empty() && p.name != hello.node_name)
+                    });
+                if need_update {
+                    let name = if hello.node_name.trim().is_empty() {
+                        format!("peer-{}", &peer_fingerprint[..8])
+                    } else {
+                        hello.node_name.clone()
+                    };
+                    let _ = peer_book.pin_with_address(
+                        name,
+                        peer_fingerprint.clone(),
+                        Some(dialable.clone()),
+                    );
+                }
+            }
+            {
+                let mut shared_cfg = config_shared.write().await;
+                let mut cfg_changed = false;
+                if shared_cfg.auto_connect_enabled
+                    && shared_cfg.mode != Mode::ClientOnly
+                    && shared_cfg.auto_connect_address.as_deref() != Some(dialable.as_str())
+                {
+                    shared_cfg.auto_connect_address = Some(dialable.clone());
+                    cfg_changed = true;
+                }
+                if shared_cfg.layout.screens.len() < 2 {
+                    let peer_label = if hello.node_name.trim().is_empty() {
+                        format!("peer-{}", &peer_fingerprint[..8])
+                    } else {
+                        hello.node_name.clone()
+                    };
+                    shared_cfg.layout = kvm_core::Layout::pair_default(
+                        &shared_cfg.device_name,
+                        &peer_label,
+                        &peer_fingerprint,
+                    );
+                    config.layout = shared_cfg.layout.clone();
+                    apply_truthful_self_geometry(&mut config.layout);
+                    cfg_changed = true;
+                }
+                if cfg_changed {
+                    let _ = shared_cfg.save(&audit_dir.join("config.json"));
+                    bump_config_revision();
+                }
+            }
             let (
                 link_id,
                 mut link_drop,
@@ -10021,15 +10668,9 @@ async fn handle_connection(
             ) = register_inbound_link(
                 &peer_fingerprint,
                 &hello.node_name,
-                &dialable_peer_address(
-                    &peer_book,
-                    &peer_fingerprint,
-                    &hello.node_name,
-                    conn.remote_address(),
-                ),
+                &dialable,
                 hello.link_id,
             );
-            drop(peer_book);
             // UDP fast-path motion: when both sides negotiated it on a link
             // with an epoch, derive the session key from the authenticated
             // verify (both fingerprints + epoch) so the UDP listener can
@@ -12036,10 +12677,13 @@ async fn handle_pairing(
         );
         bail!("pairing was rejected or timed out locally");
     }
-    peers
-        .write()
-        .await
-        .pin(node_name, actual_peer_fingerprint.to_owned())?;
+    let dialable_addr =
+        std::net::SocketAddr::new(conn.remote_address().ip(), DEFAULT_PORT).to_string();
+    peers.write().await.pin_with_address(
+        node_name,
+        actual_peer_fingerprint.to_owned(),
+        Some(dialable_addr),
+    )?;
     // A completed pairing IS a link approval for the link born right
     // after it: the human approved this exact device seconds ago, so its
     // first link epoch passes silently instead of popping a second
@@ -12518,7 +13162,12 @@ async fn connect_input(
         // connections take the TLS-pinned branch above.
         transport::make_client_endpoint(identity)?
     };
-    let conn = endpoint.connect(addr, "thekvm")?.await?;
+    let conn = tokio::time::timeout(
+        Duration::from_millis(2500),
+        endpoint.connect(addr, "thekvm")?,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connect to {addr} timed out"))??;
     let fingerprint = peer_fingerprint(&conn)?;
     if !peers.is_pinned(&fingerprint) {
         bail!("peer {addr} is not paired (fingerprint {fingerprint})");
@@ -15216,13 +15865,18 @@ mod tests {
 
     #[test]
     fn lock_screen_requests_require_local_opt_in() {
-        // Windows downgrades a privileged request to an ordinary desktop
-        // session (MWB-like both-ways); non-Windows uinput keeps the hard
-        // reject because it writes below the compositor.
+        // Default config has `allow_lock_screen_control: true` so lock-screen
+        // control works out of the box; explicit opt-out (`false`) downgrades
+        // on Windows and rejects on non-Windows.
+        assert!(validate_input_capability(&Config::default(), true).unwrap());
+        let opted_out = Config {
+            allow_lock_screen_control: false,
+            ..Config::default()
+        };
         if cfg!(target_os = "windows") {
-            assert!(!validate_input_capability(&Config::default(), true).unwrap());
+            assert!(!validate_input_capability(&opted_out, true).unwrap());
         } else {
-            assert!(validate_input_capability(&Config::default(), true).is_err());
+            assert!(validate_input_capability(&opted_out, true).is_err());
         }
         assert!(validate_input_capability(
             &Config {

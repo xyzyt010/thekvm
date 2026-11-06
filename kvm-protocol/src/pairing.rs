@@ -364,7 +364,7 @@ pub struct PeerBook {
     pub peers: Vec<Peer>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Peer {
     pub name: String,
     pub fingerprint_hex: String,

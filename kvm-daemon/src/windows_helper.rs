@@ -107,6 +107,21 @@ pub struct InjectionReceipts {
     pub absolute_detail: String,
 }
 
+static POOLED_INPUT_PROXIES: std::sync::OnceLock<std::sync::Mutex<Vec<ServiceInputProxy>>> =
+    std::sync::OnceLock::new();
+
+fn pooled_input_proxies() -> &'static std::sync::Mutex<Vec<ServiceInputProxy>> {
+    POOLED_INPUT_PROXIES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Pre-warm the interactive input helpers at Windows service startup so the
+/// first incoming `Hello` handshake pays zero process-creation latency.
+pub fn prewarm_input_helpers(lock_screen_enabled: bool) {
+    if let Ok(proxy) = ServiceInputProxy::create(lock_screen_enabled) {
+        drop(proxy);
+    }
+}
+
 /// The service-side fan-out connection to the interactive helpers.
 pub struct ServiceInputProxy {
     streams: Vec<TcpStream>,
@@ -118,6 +133,29 @@ pub struct ServiceInputProxy {
 
 impl ServiceInputProxy {
     pub fn create(lock_screen_enabled: bool) -> Result<Self> {
+        if let Ok(mut guard) = pooled_input_proxies().lock() {
+            while let Some(mut cached) = guard.pop() {
+                let has_winlogon = cached
+                    .desktops
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case("winsta0\\winlogon"));
+                if (!lock_screen_enabled || has_winlogon)
+                    && cached.ensure_session().is_ok()
+                    && !cached.streams.is_empty()
+                    && cached.release_all().is_ok()
+                {
+                    return Ok(cached);
+                }
+                for stream in &cached.streams {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+                cached.streams.clear();
+            }
+        }
+        Self::spawn_fresh(lock_screen_enabled)
+    }
+
+    fn spawn_fresh(lock_screen_enabled: bool) -> Result<Self> {
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).context("bind Windows helper loopback listener")?;
         let port = listener.local_addr()?.port();
@@ -437,7 +475,33 @@ fn active_console_session_id() -> Result<u32> {
 
 impl Drop for ServiceInputProxy {
     fn drop(&mut self) {
-        let _ = self.release_all();
+        let released = self.release_all().is_ok();
+        // Return healthy real-session helpers back to the pool (up to 2 so
+        // overlapping verify + prewarm streams both reuse helpers without
+        // respawning). Any excess or dead streams are shut down cleanly so
+        // their helper processes exit immediately on EOF.
+        if released
+            && !self.streams.is_empty()
+            && self
+                .desktops
+                .iter()
+                .any(|d| d.starts_with("winsta0\\"))
+            && self.ensure_session().is_ok()
+        {
+            if let Ok(mut guard) = pooled_input_proxies().lock() {
+                if guard.len() < 2 {
+                    guard.push(ServiceInputProxy {
+                        streams: std::mem::take(&mut self.streams),
+                        desktops: std::mem::take(&mut self.desktops),
+                        session_id: self.session_id,
+                    });
+                    return;
+                }
+            }
+        }
+        for stream in &self.streams {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
@@ -718,14 +782,20 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                 injector.release_all()?;
                 return Ok(());
             }
-            Err(error) => {
-                // A transient bridge hiccup must not kill the helper (the
-                // old `?` turned one bad read into a dead drive with every
-                // upstream counter green). Back off briefly and keep
-                // reading; a truly dead bridge ends via EOF above.
-                tracing::warn!(%error, "helper bridge read failed; continuing");
-                std::thread::sleep(Duration::from_millis(10));
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
                 continue;
+            }
+            Err(error) => {
+                tracing::info!(%error, "helper bridge closed; exiting helper");
+                let _ = injector.release_all();
+                return Ok(());
             }
         };
         let message: HelperMessage = match serde_json::from_slice(&frame) {
@@ -858,7 +928,10 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                             injector.note_warp(x, y);
                             let expected = warp_readback_expectation(x, y);
                             match kvm_platform::capture::current_cursor_position() {
-                                Ok(Some(actual)) if actual == expected => {
+                                Ok(Some(actual))
+                                    if (actual.0 as i32 - expected.0 as i32).abs() <= 2
+                                        && (actual.1 as i32 - expected.1 as i32).abs() <= 2 =>
+                                {
                                     (true, format!("warped on {desktop}"))
                                 }
                                 Ok(actual) => (
@@ -955,13 +1028,21 @@ pub fn run_capture_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
                     kvm_platform::capture::set_exclusive(enabled);
                 }
             }
-            Ok(None) => break,
+            Ok(None) => {
+                command_stop.store(true, std::sync::atomic::Ordering::Release);
+                kvm_platform::capture::set_exclusive(false);
+                break;
+            }
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) => {}
-            Err(_) => break,
+            Err(_) => {
+                command_stop.store(true, std::sync::atomic::Ordering::Release);
+                kvm_platform::capture::set_exclusive(false);
+                break;
+            }
         }
     });
 
@@ -1103,39 +1184,33 @@ fn current_desktop_is_input() -> Result<bool> {
     }
     .context("query helper desktop input ownership")?;
     let owns = receives_input.as_bool();
-    // Name the desktop on first check and on every ownership change: a
-    // helper serving the wrong desktop (or losing input mid-drive)
-    // explains motion that vanishes past every upstream counter, and the
-    // name tells exactly which desktop each helper is parked on.
-    let mut name = vec![0u16; 256];
-    let desktop_name = if unsafe {
-        GetUserObjectInformationW(
-            HANDLE(desktop.0),
-            UOI_NAME,
-            Some(name.as_mut_ptr().cast()),
-            (name.len() * std::mem::size_of::<u16>()) as u32,
-            None,
-        )
-    }
-    .is_ok()
-    {
-        let len = name
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(name.len());
-        String::from_utf16_lossy(&name[..len])
-    } else {
-        "<unnamed>".to_owned()
-    };
-    static LAST: std::sync::Mutex<Option<(String, bool)>> = std::sync::Mutex::new(None);
-    if let Ok(mut guard) = LAST.lock() {
-        if guard
-            .as_ref()
-            .is_none_or(|last| last.0 != desktop_name || last.1 != owns)
-        {
-            tracing::info!(desktop = %desktop_name, owns_input = owns, "Windows helper desktop ownership");
-            *guard = Some((desktop_name, owns));
+    // Fast atomic transition check: avoids querying UOI_NAME + heap-allocating
+    // a String + locking a Mutex on every 1000Hz mouse move event.
+    // 0 = uninitialized, 1 = false, 2 = true.
+    static LAST_OWNS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let state_val = if owns { 2u8 } else { 1u8 };
+    if LAST_OWNS.swap(state_val, std::sync::atomic::Ordering::Relaxed) != state_val {
+        let mut name = [0u16; 128];
+        let desktop_name = if unsafe {
+            GetUserObjectInformationW(
+                HANDLE(desktop.0),
+                UOI_NAME,
+                Some(name.as_mut_ptr().cast()),
+                (name.len() * std::mem::size_of::<u16>()) as u32,
+                None,
+            )
         }
+        .is_ok()
+        {
+            let len = name
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(name.len());
+            String::from_utf16_lossy(&name[..len])
+        } else {
+            "<unnamed>".to_owned()
+        };
+        tracing::info!(desktop = %desktop_name, owns_input = owns, "Windows helper desktop ownership");
     }
     Ok(owns)
 }
@@ -1183,8 +1258,16 @@ fn write_ipc_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()
             "helper IPC frame exceeds limit",
         ));
     }
-    stream.write_all(&(payload.len() as u32).to_be_bytes())?;
-    stream.write_all(payload)?;
+    let len_bytes = (payload.len() as u32).to_be_bytes();
+    if payload.len() <= 252 {
+        let mut stack_buf = [0u8; 256];
+        stack_buf[..4].copy_from_slice(&len_bytes);
+        stack_buf[4..4 + payload.len()].copy_from_slice(payload);
+        stream.write_all(&stack_buf[..4 + payload.len()])?;
+    } else {
+        stream.write_all(&len_bytes)?;
+        stream.write_all(payload)?;
+    }
     stream.flush()
 }
 
@@ -1207,7 +1290,18 @@ fn read_ipc_frame_optional(stream: &mut TcpStream) -> std::io::Result<Option<Vec
     let mut length = [0u8; 4];
     match stream.read_exact(&mut length) {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(error) => return Err(error),
     }
     let length = u32::from_be_bytes(length) as usize;

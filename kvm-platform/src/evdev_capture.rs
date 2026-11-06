@@ -550,6 +550,8 @@ pub struct EvdevCapture {
     pressed_buttons: BTreeSet<MouseButton>,
     exclusive: bool,
     last_reload: Instant,
+    last_dir_mtime: Option<std::time::SystemTime>,
+    pollfds: Vec<libc::pollfd>,
 }
 
 impl EvdevCapture {
@@ -561,6 +563,8 @@ impl EvdevCapture {
             pressed_buttons: BTreeSet::new(),
             exclusive: false,
             last_reload: Instant::now(),
+            last_dir_mtime: None,
+            pollfds: Vec::with_capacity(16),
         };
         capture.reload()?;
         if !capture.devices.iter().any(|device| !device.is_own_injector) {
@@ -573,6 +577,17 @@ impl EvdevCapture {
     }
 
     fn reload(&mut self) -> Result<(), PlatformError> {
+        let current_mtime = std::fs::metadata("/dev/input")
+            .and_then(|meta| meta.modified())
+            .ok();
+        if !self.devices.is_empty()
+            && current_mtime.is_some()
+            && current_mtime == self.last_dir_mtime
+        {
+            return Ok(());
+        }
+        self.last_dir_mtime = current_mtime;
+
         let mut paths = read_dir("/dev/input")
             .map_err(|e| PlatformError::Capture(format!("read /dev/input: {e}")))?
             .filter_map(Result::ok)
@@ -758,7 +773,7 @@ impl CaptureBackend for EvdevCapture {
         _release: &AtomicBool,
     ) -> Result<InputEvent, PlatformError> {
         loop {
-            if self.last_reload.elapsed() >= Duration::from_secs(1) {
+            if self.last_reload.elapsed() >= Duration::from_secs(3) {
                 self.reload()?;
                 self.last_reload = Instant::now();
             }
@@ -781,23 +796,33 @@ impl CaptureBackend for EvdevCapture {
 
             if self.devices.is_empty() {
                 std::thread::sleep(std::time::Duration::from_millis(50));
+                self.last_dir_mtime = None;
                 self.reload()?;
                 continue;
             }
 
-            let mut pollfds = self
-                .devices
-                .iter()
-                .map(|device| libc::pollfd {
+            self.pollfds.clear();
+            for device in &self.devices {
+                self.pollfds.push(libc::pollfd {
                     fd: device.file.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
-                })
-                .collect::<Vec<_>>();
-            // 8ms poll cadence: `exclusive` transitions (EVIOCGRAB engage /
-            // release) take effect within one frame instead of stalling the
-            // first 250ms of a crossing or return.
-            let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, 8) };
+                });
+            }
+            let dev_count = self.pollfds.len();
+            #[cfg(target_os = "linux")]
+            if let Some(wfd) = crate::capture::capture_wake_fd() {
+                self.pollfds.push(libc::pollfd {
+                    fd: wfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            // Wakes in 0ms on any physical input or `set_exclusive` transition
+            // via `capture_wake_fd`, sleeping up to 100ms when completely idle.
+            let result = unsafe {
+                libc::poll(self.pollfds.as_mut_ptr(), self.pollfds.len() as _, 100)
+            };
             if result < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
@@ -808,14 +833,21 @@ impl CaptureBackend for EvdevCapture {
             if result == 0 {
                 continue;
             }
+            #[cfg(target_os = "linux")]
+            if self.pollfds.len() > dev_count
+                && self.pollfds[dev_count].revents & libc::POLLIN != 0
+            {
+                crate::capture::drain_capture_wake();
+            }
 
             let mut disconnected = Vec::new();
-            for (index, pollfd) in pollfds.iter().enumerate() {
-                if pollfd.revents & libc::POLLNVAL != 0 {
+            for index in 0..dev_count {
+                let revents = self.pollfds[index].revents;
+                if revents & libc::POLLNVAL != 0 {
                     disconnected.push(index);
                     continue;
                 }
-                if pollfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
+                if revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
                     continue;
                 }
                 loop {
@@ -850,11 +882,12 @@ impl CaptureBackend for EvdevCapture {
                         }
                     }
                 }
-                if pollfd.revents & libc::POLLHUP != 0 {
+                if revents & libc::POLLHUP != 0 {
                     disconnected.push(index);
                 }
             }
             if !disconnected.is_empty() {
+                self.last_dir_mtime = None;
                 self.remove_devices(disconnected);
             }
         }
@@ -1373,6 +1406,8 @@ mod tests {
             pressed_buttons: BTreeSet::from([MouseButton::Left]),
             exclusive: false,
             last_reload: Instant::now(),
+            last_dir_mtime: None,
+            pollfds: Vec::new(),
         };
         capture.devices[0].pressed_keys.insert(0x04);
         capture.devices[0].pressed_buttons.insert(MouseButton::Left);
@@ -1402,6 +1437,8 @@ mod tests {
             pressed_buttons: BTreeSet::new(),
             exclusive: false,
             last_reload: Instant::now(),
+            last_dir_mtime: None,
+            pollfds: Vec::new(),
         };
 
         let key = InputEvent::Key(KeyEvent {

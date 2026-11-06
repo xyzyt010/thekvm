@@ -87,26 +87,27 @@ pub fn derive_udp_key(
 /// Encode one UDP packet. `body` must already fit the MTU budget; use
 /// [`split_reliable`] for larger JSON messages.
 pub fn encode_packet(key: &[u8; 32], kind: u8, seq: u64, body: &[u8]) -> Vec<u8> {
-    let mut plaintext = Vec::with_capacity(1 + 1 + 8 + body.len());
-    plaintext.push(UDP_VERSION);
-    plaintext.push(kind);
-    plaintext.extend_from_slice(&seq.to_be_bytes());
-    plaintext.extend_from_slice(body);
-
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    for byte in nonce_bytes.iter_mut() {
-        *byte = rand::random();
-    }
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let mut buffer = plaintext;
-    cipher
-        .encrypt_in_place(nonce, b"", &mut buffer)
-        .expect("chacha encryption cannot fail with valid key/nonce");
-    let mut out = Vec::with_capacity(HEADER_LEN + buffer.len() + TAG_LEN);
+    rand::Fill::try_fill(&mut nonce_bytes[..], &mut rand::thread_rng())
+        .unwrap_or_else(|_| {
+            for byte in nonce_bytes.iter_mut() {
+                *byte = rand::random();
+            }
+        });
+    let mut out = Vec::with_capacity(HEADER_LEN + 1 + 1 + 8 + body.len() + TAG_LEN);
     out.extend_from_slice(UDP_MAGIC);
     out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&buffer);
+    out.push(UDP_VERSION);
+    out.push(kind);
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(body);
+
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let tag = cipher
+        .encrypt_in_place_detached(nonce, b"", &mut out[HEADER_LEN..])
+        .expect("chacha encryption cannot fail with valid key/nonce");
+    out.extend_from_slice(&tag);
     debug_assert!(out.len() <= MAX_UDP_DATAGRAM || kind == KIND_RELIABLE);
     out
 }
@@ -128,6 +129,33 @@ pub fn decode_packet(
         .map_err(|_| "bad nonce".to_string())?;
     let ciphertext = &datagram[HEADER_LEN..];
     let nonce = Nonce::from_slice(&nonce_bytes);
+    // Fast stack path for small packets (motion packets are 54 bytes total):
+    // avoids heap allocations per key attempt at 1000Hz mouse report rates.
+    if ciphertext.len() <= 128 {
+        let mut stack_buf = [0u8; 128];
+        let ct_len = ciphertext.len();
+        for (index, key) in keys.iter().enumerate() {
+            stack_buf[..ct_len].copy_from_slice(ciphertext);
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+            let (msg, tag) = stack_buf[..ct_len].split_at_mut(ct_len - TAG_LEN);
+            let tag = chacha20poly1305::Tag::from_slice(tag);
+            if cipher.decrypt_in_place_detached(nonce, b"", msg, tag).is_ok() {
+                if msg.len() < 10 {
+                    return Err("plaintext too short".into());
+                }
+                if msg[0] != UDP_VERSION {
+                    return Err("unsupported udp version".into());
+                }
+                let kind = msg[1];
+                if kind != KIND_RELIABLE && kind != KIND_MOTION && kind != KIND_ACK {
+                    return Err("unknown packet kind".into());
+                }
+                let seq = u64::from_be_bytes(msg[2..10].try_into().unwrap());
+                return Ok((index, kind, seq, msg[10..].to_vec()));
+            }
+        }
+        return Err("decrypt failed for all keys".into());
+    }
     for (index, key) in keys.iter().enumerate() {
         let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
         let mut buffer = ciphertext.to_vec();

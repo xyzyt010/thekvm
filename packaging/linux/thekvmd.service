@@ -10,14 +10,15 @@ User=thekvm
 Group=thekvm
 SupplementaryGroups=input
 ExecStart=/usr/bin/kvm-daemon serve
-Restart=on-failure
-RestartSec=3
+Restart=always
+RestartSec=1
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/thekvm
 PrivateTmp=yes
-ProtectHome=yes
+ProtectHome=read-only
 DeviceAllow=/dev/uinput rw
+DeviceAllow=/dev/input/event* rw
 UMask=0007
 
 [Install]

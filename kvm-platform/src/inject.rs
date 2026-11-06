@@ -85,7 +85,7 @@ mod linux_uinput {
         bytes
     }
 
-    pub struct UinputDevice {
+    struct RawUinputDevice {
         mouse: File,
         keyboard: File,
         pressed_keys: BTreeSet<u16>,
@@ -113,6 +113,88 @@ mod linux_uinput {
         touch_warned: bool,
     }
 
+    static SHARED_UINPUT: std::sync::OnceLock<std::sync::Mutex<Option<RawUinputDevice>>> =
+        std::sync::OnceLock::new();
+
+    fn shared_uinput_slot() -> &'static std::sync::Mutex<Option<RawUinputDevice>> {
+        SHARED_UINPUT.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    pub struct UinputDevice;
+
+    impl UinputDevice {
+        pub fn create() -> Result<Self, PlatformError> {
+            let mut slot = shared_uinput_slot()
+                .lock()
+                .map_err(|_| PlatformError::Uinput("uinput lock poisoned".into()))?;
+            if slot.is_none() {
+                *slot = Some(RawUinputDevice::create()?);
+            } else if let Some(dev) = slot.as_mut() {
+                let _ = dev.release_all();
+            }
+            Ok(Self)
+        }
+
+        pub fn send(&mut self, event: InputEvent) -> Result<(), PlatformError> {
+            let mut slot = shared_uinput_slot()
+                .lock()
+                .map_err(|_| PlatformError::Uinput("uinput lock poisoned".into()))?;
+            if slot.is_none() {
+                *slot = Some(RawUinputDevice::create()?);
+            }
+            let result = slot.as_mut().expect("just initialized").send(event);
+            if result.is_err() {
+                *slot = None;
+            }
+            result
+        }
+
+        pub fn inject_pinch(&mut self, delta: i32, display: Option<&str>) -> bool {
+            let Ok(mut slot) = shared_uinput_slot().lock() else {
+                return false;
+            };
+            if slot.is_none() {
+                *slot = RawUinputDevice::create().ok();
+            }
+            slot.as_mut()
+                .map(|dev| dev.inject_pinch(delta, display))
+                .unwrap_or(false)
+        }
+
+        pub fn end_pinch(&mut self) {
+            if let Ok(mut slot) = shared_uinput_slot().lock() {
+                if let Some(dev) = slot.as_mut() {
+                    dev.end_pinch();
+                }
+            }
+        }
+
+        pub fn key_pressed(&self, usage: HidUsage) -> bool {
+            shared_uinput_slot()
+                .lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(|dev| dev.key_pressed(usage)))
+                .unwrap_or(false)
+        }
+
+        pub fn release_all(&mut self) -> Result<(), PlatformError> {
+            let Ok(mut slot) = shared_uinput_slot().lock() else {
+                return Ok(());
+            };
+            if let Some(dev) = slot.as_mut() {
+                dev.release_all()
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for UinputDevice {
+        fn drop(&mut self) {
+            let _ = self.release_all();
+        }
+    }
+
     /// Bank one smooth-scroll axis (120ths): returns the whole detents to
     /// emit on the legacy axis plus the new banked remainder. The bank is
     /// NET accumulation, never dropped on reversal: trackpad sensors
@@ -131,7 +213,7 @@ mod linux_uinput {
         (detents, debt - detents.saturating_mul(120))
     }
 
-    impl UinputDevice {
+    impl RawUinputDevice {
         pub fn create() -> Result<Self, PlatformError> {
             let open = || {
                 OpenOptions::new()
@@ -432,7 +514,7 @@ mod linux_uinput {
         }
     }
 
-    impl Drop for UinputDevice {
+    impl Drop for RawUinputDevice {
         fn drop(&mut self) {
             let _ = self.release_all();
             if self.mouse_created {
@@ -781,6 +863,7 @@ mod linux_uinput {
         file: File,
         created_at: std::time::Instant,
         settled: bool,
+        last_sync: Option<(i32, i32)>,
     }
 
     impl UinputAbsPointer {
@@ -810,6 +893,7 @@ mod linux_uinput {
                 file,
                 created_at: std::time::Instant::now(),
                 settled: false,
+                last_sync: None,
             })
         }
 
@@ -828,6 +912,7 @@ mod linux_uinput {
             self.ensure_settled();
             let ax = abs_pointer_unit(x, width);
             let ay = abs_pointer_unit(y, height);
+            self.last_sync = Some((ax, ay));
             // 1-unit pre-nudge defeats the kernel evdev duplicate-value
             // filter when warping to the same edge coordinate twice in a
             // row (after relative motion moved the cursor away).
@@ -856,6 +941,10 @@ mod linux_uinput {
             }
             let ax = abs_pointer_unit(x, width);
             let ay = abs_pointer_unit(y, height);
+            if self.last_sync == Some((ax, ay)) {
+                return Ok(());
+            }
+            self.last_sync = Some((ax, ay));
             let mut buf = Vec::with_capacity(3 * 24);
             for &(t, c, v) in &[
                 (EV_ABS, ABS_X, ax),

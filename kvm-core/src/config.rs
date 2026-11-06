@@ -34,13 +34,17 @@ pub struct Config {
     pub edge_mode: EdgeMode,
     #[serde(default)]
     pub layout: crate::layout::Layout,
-    #[serde(default)]
+    #[serde(default = "default_allow_lock_screen_control")]
     pub allow_lock_screen_control: bool,
-    /// Optional fixed peer for the Windows LocalSystem controller path. This
-    /// is deliberately opt-in; an ordinary service installation remains a
-    /// receiver until a user configures a paired address.
+    /// Optional fixed peer for the boot-time / startup controller path.
+    /// Automatically populated when pairing or connecting while
+    /// `auto_connect_enabled` is true.
     #[serde(default)]
     pub auto_connect_address: Option<String>,
+    /// Automatically connect to paired peers at startup (including across
+    /// restarts, shutdowns, and lockscreens). Default on for all devices.
+    #[serde(default = "default_auto_connect_enabled")]
+    pub auto_connect_enabled: bool,
     /// Synchronize plain text clipboard contents for ordinary logged-in
     /// sessions. Default on: both machines sync while linked. Clipboard
     /// data is user content, so either side can still switch it off in
@@ -121,8 +125,9 @@ impl Default for Config {
             transport: TransportProtocol::Udp,
             edge_mode: EdgeMode::Double,
             layout: Default::default(),
-            allow_lock_screen_control: false,
+            allow_lock_screen_control: true,
             auto_connect_address: None,
+            auto_connect_enabled: true,
             clipboard_enabled: true,
             clipboard_max_mb: DEFAULT_CLIPBOARD_MAX_MB,
             reverse_scroll: false,
@@ -130,6 +135,14 @@ impl Default for Config {
             double_edge_style: DoubleEdgeStyle::Mirror,
         }
     }
+}
+
+fn default_allow_lock_screen_control() -> bool {
+    true
+}
+
+fn default_auto_connect_enabled() -> bool {
+    true
 }
 
 /// Auto-discovery defaults on: it only lists machines, never connects, so
@@ -170,6 +183,10 @@ impl Config {
         if !raw.contains("\"double_edge_style\"") {
             config.edge_mode = EdgeMode::Double;
             config.double_edge_style = crate::layout::DoubleEdgeStyle::Mirror;
+        }
+        if !raw.contains("\"auto_connect_enabled\"") {
+            config.auto_connect_enabled = true;
+            config.allow_lock_screen_control = true;
         }
         config.validate().map_err(std::io::Error::other)?;
         Ok(config)
@@ -396,7 +413,8 @@ mod tests {
         )
         .unwrap();
         assert!(config.layout.screens.is_empty());
-        assert!(!config.allow_lock_screen_control);
+        assert!(config.allow_lock_screen_control);
+        assert!(config.auto_connect_enabled);
         assert!(config.auto_connect_address.is_none());
         // Files predating the clipboard field never opted out, so they
         // pick up the current default-on.

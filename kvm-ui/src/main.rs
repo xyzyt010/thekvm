@@ -254,11 +254,8 @@ fn main() -> Result<()> {
         ui.set_auto_connect_address(SharedString::from(
             config.auto_connect_address.clone().unwrap_or_default(),
         ));
-        // Auto-reconnect: the remembered address IS the "last live link"
-        // (a Disconnect clears it), so the switch starts on exactly when
-        // this machine would re-link by itself after a reboot.
-        ui.set_auto_connect_on_start(config.auto_connect_address.is_some());
-        ui.set_auto_connect_known(config.auto_connect_address.is_some());
+        ui.set_auto_connect_on_start(config.auto_connect_enabled);
+        ui.set_auto_connect_known(config.auto_connect_enabled);
         ui.set_mode_index(match config.mode {
             kvm_core::Mode::Bidirectional => 0,
             kvm_core::Mode::ServerClient => 1,
@@ -315,8 +312,18 @@ fn main() -> Result<()> {
     // effort — a missing xhost binary just keeps today's behavior.
     #[cfg(target_os = "linux")]
     grant_daemon_x_access();
-    // Login auto-start: show what this machine will ACTUALLY do at the
-    // next logon (the OS owns that state — see kvm_platform::autostart).
+    // Login auto-start: enabled by default on first run so TheKVM launches
+    // automatically after reboots and shutdowns.
+    if kvm_platform::autostart::SUPPORTED {
+        let marker = startup_dir.join(".autostart-initialized");
+        if !marker.exists() {
+            let _ = std::fs::create_dir_all(&startup_dir);
+            if kvm_platform::autostart::set_enabled(true).is_ok() {
+                let _ = std::fs::write(&marker, b"1");
+                ui_log("autostart: enabled login auto-start by default on first run");
+            }
+        }
+    }
     ui.set_autostart_supported(kvm_platform::autostart::SUPPORTED);
     match kvm_platform::autostart::enabled() {
         Ok(on) => {
@@ -340,73 +347,126 @@ fn main() -> Result<()> {
     // of landing. This thread takes them and applies them with the
     // logged-in session's own clipboard — text and screenshots alike.
     spawn_clipboard_relay();
-    // Auto-reconnect at startup (Problem 3: "after a power cut the link
-    // comes back with zero clicks once both are logged in"). The
-    // remembered `auto_connect_address` IS the last live link: a user
-    // Disconnect clears it, so a retired link is never resurrected here,
-    // and the epoch-ban system still refuses the re-dial when the peer
-    // ended that link on their side.
-    //
-    // Deliberately OUTSIDE the poll thread's link-following logic and
-    // one-shot: that logic reacts to an INBOUND session (the other
-    // machine dialled us), which does not exist yet after a power cut on
-    // both sides. This dials the remembered peer once the daemon answers.
-    // The same first-connect spinner runs, so the window looks exactly
-    // like a manual Connect.
+    // Default-on startup auto-connect: once the background daemon is
+    // reachable, resolve the paired peer from `auto_connect_address`,
+    // daemon `ListPeers`, or user `PeerBook` and launch the supervised
+    // `connect` session (which continuously retries and heals changed LAN
+    // IPs via discovery/history).
     {
         let weak = weak.clone();
         let pending = pending_pair.clone();
         let session = session_state.clone();
         let data_dir = startup_dir.clone();
-        let address = ui.get_auto_connect_address().as_str().trim().to_owned();
-        if !address.is_empty() {
-            ui_log(&format!("autoconnect: startup, re-linking to {address}"));
-            std::thread::spawn(move || {
-                // Startup barrier: wait for the daemon, and bring one up if
-                // this machine has none. A plain poll would race the
-                // background daemon's own start on a source install and
-                // give up right before it appeared; `ensure_user_daemon`
-                // is the same path the Start button and the poll use, so
-                // the re-link cannot lose to a cold boot.
-                let mut endpoint_ready = false;
-                for _ in 0..30 {
-                    if control_request(ControlRequest::Status).is_ok() {
-                        endpoint_ready = true;
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::spawn(move || {
+            let mut endpoint_ready = false;
+            for _ in 0..30 {
+                if control_request(ControlRequest::Status).is_ok() {
+                    endpoint_ready = true;
+                    break;
                 }
-                if !endpoint_ready {
-                    match ensure_user_daemon() {
-                        Ok(()) => ui_log("autoconnect: started a user-session daemon"),
-                        // A packaged machine whose system service is still
-                        // coming up: give it a few more seconds rather than
-                        // declaring the re-link failed.
-                        Err(error) => {
-                            ui_log(&format!("autoconnect: daemon not ready ({error}); waiting"));
-                            for _ in 0..12 {
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                                if control_request(ControlRequest::Status).is_ok() {
-                                    break;
-                                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            if !endpoint_ready {
+                match ensure_user_daemon() {
+                    Ok(()) => ui_log("autoconnect: started a user-session daemon"),
+                    Err(error) => {
+                        ui_log(&format!("autoconnect: daemon not ready ({error}); waiting"));
+                        for _ in 0..12 {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            if control_request(ControlRequest::Status).is_ok() {
+                                break;
                             }
                         }
                     }
                 }
-                if control_request(ControlRequest::Status).is_err() {
-                    ui_log("autoconnect: background service unreachable; not reconnecting");
-                    finish_auto_connect(
-                        &weak,
-                        true,
-                        "Background service unreachable — open TheKVM again once it starts."
-                            .to_owned(),
-                    );
-                    return;
+            }
+            let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) else {
+                ui_log("autoconnect: background service unreachable; not reconnecting");
+                return;
+            };
+            if !status.auto_connect_enabled || status.mode == kvm_core::Mode::ClientOnly {
+                return;
+            }
+            ensure_link_arrangement();
+            // Give the poll thread 1.5s to adopt any already-live inbound
+            // session via `follow_link` first, avoiding a double-dial race.
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            if child_running(&session) {
+                return;
+            }
+            let user_cfg = kvm_core::Config::load(&data_dir.join("config.json")).ok();
+            let daemon_peers = match control_request(ControlRequest::ListPeers) {
+                Ok(ControlResponse::Peers(p)) => p,
+                _ => Vec::new(),
+            };
+            let user_peers = kvm_protocol::pairing::PeerBook::load_or_create(&data_dir)
+                .map(|b| b.peers)
+                .unwrap_or_default();
+            // Ensure both peer books share all known pins and addresses.
+            for p in &daemon_peers {
+                ensure_user_pin(&p.fingerprint_hex, &p.name, p.address.as_deref());
+            }
+            for p in &user_peers {
+                if !daemon_peers.iter().any(|dp| dp.fingerprint_hex == p.fingerprint_hex) {
+                    pin_daemon_peer(&p.fingerprint_hex, &p.name, p.address.as_deref());
                 }
-                set_link_connecting(&weak, true);
-                start_session_flow(&weak, &pending, &data_dir, &session, address, None);
-            });
-        }
+            }
+            let target_address = status
+                .auto_connect_address
+                .clone()
+                .filter(|a| !a.trim().is_empty())
+                .or_else(|| {
+                    user_cfg
+                        .and_then(|c| c.auto_connect_address)
+                        .filter(|a| !a.trim().is_empty())
+                })
+                .or_else(|| {
+                    status
+                        .sessions
+                        .first()
+                        .map(|s| s.address.clone())
+                        .filter(|a| !a.trim().is_empty())
+                })
+                .or_else(|| {
+                    status
+                        .recent_inbound
+                        .first()
+                        .map(|r| r.address.clone())
+                        .filter(|a| !a.trim().is_empty())
+                })
+                .or_else(|| {
+                    daemon_peers
+                        .iter()
+                        .find_map(|p| p.address.clone())
+                        .filter(|a| !a.trim().is_empty())
+                })
+                .or_else(|| {
+                    user_peers
+                        .iter()
+                        .find_map(|p| p.address.clone())
+                        .filter(|a| !a.trim().is_empty())
+                })
+                .or_else(|| {
+                    if !daemon_peers.is_empty() || !user_peers.is_empty() {
+                        Some(format!("0.0.0.0:{}", kvm_protocol::DEFAULT_PORT))
+                    } else {
+                        None
+                    }
+                });
+            let Some(address) = target_address else {
+                return;
+            };
+            if child_running(&session) {
+                return;
+            }
+            ui_log(&format!("autoconnect: startup auto-linking to {address}"));
+            if !address.starts_with("0.0.0.0:") {
+                set_peer_address_field(&weak, &address);
+                remember_auto_connect_peer(&data_dir, &address);
+            }
+            set_link_connecting(&weak, true);
+            spawn_session(&weak, &session, &pending, &data_dir, address);
+        });
     }
 
     // Poll thread owns no UI handles (see NOTE inside the loop); everything
@@ -418,25 +478,15 @@ fn main() -> Result<()> {
         let mut was_failing = false;
         // Countdown to the next background LAN scan (see below): ~15s.
         let mut auto_scan_in: u32 = 1;
+        let mut cached_peers: Vec<kvm_protocol::pairing::Peer> = Vec::new();
+        let mut last_peer_count: usize = usize::MAX;
+        let mut last_link_running = false;
+        let mut peer_refresh_ticks: u32 = 0;
         ui_log("poll thread started");
         loop {
-            // NOTE: never gate this loop on weak.upgrade(). Slint component
-            // handles live on the event-loop thread: upgrading a Weak from any
-            // background thread ALWAYS returns None, so such a check exits the
-            // poll on its very first iteration — silently killing every
-            // poll-driven display (status, station code, invite, peers,
-            // incoming approvals, update counter) on all machines while buttons
-            // keep working. The per-update closures below upgrade safely
-            // because invoke_from_event_loop runs them ON the UI thread. This
-            // thread holds no strong handle, so process exit still ends it.
-            // One panicking iteration must never kill the whole poll thread:
-            // catch it, log it, count it as a failure, keep polling.
             let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match control_request(ControlRequest::Status) {
                     Ok(ControlResponse::Status(status)) => {
-                        // Make every success transition provable in ui.log: a poll
-                        // that works but stays silent is indistinguishable from a
-                        // dead one, and that ambiguity has cost real debugging days.
                         let code_state = if status.pairing_code.is_empty() {
                             "station code unset"
                         } else {
@@ -445,9 +495,9 @@ fn main() -> Result<()> {
                         if was_failing {
                             was_failing = false;
                             ui_log(&format!(
-                        "poll: daemon reachable again after failures ({} peers, {code_state})",
-                        status.peer_count
-                    ));
+                                "poll: daemon reachable again after failures ({} peers, {code_state})",
+                                status.peer_count
+                            ));
                         }
                         if !POLL_FIRST_OK.swap(true, std::sync::atomic::Ordering::Relaxed) {
                             ui_log(&format!(
@@ -456,20 +506,19 @@ fn main() -> Result<()> {
                             ));
                         }
                         consecutive_failures = 0;
-                        // Station-side default arrangement (both sides number
-                        // themselves 1 — see ensure_link_arrangement) and the
-                        // Devices arrangement display both refresh here, from live
-                        // daemon state.
                         ensure_link_arrangement();
                         let link_running = session_for_poll
                             .lock()
                             .ok()
                             .is_some_and(|slot| slot.is_some());
-                        refresh_arrangement(&weak, link_running);
-                        // Link-following (MWB arming): children run only inside a
-                        // live link — never at boot, never unprompted. Outbound
-                        // links belong to the session flow; this arms (and tears
-                        // down) the station half of an inbound link automatically.
+                        peer_refresh_ticks = peer_refresh_ticks.wrapping_add(1);
+                        if status.peer_count != last_peer_count
+                            || link_running != last_link_running
+                            || peer_refresh_ticks.is_multiple_of(5)
+                        {
+                            last_link_running = link_running;
+                            refresh_arrangement(&weak, link_running);
+                        }
                         follow_link(
                             &weak,
                             &status,
@@ -480,12 +529,6 @@ fn main() -> Result<()> {
                             &last_dialback_state,
                             &last_link_seen_state,
                         );
-                        // Bilateral Disconnect: the peer hung up (their
-                        // LinkEnded banned the epoch here). End our side
-                        // too — even an idle child with no live episodes
-                        // — so one Disconnect lands on both computers.
-                        // Stale entries can only match a dead epoch (every
-                        // Connect mints fresh), never a live link.
                         let peer_ended_ours = session_for_poll.lock().ok().and_then(|slot| {
                             slot.as_ref()
                                 .and_then(|session| session.link_id)
@@ -500,15 +543,18 @@ fn main() -> Result<()> {
                         }
                         let port = status.listen_port;
                         let fingerprint = status.fingerprint_hex.clone();
+                        let peer_count = status.peer_count;
                         set_daemon_status(&weak, status);
                         refresh_invite(&weak, &invite_state, port, &fingerprint);
-                        match control_request(ControlRequest::ListPeers) {
-                            Ok(ControlResponse::Peers(peers)) => set_peer_list(&weak, peers),
-                            Ok(other) => {
-                                set_status(&weak, format!("Unexpected peer list: {other:?}"))
-                            }
-                            Err(error) => {
-                                set_status(&weak, format!("Peer list unavailable: {error}"))
+                        if peer_count != last_peer_count || peer_refresh_ticks.is_multiple_of(5) {
+                            if let Ok(ControlResponse::Peers(peers)) =
+                                control_request(ControlRequest::ListPeers)
+                            {
+                                last_peer_count = peer_count;
+                                if peers != cached_peers {
+                                    cached_peers = peers.clone();
+                                    set_peer_list(&weak, peers);
+                                }
                             }
                         }
                         if let Ok(ControlResponse::PendingPairings(pairings)) =
@@ -517,12 +563,13 @@ fn main() -> Result<()> {
                             // Log arrivals and clears: "UI knew but didn't show" vs
                             // "UI never knew" must always be answerable from ui.log.
                             let count = pairings.len();
-                            if LAST_INCOMING_COUNT.swap(count, std::sync::atomic::Ordering::Relaxed)
-                                != count
-                            {
+                            let prev = LAST_INCOMING_COUNT.swap(count, std::sync::atomic::Ordering::Relaxed);
+                            if prev != count {
                                 ui_log(&format!("poll: {count} incoming pairing(s) listed"));
                             }
-                            set_incoming_pairing(&weak, pairings);
+                            if prev != count || count > 0 {
+                                set_incoming_pairing(&weak, pairings);
+                            }
                         }
                         if let Ok(ControlResponse::PendingLinks(links)) =
                             control_request(ControlRequest::ListPendingLinks)
@@ -551,16 +598,17 @@ fn main() -> Result<()> {
                                 visible.push(link);
                             }
                             let count = visible.len();
-                            if LAST_INCOMING_LINK_COUNT
-                                .swap(count, std::sync::atomic::Ordering::Relaxed)
-                                != count
-                            {
+                            let prev = LAST_INCOMING_LINK_COUNT
+                                .swap(count, std::sync::atomic::Ordering::Relaxed);
+                            if prev != count {
                                 ui_log(&format!("poll: {count} incoming link(s) listed"));
                             }
                             if let Ok(mut slot) = pending_links_for_poll.lock() {
                                 *slot = visible.clone();
                             }
-                            set_incoming_link(&weak, visible);
+                            if prev != count || count > 0 {
+                                set_incoming_link(&weak, visible);
+                            }
                         }
                     }
                     Ok(other) => {
@@ -744,6 +792,7 @@ fn main() -> Result<()> {
         current: &kvm_core::Config,
         address: Option<String>,
         clear: bool,
+        enabled: bool,
     ) -> ControlRequest {
         ControlRequest::SetConfig {
             device_name: Some(current.device_name.clone()),
@@ -760,6 +809,7 @@ fn main() -> Result<()> {
             reverse_scroll: None,
             auto_discover: None,
             double_edge_style: None,
+            auto_connect_enabled: Some(enabled),
         }
     }
 
@@ -849,14 +899,11 @@ fn main() -> Result<()> {
         });
     }
 
-    // Auto-reconnect (Problem 3: "it automatically reconnects to the last
-    // linked computer without me pressing anything"). The remembered
-    // address is exactly the last live link: a Disconnect clears it
-    // (`auto_connect_address: None`), and a deliberately ended epoch is
-    // still refused by the epoch-ban system, so nothing the user ended
-    // comes back on its own.
+    // Auto-reconnect (enabled by default): automatically connects to paired
+    // peers on startup and across restarts/lockscreens/IP changes.
     {
         let weak = ui.as_weak();
+        let auto_data_dir = startup_dir.clone();
         ui.on_apply_auto_connect(move |wanted| {
             let weak = weak.clone();
             if let Some(ui) = weak.upgrade() {
@@ -873,12 +920,16 @@ fn main() -> Result<()> {
                     return;
                 }
             };
-            // Turning it OFF forgets the peer on purpose: a link the user
-            // retired must not be resurrected at the next boot.
             if !wanted {
-                match control_request(only_auto_connect(&current, None, true)) {
+                match control_request(only_auto_connect(&current, None, true, false)) {
                     Ok(ControlResponse::Applied { .. }) => {
-                        ui_log("auto-connect: cleared; the next start stays local");
+                        let path = auto_data_dir.join("config.json");
+                        if let Ok(mut ucfg) = kvm_core::Config::load(&path) {
+                            ucfg.auto_connect_enabled = false;
+                            ucfg.auto_connect_address = None;
+                            let _ = ucfg.save(&path);
+                        }
+                        ui_log("auto-connect: disabled; the next start stays local");
                         finish_auto_connect(
                             &weak,
                             false,
@@ -888,32 +939,44 @@ fn main() -> Result<()> {
                     other => {
                         let message = describe_control_outcome(other, "clear");
                         ui_log(&format!("auto-connect: {message}"));
-                        finish_auto_connect(&weak, current.auto_connect_address.is_some(), message);
+                        finish_auto_connect(&weak, current.auto_connect_enabled, message);
                     }
                 }
                 return;
             }
-            // Turning it ON with nothing remembered says so instead of
-            // pretending the next boot will link up.
-            let Some(address) = current.auto_connect_address.clone() else {
-                ui_log("auto-connect: nothing to reconnect to yet; connect once first");
-                finish_auto_connect(
-                    &weak,
-                    false,
-                    "Connect to a computer once, then this switch re-links at startup.".to_owned(),
-                );
-                return;
-            };
-            match control_request(only_auto_connect(&current, Some(address.clone()), false)) {
+            let address = current
+                .auto_connect_address
+                .clone()
+                .filter(|a| !a.trim().is_empty())
+                .or_else(|| {
+                    match control_request(ControlRequest::ListPeers) {
+                        Ok(ControlResponse::Peers(peers)) => {
+                            peers.into_iter().find_map(|p| p.address)
+                        }
+                        _ => None,
+                    }
+                })
+                .or_else(|| {
+                    kvm_protocol::pairing::PeerBook::load_or_create(&auto_data_dir)
+                        .ok()
+                        .and_then(|b| b.peers.into_iter().find_map(|p| p.address))
+                });
+            match control_request(only_auto_connect(&current, address.clone(), false, true)) {
                 Ok(ControlResponse::Applied { .. }) => {
-                    ui_log(&format!(
-                        "auto-connect: will re-link to {address} at startup"
-                    ));
-                    finish_auto_connect(
-                        &weak,
-                        true,
-                        format!("Reconnects to {address} at startup."),
-                    );
+                    let path = auto_data_dir.join("config.json");
+                    if let Ok(mut ucfg) = kvm_core::Config::load(&path) {
+                        ucfg.auto_connect_enabled = true;
+                        if address.is_some() {
+                            ucfg.auto_connect_address = address.clone();
+                        }
+                        let _ = ucfg.save(&path);
+                    }
+                    let note = match &address {
+                        Some(addr) => format!("Reconnects to {addr} at startup."),
+                        None => "Auto-connect enabled: will reconnect to paired computers at startup.".to_owned(),
+                    };
+                    ui_log(&format!("auto-connect: enabled ({note})"));
+                    finish_auto_connect(&weak, true, note);
                 }
                 other => {
                     let message = describe_control_outcome(other, "save");
@@ -976,6 +1039,7 @@ fn main() -> Result<()> {
                 reverse_scroll: None,
                 auto_discover: None,
                 double_edge_style: None,
+                auto_connect_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -1100,6 +1164,7 @@ fn main() -> Result<()> {
                 reverse_scroll: None,
                 auto_discover: None,
                 double_edge_style: Some(requested_style),
+                auto_connect_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -1188,6 +1253,7 @@ fn main() -> Result<()> {
                 reverse_scroll: Some(wanted),
                 auto_discover: None,
                 double_edge_style: None,
+                auto_connect_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -1464,6 +1530,7 @@ fn main() -> Result<()> {
                 reverse_scroll: None,
                 auto_discover: Some(wanted),
                 double_edge_style: None,
+                auto_connect_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -1763,6 +1830,7 @@ fn main() -> Result<()> {
                     reverse_scroll: None,
                     auto_discover: None,
                     double_edge_style: None,
+                    auto_connect_enabled: None,
                 }) {
                     Ok(ControlResponse::Applied { restart_required }) => {
                         // Same truth rule as the role buttons: the green
@@ -1851,6 +1919,7 @@ fn main() -> Result<()> {
                             reverse_scroll: None,
                             auto_discover: None,
                             double_edge_style: None,
+                            auto_connect_enabled: None,
                         })? {
                             ControlResponse::Applied { .. } => Ok(()),
                             ControlResponse::Error { message } => anyhow::bail!(message),
@@ -2130,9 +2199,6 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
-                // The role buttons apply explicitly through set-role; status
-                // polling only displays the daemon's authoritative state and
-                // must never write settings back.
                 ui.set_connected(true);
                 ui.set_status_text(SharedString::from(format!(
                     "Daemon online · {} trusted peer(s) · {} active session(s)",
@@ -2143,13 +2209,16 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                 ui.set_reverse_scroll(status.reverse_scroll);
                 ui.set_auto_discover(status.auto_discover);
                 ui.set_clipboard_max_mb(SharedString::from(status.clipboard_max_mb.to_string()));
-                // Tray tooltip stays static ("TheKVM"): the TrayIcon is
-                // owned by its pump thread (neither Send nor Sync), so
-                // live status lives in the window, not the tooltip.
                 ui.set_device_name(SharedString::from(status.node_name));
                 ui.set_auto_connect_address(SharedString::from(
-                    status.auto_connect_address.unwrap_or_default(),
+                    status.auto_connect_address.clone().unwrap_or_default(),
                 ));
+                ui.set_auto_connect_on_start(status.auto_connect_enabled);
+                ui.set_auto_connect_known(
+                    status.auto_connect_enabled
+                        || status.auto_connect_address.is_some()
+                        || status.peer_count > 0,
+                );
                 ui.set_mode_index(match status.mode {
                     Mode::Bidirectional => 0,
                     Mode::ServerClient => 1,
@@ -2609,6 +2678,18 @@ fn start_session_flow(
             .map(|config| config.device_name)
             .unwrap_or_else(|_| fallback_node_name());
         set_peer_address_field(&weak, &address);
+        // Fast path for already-pinned peers when no pairing code was typed:
+        // skip the 10s `PairRequest` round-trip and launch `kvm-daemon connect`
+        // directly (which verifies TLS pinning, heals changed LAN IPs, and
+        // retries across reboots). If the peer was reset on the other side,
+        // `relay_session_progress` catches 3x "peer is not paired", unpins
+        // locally, and re-runs this flow into `pair_prepare`.
+        if pairing_code.is_none() && fingerprint_for_address(&data_dir, &address).is_some() {
+            set_status(&weak, format!("Connecting to {address}…"));
+            remember_auto_connect_peer(&data_dir, &address);
+            spawn_session(&weak, &session, &pending, &data_dir, address);
+            return;
+        }
         set_status(&weak, format!("Contacting {address}…"));
         let mut dial_address = address.clone();
         let mut healed_address: Option<String> = None;
@@ -2802,6 +2883,7 @@ fn run_pair_confirm(
                             &peer_name,
                             Some(&pending.address),
                         );
+                        remember_auto_connect_peer(&confirm_data_dir, &pending.address);
                         ensure_default_arrangement(&peer_name, &pending.peer_fingerprint);
                         spawn_session(
                             &weak,
@@ -3000,22 +3082,88 @@ fn adopt_link_fingerprint(data_dir: &std::path::Path, address: &str) {
     adopt_layout_fingerprint(&peer.name.clone(), &peer.fingerprint_hex.clone());
 }
 
-/// Fingerprint for a dial address from the user peer book (Disconnect
-/// path): mirrors adopt_link_fingerprint's matching (exact, then host).
+/// Persist a verified peer address as the startup auto-connect target in both
+/// the user config and the running daemon config when `auto_connect_enabled`
+/// is on (the default).
+fn remember_auto_connect_peer(data_dir: &std::path::Path, address: &str) {
+    let trimmed = address.trim();
+    if trimmed.is_empty() || trimmed.starts_with("0.0.0.0:") {
+        return;
+    }
+    let user_path = data_dir.join("config.json");
+    if let Ok(mut cfg) = kvm_core::Config::load(&user_path) {
+        if cfg.auto_connect_enabled
+            && cfg.mode != kvm_core::Mode::ClientOnly
+            && cfg.auto_connect_address.as_deref() != Some(trimmed)
+        {
+            cfg.auto_connect_address = Some(trimmed.to_owned());
+            let _ = cfg.save(&user_path);
+        }
+    }
+    if let Ok(ControlResponse::Config(current)) = control_request(ControlRequest::GetConfig) {
+        if current.auto_connect_enabled
+            && current.mode != kvm_core::Mode::ClientOnly
+            && current.auto_connect_address.as_deref() != Some(trimmed)
+        {
+            let _ = control_request(ControlRequest::SetConfig {
+                device_name: None,
+                mode: None,
+                allow_lock_screen_control: None,
+                listen_port: None,
+                layout: None,
+                auto_connect_address: Some(trimmed.to_owned()),
+                clear_auto_connect: false,
+                clipboard_enabled: None,
+                clipboard_max_mb: None,
+                edge_mode: None,
+                transport: None,
+                reverse_scroll: None,
+                auto_discover: None,
+                double_edge_style: None,
+                auto_connect_enabled: None,
+            });
+        }
+    }
+}
+
+/// Fingerprint for a dial address from the user or daemon peer book
+/// (Disconnect and fast-connect paths): matches exact address first, then host.
 fn fingerprint_for_address(data_dir: &std::path::Path, address: &str) -> Option<String> {
-    let book = kvm_protocol::pairing::PeerBook::load_or_create(data_dir).ok()?;
     let host = address.split(':').next().unwrap_or(address);
-    book.peers
-        .iter()
-        .find(|peer| peer.address.as_deref() == Some(address))
-        .or_else(|| {
-            book.peers.iter().find(|peer| {
-                peer.address
-                    .as_deref()
-                    .is_some_and(|stored| stored.split(':').next() == Some(host))
+    if let Ok(book) = kvm_protocol::pairing::PeerBook::load_or_create(data_dir) {
+        if let Some(fp) = book
+            .peers
+            .iter()
+            .find(|peer| peer.address.as_deref() == Some(address))
+            .or_else(|| {
+                book.peers.iter().find(|peer| {
+                    peer.address
+                        .as_deref()
+                        .is_some_and(|stored| stored.split(':').next() == Some(host))
+                })
             })
-        })
-        .map(|peer| peer.fingerprint_hex.clone())
+            .map(|peer| peer.fingerprint_hex.clone())
+        {
+            return Some(fp);
+        }
+    }
+    if let Ok(ControlResponse::Peers(peers)) = control_request(ControlRequest::ListPeers) {
+        if let Some(peer) = peers
+            .iter()
+            .find(|peer| peer.address.as_deref() == Some(address))
+            .or_else(|| {
+                peers.iter().find(|peer| {
+                    peer.address
+                        .as_deref()
+                        .is_some_and(|stored| stored.split(':').next() == Some(host))
+                })
+            })
+        {
+            ensure_user_pin(&peer.fingerprint_hex, &peer.name, peer.address.as_deref());
+            return Some(peer.fingerprint_hex.clone());
+        }
+    }
+    None
 }
 
 /// A trusted peer's stored LAN address goes stale when DHCP hands it a new
@@ -3116,6 +3264,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         reverse_scroll: None,
         auto_discover: None,
         double_edge_style: None,
+        auto_connect_enabled: None,
     }) {
         Ok(ControlResponse::Applied { .. }) => {}
         Ok(ControlResponse::Error { message }) => anyhow::bail!("{message}"),
@@ -3335,7 +3484,7 @@ struct LinkedPeer {
     side: Option<kvm_core::Edge>,
 }
 
-fn linked_peers() -> Vec<LinkedPeer> {
+fn linked_peers_and_edge() -> (Vec<LinkedPeer>, EdgeMode) {
     let mut ordered: Vec<(String, String, Option<String>)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     if let Ok(ControlResponse::Peers(peers)) = control_request(ControlRequest::ListPeers) {
@@ -3356,11 +3505,11 @@ fn linked_peers() -> Vec<LinkedPeer> {
             }
         }
     }
-    let layout = match control_request(ControlRequest::GetConfig) {
-        Ok(ControlResponse::Config(config)) => config.layout,
-        _ => kvm_core::Layout::default(),
+    let (layout, edge_mode) = match control_request(ControlRequest::GetConfig) {
+        Ok(ControlResponse::Config(config)) => (config.layout, config.edge_mode),
+        _ => (kvm_core::Layout::default(), EdgeMode::Single),
     };
-    ordered
+    let peers = ordered
         .into_iter()
         .map(|(name, fingerprint, address)| {
             let side = layout.side_of_peer(&fingerprint);
@@ -3371,7 +3520,12 @@ fn linked_peers() -> Vec<LinkedPeer> {
                 side,
             }
         })
-        .collect()
+        .collect();
+    (peers, edge_mode)
+}
+
+fn linked_peers() -> Vec<LinkedPeer> {
+    linked_peers_and_edge().0
 }
 
 fn side_name(side: kvm_core::Edge) -> &'static str {
@@ -3386,13 +3540,7 @@ fn side_name(side: kvm_core::Edge) -> &'static str {
 /// Refresh the Devices arrangement display from live state. Runs on the
 /// poll worker; all blocking calls are fine there.
 fn refresh_arrangement(weak: &slint::Weak<AppWindow>, edge_active: bool) {
-    let peers = linked_peers();
-    // The crossing copy follows the Settings discipline, not just the
-    // geometry: double-edge links cross past either horizontal edge.
-    let edge_mode = match control_request(ControlRequest::GetConfig) {
-        Ok(ControlResponse::Config(config)) => config.edge_mode,
-        _ => EdgeMode::Single,
-    };
+    let (peers, edge_mode) = linked_peers_and_edge();
     let (peer_name, text, peer_on_right) = match peers.first() {
         None => (
             String::new(),
@@ -3925,6 +4073,8 @@ fn spawn_dial_back(
 // (user Connect and automatic dial-back) exactly, so neither has to
 // invent placeholder values to satisfy the other. Grouping them behind a
 // struct would only move the same data one level down.
+static LAUNCH_CHILD_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
 #[allow(clippy::too_many_arguments)]
 fn launch_child(
     weak: &slint::Weak<AppWindow>,
@@ -3936,6 +4086,10 @@ fn launch_child(
     dialback: bool,
     link_id: Option<u64>,
 ) {
+    let _launch_guard = LAUNCH_CHILD_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if session
         .lock()
         .ok()
@@ -4045,13 +4199,16 @@ fn launch_child(
             }
             let verified = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Ok(mut slot) = session.lock() {
-                *slot = Some(Session {
+                if let Some(mut stale) = slot.replace(Session {
                     child,
                     address: label.clone(),
                     verified: verified.clone(),
                     dialback,
                     link_id,
-                });
+                }) {
+                    let _ = stale.child.kill();
+                    let _ = stale.child.wait();
+                }
             }
             set_session_connecting(weak, &label);
             set_status(
@@ -4238,13 +4395,18 @@ fn relay_session_progress(
                 continue;
             }
             "established" => {
-                set_session_connected(weak, session, verified, address);
+                let effective_addr = if detail.is_empty() { address } else { detail };
+                set_session_connected(weak, session, verified, effective_addr);
+                if !effective_addr.starts_with("0.0.0.0:") {
+                    set_peer_address_field(weak, effective_addr);
+                    remember_auto_connect_peer(&data_dir, effective_addr);
+                }
                 // Adopt the live fingerprint for this address: the peer may
                 // have re-paired under a new identity since the screens were
                 // arranged (ghost pins misroute every handoff).
-                adopt_link_fingerprint(&data_dir, address);
+                adopt_link_fingerprint(&data_dir, effective_addr);
                 format!(
-                    "Connected to {address} — shared cursor is live both ways: push past the arranged edge to drive the other screen, push back past the edge to return. Both computers stay usable. Disconnect ends the link."
+                    "Connected to {effective_addr} — shared cursor is live both ways: push past the arranged edge to drive the other screen, push back past the edge to return. Both computers stay usable. Disconnect ends the link."
                 )
             }
             "edge-ready" => {
@@ -5314,7 +5476,12 @@ fn mirror_user_config(
     if let Some(max_mb) = clipboard_max_mb {
         config.clipboard_max_mb = max_mb;
     }
-    config.auto_connect_address = None;
+    // Preserve `auto_connect_address` unless `mode` is `ClientOnly` so
+    // role/edge/arrangement/scroll changes never wipe the startup auto-connect
+    // peer in the user config.
+    if mode == Mode::ClientOnly {
+        config.auto_connect_address = None;
+    }
     // A supplied layout replaces the user's topology (arrangement UI,
     // auto-layout); omission preserves whatever is there so role presses
     // can never wipe the screen arrangement. Same rule for the edge
@@ -5615,9 +5782,15 @@ fn spawn_clipboard_relay() {
                     }
                 }
                 let notice = match &watcher {
-                    Some(watch) => watch.wait_notice(std::time::Duration::from_millis(100)),
+                    Some(watch) => {
+                        let notified = watch.wait_notice(std::time::Duration::from_millis(500));
+                        if !notified {
+                            continue;
+                        }
+                        true
+                    }
                     None => {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        std::thread::sleep(std::time::Duration::from_millis(250));
                         false
                     }
                 };
@@ -5735,6 +5908,9 @@ fn clipboard_take_loop(apply_tx: std::sync::mpsc::Sender<(ClipboardKind, String)
             continue;
         }
         let Some(first) = clipboard_poll_once(last_seen_revision, 0, CLIPBOARD_LONG_POLL_MS) else {
+            // Daemon restarted or unreachable: reset `last_seen_revision` so
+            // a freshly started daemon's revisions starting from 1 are accepted.
+            last_seen_revision = 0;
             std::thread::sleep(std::time::Duration::from_millis(500));
             continue;
         };

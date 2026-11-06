@@ -348,18 +348,44 @@ impl MtPinchTap {
         })
     }
 
-    /// Drain every node (non-blocking) and return at most one gesture
-    /// event. `None` is the common case: no fingers, scrolling fingers,
-    /// or an engaged pinch holding still.
-    pub fn poll(&mut self) -> Option<InputEvent> {
+    /// Return any already-queued gesture event without performing syscalls.
+    pub fn take_pending(&mut self) -> Option<InputEvent> {
         for device in &mut self.devices {
-            loop {
-                match read_raw(&device.file) {
-                    Ok(Some(event)) => device.ingest(event),
-                    Ok(None) => break,
-                    Err(error) => {
-                        tracing::debug!(%error, "multitouch tap read failed; node skipped this poll");
-                        break;
+            if let Some(gesture) = device.pending.take() {
+                return Some(gesture);
+            }
+        }
+        None
+    }
+
+    /// Append each tap node's file descriptor to `pollfds` so the caller
+    /// can sleep in a single `libc::poll` alongside its X11 socket.
+    pub fn append_pollfds(&self, pollfds: &mut Vec<libc::pollfd>) {
+        for device in &self.devices {
+            pollfds.push(libc::pollfd {
+                fd: device.file.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+    }
+
+    /// Drain only the nodes whose `pollfd` reported `POLLIN` (or drain all
+    /// when `slice` is empty) and return at most one gesture event.
+    pub fn poll_ready(&mut self, slice: &[libc::pollfd]) -> Option<InputEvent> {
+        for (index, device) in self.devices.iter_mut().enumerate() {
+            let ready = slice
+                .get(index)
+                .is_none_or(|pfd| pfd.revents & libc::POLLIN != 0);
+            if ready {
+                loop {
+                    match read_raw(&device.file) {
+                        Ok(Some(event)) => device.ingest(event),
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::debug!(%error, "multitouch tap read failed; node skipped this poll");
+                            break;
+                        }
                     }
                 }
             }
@@ -368,6 +394,13 @@ impl MtPinchTap {
             }
         }
         None
+    }
+
+    /// Drain every node (non-blocking) and return at most one gesture
+    /// event. `None` is the common case: no fingers, scrolling fingers,
+    /// or an engaged pinch holding still.
+    pub fn poll(&mut self) -> Option<InputEvent> {
+        self.poll_ready(&[])
     }
 }
 

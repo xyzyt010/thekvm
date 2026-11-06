@@ -21,8 +21,8 @@
 use crate::{capture::CaptureBackend, PlatformError};
 use kvm_core::{InputEvent, KeyEvent, MouseButton};
 use std::collections::{HashMap, HashSet};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
 use std::time::Duration;
 use x11rb::connection::Connection;
 use x11rb::protocol::xfixes::ConnectionExt as XFixesConnectionExt;
@@ -31,12 +31,6 @@ use x11rb::protocol::xproto::{self, ConnectionExt as XprotoConnectionExt};
 use x11rb::rust_connection::RustConnection;
 
 const ALL_MASTER_DEVICES: u16 = 1;
-// Event-poll quantum: an X event arriving just after a poll waits at most
-// this long (keystroke/motion capture latency). 1ms keeps every keystroke
-// wire-bound instead of poll-bound — ~1000 cheap empty polls/s is ~0.2%
-// of a core, nothing next to a 60Hz compositor — while the repeat
-// synthesis below keeps its own 33ms cadence regardless.
-const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const FIXED_POINT_SCALE: f64 = 4_294_967_296.0;
 
 /// Blocking adapter around XInput2's raw event stream.
@@ -650,8 +644,8 @@ impl X11Capture {
                 x11rb::COPY_DEPTH_FROM_PARENT,
                 grab_window,
                 root,
-                0,
-                0,
+                -10,
+                -10,
                 1,
                 1,
                 0,
@@ -667,7 +661,7 @@ impl X11Capture {
             .map_err(|error| PlatformError::Capture(format!("map grab window: {error}")))?
             .check()
             .map_err(|error| PlatformError::Capture(format!("map grab window: {error}")))?;
-        Ok(Self {
+        let mut capture = Self {
             connection,
             root,
             exclusive: false,
@@ -698,7 +692,16 @@ impl X11Capture {
             // empty tap only disables pinch, never capture startup.
             mt_pinch: crate::mt_pinch::MtPinchTap::open(),
             held_keys: HashMap::new(),
-        })
+        };
+        let left_ptr = capture.ensure_left_ptr();
+        if left_ptr != 0 {
+            let _ = capture.connection.change_window_attributes(
+                capture.grab_window,
+                &xproto::ChangeWindowAttributesAux::new().cursor(left_ptr),
+            );
+            let _ = capture.connection.flush();
+        }
+        Ok(capture)
     }
 
     /// FPS-style recenter cage for the Core hold (see
@@ -925,6 +928,11 @@ impl X11Capture {
         if let Some(fresh) = query_own_sources(&self.connection) {
             self.ignored_sources = fresh;
         }
+        let refreshed_axes = query_scroll_axes(&self.connection);
+        if !refreshed_axes.is_empty() {
+            self.scroll_axes = refreshed_axes;
+        }
+        self.last_source_refresh = std::time::Instant::now();
         if self.seen_sources.len() > 512 {
             self.seen_sources.clear();
         }
@@ -1194,14 +1202,12 @@ impl CaptureBackend for X11Capture {
         exclusive: &AtomicBool,
         release: &AtomicBool,
     ) -> Result<InputEvent, PlatformError> {
+        let mut pollfds = Vec::with_capacity(8);
         loop {
             if stop.load(Ordering::Acquire) {
                 return Err(PlatformError::Capture("capture stopped".into()));
             }
-            // Trackpad pinch tap (see mt_pinch): gestures arrive here,
-            // never from the X event stream. Non-blocking drain first so
-            // a pinch stays as snappy as the 1ms X poll below it.
-            if let Some(gesture) = self.mt_pinch.poll() {
+            if let Some(gesture) = self.mt_pinch.take_pending() {
                 return Ok(gesture);
             }
             // Typematic hold-repeat (see held_keys): X servers that emit a
@@ -1213,70 +1219,44 @@ impl CaptureBackend for X11Capture {
                 XI_KEY.fetch_add(1, Ordering::Relaxed);
                 return Ok(repeat);
             }
-            // The injector (re)creates its uinput devices per receiver
-            // session, which can postdate this backend: re-resolve our own
-            // sources every few seconds so freshly injected input is never
-            // re-captured. One round trip per interval is negligible next
-            // to the 1ms event poll.
-            if self.last_source_refresh.elapsed() > std::time::Duration::from_secs(5) {
-                self.last_source_refresh = std::time::Instant::now();
-                if let Some(refreshed) = query_own_sources(&self.connection) {
-                    self.ignored_sources = refreshed;
-                }
-                // Hot-plugged scroll devices (or a server that grows
-                // scroll classes late) join without a restart.
-                let refreshed_axes = query_scroll_axes(&self.connection);
-                if !refreshed_axes.is_empty() {
-                    self.scroll_axes = refreshed_axes;
-                }
-            }
             if release.swap(false, Ordering::AcqRel) {
                 self.release()?;
             }
             let desired_exclusive = exclusive.load(Ordering::Acquire);
             if desired_exclusive != self.exclusive {
-                match self.set_exclusive(desired_exclusive) {
-                    Ok(()) => {
-                        self.grab_retry_since = None;
-                    }
-                    Err(error) => {
-                        // A refused grab is NOT a dead backend: the pointer
-                        // is often held transiently (compositor popup,
-                        // racing release flush, peer-driven cage), and
-                        // dropping the backend over it stops all capture —
-                        // the machine can never cross again until a
-                        // restart. Keep capturing ungrabbed and retry with
-                        // backoff; only seconds of continuous refusal earn
-                        // a backend rebuild (a genuinely wedged server).
-                        // Releasing never waits: a stuck release must not
-                        // hold local input hostage for seconds.
-                        if !desired_exclusive {
-                            return Err(error);
-                        }
-                        let now = std::time::Instant::now();
-                        let since = *self.grab_retry_since.get_or_insert(now);
-                        if now.duration_since(since) >= std::time::Duration::from_secs(2) {
+                let should_try = !desired_exclusive
+                    || self
+                        .grab_retry_since
+                        .is_none_or(|last| last.elapsed() >= Duration::from_millis(250));
+                if should_try {
+                    match self.set_exclusive(desired_exclusive) {
+                        Ok(()) => {
                             self.grab_retry_since = None;
-                            return Err(error);
                         }
-                        let due = self
-                            .last_grab_warn
-                            .map(|when| {
-                                now.duration_since(when) > std::time::Duration::from_secs(5)
-                            })
-                            .unwrap_or(true);
-                        if due {
-                            self.last_grab_warn = Some(now);
-                            tracing::warn!(%error, "drive grab refused; capturing ungrabbed and retrying");
+                        Err(error) => {
+                            if !desired_exclusive {
+                                return Err(error);
+                            }
+                            let now = std::time::Instant::now();
+                            self.grab_retry_since = Some(now);
+                            let due = self
+                                .last_grab_warn
+                                .map(|when| {
+                                    now.duration_since(when) > std::time::Duration::from_secs(5)
+                                })
+                                .unwrap_or(true);
+                            if due {
+                                self.last_grab_warn = Some(now);
+                                tracing::warn!(%error, "drive grab refused; capturing ungrabbed and retrying");
+                            }
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        continue;
                     }
                 }
+            } else {
+                self.grab_retry_since = None;
             }
-            // The cage runs on every poll while core-grabbed (see
-            // maybe_recenter_cage): cheap integer compares mid-screen,
-            // one warp per edge visit — never per event.
+            // The cage runs while core-grabbed (see maybe_recenter_cage):
+            // cheap integer compares mid-screen, one warp per edge visit.
             if self.grab_kind == GrabKind::Core {
                 self.maybe_recenter_cage();
             }
@@ -1298,7 +1278,7 @@ impl CaptureBackend for X11Capture {
                     );
                 }
             }
-            if let Some(event) = self
+            while let Some(event) = self
                 .connection
                 .poll_for_event()
                 .map_err(|error| PlatformError::Capture(format!("poll XInput2 events: {error}")))?
@@ -1306,9 +1286,49 @@ impl CaptureBackend for X11Capture {
                 if let Some(event) = self.translate(event) {
                     return Ok(event);
                 }
-                continue;
             }
-            thread::sleep(POLL_INTERVAL);
+
+            // Sleep in kernel `poll()` across the X11 socket, the transition
+            // wake eventfd, and any multitouch tap fds: 0% CPU when idle and
+            // 0ms wake latency when input or `set_exclusive` arrives.
+            pollfds.clear();
+            pollfds.push(libc::pollfd {
+                fd: self.connection.stream().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            let wake_index = if let Some(wfd) = crate::capture::capture_wake_fd() {
+                let idx = pollfds.len();
+                pollfds.push(libc::pollfd {
+                    fd: wfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                Some(idx)
+            } else {
+                None
+            };
+            let mt_base = pollfds.len();
+            self.mt_pinch.append_pollfds(&mut pollfds);
+
+            let timeout_ms = if !self.held_keys.is_empty() {
+                16
+            } else {
+                100
+            };
+            let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+            if rc > 0 {
+                if let Some(idx) = wake_index {
+                    if pollfds[idx].revents & libc::POLLIN != 0 {
+                        crate::capture::drain_capture_wake();
+                    }
+                }
+                if pollfds.len() > mt_base {
+                    if let Some(gesture) = self.mt_pinch.poll_ready(&pollfds[mt_base..]) {
+                        return Ok(gesture);
+                    }
+                }
+            }
         }
     }
 
@@ -1317,35 +1337,15 @@ impl CaptureBackend for X11Capture {
             return Ok(());
         }
         if exclusive {
-            // XI2 active grab first, sweeping device selectors: some
-            // servers refuse the abstract XIAllDevices/XIAllMasterDevices
-            // selectors while accepting the concrete master ids (and vice
-            // versa — live-proven: this Xorg answers every XIGrabDevice
-            // variant with BadValue while XGrabPointer succeeds). Either
-            // XI hold suppresses local delivery with raw XI capture
-            // flowing underneath; Deskflow-style core grabs are the last
-            // resort, with the recenter cage keeping their
-            // position-derived deltas unbounded (see maybe_recenter_cage).
-            match xi_grab_sweep(&self.connection, self.grab_window) {
+            let cursor = self.ensure_left_ptr();
+            match xi_grab_sweep(&self.connection, self.grab_window, cursor) {
                 Ok(held) => {
                     self.grab_held = held;
                     self.grab_kind = GrabKind::Xi;
                 }
                 Err(xi_error) => {
                     tracing::info!(%xi_error, "XIGrabDevice refused; falling back to core pointer+keyboard grab");
-                    // A failed acquire holds nothing: clear a stale record
-                    // so a later kind-matched release cannot skip a real
-                    // hold (or chase a phantom one).
                     self.grab_kind = GrabKind::None;
-                    let cursor = self.ensure_left_ptr();
-                    // Transient holders (compositor popups, a racing
-                    // release flush) clear in milliseconds; failing the
-                    // whole drive on the first refusal turned every such
-                    // blip into rebuild churn and, compounded, a capture
-                    // that can never cross again. Retry the core grab
-                    // briefly — the XI refusal above stays single-attempt
-                    // (Mint Xorg refuses it permanently, so retrying it
-                    // would tax every drive start for nothing).
                     let mut attempts = 0;
                     loop {
                         match core_grab(&self.connection, self.grab_window, cursor) {
@@ -1355,10 +1355,10 @@ impl CaptureBackend for X11Capture {
                             }
                             Err(core_error) => {
                                 attempts += 1;
-                                if attempts >= 6 {
+                                if attempts >= 2 {
                                     return Err(core_error);
                                 }
-                                std::thread::sleep(std::time::Duration::from_millis(80));
+                                std::thread::sleep(std::time::Duration::from_millis(15));
                             }
                         }
                     }
@@ -1506,6 +1506,7 @@ fn xi_grab(
     connection: &RustConnection,
     grab_window: xproto::Window,
     deviceid: u16,
+    cursor: u32,
 ) -> Result<(), PlatformError> {
     let mask = [raw_mask()
         | u32::from(xinput::XIEventMask::BUTTON_PRESS)
@@ -1517,7 +1518,7 @@ fn xi_grab(
         .xinput_xi_grab_device(
             grab_window,
             0u32,
-            0u32,
+            cursor,
             deviceid,
             xproto::GrabMode::ASYNC,
             xproto::GrabMode::ASYNC,
@@ -1545,10 +1546,11 @@ fn xi_grab(
 fn xi_grab_sweep(
     connection: &RustConnection,
     grab_window: xproto::Window,
+    cursor: u32,
 ) -> Result<Vec<u16>, PlatformError> {
     let mut refusals = Vec::new();
     for deviceid in XI_GRAB_SINGLETONS {
-        match xi_grab(connection, grab_window, deviceid) {
+        match xi_grab(connection, grab_window, deviceid, cursor) {
             Ok(()) => return Ok(vec![deviceid]),
             Err(error) => {
                 tracing::debug!(deviceid, %error, "XI grab selector refused");
@@ -1559,7 +1561,7 @@ fn xi_grab_sweep(
     // Concrete masters last: two holds or none (see above).
     let pair = XI_GRAB_MASTER_PAIR
         .into_iter()
-        .map(|deviceid| xi_grab(connection, grab_window, deviceid))
+        .map(|deviceid| xi_grab(connection, grab_window, deviceid, cursor))
         .collect::<Vec<_>>();
     if pair.iter().all(|result| result.is_ok()) {
         return Ok(XI_GRAB_MASTER_PAIR.to_vec());

@@ -113,6 +113,20 @@ install -d -m 0755 "$PREFIX/bin"
 install -m 0755 "$RELEASE_DIR/kvm-daemon" "$PREFIX/bin/kvm-daemon"
 if [ -x "$RELEASE_DIR/kvm-ui" ]; then
     install -m 0755 "$RELEASE_DIR/kvm-ui" "$PREFIX/bin/kvm-ui"
+    install -d -m 0755 /usr/share/applications /etc/xdg/autostart
+    cat > /usr/share/applications/thekvm-ui.desktop <<'DESKTOP_EOF'
+[Desktop Entry]
+Type=Application
+Name=TheKVM
+GenericName=Cross-OS keyboard/mouse sharing
+Comment=Pair and control nearby machines with one keyboard and mouse
+Exec=/usr/bin/kvm-ui
+Icon=preferences-desktop-peripherals
+Terminal=false
+Categories=Network;Utility;
+Keywords=kvm;keyboard;mouse;synergy;deskflow;
+DESKTOP_EOF
+    cp /usr/share/applications/thekvm-ui.desktop /etc/xdg/autostart/thekvm-ui.desktop
 fi
 
 if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then

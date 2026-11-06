@@ -621,15 +621,16 @@ where
                 }
             }
             if crate::service::presence_end(id) {
-                tracing::info!("desktop app gone: presence lease ended");
-                crate::service::on_ui_gone(&data_dir).await;
+                tracing::info!("desktop app presence lease ended (logout, restart, or close)");
             }
             return Ok(());
         }
-        // Persistent outbound-link lease: the supervised child's death
-        // (any cause) ends this connection and tears the whole link
-        // down, so a killed UI or Task Manager kill can never leave the
-        // peer driving a machine whose controller is gone.
+        // Persistent outbound-link lease: tracks whether a supervised
+        // `connect` child currently owns the outbound link. Explicit user
+        // Disconnects and Tray Quit call `DisconnectLink` directly; EOF
+        // here (reboot, shutdown, logout, or epoch tie-break replacement)
+        // simply releases the lease slot without banning the link or
+        // sending `LinkEnded` to the peer.
         ControlRequest::LinkLease {
             fingerprint_hex,
             address,
@@ -655,8 +656,6 @@ where
             )
             .await?;
             let silence_limit = crate::service::lease_silence_limit();
-            // Any other frame, EOF, read error, or silence ends the lease;
-            // teardown below runs exactly once on exit.
             while let Ok(Ok(Some(ControlRequest::LinkLeasePing))) =
                 tokio::time::timeout(silence_limit, read_request(&mut stream)).await
             {
@@ -679,16 +678,8 @@ where
                 tracing::info!(
                     peer = %lease.fingerprint_hex,
                     link_id = ?lease.link_id,
-                    "supervised link child exited; tearing the link down"
+                    "supervised link child exited; lease released"
                 );
-                crate::service::teardown_link(
-                    &data_dir,
-                    Some(&lease.fingerprint_hex),
-                    Some(&lease.address),
-                    lease.link_id,
-                    "link-child-exit",
-                )
-                .await;
             }
             return Ok(());
         }
@@ -748,6 +739,7 @@ where
                 mode: current.mode,
                 allow_lock_screen_control: current.allow_lock_screen_control,
                 auto_connect_address: current.auto_connect_address,
+                auto_connect_enabled: current.auto_connect_enabled,
                 clipboard_enabled: current.clipboard_enabled,
                 clipboard_max_mb: current.clipboard_max_mb,
                 edge_mode: current.edge_mode,
@@ -787,6 +779,23 @@ where
             width,
             height,
         } => crate::service::submit_local_clipboard_chunk(
+            generation,
+            kind,
+            total_chunks,
+            index,
+            data,
+            width,
+            height,
+        ),
+        ControlRequest::ClipboardStash {
+            generation,
+            kind,
+            total_chunks,
+            index,
+            data,
+            width,
+            height,
+        } => crate::service::submit_inbound_clipboard_stash_chunk(
             generation,
             kind,
             total_chunks,
@@ -1083,12 +1092,27 @@ where
                 let name = node_name
                     .filter(|name| !name.trim().is_empty())
                     .unwrap_or_else(|| format!("peer-{}", &fingerprint_hex[..8]));
+                let clean_addr = address
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_owned);
                 match peers
                     .write()
                     .await
-                    .pin_with_address(name, fingerprint_hex.clone(), address)
+                    .pin_with_address(name, fingerprint_hex.clone(), clean_addr.clone())
                 {
                     Ok(()) => {
+                        if let Some(addr) = clean_addr {
+                            let mut cfg = config.write().await;
+                            if cfg.auto_connect_enabled
+                                && cfg.mode != kvm_core::Mode::ClientOnly
+                                && cfg.auto_connect_address.as_deref() != Some(addr.as_str())
+                            {
+                                cfg.auto_connect_address = Some(addr);
+                                let _ = cfg.save(&data_dir.join("config.json"));
+                            }
+                        }
                         crate::service::audit_event(
                             &data_dir,
                             &format!("peer-pinned fingerprint={fingerprint_hex}"),
@@ -1116,6 +1140,7 @@ where
             reverse_scroll,
             auto_discover,
             double_edge_style,
+            auto_connect_enabled,
         } => {
             if listen_port == Some(0) {
                 ControlResponse::Error {
@@ -1141,9 +1166,15 @@ where
                     }
                     if let Some(mode) = mode {
                         updated.mode = mode;
+                        if mode == kvm_core::Mode::ClientOnly {
+                            updated.auto_connect_address = None;
+                        }
                     }
                     if let Some(allow_lock_screen_control) = allow_lock_screen_control {
                         updated.allow_lock_screen_control = allow_lock_screen_control;
+                    }
+                    if let Some(auto_enabled) = auto_connect_enabled {
+                        updated.auto_connect_enabled = auto_enabled;
                     }
                     if clear_auto_connect {
                         updated.auto_connect_address = None;
@@ -1158,7 +1189,9 @@ where
                             .await
                             .map_err(Into::into);
                         }
-                        updated.auto_connect_address = Some(address.trim().to_owned());
+                        if updated.mode != kvm_core::Mode::ClientOnly {
+                            updated.auto_connect_address = Some(address.trim().to_owned());
+                        }
                     }
                     if let Some(enabled) = clipboard_enabled {
                         updated.clipboard_enabled = enabled;
@@ -1211,15 +1244,7 @@ where
                     }
                     match updated.save(&data_dir.join("config.json")) {
                         Ok(()) => {
-                            let windows_controller_configured =
-                                current.auto_connect_address.is_some()
-                                    || updated.auto_connect_address.is_some();
-                            let restart_required = cfg!(target_os = "windows")
-                                && (updated.auto_connect_address != current.auto_connect_address
-                                    || (windows_controller_configured
-                                        && (updated.mode != current.mode
-                                            || updated.allow_lock_screen_control
-                                                != current.allow_lock_screen_control)));
+                            let restart_required = false;
                             // Audit every applied change with its provenance:
                             // if a mode ever "reverts by itself", this trail
                             // names exactly which writer did it and when.

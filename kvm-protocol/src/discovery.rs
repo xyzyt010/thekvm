@@ -108,20 +108,44 @@ fn broadcast_targets() -> Vec<Ipv4Addr> {
     targets
 }
 
+/// Unicast `/24` neighbor addresses for each active IPv4 interface: used as
+/// a fallback when routers or Wi-Fi APs filter broadcast UDP packets.
+fn unicast_subnet_targets() -> Vec<Ipv4Addr> {
+    let mut out = Vec::new();
+    let mut prefixes = Vec::new();
+    for interface in if_addrs::get_if_addrs().unwrap_or_default() {
+        let ip = match interface.addr {
+            if_addrs::IfAddr::V4(v4) => v4.ip,
+            _ => continue,
+        };
+        if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+            continue;
+        }
+        let octets = ip.octets();
+        // Skip common virtual/container bridges (Docker 172.17.x, WSL) unless
+        // they are the only interface; cap at 2 subnets so a multi-NIC host
+        // never sends more than ~500 tiny 17-byte datagrams.
+        let prefix = [octets[0], octets[1], octets[2]];
+        if !prefixes.contains(&prefix) && prefixes.len() < 2 {
+            prefixes.push(prefix);
+            for host in 1u8..=254 {
+                if host != octets[3] {
+                    out.push(Ipv4Addr::new(prefix[0], prefix[1], prefix[2], host));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Scan the local IPv4 LAN for metadata-only advertisements. The caller still
 /// has to pair through QUIC and confirm the returned certificate fingerprint.
 ///
 /// Requests go to the global broadcast address AND to every local subnet's
-/// directed broadcast (e.g. 192.168.1.255): some stacks (observed live on
-/// Windows with several interfaces) route the limited broadcast
-/// 255.255.255.255 out the wrong interface only, so a scanner hears just
-/// itself. Directed broadcasts route through the normal table and reach
-/// the real LAN. Replies are unicast and deduped by fingerprint.
-///
-/// Broadcast UDP is lossy (one dropped request or reply used to hide a
-/// device until the user pressed Scan again), so the request is repeated
-/// every round inside the same overall timeout: a device only has to answer
-/// once for the whole scan to see it.
+/// directed broadcast (e.g. 192.168.1.255), plus a non-blocking unicast `/24`
+/// sweep on the second round so routers that drop broadcast UDP still deliver
+/// discovery across local IP changes. Replies are unicast and deduped by
+/// fingerprint.
 pub async fn scan(timeout: Duration) -> std::io::Result<Vec<(SocketAddr, Advertisement)>> {
     const ROUNDS: u32 = 3;
     let socket = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
@@ -133,11 +157,16 @@ pub async fn scan(timeout: Duration) -> std::io::Result<Vec<(SocketAddr, Adverti
     let mut results = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut buffer = [0u8; 2048];
-    for _ in 0..ROUNDS {
+    for round in 0..ROUNDS {
         for target in &targets {
             let _ = socket
                 .send_to(REQUEST, SocketAddr::from((*target, DISCOVERY_PORT)))
                 .await;
+        }
+        if round == 1 {
+            for target in unicast_subnet_targets() {
+                let _ = socket.try_send_to(REQUEST, SocketAddr::from((target, DISCOVERY_PORT)));
+            }
         }
         let round_deadline = (Instant::now() + round_window).min(deadline);
         loop {

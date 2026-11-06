@@ -86,7 +86,41 @@ pub fn set_exclusive(exclusive: bool) {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn set_exclusive(_exclusive: bool) {}
+pub fn set_exclusive(_exclusive: bool) {
+    #[cfg(target_os = "linux")]
+    notify_capture_wake();
+}
+
+/// Process-wide non-blocking eventfd used to wake Linux capture `poll()`
+/// immediately on `set_exclusive` / stop transitions instead of busy-polling.
+#[cfg(target_os = "linux")]
+pub(crate) fn capture_wake_fd() -> Option<std::os::fd::RawFd> {
+    static WAKE_FD: std::sync::OnceLock<Option<std::os::fd::RawFd>> = std::sync::OnceLock::new();
+    *WAKE_FD.get_or_init(|| {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        (fd >= 0).then_some(fd)
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn notify_capture_wake() {
+    if let Some(fd) = capture_wake_fd() {
+        let val: u64 = 1;
+        unsafe {
+            let _ = libc::write(fd, (&val as *const u64).cast::<libc::c_void>(), 8);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn drain_capture_wake() {
+    if let Some(fd) = capture_wake_fd() {
+        let mut val: u64 = 0;
+        unsafe {
+            let _ = libc::read(fd, (&mut val as *mut u64).cast::<libc::c_void>(), 8);
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 static LAST_SCREEN_WIDTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -111,10 +145,13 @@ pub fn note_screen_size(width: u32, height: u32) {
 /// ignores `XWarpPointer` for the visible cursor.
 #[cfg(target_os = "linux")]
 pub fn is_wayland_session() -> bool {
-    classify_wayland_session(
-        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
-        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
-    )
+    static IS_WAYLAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IS_WAYLAND.get_or_init(|| {
+        classify_wayland_session(
+            std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+        )
+    })
 }
 
 /// Pure session classifier behind `is_wayland_session` (ungated so it is
@@ -170,6 +207,22 @@ pub fn warp_cursor(x: u32, y: u32) -> Result<(), PlatformError> {
 /// `xhost`), and also performs X11 `warp_pointer` best-effort so
 /// Xwayland / X11 clients see the updated root coordinate.
 #[cfg(target_os = "linux")]
+type X11CacheEntry = (
+    Option<String>,
+    x11rb::rust_connection::RustConnection,
+    u32,
+    u32,
+    u32,
+);
+
+#[cfg(target_os = "linux")]
+fn x11_cached_cache() -> &'static std::sync::Mutex<Option<X11CacheEntry>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<X11CacheEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(target_os = "linux")]
 pub fn warp_cursor_on(display: Option<&str>, x: u32, y: u32) -> Result<(), PlatformError> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt;
@@ -177,25 +230,51 @@ pub fn warp_cursor_on(display: Option<&str>, x: u32, y: u32) -> Result<(), Platf
     let mut width = LAST_SCREEN_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
     let mut height = LAST_SCREEN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
 
+    // Kernel-level uinput warp first: works on Wayland, X11, and pre-login
+    // greeters/lockscreens without needing X11 authentication.
+    let mut uinput_result = if width > 0 && height > 0 {
+        crate::inject::warp_cursor_uinput(x, y, width, height)
+    } else {
+        Err(PlatformError::Uinput(
+            "screen dimensions unknown for uinput warp".into(),
+        ))
+    };
+
     let x11_result: Result<(), PlatformError> = (|| {
-        let (connection, screen) = x11rb::connect(display).map_err(|error| {
-            PlatformError::Capture(format!("connect to X11 for pointer warp: {error}"))
-        })?;
-        let info = connection
-            .setup()
-            .roots
-            .get(screen)
-            .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?;
-        if (width == 0 || height == 0) && info.width_in_pixels > 0 && info.height_in_pixels > 0 {
-            width = info.width_in_pixels as u32;
-            height = info.height_in_pixels as u32;
+        let mut guard = x11_cached_cache()
+            .lock()
+            .map_err(|_| PlatformError::Capture("X11 cache poisoned".into()))?;
+        let display_owned = display.map(str::to_owned);
+        let needs_connect = guard
+            .as_ref()
+            .is_none_or(|(cached_disp, _, _, _, _)| *cached_disp != display_owned);
+        if needs_connect {
+            let (connection, screen) = x11rb::connect(display).map_err(|error| {
+                PlatformError::Capture(format!("connect to X11 for pointer warp: {error}"))
+            })?;
+            let info = connection
+                .setup()
+                .roots
+                .get(screen)
+                .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?;
+            let w = info.width_in_pixels as u32;
+            let h = info.height_in_pixels as u32;
+            let root = info.root;
+            if w > 0 && h > 0 {
+                note_screen_size(w, h);
+            }
+            *guard = Some((display_owned, connection, root, w, h));
+        }
+        let (_, connection, root, w, h) = guard.as_ref().expect("just initialized");
+        if (width == 0 || height == 0) && *w > 0 && *h > 0 {
+            width = *w;
+            height = *h;
             note_screen_size(width, height);
         }
-        let root = info.root;
-        connection
+        let warped = connection
             .warp_pointer(
                 x11rb::NONE,
-                root,
+                *root,
                 0,
                 0,
                 0,
@@ -203,22 +282,26 @@ pub fn warp_cursor_on(display: Option<&str>, x: u32, y: u32) -> Result<(), Platf
                 x.min(i16::MAX as u32) as i16,
                 y.min(i16::MAX as u32) as i16,
             )
-            .map_err(|error| PlatformError::Capture(format!("warp X11 pointer: {error}")))?
-            .check()
-            .map_err(|error| PlatformError::Capture(format!("warp X11 pointer: {error}")))?;
-        connection
-            .flush()
-            .map_err(|error| PlatformError::Capture(format!("flush X11 pointer warp: {error}")))?;
-        Ok(())
+            .map_err(|error| PlatformError::Capture(format!("warp X11 pointer: {error}")))
+            .and_then(|cookie| {
+                cookie
+                    .check()
+                    .map_err(|error| PlatformError::Capture(format!("warp X11 pointer: {error}")))
+            })
+            .and_then(|()| {
+                connection.flush().map_err(|error| {
+                    PlatformError::Capture(format!("flush X11 pointer warp: {error}"))
+                })
+            });
+        if warped.is_err() {
+            *guard = None;
+        }
+        warped
     })();
 
-    let uinput_result = if width > 0 && height > 0 {
-        crate::inject::warp_cursor_uinput(x, y, width, height)
-    } else {
-        Err(PlatformError::Uinput(
-            "screen dimensions unknown for uinput warp".into(),
-        ))
-    };
+    if uinput_result.is_err() && width > 0 && height > 0 {
+        uinput_result = crate::inject::warp_cursor_uinput(x, y, width, height);
+    }
 
     if uinput_result.is_ok() || x11_result.is_ok() {
         Ok(())
@@ -240,33 +323,28 @@ pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {
         return Ok(None);
     }
 
-    // One cached connection for the life of the daemon: the router polls
-    // this at 20–50Hz (near an edge) on every local motion event, and a
-    // fresh connect + auth + setup per read cost about a millisecond —
-    // enough to visibly stall the drive task on the X11 sender, which is
-    // the "little lag on the Linux side" shape. A dead server orphans the
-    // cache: the next call reconnects, so an X restart heals itself.
-    static POINTER: std::sync::OnceLock<
-        std::sync::Mutex<Option<(x11rb::rust_connection::RustConnection, u32)>>,
-    > = std::sync::OnceLock::new();
-    let slot = POINTER.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = slot
+    let mut guard = x11_cached_cache()
         .lock()
         .map_err(|_| PlatformError::Capture("X11 pointer cache poisoned".into()))?;
-    if guard.is_none() {
+    if guard.as_ref().is_none_or(|(disp, _, _, _, _)| disp.is_some()) {
         let (connection, screen) = x11rb::connect(None).map_err(|error| {
             PlatformError::Capture(format!("connect to X11 for pointer query: {error}"))
         })?;
-        let root = connection
+        let info = connection
             .setup()
             .roots
             .get(screen)
-            .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?
-            .root;
-        *guard = Some((connection, root));
+            .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?;
+        let root = info.root;
+        let w = info.width_in_pixels as u32;
+        let h = info.height_in_pixels as u32;
+        if w > 0 && h > 0 {
+            note_screen_size(w, h);
+        }
+        *guard = Some((None, connection, root, w, h));
     }
     let reply_result = {
-        let (connection, root) = guard.as_ref().expect("X11 pointer cache was just filled");
+        let (_, connection, root, _, _) = guard.as_ref().expect("X11 pointer cache was just filled");
         connection
             .query_pointer(*root)
             .map_err(|error| PlatformError::Capture(format!("query X11 pointer: {error}")))
@@ -291,27 +369,63 @@ pub fn current_cursor_position() -> Result<Option<(u32, u32)>, PlatformError> {
     Ok(Some((reply.root_x as u32, reply.root_y as u32)))
 }
 
-/// Measured X11 root size in pixels (see the Windows twin above). Reads
-/// the same screen the pointer query uses, so seed and dims agree.
+/// Measured X11 root size in pixels (see the Windows twin above). Reuses
+/// the cached X11 connection instead of opening a new socket per call.
 #[cfg(target_os = "linux")]
 pub fn screen_size() -> Result<Option<(u32, u32)>, PlatformError> {
     use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt;
 
-    let (connection, screen) = x11rb::connect(None).map_err(|error| {
-        PlatformError::Capture(format!("connect to X11 for screen size: {error}"))
-    })?;
-    let info = connection
-        .setup()
-        .roots
-        .get(screen)
-        .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?;
-    if info.width_in_pixels == 0 || info.height_in_pixels == 0 {
-        return Ok(None);
+    let mut guard = x11_cached_cache()
+        .lock()
+        .map_err(|_| PlatformError::Capture("X11 screen size cache poisoned".into()))?;
+    if guard.as_ref().is_none_or(|(disp, _, _, _, _)| disp.is_some()) {
+        let (connection, screen) = x11rb::connect(None).map_err(|error| {
+            PlatformError::Capture(format!("connect to X11 for screen size: {error}"))
+        })?;
+        let info = connection
+            .setup()
+            .roots
+            .get(screen)
+            .ok_or_else(|| PlatformError::Capture("X11 screen does not exist".into()))?;
+        let root = info.root;
+        let w = info.width_in_pixels as u32;
+        let h = info.height_in_pixels as u32;
+        if w > 0 && h > 0 {
+            note_screen_size(w, h);
+        }
+        *guard = Some((None, connection, root, w, h));
     }
-    let width = info.width_in_pixels as u32;
-    let height = info.height_in_pixels as u32;
-    note_screen_size(width, height);
-    Ok(Some((width, height)))
+    let query_result = {
+        let (_, connection, root, _, _) = guard.as_ref().expect("just initialized");
+        connection
+            .get_geometry(*root)
+            .map_err(|error| PlatformError::Capture(format!("query X11 root geometry: {error}")))
+            .and_then(|cookie| {
+                cookie.reply().map_err(|error| {
+                    PlatformError::Capture(format!("read X11 root geometry: {error}"))
+                })
+            })
+    };
+    match query_result {
+        Ok(geom) => {
+            if geom.width == 0 || geom.height == 0 {
+                return Ok(None);
+            }
+            let width = geom.width as u32;
+            let height = geom.height as u32;
+            note_screen_size(width, height);
+            if let Some((_, _, _, w, h)) = guard.as_mut() {
+                *w = width;
+                *h = height;
+            }
+            Ok(Some((width, height)))
+        }
+        Err(error) => {
+            *guard = None;
+            Err(error)
+        }
+    }
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
@@ -561,6 +675,23 @@ mod win32_hooks {
     static CONSUMER_NOLEGACY: AtomicBool = AtomicBool::new(false);
     /// Scroll-guard pixel window (see scroll_guard_pixel): 0 when absent.
     static GUARD_PIXEL: AtomicIsize = AtomicIsize::new(0);
+    /// Last packed `(x, y)` coordinate passed to `SetWindowPos` for the
+    /// guard pixel (`u64::MAX` when unplaced), avoiding redundant DWM calls.
+    static GUARD_POS: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// Cached `IDC_ARROW` cursor handle.
+    static ARROW_CURSOR: AtomicIsize = AtomicIsize::new(0);
+
+    fn arrow_cursor() -> windows::Win32::UI::WindowsAndMessaging::HCURSOR {
+        let cached = ARROW_CURSOR.load(Ordering::Relaxed);
+        if cached != 0 {
+            return windows::Win32::UI::WindowsAndMessaging::HCURSOR(cached as *mut std::ffi::c_void);
+        }
+        if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+            ARROW_CURSOR.store(cursor.0 as isize, Ordering::Relaxed);
+            return cursor;
+        }
+        windows::Win32::UI::WindowsAndMessaging::HCURSOR::default()
+    }
     /// Cursor park point the guard pixel (and the cursor glue below) hold
     /// while driving: packed x/i32-low + y/i32-high. Written when the
     /// pixel parks, read on every swallowed motion tick. PARK_VALID gates
@@ -701,18 +832,23 @@ mod win32_hooks {
             _release: &AtomicBool,
         ) -> Result<InputEvent, PlatformError> {
             loop {
-                BLOCK_LOCAL.store(exclusive.load(Ordering::Acquire), Ordering::Release);
+                let is_exclusive = exclusive.load(Ordering::Acquire);
+                BLOCK_LOCAL.store(is_exclusive, Ordering::Release);
                 // Slow-path cursor/pixel glue (see slow_glue_tick): every
-                // iteration, so a cursor that escaped past the hook fast
-                // path is pulled home within one tick.
-                slow_glue_tick();
+                // iteration while exclusive, so a cursor that escaped past
+                // the hook fast path is pulled home within one tick.
+                if is_exclusive {
+                    slow_glue_tick();
+                }
                 if stop.load(Ordering::Acquire) {
                     return Err(PlatformError::Capture("capture stopped".into()));
                 }
-                match self
-                    .receiver
-                    .recv_timeout(std::time::Duration::from_millis(100))
-                {
+                let timeout = if is_exclusive {
+                    std::time::Duration::from_millis(100)
+                } else {
+                    std::time::Duration::from_millis(250)
+                };
+                match self.receiver.recv_timeout(timeout) {
                     Ok(event) => return Ok(event),
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -964,7 +1100,8 @@ mod win32_hooks {
                 // hourglass shows through the drive. Force an arrow for
                 // every local event we swallow.
                 if BLOCK_LOCAL.load(Ordering::Acquire) {
-                    if let Ok(arrow) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+                    let arrow = arrow_cursor();
+                    if !arrow.0.is_null() {
                         unsafe {
                             SetCursor(arrow);
                         }
@@ -1319,7 +1456,8 @@ mod win32_hooks {
             // app under the park point reads as our glitch for the whole
             // drive. Answer arrow ourselves; handled means TRUE.
             if message == WM_SETCURSOR {
-                if let Ok(arrow) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+                let arrow = arrow_cursor();
+                if !arrow.0.is_null() {
                     unsafe {
                         SetCursor(arrow);
                     }
@@ -1334,6 +1472,7 @@ mod win32_hooks {
                 if raw != 0 {
                     let _ = DestroyWindow(HWND(raw as *mut std::ffi::c_void));
                 }
+                GUARD_POS.store(u64::MAX, Ordering::Release);
                 PARK_VALID.store(false, Ordering::Release);
                 return;
             }
@@ -1347,10 +1486,8 @@ mod win32_hooks {
             // The park point doubles as the cursor glue below (see
             // glue_cursor_to_park): store it before creating, so a
             // failed create still leaves a valid glue target.
-            PARK_POINT.store(
-                (point.x as u32 as u64) | ((point.y as u32 as u64) << 32),
-                Ordering::Release,
-            );
+            let packed_point = (point.x as u32 as u64) | ((point.y as u32 as u64) << 32);
+            PARK_POINT.store(packed_point, Ordering::Release);
             PARK_VALID.store(true, Ordering::Release);
             log_park_window(point);
             let instance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
@@ -1361,6 +1498,7 @@ mod win32_hooks {
             let _ = RegisterClassW(&WNDCLASSW {
                 lpfnWndProc: Some(guard_proc),
                 hInstance: instance,
+                hCursor: arrow_cursor(),
                 lpszClassName: PCWSTR(GUARD_CLASS.as_ptr()),
                 ..Default::default()
             });
@@ -1391,6 +1529,7 @@ mod win32_hooks {
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                     );
                     let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
+                    GUARD_POS.store(packed_point, Ordering::Release);
                     GUARD_PIXEL.store(window.0 as isize, Ordering::Release);
                     tracing::debug!("scroll-guard pixel parked under the held cursor");
                 }
@@ -1452,6 +1591,10 @@ mod win32_hooks {
     fn repark_guard_pixel(point: POINT) {
         let raw = GUARD_PIXEL.load(Ordering::Acquire);
         if raw == 0 {
+            return;
+        }
+        let packed = (point.x as u32 as u64) | ((point.y as u32 as u64) << 32);
+        if GUARD_POS.swap(packed, Ordering::AcqRel) == packed {
             return;
         }
         unsafe {
@@ -1847,7 +1990,14 @@ mod win32_hooks {
             return;
         }
 
-        let mut buffer = vec![0u8; size as usize];
+        let mut stack_buf = [0u8; 256];
+        let mut heap_buf: Vec<u8>;
+        let buffer: &mut [u8] = if (size as usize) <= stack_buf.len() {
+            &mut stack_buf[..size as usize]
+        } else {
+            heap_buf = vec![0u8; size as usize];
+            &mut heap_buf
+        };
         let result = GetRawInputData(
             raw_input,
             RID_INPUT,

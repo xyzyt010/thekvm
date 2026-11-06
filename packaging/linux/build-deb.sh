@@ -7,10 +7,10 @@ set -eu
 # user). Default keeps the documented ~/thekvm-build layout for Mint builds.
 BUILD_DIR="${THEKVM_BUILD_DIR:-$HOME/thekvm-build}"
 cd "$BUILD_DIR"
-VER=0.9.88
+VER=0.9.92
 PKG=thekvm
 ROOT=debroot
-rm -rf "$ROOT" "${PKG}_${VER}_amd64.deb"
+sudo rm -rf "$ROOT" "${PKG}_${VER}_amd64.deb"
 mkdir -p "$ROOT/DEBIAN" \
          "$ROOT/usr/bin" \
          "$ROOT/lib/systemd/system" \
@@ -37,14 +37,15 @@ User=thekvm
 Group=thekvm
 SupplementaryGroups=input
 ExecStart=/usr/bin/kvm-daemon serve
-Restart=on-failure
-RestartSec=3
+Restart=always
+RestartSec=1
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/thekvm
 PrivateTmp=yes
-ProtectHome=yes
+ProtectHome=read-only
 DeviceAllow=/dev/uinput rw
+DeviceAllow=/dev/input/event* rw
 UMask=0007
 
 [Install]

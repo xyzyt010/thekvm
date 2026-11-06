@@ -223,6 +223,11 @@ pub enum ControlRequest {
         /// are safe.
         #[serde(default)]
         double_edge_style: Option<DoubleEdgeStyle>,
+        /// Automatically connect to paired peers on startup (see
+        /// `Config::auto_connect_enabled`); omission preserves the current
+        /// value.
+        #[serde(default)]
+        auto_connect_enabled: Option<bool>,
     },
     /// Take one chunk of the latest peer paste stashed for this
     /// logged-in session (see [`ClipboardUpdate`]): the headless
@@ -250,6 +255,18 @@ pub enum ControlRequest {
     /// starts a new paste, and the daemon publishes it once every chunk
     /// has arrived. Chunked for the same reason as [`ClipboardPoll`].
     ClipboardOffer {
+        generation: u64,
+        kind: ClipboardKind,
+        total_chunks: u32,
+        index: u32,
+        data: String,
+        width: u32,
+        height: u32,
+    },
+    /// Stash an inbound peer paste received by a supervised `connect` child
+    /// into the daemon's `CLIPBOARD_RELAY` slot so the logged-in UI's
+    /// `ClipboardPoll` long-poll receives and applies it immediately.
+    ClipboardStash {
         generation: u64,
         kind: ClipboardKind,
         total_chunks: u32,
@@ -305,6 +322,10 @@ fn default_auto_discover() -> bool {
     true
 }
 
+fn default_auto_connect_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub node_name: String,
@@ -313,6 +334,8 @@ pub struct DaemonStatus {
     pub mode: Mode,
     pub allow_lock_screen_control: bool,
     pub auto_connect_address: Option<String>,
+    #[serde(default = "default_auto_connect_enabled")]
+    pub auto_connect_enabled: bool,
     pub clipboard_enabled: bool,
     /// Largest single clipboard update (MiB). Defaults to 2 for older
     /// daemons that predate the field.
@@ -554,18 +577,19 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let payload = serde_json::to_vec(value)
+    let mut frame = Vec::with_capacity(256);
+    frame.extend_from_slice(&[0u8; 4]);
+    serde_json::to_writer(&mut frame, value)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if payload.is_empty() || payload.len() > MAX_CONTROL_FRAME_SIZE {
+    let payload_len = frame.len() - 4;
+    if payload_len == 0 || payload_len > MAX_CONTROL_FRAME_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "control message exceeds maximum frame size",
         ));
     }
-    writer
-        .write_all(&(payload.len() as u32).to_be_bytes())
-        .await?;
-    writer.write_all(&payload).await?;
+    frame[..4].copy_from_slice(&(payload_len as u32).to_be_bytes());
+    writer.write_all(&frame).await?;
     writer.flush().await
 }
 
@@ -616,6 +640,7 @@ mod tests {
             reverse_scroll: None,
             auto_discover: Some(true),
             double_edge_style: None,
+            auto_connect_enabled: Some(true),
         };
         let expected_address = "127.0.0.1:42110".to_owned();
         let sender = tokio::spawn(async move {
@@ -636,6 +661,7 @@ mod tests {
             reverse_scroll,
             auto_discover,
             double_edge_style,
+            auto_connect_enabled,
         }) = read_request(&mut right).await.unwrap()
         else {
             panic!("expected SetConfig request");
@@ -657,6 +683,7 @@ mod tests {
         assert_eq!(reverse_scroll, None);
         assert_eq!(auto_discover, Some(true));
         assert_eq!(double_edge_style, None);
+        assert_eq!(auto_connect_enabled, Some(true));
         sender.await.unwrap();
     }
 

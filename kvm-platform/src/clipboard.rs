@@ -74,7 +74,7 @@ impl SystemClipboard {
             Err(_) => return Ok(None),
         };
         let same = self.last_text.as_deref() == Some(text.as_str());
-        if same && !ownership_changed {
+        if same {
             return Ok(None);
         }
         self.last_text = Some(text.clone());
@@ -103,7 +103,7 @@ impl SystemClipboard {
         let rgba = image.bytes.to_vec();
         let fingerprint = Self::image_fingerprint(image.width, image.height, &rgba);
         let same = self.last_image_hash == Some(fingerprint);
-        if same && !ownership_changed {
+        if same {
             return Ok(None);
         }
         self.last_image_hash = Some(fingerprint);
@@ -164,14 +164,25 @@ impl SystemClipboard {
     /// Set text received from a peer and remember it as locally observed so
     /// the polling loop does not immediately echo it back.
     pub fn set_text(&mut self, text: String) -> Result<(), PlatformError> {
-        self.clipboard
-            .set_text(text.clone())
-            .map_err(|error| PlatformError::Clipboard(format!("set system clipboard: {error}")))?;
-        self.last_text = Some(text);
+        self.last_text = Some(text.clone());
         self.last_image_hash = None;
-        // Text poll and image poll can each observe the owner change.
-        self.ignore_owner_events = 2;
-        Ok(())
+        self.ignore_owner_events = 4;
+        let mut last_err = None;
+        for attempt in 0..4 {
+            match self.clipboard.set_text(text.clone()) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_err = Some(error);
+                    if attempt < 3 {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        Err(PlatformError::Clipboard(format!(
+            "set system clipboard: {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        )))
     }
 
     /// Set image pixels received from a peer (decoded RGBA) and remember
@@ -190,17 +201,27 @@ impl SystemClipboard {
         }
         self.last_image_hash = Some(Self::image_fingerprint(width, height, &rgba));
         self.last_text = None;
-        self.ignore_owner_events = 2;
-        self.clipboard
-            .set_image(arboard::ImageData {
+        self.ignore_owner_events = 4;
+        let mut last_err = None;
+        for attempt in 0..4 {
+            match self.clipboard.set_image(arboard::ImageData {
                 width,
                 height,
-                bytes: std::borrow::Cow::Owned(rgba),
-            })
-            .map_err(|error| {
-                PlatformError::Clipboard(format!("set system clipboard image: {error}"))
-            })?;
-        Ok(())
+                bytes: std::borrow::Cow::Borrowed(&rgba),
+            }) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_err = Some(error);
+                    if attempt < 3 {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        Err(PlatformError::Clipboard(format!(
+            "set system clipboard image: {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        )))
     }
 }
 
@@ -400,23 +421,41 @@ impl ClipboardWatcher {
     /// selection. True means "re-read now"; false is just the timeout —
     /// the caller still does its safety re-read.
     pub fn wait_notice(&self, timeout: Duration) -> bool {
+        use std::os::fd::AsRawFd;
         use x11rb::connection::Connection;
         use x11rb::protocol::Event;
         let deadline = std::time::Instant::now() + timeout;
+        let mut notified = false;
         loop {
-            match self.connection.poll_for_event() {
-                Ok(Some(Event::XfixesSelectionNotify(event)))
-                    if event.selection == self.clipboard =>
-                {
-                    return true
+            loop {
+                match self.connection.poll_for_event() {
+                    Ok(Some(Event::XfixesSelectionNotify(event)))
+                        if event.selection == self.clipboard =>
+                    {
+                        notified = true;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => return notified,
                 }
-                Ok(_) => {}
-                Err(_) => return false,
             }
-            if std::time::Instant::now() >= deadline {
+            if notified {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            let mut pfd = libc::pollfd {
+                fd: self.connection.stream().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let wait_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let rc = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
+            if rc <= 0 {
+                return false;
+            }
         }
     }
 }
@@ -502,7 +541,8 @@ impl ClipboardWatcher {
     /// reported a copy: re-read now. False is just the timeout.
     pub fn wait_notice(&self, timeout: Duration) -> bool {
         use windows::Win32::UI::WindowsAndMessaging::{
-            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+            DispatchMessageW, MsgWaitForMultipleObjectsEx, PeekMessageW, TranslateMessage, MSG,
+            MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT,
         };
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -516,10 +556,19 @@ impl ClipboardWatcher {
             if CLIPBOARD_NOTIFIED.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 return true;
             }
-            if std::time::Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+            unsafe {
+                let _ = MsgWaitForMultipleObjectsEx(
+                    None,
+                    wait_ms,
+                    QS_ALLINPUT,
+                    MWMO_INPUTAVAILABLE,
+                );
+            }
         }
     }
 }

@@ -409,18 +409,19 @@ where
     W: AsyncWrite + Unpin,
 {
     validate_message(message)?;
-    let payload = serde_json::to_vec(message)
+    let mut frame = Vec::with_capacity(128);
+    frame.extend_from_slice(&[0u8; 4]);
+    serde_json::to_writer(&mut frame, message)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    if payload.len() > MAX_FRAME_SIZE {
+    let payload_len = frame.len() - 4;
+    if payload_len > MAX_FRAME_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "wire message exceeds maximum frame size",
         ));
     }
-    writer
-        .write_all(&(payload.len() as u32).to_be_bytes())
-        .await?;
-    writer.write_all(&payload).await?;
+    frame[..4].copy_from_slice(&(payload_len as u32).to_be_bytes());
+    writer.write_all(&frame).await?;
     writer.flush().await
 }
 
