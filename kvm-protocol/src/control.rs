@@ -131,6 +131,16 @@ pub enum ControlRequest {
         #[serde(default)]
         link_id: Option<u64>,
     },
+    /// Stop auto-dialing one peer until a fresh, explicit Connect: recorded
+    /// by the Disconnect button and by app quit so the daemon's controllers
+    /// (Windows service, Linux pre-login) never resurrect a link the user
+    /// just ended. The reply is `Applied`.
+    PausePeerController {
+        fingerprint_hex: String,
+    },
+    /// Clear every controller pause: the desktop app just launched, which is
+    /// explicit user intent to use the links again. The reply is `Applied`.
+    ResumeControllers,
     /// Hold a daemon-side lease on one outbound link for this process's
     /// lifetime: the supervised child opens this persistent control
     /// connection right after its verify and keeps it open with
@@ -336,6 +346,10 @@ pub struct DaemonStatus {
     pub auto_connect_address: Option<String>,
     #[serde(default = "default_auto_connect_enabled")]
     pub auto_connect_enabled: bool,
+    /// Peers this daemon refuses to auto-dial until a fresh explicit
+    /// Connect (a deliberate Disconnect, or a LinkEnded that peer sent us).
+    #[serde(default)]
+    pub controller_paused_peers: Vec<String>,
     pub clipboard_enabled: bool,
     /// Largest single clipboard update (MiB). Defaults to 2 for older
     /// daemons that predate the field.

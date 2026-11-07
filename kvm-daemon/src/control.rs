@@ -472,7 +472,36 @@ pub async fn request(_data_dir: PathBuf, request: ControlRequest) -> Result<Cont
         const ERROR_PIPE_BUSY: i32 = 231;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1_000);
         loop {
-            match tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe) {
+            // The open itself is bounded in blocking time: when the daemon's
+            // accept pool is wedged every instance is busy and a bare
+            // `ClientOptions::open` parks the caller forever (that was the
+            // `kvm-daemon status` / `configure` hang). Fail loudly instead.
+            let attempt = tokio::task::spawn_blocking({
+                let pipe = pipe.clone();
+                move || tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe)
+            });
+            let outcome = match tokio::time::timeout(
+                std::time::Duration::from_millis(750),
+                attempt,
+            )
+            .await
+            {
+                Ok(joined) => match joined {
+                    Ok(outcome) => outcome,
+                    Err(join_error) => {
+                        Err(std::io::Error::other(format!(
+                            "control pipe opener failed: {join_error}"
+                        )))
+                    }
+                },
+                Err(_) => {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "control pipe open timed out; the daemon control endpoint is not accepting (restart the TheKVM service)",
+                    ))
+                }
+            };
+            match outcome {
                 Err(error)
                     if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
                         && std::time::Instant::now() < deadline =>
@@ -592,6 +621,9 @@ where
         // frames on one connection, unlike every other request.
         ControlRequest::PresenceLease => {
             let id = crate::service::presence_begin();
+            // A fresh app launch is explicit user intent: every controller
+            // pause recorded by an earlier Disconnect or quit lifts now.
+            crate::service::resume_all_controllers();
             write_response(
                 &mut stream,
                 &ControlResponse::Applied {
@@ -678,8 +710,36 @@ where
                 tracing::info!(
                     peer = %lease.fingerprint_hex,
                     link_id = ?lease.link_id,
-                    "supervised link child exited; lease released"
+                    "supervised link child exited; hanging the whole link up on both sides"
                 );
+                // The supervised child IS the link: it died because the app
+                // was quit or killed (or the peer already ended it), so ban
+                // the epoch, drop the peer's inbound sessions here, tell the
+                // peer, and stand this daemon's controller down — a killed
+                // app must never leave a live link, and nothing may
+                // resurrect it until a fresh explicit Connect.
+                // Already-ended epochs (an earlier teardown, or a stale
+                // lease row finally reaping) are skipped: re-running the
+                // teardown only spams the journal.
+                let already_ended = lease
+                    .link_id
+                    .is_some_and(|id| crate::service::link_ended(id));
+                if !already_ended {
+                    crate::service::teardown_link(
+                        &data_dir,
+                        Some(&lease.fingerprint_hex),
+                        Some(&lease.address),
+                        lease.link_id,
+                        "link-child-exit",
+                    )
+                    .await;
+                    // No local controller pause here: this daemon's own
+                    // controller is already gated on "nobody logged in and
+                    // no app", and the peer stands down via the LinkEnded
+                    // above. Pausing locally would fight a legitimate
+                    // relaunch, whose fresh presence lease lands before the
+                    // dead child's trailing EOF.
+                }
             }
             return Ok(());
         }
@@ -718,6 +778,12 @@ where
                     "disconnect",
                 )
                 .await;
+                // A deliberate local Disconnect also stands this daemon's
+                // controller down for that peer: nothing re-dials them until
+                // a fresh explicit Connect (which clears the pause).
+                if let Some(fingerprint) = fingerprint_hex.as_deref() {
+                    crate::service::pause_peer_controller(fingerprint);
+                }
                 ControlResponse::Disconnected {
                     fingerprint_hex,
                     link_id,
@@ -740,6 +806,7 @@ where
                 allow_lock_screen_control: current.allow_lock_screen_control,
                 auto_connect_address: current.auto_connect_address,
                 auto_connect_enabled: current.auto_connect_enabled,
+                controller_paused_peers: crate::service::paused_peer_list(),
                 clipboard_enabled: current.clipboard_enabled,
                 clipboard_max_mb: current.clipboard_max_mb,
                 edge_mode: current.edge_mode,
@@ -986,20 +1053,33 @@ where
                 }
             } else {
                 let fingerprint_hex = fingerprint_hex.to_ascii_lowercase();
-                if crate::service::drop_inbound_link(&fingerprint_hex) {
-                    // A hung-up link must not silently re-open: forget its
-                    // approvals so the next dial prompts again.
-                    link_approvals().revoke_peer(&fingerprint_hex).await;
-                    crate::service::audit_event(
-                        &data_dir,
-                        &format!("session-dropped fingerprint={fingerprint_hex}"),
-                    );
-                    ControlResponse::SessionDropped { fingerprint_hex }
-                } else {
-                    ControlResponse::Error {
-                        message: "no live inbound session for that peer".into(),
-                    }
-                }
+                // Dropping the episode alone was not enough: the driver's
+                // child stayed alive at edge-ready and re-drove on the very
+                // next mouse push. End the whole link instead — ban the epoch,
+                // drop every inbound session from this peer, forget its
+                // approvals, and tell the peer — so both sides go down
+                // together, exactly like Disconnect.
+                let target = crate::service::list_inbound_links()
+                    .into_iter()
+                    .find(|session| session.fingerprint_hex == fingerprint_hex);
+                crate::service::teardown_link(
+                    &data_dir,
+                    Some(&fingerprint_hex),
+                    target.as_ref().map(|session| session.address.as_str()),
+                    target.as_ref().and_then(|session| session.link_id),
+                    "station-drop",
+                )
+                .await;
+                let _ = crate::service::drop_inbound_link(&fingerprint_hex);
+                link_approvals().revoke_peer(&fingerprint_hex).await;
+                // The user just kicked this peer off: our controller must not
+                // auto-dial them again until a fresh explicit Connect.
+                crate::service::pause_peer_controller(&fingerprint_hex);
+                crate::service::audit_event(
+                    &data_dir,
+                    &format!("session-dropped-and-link-ended fingerprint={fingerprint_hex}"),
+                );
+                ControlResponse::SessionDropped { fingerprint_hex }
             }
         }
         ControlRequest::EndLink { link_id } => {
@@ -1076,6 +1156,24 @@ where
                 Err(error) => ControlResponse::Error {
                     message: format!("reading daemon identity failed: {error}"),
                 },
+            }
+        }
+        ControlRequest::PausePeerController { fingerprint_hex } => {
+            if !is_fingerprint(&fingerprint_hex) {
+                ControlResponse::Error {
+                    message: "peer fingerprint must contain 64 hexadecimal characters".into(),
+                }
+            } else {
+                crate::service::pause_peer_controller(&fingerprint_hex);
+                ControlResponse::Applied {
+                    restart_required: false,
+                }
+            }
+        }
+        ControlRequest::ResumeControllers => {
+            crate::service::resume_all_controllers();
+            ControlResponse::Applied {
+                restart_required: false,
             }
         }
         ControlRequest::PinPeer {
@@ -1589,37 +1687,40 @@ async fn run_windows_server(
     // will not hang up. The OS cap stays 64; four workers are enough to
     // absorb poll bursts without idle waste.
     const WORKERS: usize = 4;
-    let mut workers = Vec::with_capacity(WORKERS);
-    for worker in 0..WORKERS {
-        let data_dir = data_dir.clone();
-        let config = config.clone();
-        let peers = peers.clone();
-        let active_sessions = active_sessions.clone();
-        let fingerprint = fingerprint.clone();
-        let started = started.clone();
-        let revoked_peers = revoked_peers.clone();
-        let pairing_approvals = pairing_approvals.clone();
-        workers.push(tokio::spawn(async move {
-            if let Err(error) = windows_accept_worker(
-                data_dir,
-                config,
-                peers,
-                active_sessions,
-                fingerprint,
-                started,
-                revoked_peers,
-                pairing_approvals,
-            )
-            .await
-            {
-                tracing::warn!(%error, worker, "control pipe worker stopped");
+    // Supervisor: every worker is immortal (it retries its own failures),
+    // and a worker that somehow still exits is respawned here. A control
+    // endpoint that quietly disappears makes the UI spawn a second daemon
+    // and makes every CLI call hang, so the pool is never left empty.
+    loop {
+        let mut workers = Vec::with_capacity(WORKERS);
+        for _ in 0..WORKERS {
+            workers.push(tokio::spawn(windows_accept_worker(
+                data_dir.clone(),
+                config.clone(),
+                peers.clone(),
+                active_sessions.clone(),
+                fingerprint.clone(),
+                started.clone(),
+                revoked_peers.clone(),
+                pairing_approvals.clone(),
+            )));
+        }
+        for worker in workers {
+            match worker.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "control pipe worker stopped; supervisor will respawn it");
+                }
+                Err(join_error) => {
+                    tracing::warn!(%join_error, "control pipe worker task failed; supervisor will respawn it");
+                }
             }
-        }));
+        }
+        tokio::select! {
+            _ = crate::service::shutdown_notifier().notified() => return Ok(()),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+        }
     }
-    for worker in workers {
-        let _ = worker.await;
-    }
-    Ok(())
 }
 
 /// One accept loop owning one waiting pipe instance at a time. After a
@@ -1648,14 +1749,35 @@ async fn windows_accept_worker(
         server_options.max_instances(64);
         server_options.reject_remote_clients(true);
         server_options.write_dac(true);
-        let server = server_options
-            .create(&pipe)
-            .context("create daemon control named pipe")?;
-        apply_control_pipe_acl(&server)?;
+        // A failure here is transient (instance churn, ACL hiccup): log it
+        // and retry. Dying instead left the machine with no control
+        // endpoint at all, which is how the UI ended up starting a second
+        // daemon and the CLI hung.
+        let server = match server_options.create(&pipe) {
+            Ok(server) => server,
+            Err(error) => {
+                tracing::warn!(%error, "cannot create control pipe instance; retrying");
+                tokio::select! {
+                    _ = crate::service::shutdown_notifier().notified() => return Ok(()),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => continue,
+                }
+            }
+        };
+        if let Err(error) = apply_control_pipe_acl(&server) {
+            tracing::warn!(%error, "cannot apply control pipe ACL; retrying");
+            tokio::select! {
+                _ = crate::service::shutdown_notifier().notified() => return Ok(()),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => continue,
+            }
+        }
         tokio::select! {
             _ = crate::service::shutdown_notifier().notified() => return Ok(()),
             connected = server.connect() => {
-                connected.context("connect daemon control named pipe")?;
+                if let Err(error) = connected {
+                    tracing::debug!(%error, "control pipe connect attempt failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
                 let data_dir = data_dir.clone();
                 let config = config.clone();
                 let peers = peers.clone();

@@ -291,6 +291,11 @@ fn main() -> Result<()> {
     let last_dialback_state = last_dialback.clone();
     let last_link_seen = Arc::new(Mutex::new(None::<std::time::Instant>));
     let last_link_seen_state = last_link_seen.clone();
+    // Last "our child holds the winning epoch" decision already logged (see
+    // follow_link): keeps the tie-break line to once per link instead of
+    // once per poll second.
+    let epoch_hold = Arc::new(Mutex::new(None::<(String, Option<u64>)>));
+    let epoch_hold_state = epoch_hold.clone();
     let pending_for_poll = pending_pair.clone();
     let link_dir = startup_dir.clone();
     // Last LAN scan results (dial addresses in ComboBox order): shared by
@@ -388,9 +393,35 @@ fn main() -> Result<()> {
                 return;
             }
             ensure_link_arrangement();
-            // Give the poll thread 1.5s to adopt any already-live inbound
-            // session via `follow_link` first, avoiding a double-dial race.
-            std::thread::sleep(std::time::Duration::from_millis(1500));
+            // De-race the mutual startup dial: both machines autostart at
+            // the same moment, and two independent fresh epochs fight (the
+            // double-Connect churn). Wait a moment for the peer's inbound
+            // link to appear first; `follow_link` then arms our half on the
+            // peer's live epoch instead of minting a competing one.
+            let jitter_ms = 250 + (std::process::id() % 1200);
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(jitter_ms)));
+            for _ in 0..6 {
+                if child_running(&session) {
+                    return;
+                }
+                match control_request(ControlRequest::Status) {
+                    Ok(ControlResponse::Status(live)) => {
+                        if !live.sessions.is_empty()
+                            || live
+                                .recent_inbound
+                                .iter()
+                                .any(|recent| recent.last_seen_secs_ago <= 30)
+                        {
+                            ui_log(
+                                "autoconnect: peer is already linking this machine; arming our half on their live link",
+                            );
+                            return;
+                        }
+                    }
+                    _ => break,
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
             if child_running(&session) {
                 return;
             }
@@ -528,6 +559,7 @@ fn main() -> Result<()> {
                             &last_inbound_state,
                             &last_dialback_state,
                             &last_link_seen_state,
+                            &epoch_hold_state,
                         );
                         let peer_ended_ours = session_for_poll.lock().ok().and_then(|slot| {
                             slot.as_ref()
@@ -1332,7 +1364,8 @@ fn main() -> Result<()> {
             // Stop follow_link from re-dialling this peer while the daemon
             // teardown is still in flight (the exact 3ms resurrection).
             tombstone_dialback(&address);
-            disconnect_link(None, Some(&address), link_id);
+            let fingerprint = fingerprint_for_address(&data_dir(), &address);
+            disconnect_link(fingerprint.as_deref(), Some(&address), link_id);
         }
         stop_session(&weak, &disconnect_session, "Disconnected");
         // Links we never dialed have no supervised child; hang them up too
@@ -1988,6 +2021,10 @@ fn main() -> Result<()> {
                                 if let Some(ui) = weak.upgrade() {
                                     let _ = ui.window().show();
                                 }
+                                // Show must also raise + foreground the window:
+                                // a minimized or behind-the-scenes app has to
+                                // come to the user, exactly like every tray app.
+                                tray::focus_main_window();
                             });
                         }
                         tray::TrayCommand::Disconnect => {
@@ -2018,7 +2055,12 @@ fn main() -> Result<()> {
                         // Bilateral hang-up before the kill, exactly like
                         // Disconnect; the presence lease EOF then hangs up
                         // any inbound-only links on the daemon side.
-                        disconnect_link(None, Some(&session.address), session.link_id);
+                        let fingerprint = fingerprint_for_address(&data_dir(), &session.address);
+                        disconnect_link(
+                            fingerprint.as_deref(),
+                            Some(&session.address),
+                            session.link_id,
+                        );
                         ui_log(&format!(
                             "app closing; stopped supervised child for {}",
                             session.address
@@ -3801,6 +3843,7 @@ fn follow_link(
     last_inbound: &Arc<Mutex<Option<(String, Option<u64>)>>>,
     last_attempt: &Arc<Mutex<Option<std::time::Instant>>>,
     last_link_seen: &Arc<Mutex<Option<std::time::Instant>>>,
+    last_epoch_hold: &Arc<Mutex<Option<(String, Option<u64>)>>>,
 ) {
     let outbound_running = session.lock().ok().is_some_and(|slot| slot.is_some());
     let ceremony_open = pending.lock().ok().is_some_and(|slot| slot.is_some());
@@ -3943,11 +3986,41 @@ fn follow_link(
                 };
                 // Same epoch both sides: nothing stale, nothing to do.
                 let same = matches!(current, Some((Some(old), _)) if old == new_id);
-                if let Some(old) = ours_lower {
-                    ui_log(&format!(
-                        "link: keeping live epoch {old} over inbound {new_id} (double-Connect tie-break); peer adopts ours"
-                    ));
-                } else if !same {
+                // Steady state (our live child already holds the winning
+                // epoch, or holds the only epoch): log once per link, never
+                // every poll second.
+                let holding = same || ours_lower.is_some();
+                let hold_key: Option<(String, Option<u64>)> = holding.then(|| {
+                    (
+                        link.fingerprint_hex.clone(),
+                        current.and_then(|(id, _)| id).or(Some(new_id)),
+                    )
+                });
+                let already_logged = match last_epoch_hold
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                {
+                    Some((fp, id)) => hold_key
+                        .as_ref()
+                        .is_some_and(|(fingerprint, epoch)| *fingerprint == fp && *epoch == id),
+                    None => false,
+                };
+                if hold_key.is_some() {
+                    if !already_logged {
+                        if let Ok(mut slot) = last_epoch_hold.lock() {
+                            *slot = hold_key;
+                        }
+                        if let Some(old) = ours_lower {
+                            ui_log(&format!(
+                                "link: keeping live epoch {old} over inbound {new_id} (double-Connect tie-break); peer adopts ours"
+                            ));
+                        }
+                    }
+                } else {
+                    if let Ok(mut slot) = last_epoch_hold.lock() {
+                        *slot = None;
+                    }
                     let stale = match current {
                         Some((Some(old), _)) if old != new_id => Some(Some(old)),
                         Some((None, _)) => Some(None),
@@ -4952,7 +5025,8 @@ fn quit_full_terminate(session: &Arc<Mutex<Option<Session>>>) {
     if let Some((address, link_id)) = outbound {
         // Same bilateral hang-up as Disconnect, before the child dies so
         // an in-flight redial is already rejected when the child stops.
-        disconnect_link(None, Some(&address), link_id);
+        let fingerprint = fingerprint_for_address(&data_dir(), &address);
+        disconnect_link(fingerprint.as_deref(), Some(&address), link_id);
     }
     if let Some(mut session) = session.lock().ok().and_then(|mut slot| slot.take()) {
         let _ = session.child.kill();

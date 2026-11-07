@@ -45,6 +45,13 @@ pub struct Config {
     /// restarts, shutdowns, and lockscreens). Default on for all devices.
     #[serde(default = "default_auto_connect_enabled")]
     pub auto_connect_enabled: bool,
+    /// Seconds of no local input after which a drive parks itself and
+    /// control returns home automatically (default 10, 0 disables). A drive
+    /// the local user stopped touching must never hold this machine's
+    /// keyboard and mouse hostage; the next push re-drives instantly on the
+    /// parked stream.
+    #[serde(default = "default_idle_home_secs")]
+    pub idle_home_secs: u32,
     /// Synchronize plain text clipboard contents for ordinary logged-in
     /// sessions. Default on: both machines sync while linked. Clipboard
     /// data is user content, so either side can still switch it off in
@@ -128,6 +135,7 @@ impl Default for Config {
             allow_lock_screen_control: true,
             auto_connect_address: None,
             auto_connect_enabled: true,
+            idle_home_secs: default_idle_home_secs(),
             clipboard_enabled: true,
             clipboard_max_mb: DEFAULT_CLIPBOARD_MAX_MB,
             reverse_scroll: false,
@@ -143,6 +151,13 @@ fn default_allow_lock_screen_control() -> bool {
 
 fn default_auto_connect_enabled() -> bool {
     true
+}
+
+/// Ten idle seconds parks a drive and returns control home. Long enough that
+/// reading or watching on the peer screen never yanks the cursor back, short
+/// enough that a forgotten drive can never hold the local machine hostage.
+fn default_idle_home_secs() -> u32 {
+    10
 }
 
 /// Auto-discovery defaults on: it only lists machines, never connects, so

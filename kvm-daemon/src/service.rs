@@ -625,7 +625,7 @@ pub(crate) fn peer_ended_links() -> Vec<u64> {
         .unwrap_or_default()
 }
 
-fn link_ended(link_id: u64) -> bool {
+pub(crate) fn link_ended(link_id: u64) -> bool {
     ended_link_ids()
         .lock()
         .ok()
@@ -1298,12 +1298,298 @@ pub(crate) fn persist_ended_links(dir: &std::path::Path) {
     }
 }
 
+/// Peers this daemon must NOT auto-dial until a fresh, explicit Connect:
+/// a deliberate local Disconnect (or a LinkEnded we received) stops the
+/// service/pre-login controllers from resurrecting the link seconds later.
+/// Persisted beside the identity so a daemon restart stays respectful too.
+fn paused_peers_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("paused-peers.json")
+}
+
+static PAUSED_PEERS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn paused_peers() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
+    PAUSED_PEERS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
+
+fn normalize_fingerprint(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (trimmed.len() == 64 && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| trimmed.to_ascii_lowercase())
+}
+
+/// Record "do not auto-dial this peer" (Disconnect, or a LinkEnded we
+/// received). Best-effort and idempotent.
+pub(crate) fn pause_peer_controller(fingerprint_hex: &str) {
+    let Some(fingerprint) = normalize_fingerprint(fingerprint_hex) else {
+        return;
+    };
+    if let Ok(mut set) = paused_peers().lock() {
+        if set.insert(fingerprint.clone()) {
+            drop(set);
+            persist_paused_peers(&data_dir());
+            tracing::info!(
+                peer = %fingerprint,
+                "controller paused for this peer; auto-connect stands down until a fresh Connect"
+            );
+        }
+    }
+}
+
+/// Clear one peer's pause (a fresh explicit dial from/to them).
+pub(crate) fn resume_peer_controller(fingerprint_hex: &str) {
+    let Some(fingerprint) = normalize_fingerprint(fingerprint_hex) else {
+        return;
+    };
+    if let Ok(mut set) = paused_peers().lock() {
+        if set.remove(&fingerprint) {
+            drop(set);
+            persist_paused_peers(&data_dir());
+            tracing::info!(peer = %fingerprint, "controller resumed for this peer");
+        }
+    }
+}
+
+/// Clear every pause: the desktop app just launched, which is explicit user
+/// intent to use the link again.
+pub(crate) fn resume_all_controllers() {
+    let cleared = match paused_peers().lock() {
+        Ok(mut set) => {
+            let had = !set.is_empty();
+            set.clear();
+            had
+        }
+        Err(_) => false,
+    };
+    if cleared {
+        persist_paused_peers(&data_dir());
+        tracing::info!("controller pauses cleared; auto-connect is armed again");
+    }
+}
+
+pub(crate) fn peer_controller_paused(fingerprint_hex: &str) -> bool {
+    let Some(fingerprint) = normalize_fingerprint(fingerprint_hex) else {
+        return false;
+    };
+    paused_peers()
+        .lock()
+        .map(|set| set.contains(&fingerprint))
+        .unwrap_or(false)
+}
+
+/// Snapshot for the status frame (the UI shows it in the auto-connect note).
+pub(crate) fn paused_peer_list() -> Vec<String> {
+    paused_peers()
+        .lock()
+        .map(|set| set.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Load persisted pauses at startup (corrupt file pauses nothing).
+pub(crate) fn load_paused_peers(dir: &std::path::Path) {
+    let raw = std::fs::read_to_string(paused_peers_path(dir)).unwrap_or_default();
+    if raw.trim().is_empty() {
+        return;
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "ignoring corrupt paused-peers file; no peers paused");
+            return;
+        }
+    };
+    let mut loaded = 0usize;
+    if let Ok(mut set) = paused_peers().lock() {
+        if let Some(items) = parsed.as_array() {
+            for item in items.iter().filter_map(|item| item.as_str()) {
+                if let Some(fingerprint) = normalize_fingerprint(item) {
+                    if set.insert(fingerprint) {
+                        loaded += 1;
+                    }
+                }
+            }
+        }
+    }
+    if loaded > 0 {
+        tracing::info!(loaded, "controller pauses restored from disk");
+    }
+}
+
+fn persist_paused_peers(dir: &std::path::Path) {
+    let list: Vec<String> = paused_peers()
+        .lock()
+        .map(|set| set.iter().cloned().collect())
+        .unwrap_or_default();
+    let body = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_owned());
+    if let Err(error) = std::fs::write(paused_peers_path(dir), body) {
+        tracing::debug!(path = %paused_peers_path(dir).display(), %error, "cannot persist controller pauses");
+    }
+}
+
+/// Pinned peer fingerprint that owns a dial address (exact match first, then
+/// host-part match so `192.168.1.7` and `192.168.1.7:42110` agree).
+fn peer_fingerprint_for_address(peers: &PeerBook, address: &str) -> Option<String> {
+    let host = address.split(':').next().unwrap_or(address);
+    peers
+        .peers
+        .iter()
+        .find(|peer| peer.address.as_deref() == Some(address))
+        .or_else(|| {
+            peers.peers.iter().find(|peer| {
+                peer.address
+                    .as_deref()
+                    .is_some_and(|stored| stored.split(':').next() == Some(host))
+            })
+        })
+        .map(|peer| peer.fingerprint_hex.clone())
+}
+
+/// True when the dial address names a peer this daemon must not auto-dial.
+fn address_controller_paused(peers: &PeerBook, address: &str) -> bool {
+    peer_fingerprint_for_address(peers, address)
+        .is_some_and(|fingerprint| peer_controller_paused(&fingerprint))
+}
+
+/// True when an interactive desktop user is logged in on this machine.
+/// The pre-login controller must only drive while NOBODY is logged in:
+/// "the app is closed" while a user sits logged in means the user quit or
+/// killed the app, and auto-reconnecting then is exactly the link that
+/// refuses to die.
+#[cfg(target_os = "windows")]
+pub(crate) fn interactive_session_active() -> bool {
+    use windows::Win32::System::RemoteDesktop::{
+        WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW, WTSUserName, WTS_CURRENT_SERVER_HANDLE,
+    };
+    let session = unsafe { WTSGetActiveConsoleSessionId() };
+    if session == u32::MAX {
+        return false;
+    }
+    let mut bytes: windows::core::PWSTR = windows::core::PWSTR::null();
+    let mut returned = 0u32;
+    let ok = unsafe {
+        WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session,
+            WTSUserName,
+            &mut bytes,
+            &mut returned,
+        )
+    };
+    if ok.is_err() {
+        return false;
+    }
+    let name = if bytes.is_null() || returned < 2 {
+        String::new()
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(bytes.0, (returned as usize) / 2) };
+        let end = slice.iter().position(|unit| *unit == 0).unwrap_or(slice.len());
+        String::from_utf16_lossy(&slice[..end])
+    };
+    if !bytes.is_null() {
+        unsafe {
+            let _ = windows::Win32::System::RemoteDesktop::WTSFreeMemory(bytes.0 as *mut _);
+        }
+    }
+    let name = name.trim().to_owned();
+    // A console session with no user name is the login screen itself.
+    !name.is_empty() && !name.eq_ignore_ascii_case("SYSTEM")
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn interactive_session_active() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    // 1. systemd-logind: any active x11/wayland/tty session means a human is
+    //    logged in (the greeter counts as nobody logged in).
+    if let Ok(output) = std::process::Command::new("loginctl")
+        .args(["list-sessions", "--no-legend"])
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let Some(session_id) = line.split_whitespace().next() else {
+                    continue;
+                };
+                if session_id.is_empty() {
+                    continue;
+                }
+                let info = std::process::Command::new("loginctl")
+                    .args([
+                        "show-session",
+                        session_id,
+                        "-p",
+                        "State",
+                        "-p",
+                        "Type",
+                        "-p",
+                        "Name",
+                        "-p",
+                        "Remote",
+                    ])
+                    .stderr(std::process::Stdio::null())
+                    .output();
+                let Ok(info) = info else { continue };
+                if !info.status.success() {
+                    continue;
+                }
+                let fields = String::from_utf8_lossy(&info.stdout);
+                let mut state = String::new();
+                let mut kind = String::new();
+                let mut user = String::new();
+                for field in fields.lines() {
+                    if let Some(rest) = field.strip_prefix("State=") {
+                        state = rest.trim().to_owned();
+                    } else if let Some(rest) = field.strip_prefix("Type=") {
+                        kind = rest.trim().to_owned();
+                    } else if let Some(rest) = field.strip_prefix("Name=") {
+                        user = rest.trim().to_owned();
+                    }
+                }
+                // A display-manager greeter session (lightdm/gdm/sddm, or any
+                // service account) is NOT a person logged in: the pre-login
+                // controller must keep driving at the login screen.
+                let greeter = user.is_empty()
+                    || user.starts_with('_')
+                    || matches!(
+                        user.as_str(),
+                        "lightdm" | "gdm" | "sddm" | "greeter" | "nobody"
+                    );
+                if !greeter
+                    && state == "active"
+                    && matches!(kind.as_str(), "x11" | "wayland" | "tty" | "mirror")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    // 2. Fallback for hosts without logind: a live user D-Bus session socket
+    //    only exists for a logged-in user.
+    if let Ok(entries) = std::fs::read_dir("/run/user") {
+        for entry in entries.flatten() {
+            let bus = entry.path().join("bus");
+            if let Ok(metadata) = std::fs::metadata(&bus) {
+                if metadata.permissions().mode() & 0o600 != 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub(crate) fn interactive_session_active() -> bool {
+    false
+}
+
 /// True when the dial failed because the peer deliberately ended this link
 /// epoch (Disconnect there). Callers exit instead of retrying: a banned
 /// link must stay dead. Matches only our own ban wording (lowercase), never
 /// the UI's display texts.
-fn is_link_ended_rejection(error: &anyhow::Error) -> bool {
-    error
+fn is_link_ended_rejection(error: &anyhow::Error) -> bool {    error
         .chain()
         .any(|cause| cause.to_string().contains("link ended"))
 }
@@ -3426,6 +3712,12 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     let mut pending_layout: Option<kvm_core::Layout> = None;
     let mut yield_probe = tokio::time::interval(Duration::from_millis(300));
     yield_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Idle auto-home (see Config::idle_home_secs): a drive the local user
+    // stopped touching parks itself and returns control home. Only ticks
+    // while a drive is active, so an idle link costs nothing.
+    let idle_home_secs = config.idle_home_secs;
+    let mut idle_home_tick = tokio::time::interval(Duration::from_secs(1));
+    idle_home_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let control_dirs = daemon_control_candidates(&dir);
     // Inbound snapshot cache (see spawn_inbound_poller): the drive
     // probes must never await control sockets on their hot path.
@@ -4197,8 +4489,8 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
             }
             _ = yield_probe.tick(), if active.is_some() => {
                 // Drive-task heartbeat (see TASK_HEARTBEAT_MS): this probe
-                // ticks every 300ms unconditionally, so the watchdog stays
-                // quiet on any live task — even an idle one.
+                // ticks every 300ms while a drive is live, so the watchdog
+                // stays quiet on any live task — even an idle one.
                 stamp_task_heartbeat();
                 // Fast dual-drive yield (300ms): a parked remote cursor
                 // produces no local input, so nothing wakes the event path
@@ -4255,6 +4547,49 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         )
                         .await;
                     }
+                }
+            }
+            _ = idle_home_tick.tick(), if active.is_some() && idle_home_secs > 0 => {
+                // Idle auto-home: while this machine drives the peer its
+                // physical keyboard and mouse are captured (that is how the
+                // cursor got there). A drive the local user stopped touching
+                // must never hold the local machine hostage — the exact
+                // "had to suspend the machine to get my cursor back" shape.
+                // Park the episode (it stays warm) and return control home;
+                // the next push re-drives instantly on the parked stream.
+                let idle_for = last_outbound_input
+                    .map(|when| when.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                if idle_for >= Duration::from_secs(u64::from(idle_home_secs)) {
+                    stamp_task_heartbeat();
+                    let target = active.as_ref().map(|session| session.target);
+                    release_suppression(&capture_control, Some(&mut suppression_requested));
+                    if let Some(session) = active.as_mut() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(300),
+                            write_frame(&mut session.send, &WireMessage::ReleaseAll),
+                        )
+                        .await;
+                    }
+                    if let Some(session) = active.take() {
+                        if let Some(stale) = parked.replace(session) {
+                            tokio::spawn(stale.finish());
+                        }
+                    }
+                    discarded_event_barrier = discarded_event_barrier
+                        .max(capture_control.snapshot().last_event_id);
+                    last_transfer = Some(std::time::Instant::now());
+                    if let Some(target) = target {
+                        let _ = router.restore_local(target);
+                    }
+                    resync_home_to_truth(&mut router);
+                    let (x, y) = router.cursor_position();
+                    let _ = capture_control.warp_cursor(x, y);
+                    tracing::info!(
+                        idle_secs = idle_for.as_secs(),
+                        "drive sat idle; control returned home automatically (push out again to re-drive)"
+                    );
+                    eprintln!("THEKVM_STATUS local");
                 }
             }
             _ = keep_alive.tick() => {
@@ -9667,6 +10002,7 @@ pub async fn run() -> Result<()> {
     // ended_links.json): without this a restart resurrects a dead link
     // — now that recently seen inbound peers auto-dial-back.
     load_ended_links(&dir);
+    load_paused_peers(&dir);
     // Station-side edge control runs as the desktop user (same machine,
     // service group): it must READ the system identity and peer book to
     // dial with the identity the peers already trust. Access is only ever
@@ -9818,7 +10154,11 @@ pub async fn run() -> Result<()> {
             // registers its `PresenceLease` before we spawn capture helpers.
             tokio::time::sleep(Duration::from_secs(8)).await;
             loop {
-                if ui_present() {
+                // Only drive while the machine is unattended: nobody logged
+                // in AND no desktop app. A closed app next to a logged-in
+                // user means the user quit or killed it, and reconnecting
+                // there is exactly the link that refuses to die.
+                if ui_present() || interactive_session_active() {
                     tokio::select! {
                         _ = shutdown_notifier().notified() => return,
                         _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
@@ -9839,6 +10179,7 @@ pub async fn run() -> Result<()> {
                         .or_else(|| {
                             (!book.peers.is_empty()).then(|| format!("0.0.0.0:{DEFAULT_PORT}"))
                         })
+                        .filter(|address| !address_controller_paused(&book, address))
                 } else {
                     None
                 };
@@ -9891,10 +10232,28 @@ pub async fn run() -> Result<()> {
                 let present = ui_present();
                 let cfg = prelogin_config.read().await.clone();
                 let book = prelogin_peers.read().await.clone();
-                let should_run = !present
+                // Pre-login means NOBODY is logged in. A logged-in user with
+                // the app closed quit or killed it — that link stays dead
+                // until they open the app again (which clears the pause).
+                let unattended = !present && !interactive_session_active();
+                let target_address = cfg
+                    .auto_connect_address
+                    .clone()
+                    .filter(|a| !a.trim().is_empty())
+                    .or_else(|| {
+                        book.peers
+                            .iter()
+                            .find_map(|p| p.address.clone())
+                            .filter(|a| !a.trim().is_empty())
+                    });
+                let target_paused = target_address
+                    .as_deref()
+                    .is_some_and(|address| address_controller_paused(&book, address));
+                let should_run = unattended
                     && cfg.auto_connect_enabled
                     && cfg.allow_lock_screen_control
                     && mode_allows_outgoing(cfg.mode)
+                    && !target_paused
                     && (cfg.auto_connect_address.is_some() || !book.peers.is_empty());
                 if !should_run {
                     if let Some(mut c) = child_proc.take() {
@@ -9918,8 +10277,7 @@ pub async fn run() -> Result<()> {
                             .stdin(std::process::Stdio::null())
                             .stdout(std::process::Stdio::null())
                             .stderr(std::process::Stdio::null());
-                        if let Some(addr) = cfg
-                            .auto_connect_address
+                        if let Some(addr) = target_address
                             .as_deref()
                             .filter(|a| !a.trim().is_empty())
                         {
@@ -10230,6 +10588,12 @@ async fn handle_connection(
                 .await?;
             }
             WireMessage::Hello(hello) => {
+                // A fresh-epoch Hello is an explicit Connect from this peer:
+                // lift any controller pause a previous Disconnect recorded,
+                // so reconnecting after hanging up just works.
+                if hello.link_id.is_some() {
+                    resume_peer_controller(&peer_fingerprint);
+                }
                 // Per-stream containment: this async block is a return
                 // boundary, so `bail!`, `return` and `?` end THIS episode
                 // with a logged reason while the association loop above keeps
@@ -11769,6 +12133,9 @@ async fn handle_connection(
                 // (that resurrected a link the user just hung up, one poll
                 // later). A fresh manual Connect re-registers as usual.
                 forget_recent_inbound(&peer_fingerprint);
+                // Stand our own controller down for them too: our daemon
+                // must not auto-dial a peer that just disconnected from us.
+                pause_peer_controller(&peer_fingerprint);
                 tracing::info!(
                     peer = %peer_fingerprint,
                     link_id = ?link_id,
