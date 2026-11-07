@@ -30,6 +30,28 @@ fn main() {
             .set("LegalCopyright", "GPL-3.0-or-later, TheKVM project")
             .set("ProductVersion", &version)
             .set("FileVersion", &numeric);
+        // Declare per-monitor DPI awareness. Without it Windows treats the
+        // process as 96-DPI-unaware and bitmap-stretches the whole window
+        // on any scaled display (125% is the common default): every control
+        // then renders ~1.25x too large, the right edge falls outside the
+        // window and nothing lines up. Slint already layouts in logical
+        // pixels, so the declaration only removes the stretch.
+        resource.set_manifest(
+            r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="TheKVM.kvm-ui" type="win32"/>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+    </windowsSettings>
+  </application>
+</assembly>"#,
+        );
         if let Err(error) = resource.compile() {
             eprintln!("winres version resource failed: {error:#}");
         }

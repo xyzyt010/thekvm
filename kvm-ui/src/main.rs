@@ -512,6 +512,9 @@ fn main() -> Result<()> {
         let mut cached_peers: Vec<kvm_protocol::pairing::Peer> = Vec::new();
         let mut last_peer_count: usize = usize::MAX;
         let mut last_link_running = false;
+        // This computer's role, refreshed from every status poll so the
+        // arrangement mesh can draw role-accurate crossing arrows.
+        let mut our_mode = Mode::Bidirectional;
         let mut peer_refresh_ticks: u32 = 0;
         ui_log("poll thread started");
         loop {
@@ -576,6 +579,7 @@ fn main() -> Result<()> {
                         let port = status.listen_port;
                         let fingerprint = status.fingerprint_hex.clone();
                         let peer_count = status.peer_count;
+                        our_mode = status.mode;
                         set_daemon_status(&weak, status);
                         refresh_invite(&weak, &invite_state, port, &fingerprint);
                         if peer_count != last_peer_count || peer_refresh_ticks.is_multiple_of(5) {
@@ -762,8 +766,23 @@ fn main() -> Result<()> {
                         .unwrap_or(true);
                     if idle && wanted {
                         set_discovery_scanning(&weak, true);
-                        let found = scan_lan_devices();
+                        let found_full = scan_lan_devices_full();
                         set_discovery_scanning(&weak, false);
+                        // Remember the linked peer's advertised role so the
+                        // arrangement arrows reflect what BOTH computers
+                        // allow (both ways -> two arrows, server/client ->
+                        // one arrow in that direction).
+                        let linked_fp = status_peer_fingerprint();
+                        if let Some(mode) = found_full
+                            .iter()
+                            .find(|(_, _, fp, _)| Some(fp.as_str()) == linked_fp.as_deref())
+                            .map(|(_, _, _, mode)| *mode)
+                        {
+                            set_arrangement_modes(&weak, our_mode, mode);
+                        }
+                        let found: Vec<(String, String, String)> = found_full                            .into_iter()
+                            .map(|(label, address, fingerprint, _)| (label, address, fingerprint))
+                            .collect();
                         if !found.is_empty() {
                             // Log only when the nearby set changes: a line
                             // every 15s forever would bury the journal.
@@ -3645,6 +3664,30 @@ fn set_arrangement(
     });
 }
 
+/// Push this computer's role and the linked computer's role into the
+/// arrangement mesh so the crossing arrows match what both machines allow.
+fn set_arrangement_modes(weak: &slint::Weak<AppWindow>, our_mode: Mode, peer_mode: Mode) {
+    let our_index = match our_mode {
+        Mode::ServerClient => 1,
+        Mode::ClientOnly => 2,
+        _ => 0,
+    };
+    let peer_index = match peer_mode {
+        Mode::ServerClient => 1,
+        Mode::ClientOnly => 2,
+        _ => 0,
+    };
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_our_mode(our_index);
+                ui.set_peer_mode(peer_index);
+            }
+        }
+    });
+}
+
 /// Resolve a peer's display name and address from either book.
 fn resolve_peer(fingerprint: &str) -> Option<(String, Option<String>)> {
     for peer in linked_peers() {
@@ -6270,6 +6313,16 @@ fn set_discovery(weak: &slint::Weak<AppWindow>, text: String, address: Option<St
 /// name — two machines can share a hostname): without this the list shows
 /// "itself" and tapping it dials a loopback link.
 fn scan_lan_devices() -> Vec<(String, String, String)> {
+    scan_lan_devices_full()
+        .into_iter()
+        .map(|(label, address, fingerprint, _)| (label, address, fingerprint))
+        .collect()
+}
+
+/// Scan the LAN and also report each device's advertised role, so the
+/// arrangement mesh can draw the crossing arrows that match what BOTH
+/// computers actually allow.
+fn scan_lan_devices_full() -> Vec<(String, String, String, kvm_core::Mode)> {
     let peers = runtime()
         .block_on(kvm_protocol::discovery::scan(
             std::time::Duration::from_secs(1),
@@ -6279,7 +6332,7 @@ fn scan_lan_devices() -> Vec<(String, String, String)> {
         Ok(ControlResponse::Status(status)) => Some(status.fingerprint_hex),
         _ => None,
     };
-    let mut found: Vec<(String, String, String)> = peers
+    let mut found: Vec<(String, String, String, kvm_core::Mode)> = peers
         .iter()
         .filter(|(_, peer)| {
             local_fingerprint
@@ -6295,11 +6348,29 @@ fn scan_lan_devices() -> Vec<(String, String, String)> {
                 ),
                 address.to_string(),
                 peer.fingerprint_hex.clone(),
+                peer.mode,
             )
         })
         .collect();
-    found.sort();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
     found
+}
+
+/// Fingerprint of the peer this computer is arranged with, from either
+/// book (daemon book first, then the user book). Used to pick the right
+/// advertised role out of a discovery scan.
+fn status_peer_fingerprint() -> Option<String> {
+    if let Ok(ControlResponse::Peers(peers)) = control_request(ControlRequest::ListPeers) {
+        if let Some(peer) = peers.into_iter().next() {
+            return Some(peer.fingerprint_hex);
+        }
+    }
+    if let Ok(book) = kvm_protocol::pairing::PeerBook::load_or_create(&data_dir()) {
+        if let Some(peer) = book.peers.into_iter().next() {
+            return Some(peer.fingerprint_hex);
+        }
+    }
+    None
 }
 
 /// Publish one scan result to the Devices ComboBox (labels), the shared
