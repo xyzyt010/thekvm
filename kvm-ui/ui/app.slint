@@ -223,19 +223,21 @@ component MonitorCard inherits Rectangle {
     Rectangle { x: 56px; y: 109px; width: 48px; height: 4px; border-radius: 2px; background: #26262a; }
 }
 
-// One tap moves the linked screen to that side; the active side stays
-// lit, so the current arrangement is visible without a caption.
+// One tap swaps the two screens. The press gets a short green flash and
+// nothing stays highlighted afterwards: the monitor positions themselves
+// already show the current arrangement, and a sticky highlight reads as a
+// toggle that never clears.
 component ChevronButton inherits Rectangle {
     in property <bool> points-left: true;
-    in property <bool> active: false;
+    in property <bool> flash: false;
     in property <bool> enabled: true;
     callback clicked();
     width: 38px;
     height: 38px;
     border-radius: 9px;
-    background: active ? #14532d : (hit.has-hover && enabled ? #1f2937 : transparent);
+    background: root.flash ? #14532d : (hit.has-hover && enabled ? #1f2937 : transparent);
     border-width: 1px;
-    border-color: active ? #22c55e : #374151;
+    border-color: root.flash ? #22c55e : #374151;
     opacity: enabled ? 1 : 0.4;
     hit := TouchArea {
         mouse-cursor: pointer;
@@ -251,7 +253,7 @@ component ChevronButton inherits Rectangle {
         height: 18px;
         viewbox-width: 18;
         viewbox-height: 18;
-        stroke: active ? #22c55e : (hit.has-hover && enabled ? #e5e7eb : #9ca3af);
+        stroke: root.flash ? #22c55e : (hit.has-hover && enabled ? #e5e7eb : #9ca3af);
         stroke-width: 2.4px;
         stroke-line-cap: round;
         stroke-line-join: round;
@@ -290,12 +292,26 @@ component ArrangementMesh inherits Rectangle {
     property <length> drag-limit: root.slot-distance + 24px;
     property <length> drag-start-abs: 0px;
     in-out property <bool> dragging: false;
+    in-out property <bool> dragging-local: false;
     in-out property <length> drag-dx: 0px;
     // A drop on the other side holds its dragged position until the
     // placement is confirmed upstream, then snaps magnetically into the
     // new slot — no rubber-band back to the old one first.
     in-out property <bool> flip-pending: false;
     in-out property <bool> flip-right: false;
+    // Which chevron is flashing (0 = left, 1 = right, -1 = none). A press
+    // lights the arrow for a moment and then clears: no sticky highlight
+    // is left behind on the last pressed arrow.
+    in-out property <int> flash-side: -1;
+    function press_side(side: int) {
+        root.flash-side = side;
+        if (side == 1) { root.to-right(); } else { root.to-left(); }
+    }
+    Timer {
+        interval: 450ms;
+        running: root.flash-side >= 0;
+        triggered => { root.flash-side = -1; }
+    }
     changed peer-on-right => {
         if (root.flip-pending && root.peer-on-right == root.flip-right) {
             root.flip-pending = false;
@@ -320,20 +336,46 @@ component ArrangementMesh inherits Rectangle {
     property <bool> enter-left: root.edge-mode == 1 || root.edge-mode == 2 || (root.edge-mode == 0 && !root.peer-on-right);
     property <bool> enter-right: root.edge-mode == 1 || root.edge-mode == 3 || (root.edge-mode == 0 && root.peer-on-right);
 
-    // Legend + affordance hint.
-    HorizontalLayout {
-        x: 14px;
-        y: 9px;
-        width: root.width - 28px;
-        spacing: 6px;
-        Rectangle { width: 12px; height: 14px; background: transparent; Rectangle { y: 5.5px; width: 12px; height: 3px; border-radius: 1.5px; background: #22c55e; } }
-        Text { text: "Exit"; color: #9ca3af; font-size: 10px; vertical-alignment: center; }
-        Rectangle { width: 12px; height: 14px; background: transparent; Rectangle { y: 5.5px; width: 12px; height: 3px; border-radius: 1.5px; background: #5eead4; } }
-        Text { text: "Entry"; color: #9ca3af; font-size: 10px; vertical-alignment: center; }
-        Rectangle { horizontal-stretch: 1; }
-        Text { text: "drag or double-click"; color: #4b5563; font-size: 10px; vertical-alignment: center; }
+    // Mirror coupling arrows (double-edge modes only): the top arrow runs
+    // this computer's left edge to the linked computer's right edge and the
+    // bottom arrow runs its left edge back to this computer's right edge —
+    // the two halves of one mirrored round trip, drawn in place so the
+    // pairing is visible without any caption text.
+    if root.edge-mode != 0 : Rectangle {
+        x: root.margin + root.card-w + 4px;
+        width: root.slot-distance - 8px;
+        y: root.card-y - 6px;
+        height: root.card-h + 12px;
+        background: transparent;
+        // Top: this computer's left exit -> peer's right entry.
+        Path {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: 6px;
+            viewbox-width: 100;
+            viewbox-height: 6;
+            stroke: #22c55e;
+            stroke-width: 1.6px;
+            stroke-line-cap: round;
+            fill: transparent;
+            commands: "M 0 3 L 90 3 M 84 0.5 L 91 3 L 84 5.5";
+        }
+        // Bottom: peer's left entry -> this computer's right exit.
+        Path {
+            x: 0;
+            y: parent.height - 6px;
+            width: parent.width;
+            height: 6px;
+            viewbox-width: 100;
+            viewbox-height: 6;
+            stroke: #5eead4;
+            stroke-width: 1.6px;
+            stroke-line-cap: round;
+            fill: transparent;
+            commands: "M 100 3 L 10 3 M 16 0.5 L 9 3 L 16 5.5";
+        }
     }
-
     // Magnetic landing slot while dragging.
     if root.dragging : Rectangle {
         x: root.will-land-right ? root.width - root.margin - root.card-w : root.margin;
@@ -350,21 +392,21 @@ component ArrangementMesh inherits Rectangle {
         x: 7px;
         y: root.card-y + root.card-h / 2 - 19px;
         points-left: true;
-        active: !root.dragging && !root.peer-on-right;
+        flash: root.flash-side == 0;
         enabled: root.enabled;
-        clicked => { root.to-left(); }
+        clicked => { root.press_side(0); }
     }
     ChevronButton {
         x: root.width - 45px;
         y: root.card-y + root.card-h / 2 - 19px;
         points-left: false;
-        active: !root.dragging && root.peer-on-right;
+        flash: root.flash-side == 1;
         enabled: root.enabled;
-        clicked => { root.to-right(); }
+        clicked => { root.press_side(1); }
     }
 
     local := MonitorCard {
-        x: root.local-x;
+        x: root.local-x + ((root.dragging-local && root.dragging) ? root.drag-dx : 0px);
         y: root.card-y;
         title: "THIS PC";
         name: root.local-name;
@@ -404,6 +446,49 @@ component ArrangementMesh inherits Rectangle {
             } else if ((event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) && root.dragging) {
                 root.dragging = false;
                 let want-right = root.will-land-right;
+                if (want-right != root.peer-on-right) {
+                    root.flip-pending = true;
+                    root.flip-right = want-right;
+                    if (want-right) {
+                        root.to-right();
+                    } else {
+                        root.to-left();
+                    }
+                } else {
+                    root.drag-dx = 0px;
+                }
+            }
+        }
+        double-clicked => {
+            if (root.peer-on-right) { root.to-left(); } else { root.to-right(); }
+        }
+        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
+    }
+    // The local monitor is draggable too: pushing THIS PC across the middle
+    // is the same swap as pulling the linked PC the other way, so the
+    // gesture feels symmetric on both halves of the pair.
+    local-drag-area := TouchArea {
+        x: root.local-x;
+        y: root.card-y;
+        width: root.card-w;
+        height: root.card-h;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? (root.dragging ? grabbing : grab) : default;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                root.flip-pending = false;
+                root.dragging = true;
+                root.drag-start-abs = self.absolute-position.x + self.mouse-x;
+                root.drag-dx = 0px;
+                root.dragging-local = true;
+            } else if (event.kind == PointerEventKind.move && root.dragging && root.dragging-local) {
+                root.drag-dx = max(-root.drag-limit, min(root.drag-limit, (self.absolute-position.x + self.mouse-x) - root.drag-start-abs));
+            } else if ((event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) && root.dragging && root.dragging-local) {
+                root.dragging = false;
+                root.dragging-local = false;
+                // Dragging the local card to the right puts the peer on the
+                // left, and vice versa.
+                let want-right = root.local-x + root.drag-dx + root.card-w / 2 > root.width / 2;
                 if (want-right != root.peer-on-right) {
                     root.flip-pending = true;
                     root.flip-right = want-right;
@@ -618,9 +703,9 @@ component RoleDropdown inherits Rectangle {
     in property <int> mode-index: 0;
     in property <bool> enabled: true;
     callback picked(int);
-    width: 230px;
-    height: 40px;
-    border-radius: 9px;
+    width: 214px;
+    height: 34px;
+    border-radius: 8px;
     background: hit.has-hover || popup.is-open ? #16202c : #111827;
     border-width: 1px;
     border-color: popup.is-open ? #22c55e : (hit.has-hover ? #4b5563 : #374151);
@@ -641,19 +726,31 @@ component RoleDropdown inherits Rectangle {
     accessible-expanded: popup.is-open;
     accessible-action-expand => { popup.show(); }
     HorizontalLayout {
-        padding-left: 12px;
-        padding-right: 10px;
+        padding-left: 11px;
+        padding-right: 9px;
         spacing: 8px;
         Text {
             text: root.current;
             color: white;
-            font-size: 14px;
+            font-size: 13px;
             font-weight: 600;
             vertical-alignment: center;
             horizontal-stretch: 1;
             overflow: elide;
         }
-        ChevronGlyph { open: popup.is-open; glyph-color: popup.is-open ? #22c55e : #9ca3af; }
+        // Chevron sits inside the box, vertically centred and sized to the
+        // 34px control: a fixed square aligned by the layout, never a
+        // corner-floating free path.
+        Rectangle {
+            width: 16px;
+            height: 16px;
+            ChevronGlyph {
+                width: 100%;
+                height: 100%;
+                open: popup.is-open;
+                glyph-color: popup.is-open ? #22c55e : #9ca3af;
+            }
+        }
     }
     popup := PopupWindow {
         x: 0;
@@ -960,56 +1057,69 @@ export component AppWindow inherits Window {
 
                     // ---- Nearby devices ----------------------------------
                     if discovery-card-visible : Rectangle {
-                        background: #111827;
+                        background: #121212;
                         border-radius: 10px;
                         border-width: 1px;
-                        border-color: #1f2937;
+                        border-color: #2a2a2a;
                         VerticalLayout {
-                            padding: 10px;
-                            spacing: 8px;
-                            HorizontalLayout {
-                                spacing: 6px;
-                                Text {
-                                    text: "Nearby devices";
-                                    color: white;
-                                    font-size: 14px;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
+                            padding: 8px;
+                            spacing: 5px;
+                            // Inner panel one step lighter for contrast.
+                            Rectangle {
+                                background: #1c1c1c;
+                                border-radius: 7px;
+                                border-width: 1px;
+                                border-color: #262626;
+                                VerticalLayout {
+                                    padding: 7px;
+                                    spacing: 5px;
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: "Nearby devices";
+                                            color: white;
+                                            font-size: 13px;
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        RescanButton {
+                                            scanning: root.discovery-scanning;
+                                            tick: root.spinner-tick;
+                                            clicked => { discover-lan(); }
+                                        }
+                                        CloseButton {
+                                            clicked => { hide-discovery(); }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.discovery-scanning ? "Scanning…" : root.discovery-text;
+                                        color: root.discovery-scanning ? #6ee7b7 : #9ca3af;
+                                        font-size: 11px;
+                                        wrap: word-wrap;
+                                    }
+                                    if discovered-labels.length > 0 : HorizontalLayout {
+                                        spacing: 8px;
+                                        found2 := ComboBox {
+                                            model: root.discovered-labels;
+                                            current-index <=> root.discovered-index;
+                                            height: 32px;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Button {
+                                            text: "Connect";
+                                            primary: true;
+                                            height: 32px;
+                                            enabled: discovered-labels.length > 0 && !session-active;
+                                            clicked => { connect-discovered(root.discovered-index); }
+                                        }
+                                    }
+                                    if discovered-labels.length == 0 && !discovery-scanning : Text {
+                                        text: "No devices found.";
+                                        color: #6b7280;
+                                        font-size: 11px;
+                                    }
                                 }
-                                Rectangle { horizontal-stretch: 1; }
-                                RescanButton {
-                                    scanning: root.discovery-scanning;
-                                    tick: root.spinner-tick;
-                                    clicked => { discover-lan(); }
-                                }
-                                CloseButton {
-                                    clicked => { hide-discovery(); }
-                                }
-                            }
-                            Text {
-                                text: root.discovery-scanning ? "Scanning…" : root.discovery-text;
-                                color: root.discovery-scanning ? #6ee7b7 : #9ca3af;
-                                font-size: 12px;
-                                wrap: word-wrap;
-                            }
-                            if discovered-labels.length > 0 : HorizontalLayout {
-                                spacing: 10px;
-                                found2 := ComboBox {
-                                    model: root.discovered-labels;
-                                    current-index <=> root.discovered-index;
-                                    horizontal-stretch: 1;
-                                }
-                                Button {
-                                    text: "Connect";
-                                    primary: true;
-                                    enabled: discovered-labels.length > 0 && !session-active;
-                                    clicked => { connect-discovered(root.discovered-index); }
-                                }
-                            }
-                            if discovered-labels.length == 0 && !discovery-scanning : Text {
-                                text: "No devices found.";
-                                color: #6b7280;
-                                font-size: 11px;
                             }
                         }
                     }
@@ -1039,12 +1149,18 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         spacing: 10px;
                         Text {
-                            text: "This computer";
+                            // This computer's name AND live LAN address: the
+                            // other machine needs the IP, so it belongs right
+                            // here, aligned with the label.
+                            text: root.local-address == ""
+                                ? "This computer"
+                                : "This computer · " + root.local-address;
                             color: #9ca3af;
                             font-size: 13px;
                             vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
                         }
-                        Rectangle { horizontal-stretch: 1; }
                         // Role selection is local configuration, not a
                         // daemon-dependent action: the dropdown is always
                         // pressable. Gating it once made it look permanently
@@ -1095,6 +1211,7 @@ export component AppWindow inherits Window {
                             height: 8px;
                             border-radius: 4px;
                             background: #22c55e;
+                            y: (parent.height - 8px) / 2;
                         }
                         Text {
                             text: session-text;
@@ -1156,10 +1273,14 @@ export component AppWindow inherits Window {
                             Button {
                                 text: "Codes match";
                                 primary: true;
+                                height: 34px;
+                                min-width: 110px;
                                 clicked => { confirm-pairing(); }
                             }
                             Button {
                                 text: "Cancel";
+                                height: 34px;
+                                min-width: 96px;
                                 clicked => { cancel-pairing(); }
                             }
                         }
@@ -1194,10 +1315,14 @@ export component AppWindow inherits Window {
                             Button {
                                 text: "Allow";
                                 primary: true;
+                                height: 34px;
+                                min-width: 96px;
                                 clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
                             }
                             Button {
                                 text: "Deny";
+                                height: 34px;
+                                min-width: 96px;
                                 clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
                             }
                         }
@@ -1221,10 +1346,14 @@ export component AppWindow inherits Window {
                             Button {
                                 text: "Allow";
                                 primary: true;
+                                height: 34px;
+                                min-width: 96px;
                                 clicked => { approve-incoming-link(incoming-link-fingerprint); }
                             }
                             Button {
                                 text: "Deny";
+                                height: 34px;
+                                min-width: 96px;
                                 clicked => { reject-incoming-link(incoming-link-fingerprint); }
                             }
                         }
@@ -1280,12 +1409,9 @@ export component AppWindow inherits Window {
                             clicked => { connect-discovered(root.discovered-index); }
                         }
                     }
-                    Text {
-                        text: peer-list;
-                        color: #d1d5db;
-                        font-size: 12px;
-                        wrap: word-wrap;
-                    }
+                    // (Past/present computer names deliberately not listed
+                    // here: the Devices tab shows what is arranged and what
+                    // is nearby. Remembered names/addresses come later.)
 
                     Rectangle { height: 1px; background: #1f2937; }
 
@@ -1559,10 +1685,14 @@ export component AppWindow inherits Window {
                             Button {
                                 text: "Allow";
                                 primary: true;
+                                height: 34px;
+                                min-width: 96px;
                                 clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
                             }
                             Button {
                                 text: "Deny";
+                                height: 34px;
+                                min-width: 96px;
                                 clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
                             }
                         }
@@ -1590,10 +1720,14 @@ export component AppWindow inherits Window {
                             Button {
                                 text: "Allow";
                                 primary: true;
+                                height: 34px;
+                                min-width: 96px;
                                 clicked => { approve-incoming-link(incoming-link-fingerprint); }
                             }
                             Button {
                                 text: "Deny";
+                                height: 34px;
+                                min-width: 96px;
                                 clicked => { reject-incoming-link(incoming-link-fingerprint); }
                             }
                         }

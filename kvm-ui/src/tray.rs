@@ -132,8 +132,12 @@ pub fn spawn_tray() -> Option<Receiver<TrayCommand>> {
                 let Ok(Some(handles)) = built else {
                     return;
                 };
-                // Dark owner-draw menu must be installed before the first
-                // right-click can show it.
+                // Publish the command channel and item ids so raw Win32
+                // menu messages can be dispatched without the menu crate
+                // (owner-drawn items deliver WM_MENUCOMMAND, which it
+                // ignores), then install the dark menu subclass.
+                let ids = [handles.show_id, handles.disconnect_id, handles.logs_id, handles.quit_id];
+                tray_bridge::publish(tx.clone(), ids);
                 install_windows_dark_menu();
                 let (show_id, disconnect_id, logs_id, quit_id) = handles.ids();
                 let _handles = handles;
@@ -320,6 +324,41 @@ fn build_icon() -> Icon {
 // Windows: dark owner-draw tray menu + window focus helper
 // ---------------------------------------------------------------------------
 
+/// The tray command channel and the menu item ids, published by `spawn_tray`
+/// before the subclass is installed so raw Win32 menu messages can be turned
+/// into UI commands directly.
+#[cfg(target_os = "windows")]
+mod tray_bridge {
+    use super::TrayCommand;
+
+    pub static CHANNEL: std::sync::OnceLock<std::sync::mpsc::Sender<TrayCommand>> =
+        std::sync::OnceLock::new();
+    /// (show, disconnect, logs, quit) command ids, in menu order.
+    pub static IDS: std::sync::OnceLock<[u32; 4]> = std::sync::OnceLock::new();
+
+    pub fn publish(tx: std::sync::mpsc::Sender<TrayCommand>, ids: [u32; 4]) {
+        let _ = CHANNEL.set(tx);
+        let _ = IDS.set(ids);
+    }
+
+    pub fn command_for_id(id: u32) -> Option<TrayCommand> {
+        let ids = IDS.get()?;
+        let index = ids.iter().position(|known| *known == id)?;
+        Some(match index {
+            0 => TrayCommand::Show,
+            1 => TrayCommand::Disconnect,
+            2 => TrayCommand::OpenLogs,
+            _ => TrayCommand::Quit,
+        })
+    }
+
+    pub fn send(command: TrayCommand) {
+        if let Some(tx) = CHANNEL.get() {
+            let _ = tx.send(command);
+        }
+    }
+}
+
 /// Bring this app's main window to the foreground (tray "Show TheKVM" and
 /// left-click). Slint exposes no focus API, so the titled top-level window
 /// owned by this process is located and foregrounded directly.
@@ -361,17 +400,21 @@ pub fn focus_main_window() {
 #[cfg(not(target_os = "windows"))]
 pub fn focus_main_window() {}
 
-/// Subclass the tray-icon window so its popup menu paints dark (`#121212`
-/// background, white text) instead of following the light system theme.
-/// Runs on the tray thread right after the tray is built, before the
-/// message loop starts.
+/// Subclass ids: the tray-icon window and the popup menu window are two
+/// different windows and each needs its own slot.
+#[cfg(target_os = "windows")]
+const TRAY_SUBCLASS_ID: usize = 0x0BAD_C0DE;
+#[cfg(target_os = "windows")]
+const MENU_WINDOW_SUBCLASS_ID: usize = 0x0BAD_C1A1;
+
+/// Locate the live tray window (tray-icon creates a hidden window with the
+/// class name `tray_icon_app`) and install the dark menu subclass on it.
+/// Called from the tray thread after the tray is built.
 #[cfg(target_os = "windows")]
 fn install_windows_dark_menu() {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::Shell::{SetWindowSubclass, SUBCLASSPROC};
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 
-    const SUBCLASS_ID: usize = 0x0BAD_C0DE;
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INSTALLED.get_or_init(|| {
         let class: Vec<u16> = "tray_icon_app\0".encode_utf16().collect();
@@ -383,8 +426,13 @@ fn install_windows_dark_menu() {
         }
         unsafe {
             set_dark_theme_globals(hwnd);
-            let proc: SUBCLASSPROC = Some(tray_menu_subclass_proc);
-            let _ = SetWindowSubclass(hwnd, proc, SUBCLASS_ID, 0);
+            let proc: windows::Win32::UI::Shell::SUBCLASSPROC = Some(tray_menu_subclass_proc);
+            let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+                hwnd,
+                proc,
+                TRAY_SUBCLASS_ID,
+                0,
+            );
         }
     });
 }
@@ -395,9 +443,7 @@ fn install_windows_dark_menu() {
 #[cfg(target_os = "windows")]
 unsafe fn set_dark_theme_globals(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
-    };
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows::Win32::UI::Controls::SetWindowTheme;
 
@@ -477,7 +523,6 @@ fn menu_font() -> usize {
         };
         let font = CreateFontIndirectW(&logfont);
         if font.is_invalid() {
-            // Fallback: stock GUI font (never destroyed).
             let stock = GetStockObject(DEFAULT_GUI_FONT);
             stock.0 as usize
         } else {
@@ -487,20 +532,44 @@ fn menu_font() -> usize {
     })
 }
 
+/// Fill a 1px frame of a rectangle with a solid colour (no `FrameRect`
+/// dependency, same result).
+#[cfg(target_os = "windows")]
+unsafe fn frame_rect_solid(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: windows::Win32::Foundation::RECT,
+    color: u32,
+) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect};
+    let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(color));
+    let thickness = 1;
+    let parts = [
+        RECT { left: rect.left, top: rect.top, right: rect.right, bottom: rect.top + thickness },
+        RECT { left: rect.left, top: rect.bottom - thickness, right: rect.right, bottom: rect.bottom },
+        RECT { left: rect.left, top: rect.top + thickness, right: rect.left + thickness, bottom: rect.bottom - thickness },
+        RECT { left: rect.right - thickness, top: rect.top + thickness, right: rect.right, bottom: rect.bottom - thickness },
+    ];
+    for part in parts {
+        FillRect(hdc, &part, brush);
+    }
+    let _ = DeleteObject(brush);
+}
+
 /// Convert every command row of `menu` to owner-draw, tagging it with its
 /// label index so the drawing handler knows which text to paint.
 #[cfg(target_os = "windows")]
 unsafe fn owner_draw_menu_items(menu: windows::Win32::UI::WindowsAndMessaging::HMENU) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetMenuItemCount, GetMenuItemInfoW, MENUITEMINFOW, MFT_OWNERDRAW, MIIM_SUBMENU, MIIM_TYPE,
-        SetMenuItemInfoW,
+        GetMenuItemCount, GetMenuItemInfoW, MENUITEMINFOW, MFT_OWNERDRAW, MIIM_ID, MIIM_SUBMENU,
+        MIIM_TYPE, SetMenuItemInfoW,
     };
 
     let count = GetMenuItemCount(menu);
     for position in 0..count {
         let mut info = MENUITEMINFOW {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_SUBMENU | MIIM_TYPE,
+            fMask: MIIM_SUBMENU | MIIM_TYPE | MIIM_ID,
             ..Default::default()
         };
         if GetMenuItemInfoW(menu, position as u32, true, &mut info).is_err() {
@@ -510,20 +579,124 @@ unsafe fn owner_draw_menu_items(menu: windows::Win32::UI::WindowsAndMessaging::H
             owner_draw_menu_items(info.hSubMenu);
             continue;
         }
-        if (info.fType & MFT_OWNERDRAW) == MFT_OWNERDRAW {
+        if (info.fType & MFT_OWNERDRAW) == MFT_OWNERDRAW || info.wID == 0 {
             continue;
         }
-        // The menu is built in TRAY_LABELS order, so the row index is the
-        // label index.
+        // Keep the command id exactly as it was: the tray dispatch (and the
+        // menu crate's own channel) match on it. Only the paint type and the
+        // owner-draw payload change.
         let mut update = MENUITEMINFOW {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_TYPE,
+            fMask: MIIM_TYPE | MIIM_ID,
             fType: MFT_OWNERDRAW,
+            wID: info.wID,
             dwItemData: position as usize,
             ..Default::default()
         };
         let _ = SetMenuItemInfoW(menu, position as u32, true, &mut update);
     }
+}
+
+/// Find the visible popup-menu window (class `#32768`) belonging to this
+/// process. One search is enough: the app shows a single tray popup.
+#[cfg(target_os = "windows")]
+fn find_menu_window() -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowThreadProcessId,
+    };
+
+    let mut found: Option<HWND> = None;
+    unsafe extern "system" fn find_enum_proc(hwnd: HWND, param: LPARAM) -> BOOL {
+        let target_pid = std::process::id();
+        let mut window_pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+        if window_pid != target_pid {
+            return true.into();
+        }
+        let mut class = [0u16; 32];
+        let len = GetClassNameW(hwnd, &mut class);
+        let name = String::from_utf16_lossy(&class[..len as usize]);
+        if name == "#32768" {
+            // Stash into the out param carried through lparam.
+            unsafe {
+                let slot = &mut *((param.0 as usize) as *mut Option<HWND>);
+                if slot.is_none() {
+                    *slot = Some(hwnd);
+                }
+            }
+            return false.into();
+        }
+        true.into()
+    }
+    unsafe {
+        let _ = EnumWindows(
+            Some(find_enum_proc),
+            LPARAM((&mut found as *mut Option<HWND>) as isize),
+        );
+    }
+    found
+}
+
+/// Paint the menu window's frame with the menu colour instead of the light
+/// system 3D edge, and mark the window dark for comctl32.
+#[cfg(target_os = "windows")]
+unsafe fn darken_menu_window(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::Graphics::Gdi::{GetWindowDC, ReleaseDC};
+    use windows::Win32::UI::Controls::SetWindowTheme;
+    use windows::Win32::UI::Shell::SetWindowSubclass;
+
+    let explorer: Vec<u16> = "DarkMode_Explorer\0".encode_utf16().collect();
+    let none: Vec<u16> = "\0".encode_utf16().collect();
+    let _ = SetWindowTheme(
+        hwnd,
+        windows::core::PCWSTR(explorer.as_ptr()),
+        windows::core::PCWSTR(none.as_ptr()),
+    );
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).is_ok() {
+        let hdc = GetWindowDC(hwnd);
+        if !hdc.is_invalid() {
+            let frame = windows::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: rect.right - rect.left,
+                bottom: rect.bottom - rect.top,
+            };
+            frame_rect_solid(hdc, frame, MENU_BG_RGB);
+            let _ = ReleaseDC(hwnd, hdc);
+        }
+    }
+    let proc: windows::Win32::UI::Shell::SUBCLASSPROC = Some(tray_menu_subclass_proc);
+    let _ = SetWindowSubclass(hwnd, proc, MENU_WINDOW_SUBCLASS_ID, 0);
+}
+
+/// Resolve the selected menu item's command id from a `WM_COMMAND` or a
+/// `WM_MENUCOMMAND` message.
+#[cfg(target_os = "windows")]
+fn menu_command_id(message: u32, wparam: usize, lparam: isize) -> Option<u32> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetMenuItemID, HMENU};
+
+    if message == 0x0111 {
+        // WM_COMMAND: the low word is the item id.
+        let id = (wparam & 0xffff) as u32;
+        return tray_bridge::command_for_id(id).map(|_| id);
+    }
+    // WM_MENUCOMMAND: wparam is either the item id or its position inside
+    // the menu named by lparam; resolve a position through the menu.
+    let direct = wparam as u32;
+    if tray_bridge::command_for_id(direct).is_some() {
+        return Some(direct);
+    }
+    let menu = HMENU(lparam as *mut _);
+    let position = wparam as i32;
+    if !menu.0.is_null() {
+        let id = unsafe { GetMenuItemID(menu, position) };
+        if id != u32::MAX && id != 0 {
+            return Some(id);
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "windows")]
@@ -532,7 +705,7 @@ unsafe extern "system" fn tray_menu_subclass_proc(
     message: u32,
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
-    _id: usize,
+    id: usize,
     _data: usize,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::Foundation::{LRESULT, COLORREF, SIZE};
@@ -544,16 +717,21 @@ unsafe extern "system" fn tray_menu_subclass_proc(
     use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODT_MENU};
     use windows::Win32::UI::Shell::DefSubclassProc;
     use windows::Win32::UI::WindowsAndMessaging::{
-        HMENU, MENUINFO, MIM_BACKGROUND, SetMenuInfo, WM_DRAWITEM, WM_INITMENUPOPUP,
-        WM_MEASUREITEM,
+        HMENU, MENUINFO, MIM_BACKGROUND, SetMenuInfo, WM_COMMAND, WM_DRAWITEM, WM_INITMENUPOPUP,
+        WM_MEASUREITEM, WM_MENUCOMMAND,
     };
+
+    // The popup-menu window: keep its frame dark on every repaint.
+    if id == MENU_WINDOW_SUBCLASS_ID && message == 0x0085 {
+        // WM_NCPAINT
+        darken_menu_window(hwnd);
+        return LRESULT(0);
+    }
 
     match message {
         WM_INITMENUPOPUP => {
             let menu = HMENU(wparam.0 as *mut _);
             owner_draw_menu_items(menu);
-            // Surface brush: everything the rows do not cover is #121212
-            // too, not the light system colour.
             let brush: HBRUSH = CreateSolidBrush(COLORREF(MENU_BG_RGB));
             let info = MENUINFO {
                 cbSize: std::mem::size_of::<MENUINFO>() as u32,
@@ -565,6 +743,10 @@ unsafe extern "system" fn tray_menu_subclass_proc(
                 dwMenuData: 0,
             };
             let _ = SetMenuInfo(menu, &info);
+            // Darken the menu window's border as soon as it exists.
+            if let Some(menu_hwnd) = find_menu_window() {
+                darken_menu_window(menu_hwnd);
+            }
             return DefSubclassProc(hwnd, message, wparam, lparam);
         }
         WM_MEASUREITEM => {
@@ -628,7 +810,19 @@ unsafe extern "system" fn tray_menu_subclass_proc(
             SelectObject(draw.hDC, old_font);
             return LRESULT(1);
         }
+        WM_COMMAND | WM_MENUCOMMAND if id == TRAY_SUBCLASS_ID => {
+            // Menu selection. Owner-drawn items arrive as WM_MENUCOMMAND;
+            // string items as WM_COMMAND. Both are answered here, which is
+            // what makes every tray button work.
+            if let Some(item_id) = menu_command_id(message, wparam.0, lparam.0) {
+                if let Some(command) = tray_bridge::command_for_id(item_id) {
+                    tray_bridge::send(command);
+                    return LRESULT(0);
+                }
+            }
+        }
         _ => {}
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
+
