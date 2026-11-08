@@ -152,13 +152,14 @@ component MonitorCard inherits Rectangle {
     in property <bool> hovered: false;
     in property <bool> dragging: false;
     in property <bool> dimmed: false;
-    // min-width, not width: an element inside a conditional reports its
-    // width as a layout constraint only when it is a min, so the row can
-    // never shrink a monitor away to zero.
-    min-width: 160px;
-    min-height: 118px;
+    // Steps fully aside while its dragged copy is on screen.
+    in property <bool> hidden: false;
+    // Fixed size: a min-width alone lets a layout inflate the card past its
+    // drawn frame, which pushed the stand off-centre.
+    width: 160px;
+    height: 118px;
     background: transparent;
-    opacity: dimmed ? 0.55 : 1;
+    opacity: root.hidden ? 0 : (dimmed ? 0.55 : 1);
     body := Rectangle {
         y: 2px;
         // Explicit width, not 100%: a percentage here makes the card's own
@@ -228,6 +229,10 @@ component MonitorCard inherits Rectangle {
             background: root.local ? #22c55e : #44403c;
         }
     }
+    // Stand neck and base. The card is a fixed 160px wide, so the stand is
+    // centred on that constant: deriving it from parent.width would make
+    // the card's width depend on the stand's position - a circular
+    // reference Slint cannot solve, which collapsed the card entirely.
     Rectangle { x: 72px; y: 100px; width: 16px; height: 9px; background: #26262a; }
     Rectangle { x: 56px; y: 109px; width: 48px; height: 4px; border-radius: 2px; background: #26262a; }
 }
@@ -282,13 +287,13 @@ component ArrangementMesh inherits Rectangle {
     in property <bool> peer-on-right: true;
     in property <bool> enabled: false;
     in property <int> edge-mode: 0;
+    // Roles of this computer and the linked computer: they decide where the
+    // arrow heads sit, exactly as in the crossing-edge illustrations.
+    in property <int> our-mode: 0;
+    in property <int> peer-mode: 0;
     callback to-left();
     callback to-right();
 
-    // Fill the tab column: a component instance does not stretch
-    // horizontally by default inside a VerticalLayout, and the pair needs
-    // the full width so the far monitor and chevron land in view.
-    horizontal-stretch: 1;
     height: 166px;
     background: #0d1117;
     border-radius: 12px;
@@ -299,7 +304,17 @@ component ArrangementMesh inherits Rectangle {
     property <length> card-w: 160px;
     property <length> card-y: 32px;
     property <length> card-h: 118px;
-    property <length> slot-distance: root.width - 2 * root.margin - root.card-w;
+
+    // Every internal position is derived from the mesh's OWN rendered width
+    // (parent.width from a child's point of view, self.width from here).
+    // root.width is the declared width; the panel can render narrower than
+    // declared when the tab column is tight, and cards placed from the
+    // declared width then land outside the visible panel.
+    property <length> inner-w: self.width;
+
+    property <length> local-x: root.peer-on-right ? root.margin : root.inner-w - root.margin - root.card-w;
+    property <length> peer-x: root.peer-on-right ? root.inner-w - root.margin - root.card-w : root.margin;
+    property <length> slot-distance: root.inner-w - 2 * root.margin - root.card-w;
     property <length> drag-limit: root.slot-distance + 24px;
     property <length> drag-start-abs: 0px;
     in-out property <bool> dragging: false;
@@ -307,7 +322,7 @@ component ArrangementMesh inherits Rectangle {
     in-out property <length> drag-dx: 0px;
     // A drop on the other side holds its dragged position until the
     // placement is confirmed upstream, then snaps magnetically into the
-    // new slot — no rubber-band back to the old one first.
+    // new slot - no rubber-band back to the old one first.
     in-out property <bool> flip-pending: false;
     in-out property <bool> flip-right: false;
     // Which chevron is flashing (0 = left, 1 = right, -1 = none). A press
@@ -329,6 +344,7 @@ component ArrangementMesh inherits Rectangle {
             root.drag-dx = 0px;
         }
     }
+    property <bool> will-land-right: root.peer-x + root.drag-dx + root.card-w / 2 > root.inner-w / 2;
     Timer {
         interval: 1500ms;
         running: root.flip-pending;
@@ -346,18 +362,187 @@ component ArrangementMesh inherits Rectangle {
     property <bool> enter-left: root.edge-mode == 1 || root.edge-mode == 2 || (root.edge-mode == 0 && !root.peer-on-right);
     property <bool> enter-right: root.edge-mode == 1 || root.edge-mode == 3 || (root.edge-mode == 0 && root.peer-on-right);
 
-    // ---- The pair of monitors -----------------------------------
-    // A layout owns the horizontal placement. Placing the cards from
-    // root.width made this component's preferred width resolve circularly
-    // (its own width feeds its children's positions) and report ~1.25x the
-    // real column, which pushed the local monitor and the right chevron
-    // off-screen. A layout speaks the same logical units as the rest of the
-    // UI, so the pair always lands inside the mesh.
-    // Row: [chevron] [near monitor] [stretch gap] [far monitor] [chevron]
-    swipe := TouchArea {
+    // ---- Roles, carried by the arrow heads -------------------------
+    property <bool> we-may-drive: root.our-mode == 0 || root.our-mode == 1;
+    property <bool> we-may-be-driven: root.our-mode == 0 || root.our-mode == 2;
+    property <bool> peer-may-drive: root.peer-mode == 0 || root.peer-mode == 1;
+    property <bool> peer-may-be-driven: root.peer-mode == 0 || root.peer-mode == 2;
+    // A sharp head sits on the machine being DRIVEN and the blunt side on
+    // the machine doing the driving: both ways gets a head on both ends.
+    property <bool> head-at-peer: root.we-may-drive && root.peer-may-be-driven;
+    property <bool> head-at-our: root.peer-may-drive && root.we-may-be-driven;
+
+    // ---- Where the two cards actually are right now ----------------
+    // A drag nudges the grabbed monitor, so the arrows follow the card they
+    // start or end on rather than its resting slot.
+    property <length> our-cur-x: root.local-x + ((root.dragging-local && root.dragging) ? root.drag-dx : 0px);
+    property <length> peer-cur-x: root.peer-x + ((root.dragging || root.flip-pending) ? root.drag-dx : 0px);
+    property <length> our-l: root.our-cur-x;
+    property <length> our-r: root.our-cur-x + root.card-w;
+    property <length> peer-l: root.peer-cur-x;
+    property <length> peer-r: root.peer-cur-x + root.card-w;
+    // Two baselines inside the lit edges, a lane under both monitors and
+    // two outside lanes the wrap-around route uses. The outside lanes sit
+    // between the chevrons and the cards so they cross nothing.
+    property <length> y-near: root.card-y + 38px;
+    property <length> y-far: root.card-y + 52px;
+    property <length> lane: 158px;
+    property <length> out-l: root.margin - 8px;
+    property <length> out-r: root.inner-w - root.margin + 8px;
+
+    // Chevron row: a plain Rectangle does not stretch its children, so the
+    // row is given the mesh's own width explicitly rather than a stretch
+    // factor (which had no effect here and dropped the right chevron off).
+    HorizontalLayout {
         x: 0;
         y: root.card-y;
-        horizontal-stretch: 1;
+        width: root.inner-w;
+        height: root.card-h;
+        spacing: 6px;
+        ChevronButton {
+            width: 38px;
+            height: 38px;
+            vertical-stretch: 0;
+            points-left: true;
+            flash: root.flash-side == 0;
+            enabled: root.enabled;
+            clicked => { root.press_side(0); }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        ChevronButton {
+            width: 38px;
+            height: 38px;
+            vertical-stretch: 0;
+            points-left: false;
+            flash: root.flash-side == 1;
+            enabled: root.enabled;
+            clicked => { root.press_side(1); }
+        }
+    }
+
+    // The two monitors, placed from the mesh's rendered width and animated:
+    // a drag nudges the grabbed monitor, a confirmed swap slides it into the
+    // other slot.
+    local := MonitorCard {
+        x: root.local-x + ((root.dragging-local && root.dragging) ? root.drag-dx : 0px);
+        y: root.card-y;
+        width: root.card-w;
+        height: root.card-h;
+        title: "THIS PC";
+        name: root.local-name;
+        local: true;
+        exit-left: root.enabled && root.exit-left;
+        exit-right: root.enabled && root.exit-right;
+        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
+    }
+    peer := MonitorCard {
+        x: root.peer-x + (root.dragging || root.flip-pending ? root.drag-dx : 0px);
+        y: root.card-y;
+        width: root.card-w;
+        height: root.card-h;
+        title: "LINKED";
+        name: root.enabled ? (root.peer-name == "" ? "Linked PC" : root.peer-name) : "Not linked";
+        local: false;
+        enter-left: root.enabled && root.enter-left;
+        enter-right: root.enabled && root.enter-right;
+        hovered: drag-area.has-hover;
+        dragging: root.dragging;
+        dimmed: !root.enabled;
+        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
+    }
+    // ---- The crossing arrows ---------------------------------------
+    // Every connected entry/exit edge has an arrow on it, and the arrows
+    // are the same two the discipline illustrations draw: a short one
+    // straight across the gap between the two facing edges, and - in every
+    // double discipline - a longer one that leaves the far edge, runs under
+    // both monitors and comes back up on the other side.
+    property <string> near-line: root.peer-on-right
+        ? "M \{root.our-r / 1px} \{root.y-near / 1px} L \{root.peer-l / 1px} \{root.y-near / 1px}"
+        : "M \{root.our-l / 1px} \{root.y-near / 1px} L \{root.peer-r / 1px} \{root.y-near / 1px}";
+    property <string> near-peer-head: root.peer-on-right
+        ? "M \{(root.peer-l / 1px) - 7} \{(root.y-near / 1px) - 3.5} L \{root.peer-l / 1px} \{root.y-near / 1px} L \{(root.peer-l / 1px) - 7} \{(root.y-near / 1px) + 3.5}"
+        : "M \{(root.peer-r / 1px) + 7} \{(root.y-near / 1px) - 3.5} L \{root.peer-r / 1px} \{root.y-near / 1px} L \{(root.peer-r / 1px) + 7} \{(root.y-near / 1px) + 3.5}";
+    property <string> near-our-head: root.peer-on-right
+        ? "M \{(root.our-r / 1px) + 7} \{(root.y-near / 1px) - 3.5} L \{root.our-r / 1px} \{root.y-near / 1px} L \{(root.our-r / 1px) + 7} \{(root.y-near / 1px) + 3.5}"
+        : "M \{(root.our-l / 1px) - 7} \{(root.y-near / 1px) - 3.5} L \{root.our-l / 1px} \{root.y-near / 1px} L \{(root.our-l / 1px) - 7} \{(root.y-near / 1px) + 3.5}";
+
+    // Which physical edge of the linked card the far-edge crossing enters
+    // through: Mirror takes the inverse of the exit (the far edge), the
+    // fixed disciplines take their pinned edge whatever side the card sits
+    // on. So the same discipline routes differently depending on the live
+    // arrangement, and the arrow has to say so.
+    property <length> entry-x:
+        root.edge-mode == 2 ? root.peer-l
+        : root.edge-mode == 3 ? root.peer-r
+        : (root.peer-on-right ? root.peer-r : root.peer-l);
+    property <bool> entry-is-peers-left: root.entry-x == root.peer-l;
+    property <bool> entry-is-far: root.entry-x == (root.peer-on-right ? root.peer-r : root.peer-l);
+    // Outside the pair when the entry edge faces away from us, through the
+    // gap between the two cards when it faces us.
+    property <length> entry-gap: root.entry-is-far ? 8px : 16px;
+    property <length> entry-lane: root.entry-is-peers-left ? root.entry-x - root.entry-gap : root.entry-x + root.entry-gap;
+    // Our own far edge, and the outside lane on that same side.
+    property <length> our-far-x: root.peer-on-right ? root.our-l : root.our-r;
+    property <length> our-far-out: root.peer-on-right ? root.out-l : root.out-r;
+
+    property <string> far-line:
+        "M \{root.our-far-x / 1px} \{root.y-far / 1px}"
+        + " L \{root.our-far-out / 1px} \{root.y-far / 1px}"
+        + " L \{root.our-far-out / 1px} \{root.lane / 1px}"
+        + " L \{root.entry-lane / 1px} \{root.lane / 1px}"
+        + " L \{root.entry-lane / 1px} \{root.y-far / 1px}"
+        + " L \{root.entry-x / 1px} \{root.y-far / 1px}";
+    // Head on the linked computer's entry edge, pointing into that edge.
+    property <string> far-peer-head: root.entry-is-peers-left
+        ? "M \{(root.entry-x / 1px) - 7} \{(root.y-far / 1px) - 3.5} L \{root.entry-x / 1px} \{root.y-far / 1px} L \{(root.entry-x / 1px) - 7} \{(root.y-far / 1px) + 3.5}"
+        : "M \{(root.entry-x / 1px) + 7} \{(root.y-far / 1px) - 3.5} L \{root.entry-x / 1px} \{root.y-far / 1px} L \{(root.entry-x / 1px) + 7} \{(root.y-far / 1px) + 3.5}";
+    // Head on this computer's far edge, pointing into this computer.
+    property <string> far-our-head: root.peer-on-right
+        ? "M \{(root.our-far-x / 1px) + 7} \{(root.y-far / 1px) - 3.5} L \{root.our-far-x / 1px} \{root.y-far / 1px} L \{(root.our-far-x / 1px) + 7} \{(root.y-far / 1px) + 3.5}"
+        : "M \{(root.our-far-x / 1px) - 7} \{(root.y-far / 1px) - 3.5} L \{root.our-far-x / 1px} \{root.y-far / 1px} L \{(root.our-far-x / 1px) - 7} \{(root.y-far / 1px) + 3.5}";
+
+    // The short arrow: the facing-edge crossing. Hidden until a peer is
+    // linked, exactly like the lit edges themselves.
+    if root.enabled : Path {
+        x: 0;
+        y: 0;
+        width: root.inner-w;
+        height: 166px;
+        viewbox-width: max(1, root.inner-w / 1px);
+        viewbox-height: 166;
+        stroke: #22c55e;
+        stroke-width: 2px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        fill: transparent;
+        commands: root.near-line
+            + (root.head-at-peer ? root.near-peer-head : "")
+            + (root.head-at-our ? root.near-our-head : "");
+    }
+    // The long arrow: the far-edge crossing. Only a double discipline has
+    // one, and it is visibly the longer route of the two.
+    if root.enabled && root.edge-mode != 0 : Path {
+        x: 0;
+        y: 0;
+        width: root.inner-w;
+        height: 166px;
+        viewbox-width: max(1, root.inner-w / 1px);
+        viewbox-height: 166;
+        stroke: #5eead4;
+        stroke-width: 2px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        fill: transparent;
+        commands: root.far-line
+            + (root.head-at-peer ? root.far-peer-head : "")
+            + (root.head-at-our ? root.far-our-head : "");
+    }
+    // The linked monitor is draggable: it follows the pointer and lands on
+    // the side it is released on.
+    drag-area := TouchArea {
+        x: root.peer-x + (root.dragging || root.flip-pending ? root.drag-dx : 0px);
+        y: root.card-y;
+        width: root.card-w;
         height: root.card-h;
         enabled: root.enabled;
         mouse-cursor: root.enabled ? (root.dragging ? grabbing : grab) : default;
@@ -371,12 +556,7 @@ component ArrangementMesh inherits Rectangle {
                 root.drag-dx = max(-root.drag-limit, min(root.drag-limit, (self.absolute-position.x + self.mouse-x) - root.drag-start-abs));
             } else if ((event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) && root.dragging) {
                 root.dragging = false;
-                // Release past the middle swaps the pair: the monitors land
-                // on the side the pointer let go on. The chevron flash and
-                // the swap are the feedback, which keeps the gesture
-                // symmetric on both monitors without pixel tracking.
-                let middle = self.absolute-position.x + self.width / 2;
-                let want-right = (self.absolute-position.x + self.mouse-x) > middle;
+                let want-right = root.will-land-right;
                 if (want-right != root.peer-on-right) {
                     root.flip-pending = true;
                     root.flip-right = want-right;
@@ -391,71 +571,63 @@ component ArrangementMesh inherits Rectangle {
             }
         }
         double-clicked => {
+            if (root.peer-on-right) { root.to-left(); } else { root.to_right(); }
+        }
+        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
+    }
+    // The local monitor is draggable too: pushing THIS PC across the middle
+    // is the same swap as pulling the linked PC the other way, so the
+    // gesture feels symmetric on both halves of the pair.
+    local-drag-area := TouchArea {
+        x: root.local-x;
+        y: root.card-y;
+        width: root.card-w;
+        height: root.card-h;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? (root.dragging ? grabbing : grab) : default;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                root.flip-pending = false;
+                root.dragging = true;
+                root.drag-start-abs = self.absolute-position.x + self.mouse_x;
+                root.drag-dx = 0px;
+                root.dragging-local = true;
+            } else if (event.kind == PointerEventKind.move && root.dragging && root.dragging-local) {
+                root.drag-dx = max(-root.drag-limit, min(root.drag-limit, (self.absolute-position.x + self.mouse_x) - root.drag-start-abs));
+            } else if ((event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) && root.dragging && root.dragging-local) {
+                root.dragging = false;
+                root.dragging-local = false;
+                // Dragging the local card to the right puts the peer on the
+                // left, and vice versa.
+                let want-right = root.local-x + root.drag-dx + root.card-w / 2 > root.inner-w / 2;
+                if (want-right != root.peer-on-right) {
+                    root.flip-pending = true;
+                    root.flip-right = want-right;
+                    if (want-right) {
+                        root.to_right();
+                    } else {
+                        root.to_left();
+                    }
+                } else {
+                    root.drag-dx = 0px;
+                }
+            }
+        }
+        double-clicked => {
             if (root.peer-on-right) { root.to-left(); } else { root.to-right(); }
         }
+        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
     }
-    HorizontalLayout {
-        x: 0;
+    // Magnetic landing slot while dragging.
+    if root.dragging : Rectangle {
+        x: root.will-land-right ? root.inner-w - root.margin - root.card-w : root.margin;
         y: root.card-y;
-        horizontal-stretch: 1;
-        // A floor so the row can never collapse below its content.
-        min-width: 424px;
+        width: root.card-w;
         height: root.card-h;
-        padding-left: 7px;
-        padding-right: 7px;
-        spacing: 7px;
-        ChevronButton {
-            width: 38px;
-            height: 38px;
-            vertical-stretch: 0;
-            points-left: true;
-            flash: root.flash-side == 0;
-            enabled: root.enabled;
-            clicked => { root.press_side(0); }
-        }
-        // The linked computer on the left, this computer on the right...
-        if !root.peer-on-right : MonitorCard {
-            title: "LINKED";
-            name: root.enabled ? (root.peer-name == "" ? "Linked PC" : root.peer-name) : "Not linked";
-            local: false;
-            enter-left: root.enabled && root.enter-left;
-            enter-right: root.enabled && root.enter-right;
-            dimmed: !root.enabled;
-        }
-        if root.peer-on-right : MonitorCard {
-            title: "THIS PC";
-            name: root.local-name;
-            local: true;
-            exit-left: root.enabled && root.exit-left;
-            exit-right: root.enabled && root.exit-right;
-        }
-        // The gap between the two monitors absorbs the spare width.
-        Rectangle { horizontal-stretch: 1; }
-        // ...or the other way round.
-        if !root.peer-on-right : MonitorCard {
-            title: "THIS PC";
-            name: root.local-name;
-            local: true;
-            exit-left: root.enabled && root.exit-left;
-            exit-right: root.enabled && root.exit-right;
-        }
-        if root.peer-on-right : MonitorCard {
-            title: "LINKED";
-            name: root.enabled ? (root.peer-name == "" ? "Linked PC" : root.peer-name) : "Not linked";
-            local: false;
-            enter-left: root.enabled && root.enter-left;
-            enter-right: root.enabled && root.enter-right;
-            dimmed: !root.enabled;
-        }
-        ChevronButton {
-            width: 38px;
-            height: 38px;
-            vertical-stretch: 0;
-            points-left: false;
-            flash: root.flash-side == 1;
-            enabled: root.enabled;
-            clicked => { root.press_side(1); }
-        }
+        border-radius: 10px;
+        border-width: 1.5px;
+        border-color: root.will-land-right == root.peer-on-right ? #22c55e33 : #22c55e;
+        background: #22c55e10;
     }
 }
 
@@ -465,12 +637,8 @@ component EdgeModeDiagram inherits Rectangle {
     in property <int> mode: 0;
     in property <int> our-mode: 0;
     in property <int> peer-mode: 0;
-    // Which side the linked computer sits on for this discipline. The
-    // fixed disciplines pin the peer to one side; the others follow the
-    // live arrangement. The arrow heads are placed relative to it.
-    in property <bool> peer-on-right: true;
-    width: 128px;
-    height: 56px;
+    width: 142px;
+    height: 66px;
     background: transparent;
 
     // ---- What each COMPUTER allows ------------------------------
@@ -480,84 +648,121 @@ component EdgeModeDiagram inherits Rectangle {
     property <bool> peer-may-be-driven: root.peer-mode == 0 || root.peer-mode == 2;
     property <bool> forward-ok: root.we-may-drive && root.peer-may-be-driven;
     property <bool> backward-ok: root.peer-may-drive && root.we-may-be-driven;
-    // The head sits on the machine being driven: we drive -> the head is
-    // on the linked computer's side; the peer drives us -> the head is on
-    // this computer's side. Both ways -> a head on both ends.
-    property <bool> head-right: (root.forward-ok && root.peer-on-right) || (root.backward-ok && !root.peer-on-right);
-    property <bool> head-left: (root.backward-ok && root.peer-on-right) || (root.forward-ok && !root.peer-on-right);
-    property <string> arrow-cmds: (root.forward-ok && root.backward-ok)
-        ? "M 2 6 L 30 6 M 2 6 L 7 2 M 2 6 L 7 10 M 30 6 L 25 2 M 30 6 L 25 10"
-        : root.head-right ? "M 2 6 L 30 6 M 25 2 L 30 6 L 25 10"
-        : root.head-left ? "M 2 6 L 30 6 M 7 2 L 2 6 L 7 10"
-        : "M 2 6 L 30 6";
+    // The sharp head sits on the machine being DRIVEN (the client); the
+    // blunt side is the machine doing the driving (the server). "Both ways"
+    // puts a head on both ends of every arrow.
+    property <bool> head-at-peer: root.forward-ok;
+    property <bool> head-at-our: root.backward-ok;
+
+    // ---- Geometry ------------------------------------------------
+    // Fixed right draws the linked computer on this computer's LEFT, so the
+    // pinned entry edge is the one that FACES us and the crossing can be
+    // shown as a short arrow plus a wrap-around. The other three disciplines
+    // draw it on the right: computer 1 (this PC) left, computer 2 (linked)
+    // right, exactly as "left side of computer 1 to right side of computer
+    // 2 and right side of computer 1 to left side of computer 2" reads.
+    property <bool> peer-on-right: root.mode != 3;
+    property <length> mon-w: 36px;
+    property <length> our-x: root.peer-on-right ? 6px : 96px;
+    property <length> peer-x: root.peer-on-right ? 96px : 6px;
+    property <length> our-l: root.our-x;
+    property <length> our-r: root.our-x + root.mon-w;
+    property <length> peer-l: root.peer-x;
+    property <length> peer-r: root.peer-x + root.mon-w;
+    // Two baselines inside the screens, eight apart, so both arrows of a
+    // double discipline can touch the same edge without overlapping.
+    property <length> y-near: 16px;
+    property <length> y-far: 24px;
+    // Route lane: under both monitors.
+    property <length> lane: 42px;
+    // Right-hand margin lane, used by the one arrow that has to come back
+    // around the outside of the linked computer.
+    property <length> rim: 140px;
 
     // ---- The two monitors ----------------------------------------
-    // This computer (green frame) on the left when the linked computer is
-    // arranged on the right, and the other way round for Fixed left.
-    property <length> our-mon-x: root.peer-on-right ? 2px : 82px;
-    property <length> peer-mon-x: root.peer-on-right ? 82px : 2px;
-    Rectangle { x: root.our-mon-x; y: 13px; width: 44px; height: 30px; background: #17171a; border-radius: 4px; border-width: 1px; border-color: #22c55e; }
-    Rectangle { x: root.our-mon-x + 4px; y: 17px; width: 36px; height: 22px; background: #0b1f14; border-radius: 2px; }
-    Rectangle { x: root.peer-mon-x; y: 13px; width: 44px; height: 30px; background: #17171a; border-radius: 4px; border-width: 1px; border-color: #57534e; }
-    Rectangle { x: root.peer-mon-x + 4px; y: 17px; width: 36px; height: 22px; background: #101010; border-radius: 2px; }
-    // Exit edges on this computer: the facing edge always, the far edge
-    // too in every double discipline.
-    if root.mode != 0 : Rectangle { x: root.our-mon-x + 4px; y: 19px; width: 2px; height: 18px; border-radius: 1px; background: #22c55e; }
-    Rectangle { x: root.our-mon-x + 38px; y: 19px; width: 2px; height: 18px; border-radius: 1px; background: #22c55e; }
-    // Entry edges on the linked computer: the facing edge, plus the far
-    // edge in Mirror and Fixed right.
-    if root.mode != 3 : Rectangle { x: root.peer-mon-x + 4px; y: 19px; width: 2px; height: 18px; border-radius: 1px; background: #5eead4; }
-    if root.mode == 1 || root.mode == 3 : Rectangle { x: root.peer-mon-x + 38px; y: 19px; width: 2px; height: 18px; border-radius: 1px; background: #5eead4; }
+    Rectangle { x: root.our-x; y: 6px; width: root.mon-w; height: 28px; background: #17171a; border-radius: 4px; border-width: 1px; border-color: #22c55e; }
+    Rectangle { x: root.our-x + 3px; y: 9px; width: root.mon-w - 6px; height: 22px; background: #0b1f14; border-radius: 2px; }
+    Rectangle { x: root.peer-x; y: 6px; width: root.mon-w; height: 28px; background: #17171a; border-radius: 4px; border-width: 1px; border-color: #57534e; }
+    Rectangle { x: root.peer-x + 3px; y: 9px; width: root.mon-w - 6px; height: 22px; background: #101010; border-radius: 2px; }
+
+    // ---- The connected edges, lit --------------------------------
+    // Exits on THIS computer: the facing edge always, the far edge too in
+    // every double discipline.
+    Rectangle { x: root.peer-on-right ? root.our-r - 1.5px : root.our-l - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #22c55e; }
+    if root.mode != 0 : Rectangle { x: root.peer-on-right ? root.our-l - 1.5px : root.our-r - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #22c55e; }
+    // Entries on the linked computer: the facing edge always, the far edge
+    // only in Mirror, whose entry is the inverse of the exit.
+    Rectangle { x: root.peer-on-right ? root.peer-l - 1.5px : root.peer-r - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
+    if root.mode == 1 : Rectangle { x: root.peer-on-right ? root.peer-r - 1.5px : root.peer-l - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
 
     // ---- The crossing arrows -------------------------------------
-    // One arrow per crossing the discipline has between the two facing
-    // edges: Mirror has two entry and two exit points, so it gets two
-    // arrows stacked with clear vertical space; the other disciplines
-    // get one. The arrow HEADS carry the role: both ways shows a head on
-    // each end, a server/client pair shows one head on the client side.
-    // Mirror: two stacked arrows.
-    if root.mode == 1 : Path {
-        x: 48px;
-        y: 15px;
-        width: 32px;
-        height: 12px;
-        viewbox-width: 32;
-        viewbox-height: 12;
+    // One arrow per connected edge pair, and every lit edge has an arrow on
+    // it. Single has one. Every double discipline has two, and the two are
+    // deliberately DIFFERENT LENGTHS: the short one runs straight across the
+    // gap between the two facing edges; the long one leaves the far edge,
+    // runs under both monitors and comes up on the other side. Mirror's long
+    // arrow lands on the linked computer's far edge; the fixed disciplines
+    // land on their pinned facing edge, so they come back up through the gap.
+    property <string> near-line: root.peer-on-right
+        ? "M \{root.our-r / 1px} 16 L \{root.peer-l / 1px} 16"
+        : "M \{root.our-l / 1px} 16 L \{root.peer-r / 1px} 16";
+    property <string> near-peer-head: root.peer-on-right
+        ? "M \{(root.peer-l / 1px) - 5} 13.5 L \{root.peer-l / 1px} 16 L \{(root.peer-l / 1px) - 5} 18.5"
+        : "M \{(root.peer-r / 1px) + 5} 13.5 L \{root.peer-r / 1px} 16 L \{(root.peer-r / 1px) + 5} 18.5";
+    property <string> near-our-head: root.peer-on-right
+        ? "M \{(root.our-r / 1px) + 5} 13.5 L \{root.our-r / 1px} 16 L \{(root.our-r / 1px) + 5} 18.5"
+        : "M \{(root.our-l / 1px) - 5} 13.5 L \{root.our-l / 1px} 16 L \{(root.our-l / 1px) - 5} 18.5";
+
+    // The long route: far edge, under both monitors, up to the entry edge.
+    property <string> far-line:
+        root.mode == 1
+            ? "M \{root.our-l / 1px} 24 L \{root.our-l / 1px} 42 L \{root.rim / 1px} 42 L \{root.rim / 1px} 24 L \{root.peer-r / 1px} 24"
+            : (root.mode == 2
+                ? "M \{root.our-l / 1px} 24 L \{root.our-l / 1px} 42 L \{(root.peer-l / 1px) - 4} 42 L \{(root.peer-l / 1px) - 4} 24 L \{root.peer-l / 1px} 24"
+                : "M \{root.our-r / 1px} 24 L \{root.our-r / 1px} 42 L \{(root.peer-r / 1px) + 4} 42 L \{(root.peer-r / 1px) + 4} 24 L \{root.peer-r / 1px} 24");
+    property <string> far-peer-head:
+        root.mode == 2
+            ? "M \{(root.peer-l / 1px) - 5} 21.5 L \{root.peer-l / 1px} 24 L \{(root.peer-l / 1px) - 5} 26.5"
+            : "M \{(root.peer-r / 1px) + 5} 21.5 L \{root.peer-r / 1px} 24 L \{(root.peer-r / 1px) + 5} 26.5";
+    property <string> far-our-head:
+        root.mode == 3
+            ? "M \{(root.our-r / 1px) + 5} 21.5 L \{root.our-r / 1px} 24 L \{(root.our-r / 1px) + 5} 26.5"
+            : "M \{(root.our-l / 1px) - 5} 21.5 L \{root.our-l / 1px} 24 L \{(root.our-l / 1px) - 5} 26.5";
+
+    // The short arrow: the facing-edge crossing. Every discipline has one.
+    Path {
+        x: 0;
+        y: 0;
+        width: 142px;
+        height: 66px;
+        viewbox-width: 142;
+        viewbox-height: 66;
         stroke: #22c55e;
         stroke-width: 2px;
         stroke-line-cap: round;
         stroke-line-join: round;
         fill: transparent;
-        commands: root.arrow-cmds;
+        commands: root.near-line
+            + (root.head-at-peer ? root.near-peer-head : "")
+            + (root.head-at-our ? root.near-our-head : "");
     }
-    if root.mode == 1 : Path {
-        x: 48px;
-        y: 33px;
-        width: 32px;
-        height: 12px;
-        viewbox-width: 32;
-        viewbox-height: 12;
+    // The long arrow: the far-edge crossing. Only a double discipline has
+    // one, and it is visibly longer than the arrow above it.
+    if root.mode != 0 : Path {
+        x: 0;
+        y: 0;
+        width: 142px;
+        height: 66px;
+        viewbox-width: 142;
+        viewbox-height: 66;
         stroke: #5eead4;
         stroke-width: 2px;
         stroke-line-cap: round;
         stroke-line-join: round;
         fill: transparent;
-        commands: root.arrow-cmds;
-    }
-    // Single / Fixed left / Fixed right: one arrow, centred.
-    if root.mode != 1 : Path {
-        x: 48px;
-        y: 24px;
-        width: 32px;
-        height: 12px;
-        viewbox-width: 32;
-        viewbox-height: 12;
-        stroke: #22c55e;
-        stroke-width: 2px;
-        stroke-line-cap: round;
-        stroke-line-join: round;
-        fill: transparent;
-        commands: root.arrow-cmds;
+        commands: root.far-line
+            + (root.head-at-peer ? root.far-peer-head : "")
+            + (root.head-at-our ? root.far-our-head : "");
     }
 }
 component EdgeModeTile inherits Rectangle {
@@ -591,17 +796,13 @@ component EdgeModeTile inherits Rectangle {
     accessible-label: root.label;
     accessible-action-default => { if (root.enabled && !root.applying) { root.clicked(); } }
     VerticalLayout {
-        padding: 8px;
-        spacing: 5px;
+        padding: 4px;
+        spacing: 4px;
         alignment: center;
         EdgeModeDiagram {
             mode: root.mode;
             our-mode: root.our-mode;
             peer-mode: root.peer-mode;
-            // Fixed left pins the linked computer to this computer's left,
-            // Fixed right to its right; the other two follow the
-            // arrangement the user actually set.
-            peer-on-right: root.mode == 2 ? false : root.mode == 3 ? true : root.arranged-peer-on-right;
         }
         Text {
             text: root.label;
@@ -710,7 +911,7 @@ component RoleRow inherits Rectangle {
     in property <bool> selected: false;
     callback picked();
     height: 40px;
-    background: hit.has-hover ? #1f2937 : transparent;
+    background: hit.has-hover ? #2a2a2a : transparent;
     border-radius: 7px;
     hit := TouchArea {
         mouse-cursor: pointer;
@@ -750,12 +951,15 @@ component RoleDropdown inherits Rectangle {
     in property <int> mode-index: 0;
     in property <bool> enabled: true;
     callback picked(int);
-    width: 214px;
+    // Compact: the widest role label plus the chevron, so the box hugs its
+    // contents instead of leaving a long empty stretch between the label
+    // and the arrow.
+    width: 176px;
     height: 34px;
     border-radius: 8px;
-    background: hit.has-hover || popup.is-open ? #16202c : #111827;
+    background: hit.has-hover || popup.is-open ? #2a2a2a : #1c1c1c;
     border-width: 1px;
-    border-color: popup.is-open ? #22c55e : (hit.has-hover ? #4b5563 : #374151);
+    border-color: popup.is-open ? #22c55e : (hit.has-hover ? #4b5563 : #2a2a2a);
     animate background { duration: 120ms; }
     animate border-color { duration: 120ms; }
     hit := TouchArea {
@@ -772,31 +976,34 @@ component RoleDropdown inherits Rectangle {
     accessible-label: "This computer's role";
     accessible-expanded: popup.is-open;
     accessible-action-expand => { popup.show(); }
-    HorizontalLayout {
-        padding-left: 11px;
-        padding-right: 9px;
-        spacing: 8px;
-        Text {
-            text: root.current;
-            color: white;
-            font-size: 13px;
-            font-weight: 600;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-            overflow: elide;
-        }
-        // Chevron sits inside the box, vertically centred and sized to the
-        // 34px control: a fixed square aligned by the layout, never a
-        // corner-floating free path.
-        Rectangle {
-            width: 16px;
-            height: 16px;
-            ChevronGlyph {
-                width: 100%;
-                height: 100%;
-                open: popup.is-open;
-                glyph-color: popup.is-open ? #22c55e : #9ca3af;
-            }
+    // Absolute placement inside the box: the label takes the width minus
+    // the chevron, and the chevron is a fixed 14px square centred on the
+    // control's own height - no layout to stretch it to the top.
+    Text {
+        x: 11px;
+        y: (parent.height - self.height) / 2;
+        // The label owns everything left of the chevron and is centred in
+        // it: left-aligning leaves a long dead gap between the label and
+        // the arrow whenever the label is short ("Both ways").
+        width: parent.width - 11px - 9px - 14px - 8px;
+        text: root.current;
+        color: white;
+        font-size: 13px;
+        font-weight: 600;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+        overflow: elide;
+    }
+    Rectangle {
+        x: parent.width - 24px;
+        y: (parent.height - 14px) / 2;
+        width: 14px;
+        height: 14px;
+        ChevronGlyph {
+            width: 100%;
+            height: 100%;
+            open: popup.is-open;
+            glyph-color: popup.is-open ? #22c55e : #9ca3af;
         }
     }
     popup := PopupWindow {
@@ -808,10 +1015,10 @@ component RoleDropdown inherits Rectangle {
         Rectangle {
             width: 100%;
             height: 100%;
-            background: #111827;
+            background: #1c1c1c;
             border-radius: 10px;
             border-width: 1px;
-            border-color: #374151;
+            border-color: #2a2a2a;
             drop-shadow-color: #000000aa;
             drop-shadow-blur: 16px;
             drop-shadow-offset-y: 6px;
@@ -875,6 +1082,7 @@ component Disclosure inherits Rectangle {
 // press Connect. Everything advanced lives under Devices and Settings.
 export component AppWindow inherits Window {
     title: "TheKVM" + title-alert;
+
     min-width: 720px;
     min-height: 560px;
     background: #0a0a0a;
@@ -1084,6 +1292,11 @@ export component AppWindow inherits Window {
                 // row with no way to reach it. Never clip again.
                 Flickable {
                 Rectangle {
+                // Exactly the Flickable's width: the content must never ask the
+                // viewport to be wider than the window, or the panels get
+                // sliced off at the right edge and a horizontal scrollbar
+                // appears for no reason.
+                width: parent.width;
                 VerticalLayout {
                     padding: 12px;
                     spacing: 12px;
@@ -1182,19 +1395,23 @@ export component AppWindow inherits Window {
                     }
 
                     // ---- Role --------------------------------------------
-                    // Layout note: an element with horizontal-stretch: 1
-                    // swallows the whole row and starves its siblings to
-                    // zero width (this is how the dropdown, the Connect
-                    // buttons and every Switch vanished). The reliable
-                    // shape is: fixed-size items first, one trailing
-                    // stretch spacer last.
+                    // Hugs its content: a stretched row leaves a wide empty
+                    // strip to the right of the dropdown. (Fixed items first,
+                    // no stretch spacer: a stretched sibling starves the
+                    // dropdown to zero width.)
                     HorizontalLayout {
                         vertical-stretch: 0;
+                        horizontal-stretch: 0;
                         spacing: 10px;
                         Text {
                             // This computer's name AND live LAN address: the
                             // other machine needs the IP, so it belongs right
                             // here, aligned with the label.
+                            // A bounded width matters: an unbounded Text
+                            // absorbs every leftover pixel of the row, which
+                            // pushed the dropdown off the right edge of the
+                            // window. Fixed at the widest the label gets.
+                            width: 260px;
                             text: root.local-address == ""
                                 ? "This computer"
                                 : "This computer · " + root.local-address;
@@ -1208,13 +1425,12 @@ export component AppWindow inherits Window {
                         // pressable. Gating it once made it look permanently
                         // dead whenever the status poll failed.
                         RoleDropdown {
-                            width: 214px;
+                            width: 176px;
                             height: 34px;
                             current: root.role-text;
                             mode-index: root.mode-index;
                             picked(index) => { set-role(index); }
                         }
-                        Rectangle { horizontal-stretch: 1; }
                     }
 
                     // ---- Connect -----------------------------------------
@@ -1439,6 +1655,11 @@ export component AppWindow inherits Window {
                 title: "Devices";
                 Flickable {
                 Rectangle {
+                // Exactly the Flickable's width: the content must never ask the
+                // viewport to be wider than the window, or the panels get
+                // sliced off at the right edge and a horizontal scrollbar
+                // appears for no reason.
+                width: parent.width;
                 VerticalLayout {
                     padding: 12px;
                     spacing: 12px;
@@ -1502,6 +1723,8 @@ export component AppWindow inherits Window {
                         peer-on-right: root.peer-on-right;
                         enabled: root.linked-peer-name != "";
                         edge-mode: root.edge-mode-index;
+                        our-mode: root.mode-index;
+                        peer-mode: root.peer-mode;
                         to-left => { place-peer-left(); }
                         to-right => { place-peer-right(); }
                     }
@@ -1569,6 +1792,11 @@ export component AppWindow inherits Window {
                 title: "Settings";
                 Flickable {
                 Rectangle {
+                // Exactly the Flickable's width: the content must never ask the
+                // viewport to be wider than the window, or the panels get
+                // sliced off at the right edge and a horizontal scrollbar
+                // appears for no reason.
+                width: parent.width;
                 VerticalLayout {
                     padding: 12px;
                     spacing: 4px;
