@@ -465,7 +465,7 @@ component ArrangementMesh inherits Rectangle {
     property <float> far-x1: root.our-far-x / 1px;
     property <float> far-x2: root.entry-x / 1px;
     property <int> y-near: root.card-y / 1px + 38;
-    property <int> y-far: 158;
+    property <int> y-far: root.card-y / 1px + 60;
     property <bool> near-right: root.near-x1 < root.near-x2;
     property <bool> far-right: root.far-x1 < root.far-x2;
 
@@ -768,15 +768,19 @@ component EdgeModeTile inherits Rectangle {
     in property <int> peer-mode: 0;
     in property <bool> arranged-peer-on-right: true;
     callback clicked();
-    width: 150px;
-    height: 104px;
+    // Slightly larger: the monitors inside are bigger, so the tile has to
+    // be too or the diagram would be squeezed.
+    width: 162px;
+    height: 110px;
     border-radius: 10px;
-    background: root.selected ? #0f2a1a : #111827;
+    // Selection is shown by a slightly lifted panel, NOT a green frame: the
+    // green outline read as a second accent competing with the arrows, and
+    // the current discipline is already named in green beside the heading.
+    background: root.selected ? #1b2740 : #111827;
     border-width: 1.5px;
-    border-color: root.selected ? #22c55e : (hit.has-hover && root.enabled ? #4b5563 : #1f2937);
+    border-color: hit.has-hover && root.enabled ? #4b5563 : #1f2937;
     opacity: root.enabled ? 1 : 0.4;
     animate background { duration: 140ms; }
-    animate border-color { duration: 140ms; }
     hit := TouchArea {
         mouse-cursor: pointer;
         clicked => { if (root.enabled && !root.applying) { root.clicked(); } }
@@ -785,8 +789,8 @@ component EdgeModeTile inherits Rectangle {
     accessible-label: root.label;
     accessible-action-default => { if (root.enabled && !root.applying) { root.clicked(); } }
     VerticalLayout {
-        padding: 4px;
-        spacing: 4px;
+        padding: 7px;
+        spacing: 6px;
         alignment: center;
         EdgeModeDiagram {
             mode: root.mode;
@@ -795,21 +799,13 @@ component EdgeModeTile inherits Rectangle {
         }
         Text {
             text: root.label;
-            color: root.selected ? #86efac : #9ca3af;
-            font-size: 12px;
+            color: root.selected ? #e5e7eb : #9ca3af;
+            font-size: 13px;
             font-weight: 700;
             horizontal-alignment: center;
         }
     }
-    // Selection indicator: a lit dot, mirrored by the green frame.
-    if root.selected : Rectangle {
-        x: root.width - 15px;
-        y: 9px;
-        width: 6px;
-        height: 6px;
-        border-radius: 3px;
-        background: #22c55e;
-    }
+
     // Applying this discipline: the same donut as everywhere else.
     if root.applying : Rectangle {
         width: 100%;
@@ -841,7 +837,7 @@ component EdgeModePicker inherits Rectangle {
     height: 104px;
     background: transparent;
     HorizontalLayout {
-        spacing: 10px;
+        spacing: 6px;
         alignment: center;
         EdgeModeTile {
             mode: 0;
