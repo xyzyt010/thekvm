@@ -381,14 +381,7 @@ component ArrangementMesh inherits Rectangle {
     property <length> our-r: root.our-cur-x + root.card-w;
     property <length> peer-l: root.peer-cur-x;
     property <length> peer-r: root.peer-cur-x + root.card-w;
-    // Two baselines inside the lit edges, a lane under both monitors and
-    // two outside lanes the wrap-around route uses. The outside lanes sit
-    // between the chevrons and the cards so they cross nothing.
-    property <length> y-near: root.card-y + 38px;
-    property <length> y-far: root.card-y + 52px;
-    property <length> lane: 158px;
-    property <length> out-l: root.margin - 8px;
-    property <length> out-r: root.inner-w - root.margin + 8px;
+
 
     // Chevron row: a plain Rectangle does not stretch its children, so the
     // row is given the mesh's own width explicitly rather than a stretch
@@ -451,55 +444,50 @@ component ArrangementMesh inherits Rectangle {
         animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
     }
     // ---- The crossing arrows ---------------------------------------
-    // Every connected entry/exit edge has an arrow on it, and the arrows
-    // are the same two the discipline illustrations draw: a short one
-    // straight across the gap between the two facing edges, and - in every
-    // double discipline - a longer one that leaves the far edge, runs under
-    // both monitors and comes back up on the other side.
-    property <string> near-line: root.peer-on-right
-        ? "M \{root.our-r / 1px} \{root.y-near / 1px} L \{root.peer-l / 1px} \{root.y-near / 1px}"
-        : "M \{root.our-l / 1px} \{root.y-near / 1px} L \{root.peer-r / 1px} \{root.y-near / 1px}";
-    property <string> near-peer-head: root.peer-on-right
-        ? "M \{(root.peer-l / 1px) - 7} \{(root.y-near / 1px) - 3.5} L \{root.peer-l / 1px} \{root.y-near / 1px} L \{(root.peer-l / 1px) - 7} \{(root.y-near / 1px) + 3.5}"
-        : "M \{(root.peer-r / 1px) + 7} \{(root.y-near / 1px) - 3.5} L \{root.peer-r / 1px} \{root.y-near / 1px} L \{(root.peer-r / 1px) + 7} \{(root.y-near / 1px) + 3.5}";
-    property <string> near-our-head: root.peer-on-right
-        ? "M \{(root.our-r / 1px) + 7} \{(root.y-near / 1px) - 3.5} L \{root.our-r / 1px} \{root.y-near / 1px} L \{(root.our-r / 1px) + 7} \{(root.y-near / 1px) + 3.5}"
-        : "M \{(root.our-l / 1px) - 7} \{(root.y-near / 1px) - 3.5} L \{root.our-l / 1px} \{root.y-near / 1px} L \{(root.our-l / 1px) - 7} \{(root.y-near / 1px) + 3.5}";
-
-    // Which physical edge of the linked card the far-edge crossing enters
-    // through: Mirror takes the inverse of the exit (the far edge), the
-    // fixed disciplines take their pinned edge whatever side the card sits
-    // on. So the same discipline routes differently depending on the live
-    // arrangement, and the arrow has to say so.
+    // Both arrows are dead straight and parallel to each other. The short
+    // one joins the two edges that FACE each other (this computer's right
+    // edge to the linked computer's left edge); the long one joins this
+    // computer's LEFT edge to the linked computer's RIGHT edge, so it runs
+    // the full span of the pair underneath both screens. Two connected
+    // edges, two arrows, and the second is visibly the longer route.
+    property <length> our-facing-x: root.peer-on-right ? root.our-r : root.our-l;
+    property <length> our-far-x: root.peer-on-right ? root.our-l : root.our-r;
+    property <length> peer-facing-x: root.peer-on-right ? root.peer-l : root.peer-r;
+    // The peer edge the second arrow lands on: Mirror takes the far edge,
+    // the fixed disciplines take their pinned edge whatever side the card
+    // sits on.
     property <length> entry-x:
         root.edge-mode == 2 ? root.peer-l
         : root.edge-mode == 3 ? root.peer-r
         : (root.peer-on-right ? root.peer-r : root.peer-l);
-    property <bool> entry-is-peers-left: root.entry-x == root.peer-l;
-    property <bool> entry-is-far: root.entry-x == (root.peer-on-right ? root.peer-r : root.peer-l);
-    // Outside the pair when the entry edge faces away from us, through the
-    // gap between the two cards when it faces us.
-    property <length> entry-gap: root.entry-is-far ? 8px : 16px;
-    property <length> entry-lane: root.entry-is-peers-left ? root.entry-x - root.entry-gap : root.entry-x + root.entry-gap;
-    // Our own far edge, and the outside lane on that same side.
-    property <length> our-far-x: root.peer-on-right ? root.our-l : root.our-r;
-    property <length> our-far-out: root.peer-on-right ? root.out-l : root.out-r;
+    property <float> near-x1: root.our-facing-x / 1px;
+    property <float> near-x2: root.peer-facing-x / 1px;
+    property <float> far-x1: root.our-far-x / 1px;
+    property <float> far-x2: root.entry-x / 1px;
+    property <int> y-near: root.card-y / 1px + 38;
+    property <int> y-far: 158;
+    property <bool> near-right: root.near-x1 < root.near-x2;
+    property <bool> far-right: root.far-x1 < root.far-x2;
 
-    property <string> far-line:
-        "M \{root.our-far-x / 1px} \{root.y-far / 1px}"
-        + " L \{root.our-far-out / 1px} \{root.y-far / 1px}"
-        + " L \{root.our-far-out / 1px} \{root.lane / 1px}"
-        + " L \{root.entry-lane / 1px} \{root.lane / 1px}"
-        + " L \{root.entry-lane / 1px} \{root.y-far / 1px}"
-        + " L \{root.entry-x / 1px} \{root.y-far / 1px}";
-    // Head on the linked computer's entry edge, pointing into that edge.
-    property <string> far-peer-head: root.entry-is-peers-left
-        ? "M \{(root.entry-x / 1px) - 7} \{(root.y-far / 1px) - 3.5} L \{root.entry-x / 1px} \{root.y-far / 1px} L \{(root.entry-x / 1px) - 7} \{(root.y-far / 1px) + 3.5}"
-        : "M \{(root.entry-x / 1px) + 7} \{(root.y-far / 1px) - 3.5} L \{root.entry-x / 1px} \{root.y-far / 1px} L \{(root.entry-x / 1px) + 7} \{(root.y-far / 1px) + 3.5}";
-    // Head on this computer's far edge, pointing into this computer.
-    property <string> far-our-head: root.peer-on-right
-        ? "M \{(root.our-far-x / 1px) + 7} \{(root.y-far / 1px) - 3.5} L \{root.our-far-x / 1px} \{root.y-far / 1px} L \{(root.our-far-x / 1px) + 7} \{(root.y-far / 1px) + 3.5}"
-        : "M \{(root.our-far-x / 1px) - 7} \{(root.y-far / 1px) - 3.5} L \{root.our-far-x / 1px} \{root.y-far / 1px} L \{(root.our-far-x / 1px) - 7} \{(root.y-far / 1px) + 3.5}";
+    property <string> near-line: "M \{root.near-x1} \{root.y-near} L \{root.near-x2} \{root.y-near}";
+    // Head on THIS computer's end of the short arrow.
+    property <string> near-our-head: root.near-right
+        ? "M \{root.near-x1 + 5} \{root.y-near - 2.5} L \{root.near-x1} \{root.y-near} L \{root.near-x1 + 5} \{root.y-near + 2.5}"
+        : "M \{root.near-x1 - 5} \{root.y-near - 2.5} L \{root.near-x1} \{root.y-near} L \{root.near-x1 - 5} \{root.y-near + 2.5}";
+    // Head on the linked computer's end of the short arrow.
+    property <string> near-peer-head: root.near-right
+        ? "M \{root.near-x2 - 5} \{root.y-near - 2.5} L \{root.near-x2} \{root.y-near} L \{root.near-x2 - 5} \{root.y-near + 2.5}"
+        : "M \{root.near-x2 + 5} \{root.y-near - 2.5} L \{root.near-x2} \{root.y-near} L \{root.near-x2 + 5} \{root.y-near + 2.5}";
+
+    property <string> far-line: "M \{root.far-x1} \{root.y-far} L \{root.far-x2} \{root.y-far}";
+    // Head on THIS computer's left-edge end of the long arrow.
+    property <string> far-our-head: root.far-right
+        ? "M \{root.far-x1 + 5} \{root.y-far - 2.5} L \{root.far-x1} \{root.y-far} L \{root.far-x1 + 5} \{root.y-far + 2.5}"
+        : "M \{root.far-x1 - 5} \{root.y-far - 2.5} L \{root.far-x1} \{root.y-far} L \{root.far-x1 - 5} \{root.y-far + 2.5}";
+    // Head on the linked computer's end of the long arrow.
+    property <string> far-peer-head: root.far-right
+        ? "M \{root.far-x2 - 5} \{root.y-far - 2.5} L \{root.far-x2} \{root.y-far} L \{root.far-x2 - 5} \{root.y-far + 2.5}"
+        : "M \{root.far-x2 + 5} \{root.y-far - 2.5} L \{root.far-x2} \{root.y-far} L \{root.far-x2 + 5} \{root.y-far + 2.5}";
 
     // The short arrow: the facing-edge crossing. Hidden until a peer is
     // linked, exactly like the lit edges themselves.
@@ -519,7 +507,7 @@ component ArrangementMesh inherits Rectangle {
             + (root.head-at-peer ? root.near-peer-head : "")
             + (root.head-at-our ? root.near-our-head : "");
     }
-    // The long arrow: the far-edge crossing. Only a double discipline has
+    // The long arrow: the second crossing. Only a double discipline has
     // one, and it is visibly the longer route of the two.
     if root.enabled && root.edge-mode != 0 : Path {
         x: 0;
@@ -617,8 +605,7 @@ component ArrangementMesh inherits Rectangle {
             if (root.peer-on-right) { root.to-left(); } else { root.to-right(); }
         }
         animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
-    }
-    // Magnetic landing slot while dragging.
+    }    // Magnetic landing slot while dragging.
     if root.dragging : Rectangle {
         x: root.will-land-right ? root.inner-w - root.margin - root.card-w : root.margin;
         y: root.card-y;
@@ -656,11 +643,8 @@ component EdgeModeDiagram inherits Rectangle {
 
     // ---- Geometry ------------------------------------------------
     // Fixed right draws the linked computer on this computer's LEFT, so the
-    // pinned entry edge is the one that FACES us and the crossing can be
-    // shown as a short arrow plus a wrap-around. The other three disciplines
-    // draw it on the right: computer 1 (this PC) left, computer 2 (linked)
-    // right, exactly as "left side of computer 1 to right side of computer
-    // 2 and right side of computer 1 to left side of computer 2" reads.
+    // pinned entry edge is the one that faces us. The other three draw it on
+    // the right: computer 1 (this PC) left, computer 2 (linked) right.
     property <bool> peer-on-right: root.mode != 3;
     property <length> mon-w: 36px;
     property <length> our-x: root.peer-on-right ? 6px : 96px;
@@ -669,15 +653,6 @@ component EdgeModeDiagram inherits Rectangle {
     property <length> our-r: root.our-x + root.mon-w;
     property <length> peer-l: root.peer-x;
     property <length> peer-r: root.peer-x + root.mon-w;
-    // Two baselines inside the screens, eight apart, so both arrows of a
-    // double discipline can touch the same edge without overlapping.
-    property <length> y-near: 16px;
-    property <length> y-far: 24px;
-    // Route lane: under both monitors.
-    property <length> lane: 42px;
-    // Right-hand margin lane, used by the one arrow that has to come back
-    // around the outside of the linked computer.
-    property <length> rim: 140px;
 
     // ---- The two monitors ----------------------------------------
     Rectangle { x: root.our-x; y: 6px; width: root.mon-w; height: 28px; background: #17171a; border-radius: 4px; border-width: 1px; border-color: #22c55e; }
@@ -696,38 +671,52 @@ component EdgeModeDiagram inherits Rectangle {
     if root.mode == 1 : Rectangle { x: root.peer-on-right ? root.peer-r - 1.5px : root.peer-l - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
 
     // ---- The crossing arrows -------------------------------------
-    // One arrow per connected edge pair, and every lit edge has an arrow on
-    // it. Single has one. Every double discipline has two, and the two are
-    // deliberately DIFFERENT LENGTHS: the short one runs straight across the
-    // gap between the two facing edges; the long one leaves the far edge,
-    // runs under both monitors and comes up on the other side. Mirror's long
-    // arrow lands on the linked computer's far edge; the fixed disciplines
-    // land on their pinned facing edge, so they come back up through the gap.
-    property <string> near-line: root.peer-on-right
-        ? "M \{root.our-r / 1px} 16 L \{root.peer-l / 1px} 16"
-        : "M \{root.our-l / 1px} 16 L \{root.peer-r / 1px} 16";
-    property <string> near-peer-head: root.peer-on-right
-        ? "M \{(root.peer-l / 1px) - 5} 13.5 L \{root.peer-l / 1px} 16 L \{(root.peer-l / 1px) - 5} 18.5"
-        : "M \{(root.peer-r / 1px) + 5} 13.5 L \{root.peer-r / 1px} 16 L \{(root.peer-r / 1px) + 5} 18.5";
-    property <string> near-our-head: root.peer-on-right
-        ? "M \{(root.our-r / 1px) + 5} 13.5 L \{root.our-r / 1px} 16 L \{(root.our-r / 1px) + 5} 18.5"
-        : "M \{(root.our-l / 1px) - 5} 13.5 L \{root.our-l / 1px} 16 L \{(root.our-l / 1px) - 5} 18.5";
+    // Both arrows are dead straight and parallel.
+    //
+    // The SHORT one runs along the baseline of the screens and joins the two
+    // edges that face each other: this computer's right edge to the linked
+    // computer's left edge.
+    //
+    // The LONG one runs underneath both screens and joins this computer's
+    // LEFT edge to the linked computer's RIGHT edge - the full span of the
+    // pair, which is what makes it the longer of the two. Mirror's entry is
+    // the inverse of the exit, so that is the edge it lands on; the fixed
+    // disciplines land on their pinned entry edge instead.
+    property <length> our-facing-x: root.peer-on-right ? root.our-r : root.our-l;
+    property <length> our-far-x: root.peer-on-right ? root.our-l : root.our-r;
+    property <length> peer-facing-x: root.peer-on-right ? root.peer-l : root.peer-r;
+    property <length> entry-x:
+        root.mode == 2 ? root.peer-l
+        : root.mode == 3 ? root.peer-r
+        : (root.peer-on-right ? root.peer-r : root.peer-l);
+    property <float> near-x1: root.our-facing-x / 1px;
+    property <float> near-x2: root.peer-facing-x / 1px;
+    property <float> far-x1: root.our-far-x / 1px;
+    property <float> far-x2: root.entry-x / 1px;
+    property <int> y-near: 20;
+    property <int> y-far: 46;
+    property <bool> near-right: root.near-x1 < root.near-x2;
+    property <bool> far-right: root.far-x1 < root.far-x2;
 
-    // The long route: far edge, under both monitors, up to the entry edge.
-    property <string> far-line:
-        root.mode == 1
-            ? "M \{root.our-l / 1px} 24 L \{root.our-l / 1px} 42 L \{root.rim / 1px} 42 L \{root.rim / 1px} 24 L \{root.peer-r / 1px} 24"
-            : (root.mode == 2
-                ? "M \{root.our-l / 1px} 24 L \{root.our-l / 1px} 42 L \{(root.peer-l / 1px) - 4} 42 L \{(root.peer-l / 1px) - 4} 24 L \{root.peer-l / 1px} 24"
-                : "M \{root.our-r / 1px} 24 L \{root.our-r / 1px} 42 L \{(root.peer-r / 1px) + 4} 42 L \{(root.peer-r / 1px) + 4} 24 L \{root.peer-r / 1px} 24");
-    property <string> far-peer-head:
-        root.mode == 2
-            ? "M \{(root.peer-l / 1px) - 5} 21.5 L \{root.peer-l / 1px} 24 L \{(root.peer-l / 1px) - 5} 26.5"
-            : "M \{(root.peer-r / 1px) + 5} 21.5 L \{root.peer-r / 1px} 24 L \{(root.peer-r / 1px) + 5} 26.5";
-    property <string> far-our-head:
-        root.mode == 3
-            ? "M \{(root.our-r / 1px) + 5} 21.5 L \{root.our-r / 1px} 24 L \{(root.our-r / 1px) + 5} 26.5"
-            : "M \{(root.our-l / 1px) - 5} 21.5 L \{root.our-l / 1px} 24 L \{(root.our-l / 1px) - 5} 26.5";
+    property <string> near-line: "M \{root.near-x1} \{root.y-near} L \{root.near-x2} \{root.y-near}";
+    // Head on THIS computer's end of the short arrow.
+    property <string> near-our-head: root.near-right
+        ? "M \{root.near-x1 + 5} \{root.y-near - 2.5} L \{root.near-x1} \{root.y-near} L \{root.near-x1 + 5} \{root.y-near + 2.5}"
+        : "M \{root.near-x1 - 5} \{root.y-near - 2.5} L \{root.near-x1} \{root.y-near} L \{root.near-x1 - 5} \{root.y-near + 2.5}";
+    // Head on the linked computer's end of the short arrow.
+    property <string> near-peer-head: root.near-right
+        ? "M \{root.near-x2 - 5} \{root.y-near - 2.5} L \{root.near-x2} \{root.y-near} L \{root.near-x2 - 5} \{root.y-near + 2.5}"
+        : "M \{root.near-x2 + 5} \{root.y-near - 2.5} L \{root.near-x2} \{root.y-near} L \{root.near-x2 + 5} \{root.y-near + 2.5}";
+
+    property <string> far-line: "M \{root.far-x1} \{root.y-far} L \{root.far-x2} \{root.y-far}";
+    // Head on THIS computer's left-edge end of the long arrow.
+    property <string> far-our-head: root.far-right
+        ? "M \{root.far-x1 + 5} \{root.y-far - 2.5} L \{root.far-x1} \{root.y-far} L \{root.far-x1 + 5} \{root.y-far + 2.5}"
+        : "M \{root.far-x1 - 5} \{root.y-far - 2.5} L \{root.far-x1} \{root.y-far} L \{root.far-x1 - 5} \{root.y-far + 2.5}";
+    // Head on the linked computer's end of the long arrow.
+    property <string> far-peer-head: root.far-right
+        ? "M \{root.far-x2 - 5} \{root.y-far - 2.5} L \{root.far-x2} \{root.y-far} L \{root.far-x2 - 5} \{root.y-far + 2.5}"
+        : "M \{root.far-x2 + 5} \{root.y-far - 2.5} L \{root.far-x2} \{root.y-far} L \{root.far-x2 + 5} \{root.y-far + 2.5}";
 
     // The short arrow: the facing-edge crossing. Every discipline has one.
     Path {
@@ -746,8 +735,8 @@ component EdgeModeDiagram inherits Rectangle {
             + (root.head-at-peer ? root.near-peer-head : "")
             + (root.head-at-our ? root.near-our-head : "");
     }
-    // The long arrow: the far-edge crossing. Only a double discipline has
-    // one, and it is visibly longer than the arrow above it.
+    // The long arrow: the second crossing. Only a double discipline has
+    // one, and it is visibly the longer route of the two.
     if root.mode != 0 : Path {
         x: 0;
         y: 0;
