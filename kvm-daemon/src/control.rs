@@ -597,7 +597,18 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Some(request) = read_request(&mut stream).await? else {
+    // Bound the wait for the first frame: a client that connects and never
+    // writes pins its pipe instance forever, and once the daemon exhausted
+    // its instance pool the whole control endpoint went silent (this was
+    // the root of the "daemon not accepting" disease). Ten seconds is far
+    // longer than any legit frame write and short enough to reclaim the
+    // instance. Parse errors still propagate; a silent client just gets
+    // dropped and the pool recovers.
+    let request = match tokio::time::timeout(Duration::from_secs(10), read_request(&mut stream)).await {
+        Ok(result) => result?,
+        Err(_) => return Ok(()),
+    };
+    let Some(request) = request else {
         return Ok(());
     };
     // Presence fallback for apps that predate the presence lease: they
@@ -621,9 +632,15 @@ where
         // frames on one connection, unlike every other request.
         ControlRequest::PresenceLease => {
             let id = crate::service::presence_begin();
-            // A fresh app launch is explicit user intent: every controller
-            // pause recorded by an earlier Disconnect or quit lifts now.
-            crate::service::resume_all_controllers();
+            // Resume controllers only on genuine first app launch per
+            // PROCESS lifetime — not on every reconnect/wake. Every
+            // presence-lease re-acquisition used to re-arm every peer,
+            // which resurrected explicitly Disconnected/quit links on any
+            // transient lease flap.
+            static PRESENCE_ONCE: std::sync::Once = std::sync::Once::new();
+            PRESENCE_ONCE.call_once(|| {
+                crate::service::resume_all_controllers();
+            });
             write_response(
                 &mut stream,
                 &ControlResponse::Applied {

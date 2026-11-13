@@ -3012,24 +3012,38 @@ async fn run_windows_service_controller(
     // Suppression watchdog for this process (see TASK_HEARTBEAT_MS).
     spawn_suppression_watchdog();
     stamp_task_heartbeat();
+    // Capture-helper retries back off instead of hammering the interactive
+    // session every 2 seconds forever: 2s, 5s, 10s, 30s cap. A permanently
+    // failing capture path (e.g. Secure Desktop key transfer broken) must
+    // not burn the session trying in a tight loop.
+    let mut retry_backoff = Duration::from_secs(2);
     loop {
         let capture_result =
             tokio::task::spawn_blocking(move || ServiceCaptureProxy::create(request_lock_screen))
                 .await;
         let mut capture = match capture_result {
-            Ok(Ok(capture)) => capture,
+            Ok(Ok(capture)) => {
+                retry_backoff = Duration::from_secs(2);
+                capture
+            }
             Ok(Err(error)) => {
-                tracing::warn!(%error, "Windows service capture helpers unavailable; retrying");
+                tracing::warn!(%error, "Windows service capture helpers unavailable; retrying in {}s", retry_backoff.as_secs());
                 tokio::select! {
                     _ = shutdown_notifier().notified() => return Ok(()),
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                    _ = tokio::time::sleep(retry_backoff) => {
+                        retry_backoff = (retry_backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, "Windows capture-helper task failed; retrying");
+                tracing::warn!(%error, "Windows capture-helper task failed; retrying in {}s", retry_backoff.as_secs());
                 tokio::select! {
                     _ = shutdown_notifier().notified() => return Ok(()),
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                    _ = tokio::time::sleep(retry_backoff) => {
+                        retry_backoff = (retry_backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
                 }
             }
         };

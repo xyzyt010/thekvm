@@ -540,6 +540,7 @@ fn main() -> Result<()> {
                             ));
                         }
                         consecutive_failures = 0;
+                        POLL_FAIL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
                         ensure_link_arrangement();
                         let link_running = session_for_poll
                             .lock()
@@ -714,7 +715,16 @@ fn main() -> Result<()> {
                                 );
                             }
                             ControlFailure::Other(message) => {
-                                ui_log(&format!("poll: daemon control failed: {message}"));
+                                // One line per transition and then one every
+                                // minute, not one per second for days: this
+                                // used to bury the journal on a wedged link.
+                                let failure = POLL_FAIL_COUNT
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if failure == 0 || failure % 60 == 0 {
+                                    ui_log(&format!(
+                                        "poll: daemon control failed ({failure} consecutive): {message}"
+                                    ));
+                                }
                                 set_daemon_offline(&weak, format!("Daemon not started: {message}"));
                             }
                         }
@@ -5184,6 +5194,13 @@ fn ui_log(message: &str) {
     use std::io::Write as _;
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
+    // Rotate past 1MB so a storm of identical poll failures cannot fill the
+    // disk over weeks (ui.log is the first thing to bloat on a wedged link).
+    if let Ok(meta) = std::fs::metadata(dir.join("ui.log")) {
+        if meta.len() > 1024 * 1024 {
+            let _ = std::fs::remove_file(dir.join("ui.log"));
+        }
+    }
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -5394,9 +5411,18 @@ fn control_request(request: ControlRequest) -> Result<ControlResponse> {
     runtime().block_on(async move {
         let mut stream = open_control_stream().await?;
         write_request(&mut stream, &request).await?;
-        read_response(&mut stream)
-            .await?
-            .context("daemon closed control connection")
+        // End-to-end timeout, not just on the pipe open: a wedged-but-
+        // connected daemon must surface as a failure (and drive the poll's
+        // backoff) instead of hanging the UI thread forever.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_response(&mut stream),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon control response timed out after 10s"))?
+        .context("daemon closed control connection")?
+        .context("daemon closed control connection before answering")?;
+        Ok(response)
     })
 }
 
@@ -5871,6 +5897,7 @@ fn spinner_wanted() -> bool {
 }
 
 static SPINNER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static POLL_FAIL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SPINNER_LINK_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static SPINNER_SCAN_ACTIVE: std::sync::atomic::AtomicBool =

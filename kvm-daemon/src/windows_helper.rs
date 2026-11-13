@@ -547,6 +547,23 @@ impl ServiceCaptureProxy {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut command_streams = Vec::with_capacity(desktops.len());
         let mut readers = Vec::with_capacity(desktops.len());
+        // Every failure path tears down whatever already started: a helper
+        // that connected must not be left running with its reader thread
+        // spinning forever (it used to leak processes per retry).
+        fn teardown_capture_helpers(
+            stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+            readers: Vec<std::thread::JoinHandle<()>>,
+            command_streams: Vec<std::net::TcpStream>,
+        ) {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            use std::net::Shutdown;
+            for stream in &command_streams {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            for reader in readers {
+                let _ = reader.join();
+            }
+        }
         while command_streams.len() < desktops.len() {
             match listener.accept() {
                 Ok((mut stream, address)) => {
@@ -555,6 +572,7 @@ impl ServiceCaptureProxy {
                     let received = read_ipc_frame(&mut stream)
                         .context("read capture helper authentication")?;
                     if received != token.as_bytes() {
+                        teardown_capture_helpers(&stop, readers, command_streams);
                         bail!("rejected unauthenticated capture helper from {address}");
                     }
                     let mut reader = stream.try_clone()?;
@@ -596,11 +614,15 @@ impl ServiceCaptureProxy {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() >= deadline {
+                        teardown_capture_helpers(&stop, readers, command_streams);
                         bail!("Windows capture helper processes did not connect within 15 seconds");
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                Err(error) => return Err(error).context("accept Windows capture helper"),
+                Err(error) => {
+                    teardown_capture_helpers(&stop, readers, command_streams);
+                    return Err(error).context("accept Windows capture helper");
+                }
             }
         }
         drop(event_tx);
