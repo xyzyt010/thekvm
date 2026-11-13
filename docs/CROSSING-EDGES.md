@@ -231,6 +231,7 @@ discipline only locally; there is no link-time reconciliation.
 | `POST_RETURN_CLEAR_PX` | 64 px | Refractory clears once the cursor comes back inside by this depth. |
 | `return_hold` (daemon) | 0 ms | Sustained-pressure window. Event-only by default; the router's own rule is the unit-tested truth. |
 | `handoff_grace` (daemon) | 40 ms | Post-crossing window in which home-facing overflow clamps, so a crossing's own fling tail never snaps control home. |
+| `idle_home_secs` (config, default `10`) | Seconds of no outbound traffic on a drive after which control auto-returns home — the cursor can never strand the machine hostage mid-roam. The drive-opening crossing, like every forwarded event, stamps the activity clock, so a drive opened from an idle machine is never judged idle milliseconds in. |
 
 ---
 

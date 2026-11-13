@@ -5913,9 +5913,10 @@ struct TopologyEventContext<'a> {
     /// refuse new handoffs briefly so opposite-edge holding cannot
     /// ping-pong the drive.
     last_yield: &'a mut Option<std::time::Instant>,
-    /// Last event forwarded to the peer on the active drive (any kind):
-    /// the idle-dual arbitration reads it. Stamped in the Forward arm
-    /// only — local input while nobody is driven must not count.
+    /// Last event that proved this machine is driving the peer: on the
+    /// active drive, the opening crossing itself and any forwarded
+    /// event both stamp it. The idle-dual arbitration reads it. Local
+    /// input while nobody is driven must not count.
     last_outbound_input: &'a mut Option<std::time::Instant>,
     /// Dialer wants UDP fast-path motion for fresh episodes.
     want_udp_motion: bool,
@@ -6693,6 +6694,15 @@ async fn handle_topology_event(
             if active.is_some() {
                 bail!("topology router attempted a second active handoff");
             }
+            // Opening the drive is itself fresh user activity. Without this
+            // stamp the new drive inherits the machine's stale idle clock:
+            // the very first idle-home tick (1s) fires with an already-zero
+            // fresh window and control is returned home milliseconds after
+            // every crossing. Every re-push then bounces off the transfer
+            // debounce and the push budget keeps resetting on the user's
+            // edge-wiggles, which made one edge look dead for minutes at a
+            // time once a drive was opened from an idle machine.
+            *last_outbound_input = Some(std::time::Instant::now());
             // Push-attempt telemetry: the router fired for this edge push.
             // If crossings silently never start, this line (or its absence
             // beside live capture) names the dead layer: no line with
