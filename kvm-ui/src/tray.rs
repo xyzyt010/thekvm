@@ -691,8 +691,8 @@ unsafe fn frame_rect_solid(
 #[cfg(target_os = "windows")]
 unsafe fn owner_draw_menu_items(menu: windows::Win32::UI::WindowsAndMessaging::HMENU) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetMenuItemCount, GetMenuItemInfoW, MENUITEMINFOW, MFT_OWNERDRAW, MIIM_ID, MIIM_SUBMENU,
-        MIIM_TYPE, SetMenuItemInfoW,
+        GetMenuItemCount, GetMenuItemInfoW, MENUITEMINFOW, MFT_OWNERDRAW, MIIM_DATA, MIIM_ID,
+        MIIM_SUBMENU, MIIM_TYPE, SetMenuItemInfoW,
     };
 
     let count = GetMenuItemCount(menu);
@@ -714,10 +714,14 @@ unsafe fn owner_draw_menu_items(menu: windows::Win32::UI::WindowsAndMessaging::H
         }
         // Keep the command id exactly as it was: the tray dispatch (and the
         // menu crate's own channel) match on it. Only the paint type and the
-        // owner-draw payload change.
+        // owner-draw payload change. MIIM_DATA is required for dwItemData to
+        // take effect at all - without it Win32 silently keeps the item's
+        // previous payload (0), which made every owner-draw row paint the
+        // label at index 0 ("Show TheKVM") while the background click still
+        // invoked the right command.
         let mut update = MENUITEMINFOW {
             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_TYPE | MIIM_ID,
+            fMask: MIIM_TYPE | MIIM_ID | MIIM_DATA,
             fType: MFT_OWNERDRAW,
             wID: info.wID,
             dwItemData: position as usize,

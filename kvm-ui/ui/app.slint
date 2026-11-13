@@ -372,8 +372,8 @@ component ArrangementMesh inherits Rectangle {
     // never lets the other one in.)
     property <bool> exit-left: root.our-mode != 2 && (root.edge-mode != 0 || !root.peer-on-right);
     property <bool> exit-right: root.our-mode != 2 && (root.edge-mode != 0 || root.peer-on-right);
-    property <bool> enter-left: root.our-mode != 1 && (root.edge-mode == 1 || root.edge-mode == 2 || (root.edge-mode == 0 && !root.peer-on-right));
-    property <bool> enter-right: root.our-mode != 1 && (root.edge-mode == 1 || root.edge-mode == 3 || (root.edge-mode == 0 && root.peer-on-right));
+    property <bool> enter-left: root.our-mode != 1 && (root.edge-mode == 1 || root.edge-mode == 2 || (root.edge-mode == 0 && root.peer-on-right));
+    property <bool> enter-right: root.our-mode != 1 && (root.edge-mode == 1 || root.edge-mode == 3 || (root.edge-mode == 0 && !root.peer-on-right));
 
     // ---- Roles, carried by the arrow heads -------------------------
     property <bool> we-may-drive: root.our-mode == 0 || root.our-mode == 1;
@@ -394,6 +394,16 @@ component ArrangementMesh inherits Rectangle {
     property <length> our-r: root.our-cur-x + root.card-w;
     property <length> peer-l: root.peer-cur-x;
     property <length> peer-r: root.peer-cur-x + root.card-w;
+    // Bar centres inside a monitor card (the source of every colored bar):
+    // the lit bars sit 7px inside the card (left edge of the screen area)
+    // or 7px+143px+3px/2 (right edge). Every arrow endpoint lands on the
+    // exact bar it connects, so an arrow never overshoots the frame it
+    // joins (an earlier version ran card-edge to card-edge and stuck out
+    // past both monitors' bezels).
+    property <length> our-bar-l: root.our-cur-x + 8.5px;
+    property <length> our-bar-r: root.our-cur-x + 151.5px;
+    property <length> peer-bar-l: root.peer-cur-x + 8.5px;
+    property <length> peer-bar-r: root.peer-cur-x + 151.5px;
 
 
     // Chevron row: a plain Rectangle does not stretch its children, so the
@@ -467,21 +477,24 @@ component ArrangementMesh inherits Rectangle {
     // computer's LEFT edge to the linked computer's RIGHT edge, so it runs
     // the full span of the pair underneath both screens. Two connected
     // edges, two arrows, and the second is visibly the longer route.
-    property <length> our-facing-x: root.peer-on-right ? root.our-r : root.our-l;
-    property <length> our-far-x: root.peer-on-right ? root.our-l : root.our-r;
-    property <length> peer-facing-x: root.peer-on-right ? root.peer-l : root.peer-r;
+    property <length> our-facing-x: root.peer-on-right ? root.our-bar-r : root.our-bar-l;
+    property <length> our-far-x: root.peer-on-right ? root.our-bar-l : root.our-bar-r;
+    property <length> peer-facing-x: root.peer-on-right ? root.peer-bar-l : root.peer-bar-r;
     // The peer edge the second arrow lands on: Mirror takes the far edge,
     // the fixed disciplines take their pinned edge whatever side the card
     // sits on.
     property <length> entry-x:
-        root.edge-mode == 2 ? root.peer-l
-        : root.edge-mode == 3 ? root.peer-r
-        : (root.peer-on-right ? root.peer-r : root.peer-l);
+        root.edge-mode == 2 ? root.peer-bar-l
+        : root.edge-mode == 3 ? root.peer-bar-r
+        : (root.peer-on-right ? root.peer-bar-r : root.peer-bar-l);
     property <float> near-x1: root.our-facing-x / 1px;
     property <float> near-x2: root.peer-facing-x / 1px;
     property <float> far-x1: root.our-far-x / 1px;
     property <float> far-x2: root.entry-x / 1px;
-    property <int> y-near: root.card-y / 1px + 38;
+    // Single draws ONE arrow, and it runs dead straight through the
+    // vertical middle of the screens; the double disciplines keep their
+    // staggered two-arrow pair.
+    property <int> y-near: root.edge-mode == 0 ? root.card-y / 1px + 49 : root.card-y / 1px + 38;
     property <int> y-far: root.card-y / 1px + 60;
     property <bool> near-right: root.near-x1 < root.near-x2;
     property <bool> far-right: root.far-x1 < root.far-x2;
@@ -659,10 +672,11 @@ component EdgeModeDiagram inherits Rectangle {
     property <bool> head-at-our: root.backward-ok;
 
     // ---- Geometry ------------------------------------------------
-    // Fixed right draws the linked computer on this computer's LEFT, so the
-    // pinned entry edge is the one that faces us. The other three draw it on
-    // the right: computer 1 (this PC) left, computer 2 (linked) right.
-    property <bool> peer-on-right: root.mode != 3;
+    // The tiles draw the CURRENT arrangement (the linked computer on the
+    // side the user arranged), not a baked-in mirrored scene: what must
+    // match reality is where the pinned entry edge is, so each discipline
+    // always visibly agrees with the arrangement shown above it.
+    in property <bool> peer-on-right: true;
     property <length> mon-w: 36px;
     property <length> our-x: root.peer-on-right ? 6px : 96px;
     property <length> peer-x: root.peer-on-right ? 96px : 6px;
@@ -710,7 +724,7 @@ component EdgeModeDiagram inherits Rectangle {
     property <float> near-x2: root.peer-facing-x / 1px;
     property <float> far-x1: root.our-far-x / 1px;
     property <float> far-x2: root.entry-x / 1px;
-    property <int> y-near: 14;
+    property <int> y-near: root.mode == 0 ? 20 : 14;
     property <int> y-far: 26;
     property <bool> near-right: root.near-x1 < root.near-x2;
     property <bool> far-right: root.far-x1 < root.far-x2;
@@ -790,12 +804,14 @@ component EdgeModeTile inherits Rectangle {
     width: 162px;
     height: 110px;
     border-radius: 10px;
-    // Selection is shown by a slightly lifted panel, NOT a green frame: the
-    // green outline read as a second accent competing with the arrows, and
-    // the current discipline is already named in green beside the heading.
-    background: root.selected ? #1b2740 : #111827;
-    border-width: 1.5px;
-    border-color: hit.has-hover && root.enabled ? #4b5563 : #1f2937;
+    // The tile in force wears a green highlight box - the same accent the
+    // live edges use - so the discipline actually applied to the link is
+    // unmistakable at a glance.
+    background: root.selected ? #14231a : #111827;
+    border-width: root.selected ? 2px : 1.5px;
+    border-color: root.selected ? #22c55e : (hit.has-hover && root.enabled ? #4b5563 : #1f2937);
+    drop-shadow-color: root.selected ? #22c55e33 : #00000000;
+    drop-shadow-blur: root.selected ? 12px : 0px;
     opacity: root.enabled ? 1 : 0.4;
     animate background { duration: 140ms; }
     hit := TouchArea {
@@ -813,6 +829,7 @@ component EdgeModeTile inherits Rectangle {
             mode: root.mode;
             our-mode: root.our-mode;
             peer-mode: root.peer-mode;
+            peer-on-right: root.arranged-peer-on-right;
         }
         Text {
             text: root.label;
@@ -1798,8 +1815,25 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0; height: 1px; background: #1f2937; }
 
                     // ---- Arrangement -------------------------------------
-                    Text {
-                        vertical-stretch: 0; text: "Screen arrangement"; color: white; font-size: 14px; font-weight: 700; }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        Text {
+                            text: "Screen arrangement";
+                            color: white;
+                            font-size: 14px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.edge-mode-index == 0 ? "Single" : root.edge-mode-index == 1 ? "Mirror" : root.edge-mode-index == 2 ? "Fixed left" : "Fixed right";
+                            color: #22c55e;
+                            font-size: 12px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
                     ArrangementMesh {
                         vertical-stretch: 0;
                         local-name: root.device-name;

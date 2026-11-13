@@ -71,6 +71,10 @@ Two binaries per machine:
 
 ## Modes
 
+There are two orthogonal mode axes: the **connection mode** (who may drive
+whom) and the **edge discipline** (which edges of each machine open and
+close crossings). Connection modes:
+
 1. **Bidirectional** — either machine may control the other when a session is connected
 2. **Controller only** — configure the server/controller with `--mode
    server-client`; it initiates sessions and accepts no incoming control
@@ -80,6 +84,11 @@ Two binaries per machine:
 For a strict one-way setup, use `server-client` on the controlling machine and
 `receiver-only` on the controlled machine. The handshake enforces both local
 roles, so a receiver-only peer cannot quietly initiate a reverse session.
+
+Edge disciplines — Single, Double Mirror (default), Double Fixed left,
+Double Fixed right — together with the full return path, refraction,
+guarantees, and a troubleshooting matrix are specified in
+[Crossing edges: how modes work](docs/CROSSING-EDGES.md).
 
 ## First vertical slice
 

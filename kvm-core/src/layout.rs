@@ -1,4 +1,4 @@
-use crate::EdgeMode;
+﻿use crate::EdgeMode;
 use crate::InputEvent;
 use serde::{Deserialize, Serialize};
 
@@ -3402,6 +3402,176 @@ mod tests {
         assert_eq!(router.active_remote(), None);
     }
 
+    // ---- Mode adherence contract (Double Mirror / FixedLeft / FixedRight /
+    // Single), exercised for outbound crossings and home-facing returns from
+    // either edge, on a two-machine side-by-side link. -------------------
+
+    /// Drive one crossing into the lone peer and return the edge the
+    /// drive exited through locally. The peer is always the grid-right
+    /// screen with a fingerprint (lone peer).
+    fn drive_into_peer(router: &mut EdgeRouter, exit_edge: Edge) -> Edge {
+        match exit_edge {
+            Edge::Right => router.place_local_cursor(1900, 540).unwrap(),
+            Edge::Left => router.place_local_cursor(20, 540).unwrap(),
+            other => panic!("test only exits horizontally, got {other:?}"),
+        }
+        let handoff = router.route(InputEvent::MouseMove {
+            dx: match exit_edge {
+                Edge::Right => 1000,
+                Edge::Left => -1000,
+                _ => unreachable!(),
+            },
+            dy: 0,
+        });
+        let RoutedEvent::Handoff { edge, .. } = handoff else {
+            panic!("expected Handoff on {exit_edge:?}, got {handoff:?}");
+        };
+        edge
+    }
+
+    /// Mirror discipline: which peer edge a given local exit enters through.
+    fn mirror_entry(exit_edge: Edge) -> Edge {
+        exit_edge.opposite()
+    }
+
+    /// Arm the return by moving inside from the entry edge.
+    fn arm_from_entry(router: &mut EdgeRouter, entry_edge: Edge) {
+        match entry_edge {
+            Edge::Left => {
+                router.route(InputEvent::MouseMove { dx: 100, dy: 0 });
+            }
+            Edge::Right => {
+                router.route(InputEvent::MouseMove { dx: -100, dy: 0 });
+            }
+            other => panic!("test only enters horizontally, got {other:?}"),
+        }
+    }
+
+    fn lone_pair_layout() -> Layout {
+        Layout::pair_default("me", "peer", &"ab".repeat(32))
+    }
+
+    #[test]
+    fn mirror_facing_entry_returns_from_both_edges() {
+        for far_push in [true, false] {
+            let mut router = EdgeRouter::new(lone_pair_layout()).unwrap();
+            router.set_edge_mode(EdgeMode::Double);
+            router.set_double_style(DoubleEdgeStyle::Mirror);
+            // Facing crossing: exit main's right edge into peer's left edge.
+            let edge = drive_into_peer(&mut router, Edge::Right);
+            assert_eq!(edge, Edge::Right);
+            arm_from_entry(&mut router, mirror_entry(Edge::Right));
+            let result = router.route(InputEvent::MouseMove {
+                dx: if far_push { 4000 } else { -4000 },
+                dy: 0,
+            });
+            assert!(
+                matches!(
+                    result,
+                    RoutedEvent::ReturnHome {
+                        from: ScreenId(2),
+                        ..
+                    }
+                ),
+                "mirror must return from both edges (far_push={far_push}), got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_outer_entry_returns_from_both_edges() {
+        for far_push in [true, false] {
+            let mut router = EdgeRouter::new(lone_pair_layout()).unwrap();
+            router.set_edge_mode(EdgeMode::Double);
+            router.set_double_style(DoubleEdgeStyle::Mirror);
+            // Outer crossing: exit main's LEFT edge into peer's RIGHT edge.
+            let edge = drive_into_peer(&mut router, Edge::Left);
+            assert_eq!(edge, Edge::Left);
+            arm_from_entry(&mut router, mirror_entry(Edge::Left));
+            let result = router.route(InputEvent::MouseMove {
+                dx: if far_push { 4000 } else { -4000 },
+                dy: 0,
+            });
+            assert!(
+                matches!(
+                    result,
+                    RoutedEvent::ReturnHome {
+                        from: ScreenId(2),
+                        ..
+                    }
+                ),
+                "mirror must return from both edges (far_push={far_push}), got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_pins_entry_and_return() {
+        for (style, pinned) in [
+            (DoubleEdgeStyle::FixedLeft, Edge::Left),
+            (DoubleEdgeStyle::FixedRight, Edge::Right),
+        ] {
+            // Outer crossing (left exit): pinned entry edge.
+            let mut router = EdgeRouter::new(lone_pair_layout()).unwrap();
+            router.set_edge_mode(EdgeMode::Double);
+            router.set_double_style(style);
+            assert_eq!(drive_into_peer(&mut router, Edge::Left), Edge::Left);
+            arm_from_entry(&mut router, pinned);
+            // Out the pinned edge: armed return.
+            let home = router.route(InputEvent::MouseMove {
+                dx: if pinned == Edge::Left { -4000 } else { 4000 },
+                dy: 0,
+            });
+            assert!(
+                matches!(home, RoutedEvent::ReturnHome { .. }),
+                "fixed mode must return through its pinned edge ({style:?}), got {home:?}"
+            );
+            // Out the other edge: pinned, so it can NEVER come home.
+            let mut router = EdgeRouter::new(lone_pair_layout()).unwrap();
+            router.set_edge_mode(EdgeMode::Double);
+            router.set_double_style(style);
+            assert_eq!(drive_into_peer(&mut router, Edge::Left), Edge::Left);
+            arm_from_entry(&mut router, pinned);
+            let held = router.route(InputEvent::MouseMove {
+                dx: if pinned == Edge::Left { 4000 } else { -4000 },
+                dy: 0,
+            });
+            assert!(
+                !matches!(held, RoutedEvent::ReturnHome { .. }),
+                "fixed mode must NOT return through the unpinned edge ({style:?}), got {held:?}"
+            );
+            assert_eq!(router.active_remote(), Some(ScreenId(2)));
+        }
+    }
+
+    #[test]
+    fn single_mode_only_the_facing_edge_crosses_and_returns() {
+        let mut router = EdgeRouter::new(lone_pair_layout()).unwrap();
+        router.set_edge_mode(EdgeMode::Single);
+        router.set_double_style(DoubleEdgeStyle::Mirror);
+        // Outer edge: no crossing at all, in either direction of push.
+        router.place_local_cursor(20, 540).unwrap();
+        let held = router.route(InputEvent::MouseMove { dx: -4000, dy: 0 });
+        assert!(!matches!(held, RoutedEvent::Handoff { .. }));
+        assert_eq!(router.active_remote(), None);
+        // Facing edge: crossing opens.
+        let edge = drive_into_peer(&mut router, Edge::Right);
+        assert_eq!(edge, Edge::Right);
+        // Returns only through the facing (left) edge: right edge clamps.
+        arm_from_entry(&mut router, mirror_entry(Edge::Right));
+        let held = router.route(InputEvent::MouseMove { dx: 4000, dy: 0 });
+        assert!(
+            !matches!(held, RoutedEvent::ReturnHome { .. }),
+            "single mode must NOT return through the outer edge, got {held:?}"
+        );
+        let home = router.route(InputEvent::MouseMove { dx: -4000, dy: 0 });
+        assert!(
+            matches!(home, RoutedEvent::ReturnHome { .. }),
+            "single mode must return through its facing edge, got {home:?}"
+        );
+    }
+
+
     #[test]
     fn opposite_edges_mirror() {
         assert_eq!(Edge::Left.opposite(), Edge::Right);
@@ -3925,3 +4095,4 @@ impl Edge {
         }
     }
 }
+
