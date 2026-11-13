@@ -7,7 +7,7 @@ set -eu
 # user). Default keeps the documented ~/thekvm-build layout for Mint builds.
 BUILD_DIR="${THEKVM_BUILD_DIR:-$HOME/thekvm-build}"
 cd "$BUILD_DIR"
-VER=0.9.93
+VER=0.9.94
 PKG=thekvm
 ROOT=debroot
 sudo rm -rf "$ROOT" "${PKG}_${VER}_amd64.deb"
