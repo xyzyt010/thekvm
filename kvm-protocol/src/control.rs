@@ -141,6 +141,14 @@ pub enum ControlRequest {
     /// Clear every controller pause: the desktop app just launched, which is
     /// explicit user intent to use the links again. The reply is `Applied`.
     ResumeControllers,
+    /// Full teardown requested by the user's "Quit TheKVM": end every link
+    /// this machine could carry (ban epochs, drop inbound sessions, notify
+    /// peers), stand this daemon's controllers down, then STOP AND DISABLE
+    /// the machine's background service so nothing on this machine can
+    /// drive or be driven until the service is installed/started again.
+    /// Local control-socket callers only (the logged-in app's Quit path).
+    /// The reply is `Applied`; the service stops in the background.
+    StopService,
     /// Hold a daemon-side lease on one outbound link for this process's
     /// lifetime: the supervised child opens this persistent control
     /// connection right after its verify and keeps it open with

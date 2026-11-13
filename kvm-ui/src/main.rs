@@ -5065,6 +5065,12 @@ fn quit_full_terminate(session: &Arc<Mutex<Option<Session>>>) {
         slot.as_ref()
             .map(|session| (session.address.clone(), session.link_id))
     });
+    // End every outbound link this app started, then ask this machine's
+    // daemon to stop its background service with it. Quit means the whole
+    // stack goes down: both sides drop the link, the port closes, nothing
+    // on this machine can drive or be driven until the service is started
+    // again. Best-effort: a daemon that is already gone must not block the
+    // exit.
     if let Some((address, link_id)) = outbound {
         // Same bilateral hang-up as Disconnect, before the child dies so
         // an in-flight redial is already rejected when the child stops.
@@ -5084,6 +5090,13 @@ fn quit_full_terminate(session: &Arc<Mutex<Option<Session>>>) {
                 link.link_id,
             );
         }
+    }
+    // Full teardown of this machine's service too: the quit button must not
+    // leave a listening port or a system service able to drive this machine
+    // after the user is done with the app.
+    match control_request(ControlRequest::StopService) {
+        Ok(_) => ui_log("tray quit: background service stop requested"),
+        Err(error) => ui_log(&format!("tray quit: background service stop request failed ({error:#}); service may still be running")),
     }
     kill_user_daemon();
     ui_log("tray quit: exit");

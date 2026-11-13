@@ -790,6 +790,52 @@ where
                 }
             }
         }
+        ControlRequest::StopService => {
+            // "Quit TheKVM": full teardown. End every link this machine
+            // could carry (ban epochs, drop inbound sessions, notify the
+            // peers), stand this machine's controller down, then stop and
+            // disable the background service so nothing on this computer can
+            // drive or be driven until the service is started again. The
+            // reply is written before the service stops so the caller never
+            // blocks on a dying daemon.
+            let inbound = crate::service::list_inbound_links();
+            for session in &inbound {
+                crate::service::teardown_link(
+                    &data_dir,
+                    Some(&session.fingerprint_hex),
+                    Some(&session.address),
+                    session.link_id,
+                    "stop-service",
+                )
+                .await;
+                let _ = crate::service::drop_inbound_link(&session.fingerprint_hex);
+            }
+            // Stand every pinned controller down so nothing re-dials between
+            // the teardown and the service going away.
+            {
+                let book = peers.read().await;
+                for peer in &book.peers {
+                    crate::service::pause_peer_controller(&peer.fingerprint_hex);
+                }
+            }
+            crate::service::audit_event(
+                &data_dir,
+                "stop-service requested by local app; service will disable and stop itself",
+            );
+            // Reply first; the service disables and stops right after.
+            let dir = data_dir.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if let Err(error) = stop_and_disable_service(&dir).await {
+                    tracing::warn!(?error, "stop-service: could not disable the background service");
+                }
+                // The service is on its way out; wake the main loop.
+                crate::service::shutdown_notifier().notify_one();
+            });
+            ControlResponse::Applied {
+                restart_required: true,
+            }
+        }
         ControlRequest::Status => {
             let current = config.read().await.clone();
             let peer_count = peers.read().await.peers.len();
@@ -1381,6 +1427,71 @@ where
     };
     write_response(&mut stream, &response).await?;
     Ok(())
+}
+
+/// Stop and disable the machine's background service. The daemon normally
+/// runs as the privileged service account (SYSTEM on Windows, root on
+/// Linux), which is exactly what is allowed to stop/disable the service
+/// itself. Best effort: failures are logged, not propagated — the caller
+/// has already been told `Applied`, and a user-run foreground daemon must
+/// never change the service it doesn't own (the commands simply refuse).
+async fn stop_and_disable_service(#[cfg_attr(target_os = "windows", allow(unused_variables))] data_dir: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        // Neutralize the SCM failure actions (restart on failure) first so
+        // the stop below is final, then stop the service. From inside the
+        // service this is an orderly request; SCM handles a service that
+        // stops itself.
+        let disable = std::process::Command::new("sc.exe")
+            .args(["config", "TheKVM", "start=", "disabled"])
+            .output();
+        match disable {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                tracing::warn!(
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "sc.exe config TheKVM start= disabled did not succeed"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "sc.exe not runnable; cannot disable the TheKVM service");
+            }
+        }
+        let stop = std::process::Command::new("sc.exe")
+            .args(["stop", "TheKVM"])
+            .output();
+        match stop {
+            Ok(output) if output.status.success() => {}
+            // 1062 = the service has not been started (nothing to stop).
+            Ok(output) if output.status.code() == Some(1062) => {}
+            Ok(output) => {
+                tracing::warn!(
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "sc.exe stop TheKVM did not succeed"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "sc.exe not runnable; cannot stop the TheKVM service");
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = std::process::Command::new("systemctl")
+            .args(["disable", "--now", "thekvmd.service"])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => {
+                anyhow::bail!(
+                    "systemctl disable --now thekvmd.service: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+            }
+            Err(error) => anyhow::bail!("systemctl not runnable: {error}"),
+        }
+    }
 }
 
 fn is_fingerprint(value: &str) -> bool {
