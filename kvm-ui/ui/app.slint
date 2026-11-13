@@ -154,6 +154,11 @@ component MonitorCard inherits Rectangle {
     in property <bool> dimmed: false;
     // Steps fully aside while its dragged copy is on screen.
     in property <bool> hidden: false;
+    // True while the linked computer is live right now; the mesh passes the
+    // link state down. False dims the card, border and power LED.
+    in property <bool> powered: true;
+    // Briefly true on a handoff: the lit edge bars flash brighter.
+    in property <bool> crossing-pulse: false;
     // Fixed size: a min-width alone lets a layout inflate the card past its
     // drawn frame, which pushed the stand off-centre.
     width: 160px;
@@ -169,7 +174,7 @@ component MonitorCard inherits Rectangle {
         background: #17171a;
         border-radius: 9px;
         border-width: 1.5px;
-        border-color: root.local ? (root.hovered || root.dragging ? #4ade80 : #22c55e) : (root.hovered || root.dragging ? #a8a29e : #57534e);
+        border-color: root.local ? (root.hovered || root.dragging ? #4ade80 : (root.powered ? #22c55e : #57534e)) : (root.hovered || root.dragging ? #a8a29e : (root.powered ? #5eead4 : #3f3f46));
         drop-shadow-color: #00000088;
         drop-shadow-blur: 10px;
         drop-shadow-offset-y: 3px;
@@ -187,10 +192,10 @@ component MonitorCard inherits Rectangle {
                 : @linear-gradient(180deg, #141414 0%, #0a0a0a 100%);
             border-radius: 4px;
             // Exit bars (this computer) and entry bars (linked computer).
-            if root.exit-left : Rectangle { x: 0; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: #22c55e; }
-            if root.exit-right : Rectangle { x: 143px; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: #22c55e; }
-            if root.enter-left : Rectangle { x: 0; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: #5eead4; }
-            if root.enter-right : Rectangle { x: 143px; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: #5eead4; }
+            if root.exit-left : Rectangle { x: 0; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #86efac : #22c55e; }
+            if root.exit-right : Rectangle { x: 143px; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #86efac : #22c55e; }
+            if root.enter-left : Rectangle { x: 0; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #99f6e4 : #5eead4; }
+            if root.enter-right : Rectangle { x: 143px; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #99f6e4 : #5eead4; }
             // Tiny direction chevrons beside the lit edges.
             if root.exit-left : Path { x: 7px; y: 35px; width: 10px; height: 10px; viewbox-width: 10; viewbox-height: 10; stroke: #22c55e; stroke-width: 1.8px; stroke-line-cap: round; stroke-line-join: round; fill: transparent; commands: "M 8 2 L 3 5 L 8 8"; }
             if root.exit-right : Path { x: 129px; y: 35px; width: 10px; height: 10px; viewbox-width: 10; viewbox-height: 10; stroke: #22c55e; stroke-width: 1.8px; stroke-line-cap: round; stroke-line-join: round; fill: transparent; commands: "M 2 2 L 7 5 L 2 8"; }
@@ -226,7 +231,7 @@ component MonitorCard inherits Rectangle {
             width: 4px;
             height: 4px;
             border-radius: 2px;
-            background: root.local ? #22c55e : #44403c;
+            background: root.powered ? (root.local ? #22c55e : #2dd4bf) : #44403c;
         }
     }
     // Stand neck and base. The card is a fixed 160px wide, so the stand is
@@ -287,6 +292,10 @@ component ArrangementMesh inherits Rectangle {
     in property <bool> peer-on-right: true;
     in property <bool> enabled: false;
     in property <int> edge-mode: 0;
+    // Live link state and a brief pulse on each handoff, passed through to
+    // the cards and arrows.
+    in property <bool> link-live: false;
+    in property <bool> crossing-pulse: false;
     // Roles of this computer and the linked computer: they decide where the
     // arrow heads sit, exactly as in the crossing-edge illustrations.
     in property <int> our-mode: 0;
@@ -357,10 +366,14 @@ component ArrangementMesh inherits Rectangle {
         }
     }
 
-    property <bool> exit-left: root.edge-mode != 0 || !root.peer-on-right;
-    property <bool> exit-right: root.edge-mode != 0 || root.peer-on-right;
-    property <bool> enter-left: root.edge-mode == 1 || root.edge-mode == 2 || (root.edge-mode == 0 && !root.peer-on-right);
-    property <bool> enter-right: root.edge-mode == 1 || root.edge-mode == 3 || (root.edge-mode == 0 && root.peer-on-right);
+    // Exit edges are this computer's way OUT and entry edges are the linked
+    // computer's way IN: hidden under the role that forbids that direction.
+    // ("Be controlled only" never leaves this machine; "Control other only"
+    // never lets the other one in.)
+    property <bool> exit-left: root.our-mode != 2 && (root.edge-mode != 0 || !root.peer-on-right);
+    property <bool> exit-right: root.our-mode != 2 && (root.edge-mode != 0 || root.peer-on-right);
+    property <bool> enter-left: root.our-mode != 1 && (root.edge-mode == 1 || root.edge-mode == 2 || (root.edge-mode == 0 && !root.peer-on-right));
+    property <bool> enter-right: root.our-mode != 1 && (root.edge-mode == 1 || root.edge-mode == 3 || (root.edge-mode == 0 && root.peer-on-right));
 
     // ---- Roles, carried by the arrow heads -------------------------
     property <bool> we-may-drive: root.our-mode == 0 || root.our-mode == 1;
@@ -426,6 +439,8 @@ component ArrangementMesh inherits Rectangle {
         local: true;
         exit-left: root.enabled && root.exit-left;
         exit-right: root.enabled && root.exit-right;
+        powered: root.link-live;
+        crossing-pulse: root.crossing-pulse;
         animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
     }
     peer := MonitorCard {
@@ -441,6 +456,8 @@ component ArrangementMesh inherits Rectangle {
         hovered: drag-area.has-hover;
         dragging: root.dragging;
         dimmed: !root.enabled;
+        powered: root.link-live;
+        crossing-pulse: root.crossing-pulse;
         animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
     }
     // ---- The crossing arrows ---------------------------------------
@@ -498,8 +515,8 @@ component ArrangementMesh inherits Rectangle {
         height: 166px;
         viewbox-width: max(1, root.inner-w / 1px);
         viewbox-height: 166;
-        stroke: #22c55e;
-        stroke-width: 2px;
+        stroke: root.crossing-pulse ? #a7f3d0 : #22c55e;
+        stroke-width: root.crossing-pulse ? 3px : 2px;
         stroke-line-cap: round;
         stroke-line-join: round;
         fill: transparent;
@@ -516,8 +533,8 @@ component ArrangementMesh inherits Rectangle {
         height: 166px;
         viewbox-width: max(1, root.inner-w / 1px);
         viewbox-height: 166;
-        stroke: #5eead4;
-        stroke-width: 2px;
+        stroke: root.crossing-pulse ? #99f6e4 : #5eead4;
+        stroke-width: root.crossing-pulse ? 3px : 2px;
         stroke-line-cap: round;
         stroke-line-join: round;
         fill: transparent;
@@ -935,6 +952,13 @@ component RoleDropdown inherits Rectangle {
     in property <string> current: "Both ways";
     in property <int> mode-index: 0;
     in property <bool> enabled: true;
+    // The daemon is applying the pending role — show a donut in the arrow
+    // slot so the press visibly took effect. Cleared when the daemon
+    // confirms (or refuses).
+    in property <bool> applying: false;
+    // The role just landed: brief green frame on the dropdown.
+    in-out property <bool> applied: false;
+    in property <int> tick: 0;
     callback picked(int);
     // Compact: the widest role label plus the chevron, so the box hugs its
     // contents instead of leaving a long empty stretch between the label
@@ -944,7 +968,7 @@ component RoleDropdown inherits Rectangle {
     border-radius: 8px;
     background: hit.has-hover || popup.is-open ? #2a2a2a : #1c1c1c;
     border-width: 1px;
-    border-color: popup.is-open ? #22c55e : (hit.has-hover ? #4b5563 : #2a2a2a);
+    border-color: root.applying || root.applied ? #22c55e : (popup.is-open ? #22c55e : (hit.has-hover ? #4b5563 : #2a2a2a));
     animate background { duration: 120ms; }
     animate border-color { duration: 120ms; }
     hit := TouchArea {
@@ -979,7 +1003,9 @@ component RoleDropdown inherits Rectangle {
         horizontal-alignment: center;
         overflow: elide;
     }
-    Rectangle {
+    // While applying, the chevron slot becomes a donut. When it lands,
+    // the frame goes green briefly (self-clearing).
+    if !root.applying : Rectangle {
         x: parent.width - 24px;
         y: (parent.height - 14px) / 2;
         width: 14px;
@@ -990,6 +1016,19 @@ component RoleDropdown inherits Rectangle {
             open: popup.is-open;
             glyph-color: popup.is-open ? #22c55e : #9ca3af;
         }
+    }
+    if root.applying : SpinnerArc {
+        x: parent.width - 24px;
+        y: (parent.height - 14px) / 2;
+        width: 14px;
+        height: 14px;
+        diameter: 14px;
+        tick: root.tick;
+    }
+    Timer {
+        interval: 700ms;
+        running: root.applied;
+        triggered => { root.applied = false; }
     }
     popup := PopupWindow {
         x: 0;
@@ -1108,6 +1147,12 @@ export component AppWindow inherits Window {
         interval: 7s;
         triggered => { root.status-notice = ""; }
     }
+    // The crossing pulse is a flash, not a state: it clears itself.
+    Timer {
+        interval: 650ms;
+        running: root.crossing-pulse;
+        triggered => { root.crossing-pulse = false; }
+    }
 
     in property <string> status-text: "";
     // Transient feedback line: mirrors the latest status briefly (errors,
@@ -1131,6 +1176,18 @@ export component AppWindow inherits Window {
     in-out property <int> peer-mode: 0;
     in-out property <bool> edge-active: false;
     in-out property <string> driving-text: "";
+    // True while a live inbound session from the peer has demonstrably taken
+    // the cursor AND sent input recently (peer is actively driving).
+    in-out property <bool> inbound-driving: false;
+    // True while OUR outbound drive is active (child stderr said "driving").
+    in-out property <bool> outbound-driving: false;
+    // Link is live right now: our dial-back child verified, or an inbound
+    // session is verifiably carrying input. The mesh, LED and borders use
+    // this instead of "some peer exists in the book".
+    in-out property <bool> link-live: false;
+    // Brief handoff pulse: the lit edge bars and crossing arrows flash
+    // bright for a moment on every crossing.
+    in-out property <bool> crossing-pulse: false;
     in-out property <string> revoke-fingerprint: "";
     in-out property <string> pending-peer-fingerprint: "";
     in-out property <string> pending-peer-name: "";
@@ -1165,6 +1222,10 @@ export component AppWindow inherits Window {
     in-out property <string> auto-connect-note: "";
     // 0 Both ways, 1 Control other only, 2 Be controlled only.
     in-out property <int> mode-index: 0;
+    // Set while a role change is in flight (arc shows in the dropdown), and
+    // briefly after it lands (green frame).
+    in-out property <bool> role-applying: false;
+    in-out property <bool> role-applied: false;
     // 0 Single, 1 Mirror, 2 Fixed left, 3 Fixed right.
     in-out property <int> edge-mode-index: 1;
     // True while an edge-mode change is being applied to a live child; the
@@ -1254,6 +1315,41 @@ export component AppWindow inherits Window {
     VerticalLayout {
         padding: 0px;
         spacing: 0px;
+
+        // Persistent offline banner: daemon unreachable is shown at all
+        // times, on every tab (not the 7-second transient footer). Visible
+        // only while offline — a conditional element takes no layout space.
+        if !connected : Rectangle {
+            vertical-stretch: 0;
+            height: 34px;
+            background: #3b2f07;
+            border-width: 1px;
+            border-color: #f59e0b;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+                Text {
+                    text: "⚠ Background service is offline";
+                    color: #fbbf24;
+                    font-size: 12px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: "the link cannot work until it is running";
+                    color: #fcd34d;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Button {
+                    text: "Start service";
+                    clicked => { root.start-daemon(); }
+                }
+            }
+        }
 
         // NOTE: no header of any kind lives here anymore — not even the
         // old slim status row. Every in-flow strip above the tabs read
@@ -1414,6 +1510,9 @@ export component AppWindow inherits Window {
                             height: 34px;
                             current: root.role-text;
                             mode-index: root.mode-index;
+                            applying: root.role-applying;
+                            applied: root.role-applied;
+                            tick: root.spinner-tick;
                             picked(index) => { set-role(index); }
                         }
                     }
@@ -1706,12 +1805,26 @@ export component AppWindow inherits Window {
                         local-name: root.device-name;
                         peer-name: root.linked-peer-name;
                         peer-on-right: root.peer-on-right;
-                        enabled: root.linked-peer-name != "";
+                        enabled: root.link-live;
+                        link-live: root.link-live;
+                        crossing-pulse: root.crossing-pulse;
                         edge-mode: root.edge-mode-index;
                         our-mode: root.mode-index;
                         peer-mode: root.peer-mode;
                         to-left => { place-peer-left(); }
                         to-right => { place-peer-right(); }
+                    }
+                    // Live cue for who has the cursor right now. Honest about
+                    // which computer currently makes this screen respond.
+                    if root.outbound-driving : Text {
+                        vertical-stretch: 0;
+                        text: "You are driving " + root.linked-peer-name;
+                        color: #22c55e; font-size: 12px; font-weight: 700;
+                    }
+                    if !root.outbound-driving && root.inbound-driving : Text {
+                        vertical-stretch: 0;
+                        text: root.linked-peer-name + " is driving this computer";
+                        color: #5eead4; font-size: 12px; font-weight: 700;
                     }
 
                     Rectangle {

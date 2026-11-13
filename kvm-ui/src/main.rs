@@ -756,63 +756,74 @@ fn main() -> Result<()> {
                 // at the top of the Connect tab populates right after
                 // startup (plus the dedicated startup scan below).
                 if auto_scan_in == 0 {
-                    auto_scan_in = 15;
-                    let idle = session_for_poll
-                        .lock()
-                        .ok()
-                        .is_none_or(|slot| slot.is_none());
+                    auto_scan_in = 20;
                     let wanted = kvm_core::Config::load(&link_dir.join("config.json"))
                         .map(|config| config.auto_discover)
                         .unwrap_or(true);
-                    if idle && wanted {
-                        set_discovery_scanning(&weak, true);
-                        let found_full = scan_lan_devices_full();
-                        set_discovery_scanning(&weak, false);
-                        // Remember the linked peer's advertised role so the
-                        // arrangement arrows reflect what BOTH computers
-                        // allow (both ways -> two arrows, server/client ->
-                        // one arrow in that direction).
+                    if wanted && scan_in_flight() {
+                        // A previous scan is still running; try again soon.
+                        auto_scan_in = 5;
+                    } else if wanted {
+                        let scan_weak = weak.clone();
+                        let scan_peers = discovered_for_poll.clone();
                         let linked_fp = status_peer_fingerprint();
-                        if let Some(mode) = found_full
-                            .iter()
-                            .find(|(_, _, fp, _)| Some(fp.as_str()) == linked_fp.as_deref())
-                            .map(|(_, _, _, mode)| *mode)
-                        {
-                            set_arrangement_modes(&weak, our_mode, mode);
-                        }
-                        let found: Vec<(String, String, String)> = found_full                            .into_iter()
-                            .map(|(label, address, fingerprint, _)| (label, address, fingerprint))
-                            .collect();
-                        if !found.is_empty() {
-                            // Log only when the nearby set changes: a line
-                            // every 15s forever would bury the journal.
-                            let changed = discovered_for_poll.lock().ok().is_none_or(|slot| {
-                                let mut old = slot.clone();
-                                old.sort();
-                                let mut new: Vec<String> =
-                                    found.iter().map(|(_, addr, _)| addr.clone()).collect();
-                                new.sort();
-                                old != new
-                            });
-                            if changed {
-                                ui_log(&format!(
-                                    "discovery: auto-scan found {} device(s): {}",
-                                    found.len(),
-                                    found
-                                        .iter()
-                                        .map(|(label, _, _)| label.clone())
-                                        .collect::<Vec<_>>()
-                                        .join("; ")
-                                ));
-                                // A newly detected computer must be visible
-                                // even if the card was hidden earlier: only
-                                // an UNCHANGED set respects the user's ✕.
-                                set_discovery_card(&weak, true);
-                            }
-                            store_discovered(&weak, &discovered_for_poll, found, false);
-                        }
-                    }
-                } else {
+                        let our_m = our_mode;
+                        std::thread::Builder::new()
+                            .name("thekvm-auto-scan".into())
+                            .spawn(move || {
+                                set_scan_in_flight(true);
+                                set_discovery_scanning(&scan_weak, true);
+                                let found_full = scan_lan_devices_full();
+                                set_discovery_scanning(&scan_weak, false);
+                                // Remember the linked peer's advertised role so the
+                                // arrangement arrows reflect what BOTH computers
+                                // allow (both ways -> two arrows, server/client ->
+                                // one arrow in that direction). Runs whether or not
+                                // a link is live, off the poll thread, so the
+                                // arrowheads never show a stale role.
+                                if let Some(mode) = found_full
+                                    .iter()
+                                    .find(|(_, _, fp, _)| Some(fp.as_str()) == linked_fp.as_deref())
+                                    .map(|(_, _, _, mode)| *mode)
+                                {
+                                    set_arrangement_modes(&scan_weak, our_m, mode);
+                                }
+                                let found: Vec<(String, String, String)> = found_full
+                                    .into_iter()
+                                    .map(|(label, address, fingerprint, _)| (label, address, fingerprint))
+                                    .collect();
+                                if !found.is_empty() {
+                                    // Log only when the nearby set changes: a line
+                                    // every 20s forever would bury the journal.
+                                    let changed = scan_peers.lock().ok().is_none_or(|slot| {
+                                        let mut old = slot.clone();
+                                        old.sort();
+                                        let mut new: Vec<String> =
+                                            found.iter().map(|(_, addr, _)| addr.clone()).collect();
+                                        new.sort();
+                                        old != new
+                                    });
+                                    if changed {
+                                        ui_log(&format!(
+                                            "discovery: auto-scan found {} device(s): {}",
+                                            found.len(),
+                                            found
+                                                .iter()
+                                                .map(|(label, _, _)| label.clone())
+                                                .collect::<Vec<_>>()
+                                                .join("; ")
+                                        ));
+                                        // A newly detected computer must be visible
+                                        // even if the card was hidden earlier: only
+                                        // an UNCHANGED set respects the user's x.
+                                        set_discovery_card(&scan_weak, true);
+                                    }
+                                    store_discovered(&scan_weak, &scan_peers, found, false);
+                                }
+                                set_scan_in_flight(false);
+                            })
+                            .ok();
+                    }                } else {
                     auto_scan_in -= 1;
                 }
             })); // end catch_unwind for one poll iteration
@@ -1052,6 +1063,7 @@ fn main() -> Result<()> {
         ui_log(&format!("role button pressed: {role}"));
         // Instant local feedback: the press always lands, even if the daemon
         // turns out to be unreachable. The result overwrites this below.
+        set_role_applying(&weak, true);
         set_status(&weak, "Applying role…".into());
         std::thread::spawn(move || {
             let requested = match role {
@@ -1065,11 +1077,13 @@ fn main() -> Result<()> {
             let current = match control_request(ControlRequest::GetConfig) {
                 Ok(ControlResponse::Config(config)) => config,
                 Ok(other) => {
+                    set_role_applying(&weak, false);
                     ui_log(&format!("role change: cannot read settings: {other:?}"));
                     set_status(&weak, format!("Cannot read settings: {other:?}"));
                     return;
                 }
                 Err(error) => {
+                    set_role_applying(&weak, false);
                     ui_log(&format!("role change: settings unreadable: {error:#}"));
                     set_status(&weak, control_denied_status(&error, "Background service unreachable"));
                     return;
@@ -1093,6 +1107,8 @@ fn main() -> Result<()> {
                 auto_connect_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
+                    set_role_applying(&weak, false);
+                    set_role_applied(&weak);
                     mirror_user_config(
                         &current.device_name,
                         requested,
@@ -1153,14 +1169,17 @@ fn main() -> Result<()> {
                     );
                 }
                 Ok(ControlResponse::Error { message }) => {
+                    set_role_applying(&weak, false);
                     ui_log(&format!("role change refused: {message}"));
                     set_status(&weak, message)
                 }
                 Ok(other) => {
+                    set_role_applying(&weak, false);
                     ui_log(&format!("role change unexpected: {other:?}"));
                     set_status(&weak, format!("Unexpected daemon response: {other:?}"))
                 }
                 Err(error) => {
+                    set_role_applying(&weak, false);
                     ui_log(&format!("role change failed: {error}"));
                     set_status(&weak, format!("Cannot set role: {error}"))
                 }
@@ -2051,7 +2070,11 @@ fn main() -> Result<()> {
                             let _ = slint::invoke_from_event_loop(move || {
                                 if let Some(ui) = weak.upgrade() {
                                     ui.invoke_disconnect();
+                                    // Visible feedback even when the user was
+                                    // in another app: bring the window forward.
+                                    let _ = ui.window().show();
                                 }
+                                tray::focus_main_window();
                             });
                         }
                         tray::TrayCommand::OpenLogs => open_log_folder(),
@@ -2059,7 +2082,10 @@ fn main() -> Result<()> {
                     }
                 }
             })
-            .ok();
+            .map(|_| ())
+            .unwrap_or_else(|error| {
+                ui_log(&format!("tray commands thread failed to spawn ({error}); tray menu is dead"));
+            });
     }
 
     // Close hides to the tray (the link keeps running); tray Quit is the
@@ -2292,6 +2318,22 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                 ui.set_fingerprint(SharedString::from(status.fingerprint_hex));
                 ui.set_role_text(SharedString::from(role_name(status.mode)));
                 ui.set_pairing_code(SharedString::from(status.pairing_code));
+                // The peer is driving THIS machine right now: a live
+                // inbound session that has taken the cursor and sent input
+                // recently. Drives the "peer is driving this computer" cue
+                // and the arrow/edge pulse. A session that has not sent
+                // input yet is not proof (a link we cannot time-stamp
+                // must not pre-empt either side).
+                let inbound = status
+                    .sessions
+                    .iter()
+                    .any(|session| session.driving && session.last_input_age_ms.is_some_and(|age| age < 5000));
+                let previous = INBOUND_DRIVING.swap(inbound, std::sync::atomic::Ordering::Relaxed);
+                if inbound != previous {
+                    ui.set_crossing_pulse(true);
+                }
+                ui.set_inbound_driving(inbound);
+                ui.set_link_live(link_live());
             }
         }
     });
@@ -2302,7 +2344,13 @@ fn set_daemon_offline(weak: &slint::Weak<AppWindow>, message: String) {
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
+                SESSION_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+                INBOUND_DRIVING.store(false, std::sync::atomic::Ordering::Relaxed);
+                OUTBOUND_DRIVING.store(false, std::sync::atomic::Ordering::Relaxed);
                 ui.set_connected(false);
+                ui.set_inbound_driving(false);
+                ui.set_outbound_driving(false);
+                ui.set_link_live(false);
                 ui.set_status_text(SharedString::from(message));
                 ui.set_incoming_pairing(SharedString::new());
                 ui.set_incoming_pairing_fingerprint(SharedString::new());
@@ -5019,9 +5067,34 @@ fn open_log_folder() {
 /// tree. The installed system service (thekvmd / TheKVM) is deliberately
 /// NOT tracked here: Quit stops everything the APP started, never the
 /// machine's service.
+// Live-link state, tracked outside the UI thread so both the poll loop and
+// the child-relay paths can publish it. link_live = any side verifiably
+// carrying the link: our dial-back child verified, or a live inbound
+// session with input, or our outbound drive active.
+static SESSION_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static INBOUND_DRIVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static OUTBOUND_DRIVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn link_live() -> bool {
+    SESSION_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+        || INBOUND_DRIVING.load(std::sync::atomic::Ordering::Relaxed)
+        || OUTBOUND_DRIVING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static USER_DAEMON: std::sync::OnceLock<std::sync::Mutex<Option<std::process::Child>>> =
     std::sync::OnceLock::new();
 
+// One LAN scan at a time: the poll timer no longer blocks on discovery, but
+// nothing stops two scans from stacking on top of each other if the LAN is
+// slow — so the scan is guarded. Without the guard, a dead link could spawn
+// a scan every 20s forever and saturate the interface.
+static SCAN_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn scan_in_flight() -> bool {
+    SCAN_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire)
+}
+fn set_scan_in_flight(value: bool) {
+    SCAN_IN_FLIGHT.store(value, std::sync::atomic::Ordering::Release);
+}
 /// Remember a UI-spawned user daemon, replacing a dead previous one. A
 /// live previous daemon means control should have worked and this spawn
 /// is redundant — but a second user daemon fights over the port, so the
@@ -5638,6 +5711,8 @@ fn mirror_user_config(
 }
 
 fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
+    SESSION_ACTIVE.store(address.is_some(), std::sync::atomic::Ordering::Relaxed);
+    let live = link_live();
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
@@ -5650,11 +5725,13 @@ fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
                         ui.set_session_active(true);
                         ui.set_session_verified(true);
                         ui.set_session_text(SharedString::from(format!("Connected to {address}")));
+                        ui.set_link_live(true);
                     }
                     None => {
                         ui.set_session_active(false);
                         ui.set_session_verified(false);
                         ui.set_session_text(SharedString::from("Not connected"));
+                        ui.set_link_live(live);
                     }
                 }
             }
@@ -5671,10 +5748,12 @@ fn set_session_connecting(weak: &slint::Weak<AppWindow>, address: &str) {
         let address = address.to_owned();
         move || {
             if let Some(ui) = weak.upgrade() {
+                SESSION_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
                 ui.set_session_active(true);
                 ui.set_session_verified(false);
                 ui.set_session_text(SharedString::from(format!("Connecting to {address}…")));
                 ui.set_link_connecting(true);
+                ui.set_link_live(true);
             }
         }
     });
@@ -5702,10 +5781,12 @@ fn set_session_connected(
         let address = address.to_owned();
         move || {
             if let Some(ui) = weak.upgrade() {
+                SESSION_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
                 ui.set_session_active(true);
                 ui.set_session_verified(true);
                 ui.set_session_text(SharedString::from(format!("Connected to {address}")));
                 ui.set_link_connecting(false);
+                ui.set_link_live(true);
             }
         }
     });
@@ -5786,6 +5867,7 @@ fn spinner_wanted() -> bool {
     SPINNER_LINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
         || SPINNER_SCAN_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
         || SPINNER_EDGE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+        || SPINNER_ROLE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static SPINNER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -5796,6 +5878,9 @@ static SPINNER_SCAN_ACTIVE: std::sync::atomic::AtomicBool =
 /// Set while an edge-mode change is being applied to a live session (the
 /// tile shows the donut until the child acknowledges on stderr).
 static SPINNER_EDGE_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Set while a role change is in flight (the dropdown shows the donut).
+static SPINNER_ROLE_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Show/hide the donut on the pressed edge-mode tile. The spinner ticker
@@ -5810,6 +5895,36 @@ fn set_edge_applying(weak: &slint::Weak<AppWindow>, applying: bool) {
         move || {
             if let Some(ui) = weak.upgrade() {
                 ui.set_edge_applying(applying);
+            }
+        }
+    });
+}
+
+/// Show/hide the donut in the role dropdown. The spinner ticker runs
+/// whenever any donut is visible.
+fn set_role_applying(weak: &slint::Weak<AppWindow>, applying: bool) {
+    SPINNER_ROLE_ACTIVE.store(applying, std::sync::atomic::Ordering::Release);
+    if applying {
+        ensure_spinner_ticker(weak);
+    }
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_role_applying(applying);
+            }
+        }
+    });
+}
+
+/// Flash the dropdown green once the role has landed (self-clearing in the
+/// dropdown itself after 700ms).
+fn set_role_applied(weak: &slint::Weak<AppWindow>) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_role_applied(true);
             }
         }
     });
@@ -6265,11 +6380,22 @@ fn edge_ready_text() -> String {
 }
 
 fn set_driving(weak: &slint::Weak<AppWindow>, text: String) {
+    // The child stderr says "driving"/"local" on every handoff; expose the
+    // boolean and pulse the edges on transitions so the user sees the
+    // crossing happen. The text keeps driving the UI copy.
+    let driving = !text.is_empty();
+    let previous = OUTBOUND_DRIVING.swap(driving, std::sync::atomic::Ordering::SeqCst);
+    let live = link_live();
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
+                ui.set_outbound_driving(driving);
                 ui.set_driving_text(SharedString::from(text));
+                if driving != previous {
+                    ui.set_crossing_pulse(true);
+                }
+                ui.set_link_live(live);
             }
         }
     });

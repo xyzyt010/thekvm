@@ -1,4 +1,4 @@
-﻿//! System tray icon with a right-click menu (Show, Disconnect, Open
+//! System tray icon with a right-click menu (Show, Disconnect, Open
 //! logs, Quit).
 //!
 //! The window close button hides to the tray instead of exiting (see
@@ -44,10 +44,12 @@ pub enum TrayCommand {
 
 type MenuIds = (u32, u32, u32, u32);
 
-/// Tray menu labels, in menu order (Windows owner-draw indexes into it).
+/// The four tray menu rows, in menu order. Single source of truth for both
+/// the menu builder and the Windows owner-draw painter.
+const TRAY_MENU_LABELS: [&str; 4] = ["Show TheKVM", "Disconnect", "Open logs", "Quit TheKVM"];
+/// Windows owner-draw indexes into the same order.
 #[cfg(target_os = "windows")]
-const TRAY_LABELS: [&str; 4] = ["Show TheKVM", "Disconnect", "Open logs", "Quit TheKVM"];
-/// Requested menu background: near-black charcoal.
+const TRAY_LABELS: [&str; 4] = TRAY_MENU_LABELS;
 #[cfg(target_os = "windows")]
 const MENU_BG_RGB: u32 = 0x0012_1212;
 /// Row highlight while the cursor is over an item.
@@ -80,6 +82,14 @@ impl TrayHandles {
 /// window-only instead of taking the whole UI down.
 pub fn spawn_tray() -> Option<Receiver<TrayCommand>> {
     let (tx, rx) = channel::<TrayCommand>();
+    // The tray icon must never exist without being usable: a dead tray is
+    // worse than no tray (the window-hide path would strand the app with no
+    // way back). Both platform thread bodies report readiness over this
+    // channel; if any step fails the caller sees None and keeps the
+    // window-only close-to-exit fallback instead of pretending the tray
+    // exists.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+
 
     // Linux: libappindicator's menu activation callbacks are dispatched by
     // the GTK main loop. Creating the tray without iterating that loop
@@ -93,10 +103,12 @@ pub fn spawn_tray() -> Option<Receiver<TrayCommand>> {
                 // GTK must be initialized on, and pumped by, this thread;
                 // no other thread touches it afterwards.
                 if gtk::init().is_err() {
+                    let _ = ready_tx.send(false);
                     return;
                 }
                 let built = std::panic::catch_unwind(build_tray_handles);
                 let Ok(Some(handles)) = built else {
+                    let _ = ready_tx.send(false);
                     return;
                 };
                 let (show_id, disconnect_id, logs_id, quit_id) = handles.ids();
@@ -114,6 +126,7 @@ pub fn spawn_tray() -> Option<Receiver<TrayCommand>> {
                 // Owned by this thread for the whole loop; dropping it would
                 // remove the icon.
                 let _handles = handles;
+                let _ = ready_tx.send(true);
                 gtk::main();
             })
             .ok()?;
@@ -130,6 +143,7 @@ pub fn spawn_tray() -> Option<Receiver<TrayCommand>> {
             .spawn(move || {
                 let built = std::panic::catch_unwind(build_tray_handles);
                 let Ok(Some(handles)) = built else {
+                    let _ = ready_tx.send(false);
                     return;
                 };
                 // Publish the command channel and item ids so raw Win32
@@ -141,6 +155,7 @@ pub fn spawn_tray() -> Option<Receiver<TrayCommand>> {
                 install_windows_dark_menu();
                 let (show_id, disconnect_id, logs_id, quit_id) = handles.ids();
                 let _handles = handles;
+                let _ = ready_tx.send(true);
                 let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
                 loop {
                     // Blocks until a tray/queue message arrives; zero CPU
@@ -173,8 +188,10 @@ pub fn spawn_tray() -> Option<Receiver<TrayCommand>> {
             .spawn(move || {
                 let built = std::panic::catch_unwind(build_tray_handles);
                 let Ok(Some(handles)) = built else {
+                    let _ = ready_tx.send(false);
                     return;
                 };
+                let _ = ready_tx.send(true);
                 loop {
                     let (show_id, disconnect_id, logs_id, quit_id) = handles.ids();
                     match drain_events(show_id, disconnect_id, logs_id, quit_id, &tx) {
@@ -191,7 +208,13 @@ pub fn spawn_tray() -> Option<Receiver<TrayCommand>> {
             .ok()?;
     }
 
-    Some(rx)
+    // Give the tray thread a bounded window to report success. A missing or
+    // broken tray must surface as None so the caller never hides the window
+    // into a dead tray.
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(4)) {
+        Ok(true) => Some(rx),
+        _ => None,
+    }
 }
 
 /// Drain both global receivers once. `Ok(true)` means Quit was delivered
@@ -226,9 +249,9 @@ fn drain_events(
     }
     let tray_rx = tray_event_receiver();
     while let Ok(event) = tray_rx.try_recv() {
-        // Left-click shows the window (standard tray UX); anything else is
-        // ignored.
-        if matches!(event.event, ClickEvent::Left) {
+        // Left-click and double-click both re-show the window (standard tray
+        // UX); anything else is ignored.
+        if matches!(event.event, ClickEvent::Left | ClickEvent::Double) {
             tx.send(TrayCommand::Show).map_err(|_| ())?;
         }
     }
@@ -237,7 +260,7 @@ fn drain_events(
 
 /// Menu labels shared by every platform's menu builder (the Windows
 /// owner-draw handler indexes the same order).
-const TRAY_MENU_LABELS: [&str; 4] = ["Show TheKVM", "Disconnect", "Open logs", "Quit TheKVM"];
+
 
 fn build_tray_handles() -> Option<TrayHandles> {
     let menu = Menu::new();
@@ -312,11 +335,16 @@ fn build_icon() -> Icon {
     }
     match Icon::from_rgba(rgba, W as u32, H as u32) {
         Ok(icon) => icon,
-        // 64x64 RGBA always satisfies Icon's invariants; a None here can
-        // only mean a platform backend refused the buffer, and the tray is
-        // optional anyway (build_tray_handles bails).
-        Err(_) => return Icon::from_rgba(vec![0u8; 64 * 64 * 4], 64, 64)
-            .unwrap_or_else(|_| unreachable!("1x1 RGBA icon is always valid")),
+        // A transparent fallback was a way to ship an invisible tray icon
+        // (no menu reachable without an Explorer restart). Fall back to a
+        // solid green glyph instead so the menu is always reachable.
+        Err(_) => {
+            let solid: Vec<u8> = (0..24 * 24)
+                .flat_map(|_| [0x22, 0xc5, 0x5e, 0xff])
+                .collect();
+            Icon::from_rgba(solid, 24, 24)
+                .unwrap_or_else(|_| unreachable!("solid 24x24 RGBA icon is always valid"))
+        }
     }
 }
 
@@ -397,8 +425,81 @@ pub fn focus_main_window() {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn focus_main_window() {}
+#[cfg(target_os = "linux")]
+pub fn focus_main_window() {
+    // Activate and raise the TheKVM window on X11 (Wayland compositors
+    // usually ignore this; the tray menu still brings it forward on X11,
+    // which is the platform where "open in the background" was reported).
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{self, ConnectionExt as XprotoConnectionExt};
+    let Ok((connection, screen)) = x11rb::connect(None) else {
+        return;
+    };
+    let root = screen.root;
+    let atom_net_client_list = match connection.intern_atom(false, b"_NET_CLIENT_LIST") {
+        Ok(reply) => reply.atom,
+        Err(_) => return,
+    };
+    let atom_net_active_window = match connection.intern_atom(false, b"_NET_ACTIVE_WINDOW") {
+        Ok(reply) => reply.atom,
+        Err(_) => return,
+    };
+    let atom_wm_name = match connection.intern_atom(false, b"_NET_WM_NAME") {
+        Ok(reply) => reply.atom,
+        Err(_) => return,
+    };
+    let atom_utf8 = match connection.intern_atom(false, b"UTF8_STRING") {
+        Ok(reply) => reply.atom,
+        Err(_) => return,
+    };
+    let reply = match connection.get_property(
+        false,
+        root,
+        atom_net_client_list,
+        xproto::AtomEnum::WINDOW,
+        0,
+        u32::MAX,
+    ) {
+        Ok(reply) => reply,
+        Err(_) => return,
+    };
+    let windows: Vec<xproto::Window> = reply
+        .value32()
+        .map(|iter| iter.collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v as xproto::Window)
+        .collect();
+    let mut target = None;
+    for hwnd in windows {
+        let Ok(prop) = connection.get_property(false, hwnd, atom_wm_name, atom_utf8, 0, 256) else {
+            continue;
+        };
+        let title = String::from_utf8_lossy(&prop.value).into_owned();
+        if title.starts_with("TheKVM") {
+            target = Some(hwnd);
+            break;
+        }
+    }
+    let Some(hwnd) = target else { return };
+    // _NET_ACTIVE_WINDOW message to the root window asks the WM to activate
+    // (raise + focus) our window.
+    let data: [u32; 5] = [2, 0, 0, 0, 0];
+    let _ = connection.send_event(
+        false,
+        root,
+        xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+        xproto::ClientMessageEvent {
+            response_type: 33, // ClientMessage
+            format: 32,
+            sequence: 0,
+            window: hwnd,
+            type_: atom_net_active_window,
+            data: xproto::ClientMessageData::from(data),
+        },
+    );
+    let _ = connection.flush();
+}
 
 /// Subclass ids: the tray-icon window and the popup menu window are two
 /// different windows and each needs its own slot.
@@ -409,32 +510,63 @@ const MENU_WINDOW_SUBCLASS_ID: usize = 0x0BAD_C1A1;
 
 /// Locate the live tray window (tray-icon creates a hidden window with the
 /// class name `tray_icon_app`) and install the dark menu subclass on it.
-/// Called from the tray thread after the tray is built.
+/// Called from the tray thread after the tray is built. The enumeration is
+/// PID-filtered: bare `FindWindowW("tray_icon_app")` would hand our subclass
+/// to *any* muda/tray-icon app sharing the desktop, and that other app would
+/// then paint our dark menu (and swallow our menu commands) instead of
+/// ours.
 #[cfg(target_os = "windows")]
 fn install_windows_dark_menu() {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
 
-    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    INSTALLED.get_or_init(|| {
-        let class: Vec<u16> = "tray_icon_app\0".encode_utf16().collect();
-        let hwnd: HWND =
-            unsafe { FindWindowW(windows::core::PCWSTR(class.as_ptr()), None) }
-                .unwrap_or_default();
-        if hwnd.0.is_null() {
-            return;
+    fn pid_of(hwnd: HWND) -> u32 {
+        let mut pid = 0u32;
+        let _ = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, Some(&mut pid))
+        };
+        pid
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, param: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL {
+        use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+        if pid_of(hwnd) != std::process::id() {
+            return true.into();
         }
-        unsafe {
-            set_dark_theme_globals(hwnd);
-            let proc: windows::Win32::UI::Shell::SUBCLASSPROC = Some(tray_menu_subclass_proc);
-            let _ = windows::Win32::UI::Shell::SetWindowSubclass(
-                hwnd,
-                proc,
-                TRAY_SUBCLASS_ID,
-                0,
-            );
+        let mut class = [0u16; 64];
+        let len = unsafe { GetClassNameW(hwnd, &mut class) };
+        let name = String::from_utf16_lossy(&class[..len as usize]);
+        if name == "tray_icon_app" {
+            let slot = &mut *(param.0 as *mut Option<HWND>);
+            if slot.is_none() {
+                *slot = Some(hwnd);
+            }
+            return false.into();
         }
-    });
+        true.into()
+    }
+
+    let mut found: Option<HWND> = None;
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_proc),
+            windows::Win32::Foundation::LPARAM(&mut found as *mut _ as isize),
+        );
+    }
+    let Some(hwnd) = found else {
+        crate::ui_log("tray: tray window not found for this process; dark menu not installed");
+        return;
+    };
+    unsafe {
+        set_dark_theme_globals(hwnd);
+        let proc: windows::Win32::UI::Shell::SUBCLASSPROC = Some(tray_menu_subclass_proc);
+        let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+            hwnd,
+            proc,
+            TRAY_SUBCLASS_ID,
+            0,
+        );
+    }
 }
 
 /// Ask comctl32/DWM to treat this window (and the process) as dark. Best
@@ -638,6 +770,31 @@ fn find_menu_window() -> Option<windows::Win32::Foundation::HWND> {
     found
 }
 
+/// One brush for the whole process (the menu popup uses it every time it
+/// paints its dark background). Creating one per right-click was leaking a
+/// GDI object every time; the process never got them back.
+#[cfg(target_os = "windows")]
+fn dark_brush() -> windows::Win32::Graphics::Gdi::HBRUSH {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH};
+    struct SharedBrush(HBRUSH);
+    unsafe impl Send for SharedBrush {}
+    unsafe impl Sync for SharedBrush {}
+    static BRUSH: std::sync::OnceLock<SharedBrush> = std::sync::OnceLock::new();
+    BRUSH.get_or_init(|| SharedBrush(unsafe { CreateSolidBrush(COLORREF(MENU_BG_RGB)) })).0
+}
+/// Called from a short-lived thread spawned on WM_INITMENUPOPUP so the tray
+#[cfg(target_os = "windows")]
+fn install_menu_window_with_retry() {
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if let Some(menu_hwnd) = find_menu_window() {
+            unsafe { darken_menu_window(menu_hwnd) };
+            return;
+        }
+    }
+}
+
 /// Paint the menu window's frame with the menu colour instead of the light
 /// system 3D edge, and mark the window dark for comctl32.
 #[cfg(target_os = "windows")]
@@ -646,13 +803,21 @@ unsafe fn darken_menu_window(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::UI::Controls::SetWindowTheme;
     use windows::Win32::UI::Shell::SetWindowSubclass;
 
-    let explorer: Vec<u16> = "DarkMode_Explorer\0".encode_utf16().collect();
-    let none: Vec<u16> = "\0".encode_utf16().collect();
-    let _ = SetWindowTheme(
-        hwnd,
-        windows::core::PCWSTR(explorer.as_ptr()),
-        windows::core::PCWSTR(none.as_ptr()),
-    );
+    // Theme + subclass are one-time installs; only the frame paint is
+    // per-repaint. Repeating the theme/subclass calls on every NCPAINT was
+    // extra flicker and per-paint GDI churn.
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let explorer: Vec<u16> = "DarkMode_Explorer\0".encode_utf16().collect();
+        let none: Vec<u16> = "\0".encode_utf16().collect();
+        let _ = SetWindowTheme(
+            hwnd,
+            windows::core::PCWSTR(explorer.as_ptr()),
+            windows::core::PCWSTR(none.as_ptr()),
+        );
+        let proc: windows::Win32::UI::Shell::SUBCLASSPROC = Some(tray_menu_subclass_proc);
+        let _ = SetWindowSubclass(hwnd, proc, MENU_WINDOW_SUBCLASS_ID, 0);
+    });
     let mut rect = windows::Win32::Foundation::RECT::default();
     if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).is_ok() {
         let hdc = GetWindowDC(hwnd);
@@ -667,8 +832,6 @@ unsafe fn darken_menu_window(hwnd: windows::Win32::Foundation::HWND) {
             let _ = ReleaseDC(hwnd, hdc);
         }
     }
-    let proc: windows::Win32::UI::Shell::SUBCLASSPROC = Some(tray_menu_subclass_proc);
-    let _ = SetWindowSubclass(hwnd, proc, MENU_WINDOW_SUBCLASS_ID, 0);
 }
 
 /// Resolve the selected menu item's command id from a `WM_COMMAND` or a
@@ -732,7 +895,7 @@ unsafe extern "system" fn tray_menu_subclass_proc(
         WM_INITMENUPOPUP => {
             let menu = HMENU(wparam.0 as *mut _);
             owner_draw_menu_items(menu);
-            let brush: HBRUSH = CreateSolidBrush(COLORREF(MENU_BG_RGB));
+            let brush: HBRUSH = dark_brush();
             let info = MENUINFO {
                 cbSize: std::mem::size_of::<MENUINFO>() as u32,
                 fMask: MIM_BACKGROUND,
@@ -743,10 +906,11 @@ unsafe extern "system" fn tray_menu_subclass_proc(
                 dwMenuData: 0,
             };
             let _ = SetMenuInfo(menu, &info);
-            // Darken the menu window's border as soon as it exists.
-            if let Some(menu_hwnd) = find_menu_window() {
-                darken_menu_window(menu_hwnd);
-            }
+            // The popup window may not exist yet at this exact moment; ask a
+            // short-lived thread to find and darken it as soon as it does.
+            // Retrying beats missing the menu frame on the first (or every)
+            // right-click.
+            std::thread::spawn(install_menu_window_with_retry);
             return DefSubclassProc(hwnd, message, wparam, lparam);
         }
         WM_MEASUREITEM => {

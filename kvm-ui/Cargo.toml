@@ -25,6 +25,10 @@ serde_json = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.15"
+# Activation (_NET_ACTIVE_WINDOW) of our window when the Linux tray menu's
+# "Show" is clicked: raises the window to the foreground instead of opening
+# it behind whatever is active.
+x11rb = { version = "0.13", default-features = false }
 # The supervised child must die with this process (PR_SET_PDEATHSIG) even
 # when the app is SIGKILLed from a terminal or the process monitor.
 libc = "0.2"
