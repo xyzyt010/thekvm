@@ -432,10 +432,12 @@ pub fn focus_main_window() {
     // which is the platform where "open in the background" was reported).
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{self, ConnectionExt as XprotoConnectionExt};
-    let Ok((connection, screen)) = x11rb::connect(None) else {
+    let Ok((connection, screen_number)) = x11rb::connect(None) else {
         return;
     };
-    let root = screen.root;
+    let Some(root) = connection.setup().roots.get(screen_number).map(|screen| screen.root) else {
+        return;
+    };
     let intern = |name: &[u8]| -> Option<xproto::Atom> {
         connection
             .intern_atom(false, name)
