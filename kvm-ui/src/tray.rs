@@ -436,44 +436,40 @@ pub fn focus_main_window() {
         return;
     };
     let root = screen.root;
-    let atom_net_client_list = match connection.intern_atom(false, b"_NET_CLIENT_LIST") {
-        Ok(reply) => reply.atom,
-        Err(_) => return,
+    let intern = |name: &[u8]| -> Option<xproto::Atom> {
+        connection
+            .intern_atom(false, name)
+            .map_err(|_| ())
+            .and_then(|cookie| cookie.reply().map_err(|_| ()))
+            .map(|reply| reply.atom)
+            .ok()
     };
-    let atom_net_active_window = match connection.intern_atom(false, b"_NET_ACTIVE_WINDOW") {
-        Ok(reply) => reply.atom,
-        Err(_) => return,
-    };
-    let atom_wm_name = match connection.intern_atom(false, b"_NET_WM_NAME") {
-        Ok(reply) => reply.atom,
-        Err(_) => return,
-    };
-    let atom_utf8 = match connection.intern_atom(false, b"UTF8_STRING") {
-        Ok(reply) => reply.atom,
-        Err(_) => return,
-    };
-    let reply = match connection.get_property(
-        false,
-        root,
-        atom_net_client_list,
-        xproto::AtomEnum::WINDOW,
-        0,
-        u32::MAX,
-    ) {
+    let Some(atom_net_client_list) = intern(b"_NET_CLIENT_LIST") else { return };
+    let Some(atom_net_active_window) = intern(b"_NET_ACTIVE_WINDOW") else { return };
+    let Some(atom_wm_name) = intern(b"_NET_WM_NAME") else { return };
+    let Some(atom_utf8) = intern(b"UTF8_STRING") else { return };
+    let reply = match connection
+        .get_property(false, root, atom_net_client_list, xproto::AtomEnum::WINDOW, 0, u32::MAX)
+        .map_err(|_| ())
+        .and_then(|cookie| cookie.reply().map_err(|_| ()))
+    {
         Ok(reply) => reply,
         Err(_) => return,
     };
     let windows: Vec<xproto::Window> = reply
-        .value32()
-        .map(|iter| iter.collect::<Vec<_>>())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|v| v as xproto::Window)
+        .value
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as xproto::Window)
         .collect();
     let mut target = None;
     for hwnd in windows {
-        let Ok(prop) = connection.get_property(false, hwnd, atom_wm_name, atom_utf8, 0, 256) else {
-            continue;
+        let prop = match connection
+            .get_property(false, hwnd, atom_wm_name, atom_utf8, 0, 256)
+            .map_err(|_| ())
+            .and_then(|cookie| cookie.reply().map_err(|_| ()))
+        {
+            Ok(reply) => reply,
+            Err(_) => continue,
         };
         let title = String::from_utf8_lossy(&prop.value).into_owned();
         if title.starts_with("TheKVM") {
