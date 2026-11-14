@@ -2154,8 +2154,6 @@ fn main() -> Result<()> {
 fn edge_style_name(style: DoubleEdgeStyle) -> &'static str {
     match style {
         DoubleEdgeStyle::Mirror => "inverse entry",
-        DoubleEdgeStyle::FixedLeft => "fixed left entry",
-        DoubleEdgeStyle::FixedRight => "fixed right entry",
     }
 }
 
@@ -2168,23 +2166,19 @@ fn edge_choice_name(mode: EdgeMode, style: DoubleEdgeStyle) -> String {
     }
 }
 
-/// Devices-tab button index: 0 Single, 1 Double inverse (the default),
-/// 2 Double fixed-left, 3 Double fixed-right. Pure for tests.
+/// Devices-tab button index: 0 Single, 1 Double inverse (the default).
+/// Pure for tests.
 fn edge_choice_index(mode: EdgeMode, style: DoubleEdgeStyle) -> i32 {
     match (mode, style) {
         (EdgeMode::Single, _) => 0,
         (EdgeMode::Double, DoubleEdgeStyle::Mirror) => 1,
-        (EdgeMode::Double, DoubleEdgeStyle::FixedLeft) => 2,
-        (EdgeMode::Double, DoubleEdgeStyle::FixedRight) => 3,
     }
 }
 
-/// Inverse of [`edge_choice_index`]: 1..=3 imply Double. Pure for tests.
+/// Inverse of [`edge_choice_index`]: 1.. imply Double. Pure for tests.
 fn edge_choice_from_index(index: i32) -> (EdgeMode, DoubleEdgeStyle) {
     match index {
         1 => (EdgeMode::Double, DoubleEdgeStyle::Mirror),
-        2 => (EdgeMode::Double, DoubleEdgeStyle::FixedLeft),
-        3 => (EdgeMode::Double, DoubleEdgeStyle::FixedRight),
         _ => (EdgeMode::Single, DoubleEdgeStyle::Mirror),
     }
 }
@@ -6773,12 +6767,12 @@ mod tests {
             0
         );
         assert_eq!(
-            edge_choice_index(EdgeMode::Double, DoubleEdgeStyle::FixedRight),
-            3
+            edge_choice_index(EdgeMode::Double, DoubleEdgeStyle::Mirror),
+            1
         );
         assert_eq!(
-            edge_choice_from_index(2),
-            (EdgeMode::Double, DoubleEdgeStyle::FixedLeft)
+            edge_choice_from_index(1),
+            (EdgeMode::Double, DoubleEdgeStyle::Mirror)
         );
         assert_eq!(
             edge_choice_from_index(99),

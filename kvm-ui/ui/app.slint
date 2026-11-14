@@ -1,4 +1,4 @@
-import { Button, ComboBox, LineEdit, Palette, Switch, TabWidget } from "std-widgets.slint";
+﻿import { Button, ComboBox, LineEdit, Palette, Switch, TabWidget } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------
 // One loading language: a donut of arc + track, rotating smoothly with
@@ -372,8 +372,8 @@ component ArrangementMesh inherits Rectangle {
     // never lets the other one in.)
     property <bool> exit-left: root.our-mode != 2 && (root.edge-mode != 0 || !root.peer-on-right);
     property <bool> exit-right: root.our-mode != 2 && (root.edge-mode != 0 || root.peer-on-right);
-    property <bool> enter-left: root.our-mode != 1 && (root.edge-mode == 1 || root.edge-mode == 2 || (root.edge-mode == 0 && root.peer-on-right));
-    property <bool> enter-right: root.our-mode != 1 && (root.edge-mode == 1 || root.edge-mode == 3 || (root.edge-mode == 0 && !root.peer-on-right));
+    property <bool> enter-left: root.our-mode != 1 && (root.edge-mode == 1 || (root.edge-mode == 0 && root.peer-on-right));
+    property <bool> enter-right: root.our-mode != 1 && (root.edge-mode == 1 || (root.edge-mode == 0 && !root.peer-on-right));
 
     // ---- Roles, carried by the arrow heads -------------------------
     property <bool> we-may-drive: root.our-mode == 0 || root.our-mode == 1;
@@ -480,13 +480,8 @@ component ArrangementMesh inherits Rectangle {
     property <length> our-facing-x: root.peer-on-right ? root.our-bar-r : root.our-bar-l;
     property <length> our-far-x: root.peer-on-right ? root.our-bar-l : root.our-bar-r;
     property <length> peer-facing-x: root.peer-on-right ? root.peer-bar-l : root.peer-bar-r;
-    // The peer edge the second arrow lands on: Mirror takes the far edge,
-    // the fixed disciplines take their pinned edge whatever side the card
-    // sits on.
-    property <length> entry-x:
-        root.edge-mode == 2 ? root.peer-bar-l
-        : root.edge-mode == 3 ? root.peer-bar-r
-        : (root.peer-on-right ? root.peer-bar-r : root.peer-bar-l);
+    // The peer edge the second arrow lands on: Mirror takes the far edge.
+    property <length> entry-x: root.peer-on-right ? root.peer-bar-r : root.peer-bar-l;
     property <float> near-x1: root.our-facing-x / 1px;
     property <float> near-x2: root.peer-facing-x / 1px;
     property <float> far-x1: root.our-far-x / 1px;
@@ -697,13 +692,9 @@ component EdgeModeDiagram inherits Rectangle {
     Rectangle { x: root.peer-on-right ? root.our-r - 1.5px : root.our-l - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #22c55e; }
     if root.mode != 0 : Rectangle { x: root.peer-on-right ? root.our-l - 1.5px : root.our-r - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #22c55e; }
     // Entries on the linked computer, exactly per discipline:
-    // Single: the facing edge. Mirror: both edges. Fixed left / Fixed
-    // right: the pinned ABS edge, in BOTH arrangements (fixed means the
-    // peer's absolute left/right edge, never the facing one). The facing
-    // bar is NOT lit for the fixed modes.
+    // Single: the facing edge. Mirror: both the facing and the far edge.
     if root.mode == 0 || root.mode == 1 : Rectangle { x: root.peer-on-right ? root.peer-l - 1.5px : root.peer-r - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
-    if root.mode == 1 || root.mode == 2 : Rectangle { x: root.peer-l - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
-    if root.mode == 1 || root.mode == 3 : Rectangle { x: root.peer-r - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
+    if root.mode == 1 : Rectangle { x: root.peer-on-right ? root.peer-r - 1.5px : root.peer-l - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
 
     // ---- The crossing arrows -------------------------------------
     // Both arrows are dead straight and parallel.
@@ -715,15 +706,11 @@ component EdgeModeDiagram inherits Rectangle {
     // The LONG one runs underneath both screens and joins this computer's
     // LEFT edge to the linked computer's RIGHT edge - the full span of the
     // pair, which is what makes it the longer of the two. Mirror's entry is
-    // the inverse of the exit, so that is the edge it lands on; the fixed
-    // disciplines land on their pinned entry edge instead.
+    // the inverse of the exit, so that is the edge it lands on.
     property <length> our-facing-x: root.peer-on-right ? root.our-r : root.our-l;
     property <length> our-far-x: root.peer-on-right ? root.our-l : root.our-r;
     property <length> peer-facing-x: root.peer-on-right ? root.peer-l : root.peer-r;
-    property <length> entry-x:
-        root.mode == 2 ? root.peer-l
-        : root.mode == 3 ? root.peer-r
-        : (root.peer-on-right ? root.peer-r : root.peer-l);
+    property <length> entry-x: root.peer-on-right ? root.peer-r : root.peer-l;
     property <float> near-x1: root.our-facing-x / 1px;
     property <float> near-x2: root.peer-facing-x / 1px;
     property <float> far-x1: root.our-far-x / 1px;
@@ -901,30 +888,7 @@ component EdgeModePicker inherits Rectangle {
             arranged-peer-on-right: root.arranged-peer-on-right;
             clicked => { root.picked(1); }
         }
-        EdgeModeTile {
-            mode: 2;
-            label: "Fixed left";
-            selected: root.selected == 2;
-            applying: root.applying && root.pending-index == 2;
-            enabled: root.enabled;
-            tick: root.tick;
-            our-mode: root.our-mode;
-            peer-mode: root.peer-mode;
-            arranged-peer-on-right: root.arranged-peer-on-right;
-            clicked => { root.picked(2); }
-        }
-        EdgeModeTile {
-            mode: 3;
-            label: "Fixed right";
-            selected: root.selected == 3;
-            applying: root.applying && root.pending-index == 3;
-            enabled: root.enabled;
-            tick: root.tick;
-            our-mode: root.our-mode;
-            peer-mode: root.peer-mode;
-            arranged-peer-on-right: root.arranged-peer-on-right;
-            clicked => { root.picked(3); }
-        }
+
     }
 }
 
@@ -981,10 +945,9 @@ component RoleDropdown inherits Rectangle {
     in-out property <bool> applied: false;
     in property <int> tick: 0;
     callback picked(int);
-    // Compact: the widest role label plus the chevron, so the box hugs its
-    // contents instead of leaving a long empty stretch between the label
-    // and the arrow.
-    width: 176px;
+    // Hugs the widest label plus the chevron with only a few px of air
+    // each side; the label keeps its centred alignment inside.
+    width: 164px;
     height: 34px;
     border-radius: 8px;
     background: hit.has-hover || popup.is-open ? #2a2a2a : #1c1c1c;
@@ -1010,12 +973,12 @@ component RoleDropdown inherits Rectangle {
     // the chevron, and the chevron is a fixed 14px square centred on the
     // control's own height - no layout to stretch it to the top.
     Text {
-        x: 11px;
+        x: 9px;
         y: (parent.height - self.height) / 2;
         // The label owns everything left of the chevron and is centred in
-        // it: left-aligning leaves a long dead gap between the label and
+        // it: left-aligning leaves a dead gap between the label and
         // the arrow whenever the label is short ("Both ways").
-        width: parent.width - 11px - 9px - 14px - 8px;
+        width: parent.width - 9px - 24px;
         text: root.current;
         color: white;
         font-size: 13px;
@@ -1247,7 +1210,7 @@ export component AppWindow inherits Window {
     // briefly after it lands (green frame).
     in-out property <bool> role-applying: false;
     in-out property <bool> role-applied: false;
-    // 0 Single, 1 Mirror, 2 Fixed left, 3 Fixed right.
+    // 0 Single, 1 Mirror.
     in-out property <int> edge-mode-index: 1;
     // True while an edge-mode change is being applied to a live child; the
     // pressed tile shows the donut until the child acknowledges.
@@ -1830,7 +1793,7 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                         Text {
-                            text: root.edge-mode-index == 0 ? "Single" : root.edge-mode-index == 1 ? "Mirror" : root.edge-mode-index == 2 ? "Fixed left" : "Fixed right";
+                            text: root.edge-mode-index == 0 ? "Single" : "Mirror";
                             color: #22c55e;
                             font-size: 12px;
                             font-weight: 700;
@@ -1880,7 +1843,7 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                         Text {
-                            text: root.edge-mode-index == 0 ? "Single" : root.edge-mode-index == 1 ? "Mirror" : root.edge-mode-index == 2 ? "Fixed left" : "Fixed right";
+                            text: root.edge-mode-index == 0 ? "Single" : "Mirror";
                             color: #22c55e;
                             font-size: 12px;
                             font-weight: 700;
@@ -2299,3 +2262,5 @@ export component AppWindow inherits Window {
             }
     }
 }
+
+

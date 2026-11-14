@@ -3435,8 +3435,6 @@ fn report_edge_applied(config: &Config) {
     };
     let style = match config.double_edge_style {
         kvm_core::DoubleEdgeStyle::Mirror => "mirror",
-        kvm_core::DoubleEdgeStyle::FixedLeft => "fixed-left",
-        kvm_core::DoubleEdgeStyle::FixedRight => "fixed-right",
     };
     eprintln!("THEKVM_STATUS edge-applied {mode} {style}");
 }

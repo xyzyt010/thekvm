@@ -471,7 +471,7 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert_eq!(config.edge_mode, EdgeMode::Double);
         assert_eq!(config.double_edge_style, DoubleEdgeStyle::Mirror);
-        // An explicit post-upgrade Single (field present) is preserved.
+        // A legacy Fixed* value from a pre-upgrade config loads as Mirror.
         std::fs::write(
             &path,
             r#"{"device_name":"n","listen_port":42110,"mode":"Bidirectional","edge_mode":"Single","double_edge_style":"FixedLeft"}"#,
@@ -479,7 +479,7 @@ mod tests {
         .unwrap();
         let config = Config::load(&path).unwrap();
         assert_eq!(config.edge_mode, EdgeMode::Single);
-        assert_eq!(config.double_edge_style, DoubleEdgeStyle::FixedLeft);
+        assert_eq!(config.double_edge_style, DoubleEdgeStyle::Mirror);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

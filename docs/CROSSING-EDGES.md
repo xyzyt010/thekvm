@@ -6,7 +6,7 @@ is governed by **two independent choices**:
 | Axis | Config key | Values | What it decides |
 |---|---|---|---|
 | **Connection mode** | `mode` | `Bidirectional` (Both ways) · `ServerClient` (Controller only) · `ClientOnly` (Receiver only) | **Who may drive whom.** |
-| **Edge discipline** | `edge_mode` + `double_edge_style` | `Single`, or `Double` with style `Mirror` (default) / `FixedLeft` (Fixed left) / `FixedRight` (Fixed right) | **Which edges open a crossing and which edges of the driven machine send control home.** |
+| **Edge discipline** | `edge_mode` + `double_edge_style` | `Single`, or `Double` with style `Mirror` (default) | **Which edges open a crossing and which edges of the driven machine send control home.** |
 
 The two axes are orthogonal. Every combination is valid, each machine
 makes its own choices, and both machines should normally be set to the
@@ -63,9 +63,9 @@ directly abuts the other on a shared edge.
 
 ---
 
-## 3. Edge discipline: the four crossing modes
+## 3. Edge discipline: the two crossing modes
 
-All four modes share the same crossing mechanics — a push must build an
+Both modes share the same crossing mechanics — a push must build an
 **8-pixel** sustained overflow (`EDGE_PUSH_PX`) on one edge streak before a
 handoff commits, resting jitter can never cross, and entries land
 **32 px** inside the peer from the entry edge (`ENTRY_INSET_PX`) with a
@@ -101,35 +101,22 @@ Mirror makes the far (mirror-image) edge a full peer edge too.
 
 Mirror is the recommended mode for a two-machine desk.
 
-### 3.3 Double edge — Fixed left
+### 3.3 Legacy disciplines (removed)
 
-| Rule | Behavior |
-|---|---|
-| Open a crossing | Either horizontal edge (Double, lone-peer rule). |
-| Peer entry edge | **Always the peer's LEFT edge** (`FixedLeft`) no matter which edge was exited. The outer-left exit enters the peer at its left edge — the same entry the facing crossing uses. |
-| Return home | **Only the peer's left edge.** Any overflow out of the pinned edge returns control; pushes out of the right edge clamp forever — the far edge is a wall, not a door. |
-| Landing on return | Same edge (the pinned left edge), inset inside it. |
-| Feel | "Every arrival lands on the left" — predictable left-aligned entry. Useful when the peer is operated from its left side (e.g. anchored keyboard on the left). |
+Earlier releases shipped two more Double disciplines, Fixed left and Fixed
+right (entry pinned to the peer's left / right edge, return pinned to the
+same edge). They were removed: Mirror covers both use cases symmetrically
+and the fixed modes made each side of the link behave differently enough
+to be permanently surprising. Configs carrying `FixedLeft` or `FixedRight`
+deserialize as `Mirror`, so older installs keep working — crossings from
+an "old-fixed" machine simply behave as Mirror.
 
-### 3.4 Double edge — Fixed right
-
-Mirror image of Fixed left:
-
-| Rule | Behavior |
-|---|---|
-| Open a crossing | Either horizontal edge (Double, lone-peer rule). |
-| Peer entry edge | **Always the peer's RIGHT edge** (`FixedRight`), no matter which edge was exited. |
-| Return home | **Only the peer's right edge.** Left-edge pushes clamp forever. |
-| Landing on return | Same edge (the pinned right edge), inset inside it. |
-
-### 3.5 Summary table — all four modes
+### 3.4 Summary table — all modes
 
 | Discipline | Outer edge crosses (lone peer)? | Peer entry edge | Return home through | Return landing |
 |---|---|---|---|---|
 | **Single** | ❌ | opposite the exit (mirrored facing) | facing edge only | inverse (mirrored) edge, inset |
 | **Mirror** | ✅ | inverse of the exit (left↔right) | **either** horizontal edge | inverse of the pushed edge (mirrored), inset |
-| **Fixed left** | ✅ | always **left** | **left only** | same (pinned) edge, inset |
-| **Fixed right** | ✅ | always **right** | **right only** | same (pinned) edge, inset |
 
 All crossings in every discipline land inset from the entry edge
 (`ENTRY_INSET_PX`, 32 px), with the along axis mapped proportionally; all
@@ -167,8 +154,8 @@ the peer and decides when control comes home:
    with inside movement and can never reach the budget; a deliberate
    shove always does.
 6. **Return landing.** `restore_local_at_edge` places the local cursor
-   pinned inside the landing edge (inverse edge in Mirror/Single, same
-   edge in Fixed modes), and arms a refractory (`post_return_edge`,
+   pinned inside the landing edge (inverse edge in Mirror and Single), and
+   arms a refractory (`post_return_edge`,
    **250 ms**, `POST_RETURN_HOLD_MS`) on the local landing edge so the held
    shove that just came home can't instantly re-open a crossing on the
    same gesture.
@@ -190,13 +177,12 @@ one machine and an entry edge on the other:
 
 So the two sides must agree on the discipline for a symmetric feel.
 They can legitimately disagree, and then each direction of travel follows
-its own rules — e.g. Windows on `FixedLeft` while Mint is on `Mirror`
-makes Windows→Mint crossings always arrive at Mint's left edge and can
-only return through it, while Mint→Windows crossings behave exactly as
-Mirror dictates. A mismatch is never an error; it's just two different
-machines doing two different jobs. (This asymmetry is exactly what made
-earlier single-direction tests feel broken while the other direction
-looked fine.)
+its own rules — e.g. Windows on `Single` while Mint is on `Mirror` makes
+Windows→Mint crossings life on the facing edge only, while Mint→Windows
+crossings use either edge as usual. A mismatch is never an error; it's
+just two different machines doing two different jobs. (This asymmetry is
+exactly what made earlier single-direction tests feel broken while the
+other direction looked fine.)
 
 **Set the same discipline on both machines.** The UI persists the edge
 discipline only locally; there is no link-time reconciliation.
@@ -208,7 +194,7 @@ discipline only locally; there is no link-time reconciliation.
 | State | Owner | Notes |
 |---|---|---|
 | `edge_mode` (`Single` / `Double`) | Each machine | Hot-applied to the live drive on both machines independently (`live edge mode applied` / `topology entry style hot-applied`). |
-| `double_edge_style` (`Mirror` / `FixedLeft` / `FixedRight`) | Each machine | Only read in Double mode on a lone-peer link. |
+| `double_edge_style` (only `Mirror`; legacy `FixedLeft`/`FixedRight` load as `Mirror`) | Each machine | Only read in Double mode on a lone-peer link. |
 | `layout` (screen arrangement, fingerprints, dims) | Each machine | Applied live; measured dims win over the 1920×1080 fallback; a change can only move crossings, never manufacture new ones. |
 | `mode` (connection mode) | Each machine | Enforced on both handshake ends (see §1). |
 | Peer fingerprint, pairing code, clipboard | Daemon + Windows UI / Mint agent | Orthogonal to edges. |
@@ -238,12 +224,12 @@ discipline only locally; there is no link-time reconciliation.
 ## 8. Where it is chosen in the UI
 
 Devices tab → **Crossing edges**: one tile per discipline (Single,
-Mirror, Fixed left, Fixed right), each an illustration of a the two
-monitors with the live roles. The tile that is in force wears a green
-highlight box; the live mode name appears in green next to both
-"Screen arrangement" and "Crossing edges" headings. The **Screen
-arrangement** mesh above the tiles shows the same disciplines against
-the live arrangement — the Single mode shows one centered arrow; double
+Mirror), each an illustration of the two monitors with the live roles.
+The tile that is in force wears a green highlight box; the live mode
+name appears in green next to both "Screen arrangement" and "Crossing
+edges" headings. The **Screen arrangement** mesh above the tiles shows
+the same disciplines against the live arrangement — the Single mode
+shows one centered arrow; the double mode shows the paired (short facing + long far) staggered arrows.
 modes show the paired (short facing + long far) staggered arrows.
 
 Changing the discipline applies to the **next crossing** — no re-link is
@@ -257,10 +243,9 @@ far behind each other.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Exiting left on Windows lands on Mint's left edge | Windows is on **Fixed left** (or any fixed discipline pinning the wrong edge) while you're expecting Mirror | Set **Mirror** on Windows (Devices → Crossing edges), same on Mint. |
+| Exiting left on Windows lands on Mint's left edge | Windows is on an old `FixedLeft` config — the legacy value is read as **Mirror** now, so Windows exits enter the mirror edge (Mint's right) | Restart both machines' TheKVM services; an explicit Single/Mirror re-pick on Devices → Crossing edges confirms the live value. |
 | One direction returns home, the other doesn't | The two machines run different `double_edge_style`s | Align both; Mirror is symmetric both directions. |
-| Pushing out the far/outer edge does nothing on Single mode | By design — Single crosses on the facing edge only | Switch to Double (Mirror/Fixed) or use the facing edge. |
-| Pushing out the unpinned edge does nothing on Fixed modes | By design — Fixed pins the return edge | Use the pinned edge, or switch to Mirror. |
+| Pushing out the far/outer edge does nothing on Single mode | By design — Single crosses on the facing edge only | Switch to Double (Mirror) or use the facing edge. |
 | Crossing works then control "bounces" back instantly | The crossing fling tail hit the return budget within the post-crossing grace window — nothing to fix; it is clamped by design for the first 40 ms | Move the cursor a few pixels inside and push again deliberately. |
 | The bottom edge never crosses | No peer is arranged across the bottom edge — grid rule, not a bug | Arrange a peer there (two-machine: rearrange the side-by-side layout), or it will never open. |
 | A stuck edge reports "no peer arranged there" | Same: the overflowed edge faces nothing | Same as above — arrange the peer or accept the clamp. |
@@ -277,12 +262,9 @@ Per machine, always true:
    machine's `double_edge_style` (Double mode) at crossing time.
 3. **Mirror**: left↔right both open (lone peer) and both return; entry is the
    inverse of the exit; return lands inverse of the push.
-4. **Fixed left / Fixed right**: both edges open (lone peer); entry pins to
-   the selected edge; return can only fire through the selected edge; landing
-   is the selected edge.
-5. **Single**: only the facing edge opens; returns fire only through it; the
+4. **Single**: only the facing edge opens; returns fire only through it; the
    outer edge is a wall in both directions.
-6. Top/bottom edges never open or return a crossing.
+5. Top/bottom edges never open or return a crossing.
 7. Return after entry is armed only once the cursor settles **≥ 40 px**
    inside the peer.
 8. A return can never happen within **40 ms** of the crossing that started
@@ -291,9 +273,8 @@ Per machine, always true:
 
 Regression tests pin this contract in `kvm-core::layout`
 (`mirror_facing_entry_returns_from_both_edges`,
-`mirror_outer_entry_returns_from_both_edges`, `fixed_pins_entry_and_return`,
+`mirror_outer_entry_returns_from_both_edges`,
 `single_mode_only_the_facing_edge_crosses_and_returns`, plus the older
-`mirror_double_returns_through_either_edge_once_settled`,
-`fixed_edge_returns_through_the_selected_edge_only`, and
+`mirror_double_returns_through_either_edge_once_settled`, and the
 `opposite_edges_mirror` suite) — see
 [kvm-core/src/layout.rs](../kvm-core/src/layout.rs).
