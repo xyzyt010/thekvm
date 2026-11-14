@@ -696,10 +696,14 @@ component EdgeModeDiagram inherits Rectangle {
     // every double discipline.
     Rectangle { x: root.peer-on-right ? root.our-r - 1.5px : root.our-l - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #22c55e; }
     if root.mode != 0 : Rectangle { x: root.peer-on-right ? root.our-l - 1.5px : root.our-r - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #22c55e; }
-    // Entries on the linked computer: the facing edge always, the far edge
-    // only in Mirror, whose entry is the inverse of the exit.
-    Rectangle { x: root.peer-on-right ? root.peer-l - 1.5px : root.peer-r - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
-    if root.mode == 1 : Rectangle { x: root.peer-on-right ? root.peer-r - 1.5px : root.peer-l - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
+    // Entries on the linked computer, exactly per discipline:
+    // Single: the facing edge. Mirror: both edges. Fixed left / Fixed
+    // right: the pinned ABS edge, in BOTH arrangements (fixed means the
+    // peer's absolute left/right edge, never the facing one). The facing
+    // bar is NOT lit for the fixed modes.
+    if root.mode == 0 || root.mode == 1 : Rectangle { x: root.peer-on-right ? root.peer-l - 1.5px : root.peer-r - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
+    if root.mode == 1 || root.mode == 2 : Rectangle { x: root.peer-l - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
+    if root.mode == 1 || root.mode == 3 : Rectangle { x: root.peer-r - 1.5px; y: 12px; width: 3px; height: 16px; border-radius: 1.5px; background: #5eead4; }
 
     // ---- The crossing arrows -------------------------------------
     // Both arrows are dead straight and parallel.

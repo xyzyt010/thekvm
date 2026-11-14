@@ -399,18 +399,26 @@ mod linux_uinput {
         }
 
         /// Render one inbound pinch delta as a native two-finger touch
-        /// gesture (see UinputTouch): the parked viewport-pinch experiment
-        /// (see PINCH-ZOOM/README.md). Only used when the receiver opts in
+        /// gesture (see UinputTouch). ONLY used when the receiver opts in
         /// via `THEKVM_LINUX_PINCH_VIEWPORT=1`; the default rendering is
-        /// Ctrl+wheel page zoom. `display` names the session X server for the anchor/dims
-        /// query. Returns true when the event was consumed; false when
-        /// touch is unavailable (the caller swallows by default, or
-        /// renders legacy page zoom under its explicit opt-in).
+        /// Ctrl+wheel page zoom everywhere (that is what browsers,
+        /// Firefox included, zoom reliably under X11 - see PINCH-ZOOM/
+        /// README.md). `display` names the session X server for the
+        /// anchor/dims query. Returns true when the event was consumed;
+        /// false when the touch path is unavailable or disabled, which
+        /// lets the caller render the default page zoom instead.
         /// Linux only: x11rb (anchor/dims) is a Linux-only dependency —
         /// elsewhere this is always false and the caller keeps its legacy
         /// rendering.
         #[cfg(target_os = "linux")]
         pub fn inject_pinch(&mut self, delta: i32, display: Option<&str>) -> bool {
+            // Native touch is strictly opt-in (see the doc comment):
+            // everywhere else falls through to the Ctrl+wheel page-zoom
+            // rendering, which is what browsers - Firefox included - zoom
+            // reliably under X11.
+            if std::env::var("THEKVM_LINUX_PINCH_VIEWPORT").as_deref() != Ok("1") {
+                return false;
+            }
             if self.touch.is_none() {
                 let Some(((cx, cy), (width, height))) = session_touch_anchor(display) else {
                     self.warn_touch_once("no session cursor/dims for the touch anchor");
