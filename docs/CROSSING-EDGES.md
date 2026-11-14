@@ -68,11 +68,20 @@ directly abuts the other on a shared edge.
 Both modes share the same crossing mechanics — a push must build an
 **8-pixel** sustained overflow (`EDGE_PUSH_PX`) on one edge streak before a
 handoff commits, resting jitter can never cross, and entries land
-**32 px** inside the peer from the entry edge (`ENTRY_INSET_PX`) with a
+**96 px** inside the peer from the entry edge (`ENTRY_INSET_PX`) with a
 **40 px** inside-movement arming threshold (`SETTLE_PX`) before any
 home-facing overflow may return. What differs per mode is *which* edges
 open a crossing and *which* edges of the driven machine send control
 back.
+
+> **Why 96 px.** A crossing's own opening shove almost always points INTO
+> the peer, toward the peer's hop tracker. With a shallow landing (32 px)
+> the first outward pushes after the crossing committed accumulated enough
+> hop budget on the peer to hand control straight back about 100 ms after
+> every opening — every drive died before anyone moved. 96 px deep: the
+> peer needs roughly another 100 px of sustained outward pressure before it
+> even considers demanding the drive back, which only a deliberate push
+> provides.
 
 ### 3.1 Single edge
 
@@ -119,7 +128,7 @@ an "old-fixed" machine simply behave as Mirror.
 | **Mirror** | ✅ | inverse of the exit (left↔right) | **either** horizontal edge | inverse of the pushed edge (mirrored), inset |
 
 All crossings in every discipline land inset from the entry edge
-(`ENTRY_INSET_PX`, 32 px), with the along axis mapped proportionally; all
+(`ENTRY_INSET_PX`, 96 px), with the along axis mapped proportionally; all
 returns land inset from the landing edge (`RETURN_INSET_PX`, 8 px).
 
 ---
@@ -153,12 +162,27 @@ the peer and decides when control comes home:
    (`RETURN_PUSH_PX`) of home-ward overflow and fires. Jitter alternates
    with inside movement and can never reach the budget; a deliberate
    shove always does.
-6. **Return landing.** `restore_local_at_edge` places the local cursor
-   pinned inside the landing edge (inverse edge in Mirror and Single), and
-   arms a refractory (`post_return_edge`,
-   **250 ms**, `POST_RETURN_HOLD_MS`) on the local landing edge so the held
-   shove that just came home can't instantly re-open a crossing on the
-   same gesture.
+6. **Return landing.** There are exactly two internal ways the drive ends,
+   and they behave **identically**:
+   - **Runtime router return** — the driving machine's virtual router sees
+     the home-facing overflow pass its budget and fires
+     `restore_local_at_edge` directly.
+   - **Peer-request return** — the peer's own stateless push-through
+     tracker sees the same physical overflow cross `EDGE_PUSH_PX` and sends
+     a `HandoffRequest` naming this machine's own screen with the
+     overflow direction left in the frame's signed `dx`/`dy` remainder
+     (`dx < 0` ⇒ its Left edge, `dx > 0` ⇒ its Right edge, `dy` ⇒ Top/Bottom).
+
+   Both land the local cursor pinned inside the landing edge (inverse
+   edge in Mirror, same edge in Single), map the along axis proportionally,
+   and arm the same refractory (`post_return_edge`, **250 ms**,
+   `POST_RETURN_HOLD_MS`) on the local landing edge so the held shove that
+   just came home cannot instantly re-open a crossing on the same gesture.
+   Either path may win the race on a fast fling — the visible outcome is
+   the same. (The old peer-request path warped to the stale pre-exit pixel
+   with no refractory, so a right-side exit landed back inside the peer's
+   mirrored entry edge: "exit Mint's right edge, end back on Mint's left."
+   That divergence is what this document's landing contract now rules out.)
 7. Telemetry: every would-be clamp names itself (`stuck edge …` in the
    journal) with the edge, position, overflow depth and reason, so a
    stuck edge is debuggable from logs alone.
@@ -208,7 +232,7 @@ discipline only locally; there is no link-time reconciliation.
 |---|---|---|
 | `EDGE_PUSH_PX` | 8 px | Overflow budget that must accumulate on one edge streak to open a crossing. |
 | `PHANTOM_START_GUARD_PX` | 64 px | Pushes starting beyond this from the border get per-event credit capped below full crossing depth — a fling from mid-screen pins at the border instead of crossing. |
-| `ENTRY_INSET_PX` | 32 px | Where the peer's cursor lands (inside the entry edge). |
+| `ENTRY_INSET_PX` | 96 px | Where the peer's cursor lands (inside the entry edge). |
 | `SETTLE_PX` | 40 px | Distance the cursor must move inside from the entry edge to arm the return. |
 | `RETURN_EDGE_PX` | 20 px | Armed return brush guard: same-edge overflow that must accumulate before control returns home. |
 | `RETURN_PUSH_PX` | 64 px | Unarmed escape-hatch budget (never-settled shoves still return home). |
@@ -244,7 +268,8 @@ far behind each other.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Exiting left on Windows lands on Mint's left edge | Windows is on an old `FixedLeft` config — the legacy value is read as **Mirror** now, so Windows exits enter the mirror edge (Mint's right) | Restart both machines' TheKVM services; an explicit Single/Mirror re-pick on Devices → Crossing edges confirms the live value. |
-| One direction returns home, the other doesn't | The two machines run different `double_edge_style`s | Align both; Mirror is symmetric both directions. |
+| One direction returns home, the other doesn't — or exiting one side comes back inside the peer's mirrored entry edge | The two return paths diverged: the controller's router lands mirrored with a refractory, the peer-request path landed on the stale pre-exit pixel with none | Fixed — both paths now call the same restore (`return_from_peer_report`), mirrored landing, same refractory. Verify: both machines on the current build. |
+| pushing out the far/outer edge bounces into the peer's entry edge | same underlying divergence: the held shove re-opened the crossing from the stale landing pixel | same fix; the post-return refractory now clamps the held shove for 250 ms / 64 px of pull-back, whichever lifts first. |
 | Pushing out the far/outer edge does nothing on Single mode | By design — Single crosses on the facing edge only | Switch to Double (Mirror) or use the facing edge. |
 | Crossing works then control "bounces" back instantly | The crossing fling tail hit the return budget within the post-crossing grace window — nothing to fix; it is clamped by design for the first 40 ms | Move the cursor a few pixels inside and push again deliberately. |
 | The bottom edge never crosses | No peer is arranged across the bottom edge — grid rule, not a bug | Arrange a peer there (two-machine: rearrange the side-by-side layout), or it will never open. |
@@ -278,3 +303,13 @@ Regression tests pin this contract in `kvm-core::layout`
 `mirror_double_returns_through_either_edge_once_settled`, and the
 `opposite_edges_mirror` suite) — see
 [kvm-core/src/layout.rs](../kvm-core/src/layout.rs).
+
+The peer-request return path — the one the peer drives by sending a
+`HandoffRequest` naming this machine's screen with the overflow
+direction in the frame remainder — is pinned by
+`peer_report_return_mirrors_and_refracts_both_edges`,
+`peer_report_sign_maps_vertical_edges_too`, and
+`peer_report_vertical_and_fallback_round_trip`. They run the exact
+scenario where exiting Mint's facing (right) edge used to bounce the
+cursor back to Mint's entry (left) edge.
+

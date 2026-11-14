@@ -3815,18 +3815,50 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             })
                             .unwrap_or((handoff.x, handoff.y));
                         // A handoff naming this machine's own screen hands
-                        // control back: re-enter at the exact pixel
-                        // departed (saved local position, Deskflow
-                        // jump-position semantics) instead of stale exit
-                        // coordinates, so return never jumps somewhere
-                        // unexpected.
+                        // control back. The peer pushed out of one of ITS
+                        // edges to ask for the return; the OLD path warped
+                        // to the stale pre-exit pixel and armed NO post-return
+                        // refractory, so the outward shove still in flight
+                        // re-opened the crossing through the local exit edge
+                        // and control bounced straight back into the peer —
+                        // "exit the peer's far edge, end back inside the
+                        // peer's entry edge". Route through the router's
+                        // peer-report restore instead: Double+Mirror lands on
+                        // the LOCAL edge opposite the peer edge left
+                        // through, single mode lands same-edge, and the
+                        // landing arms the refractory either way (see
+                        // return_from_peer_report).
                         if target == router.local_screen() {
-                            let (home_x, home_y) = router.local_cursor_position();
-                            router
-                                .handoff_to(target, home_x, home_y)
-                                .map_err(anyhow::Error::msg)?;
-                            capture_control.warp_cursor(home_x, home_y)?;
-                            tracing::info!(?target, "topology peer returned control locally");
+                            match router.active_remote() {
+                                Some(from) => {
+                                    match router.return_from_peer_report(from, (handoff.dx, handoff.dy)) {
+                                        Ok((home_x, home_y)) => {
+                                            capture_control.warp_cursor(home_x, home_y)?;
+                                            tracing::info!(?target, home_x, home_y, dx = handoff.dx, dy = handoff.dy, "topology peer returned control locally");
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(%error, ?target, "peer-return restore refused; staying at the saved pixel");
+                                            let (home_x, home_y) = router.local_cursor_position();
+                                            router
+                                                .handoff_to(target, home_x, home_y)
+                                                .map_err(anyhow::Error::msg)?;
+                                            capture_control.warp_cursor(home_x, home_y)?;
+                                            tracing::info!(?target, "topology peer returned control locally (saved position)");
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // From-non-active handoff naming us. Should
+                                    // not happen while we drive the peer, but
+                                    // never take control back blind.
+                                    let (home_x, home_y) = router.local_cursor_position();
+                                    router
+                                        .handoff_to(target, home_x, home_y)
+                                        .map_err(anyhow::Error::msg)?;
+                                    capture_control.warp_cursor(home_x, home_y)?;
+                                    tracing::warn!(?target, "peer return arrived without an active remote; restored saved pixel");
+                                }
+                            }
                             eprintln!("THEKVM_STATUS local");
                             continue;
                         }
