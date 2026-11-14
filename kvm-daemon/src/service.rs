@@ -3837,26 +3837,26 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                             tracing::info!(?target, home_x, home_y, dx = handoff.dx, dy = handoff.dy, "topology peer returned control locally");
                                         }
                                         Err(error) => {
-                                            tracing::warn!(%error, ?target, "peer-return restore refused; staying at the saved pixel");
-                                            let (home_x, home_y) = router.local_cursor_position();
-                                            router
-                                                .handoff_to(target, home_x, home_y)
-                                                .map_err(anyhow::Error::msg)?;
-                                            capture_control.warp_cursor(home_x, home_y)?;
-                                            tracing::info!(?target, "topology peer returned control locally (saved position)");
+                                            // The restore refused (state torn down
+                                            // mid-flight or a broken layout). Do NOT
+                                            // warp blind: the drive's own return
+                                            // (router ReturnHome) is authoritative,
+                                            // and teleporting to the stale pre-exit
+                                            // pixel re-opens a ping-pong. Leave the
+                                            // cursor exactly where it is.
+                                            tracing::warn!(%error, ?target, "peer-return restore refused; leaving the cursor where it is");
                                         }
                                     }
                                 }
                                 None => {
-                                    // From-non-active handoff naming us. Should
-                                    // not happen while we drive the peer, but
-                                    // never take control back blind.
-                                    let (home_x, home_y) = router.local_cursor_position();
-                                    router
-                                        .handoff_to(target, home_x, home_y)
-                                        .map_err(anyhow::Error::msg)?;
-                                    capture_control.warp_cursor(home_x, home_y)?;
-                                    tracing::warn!(?target, "peer return arrived without an active remote; restored saved pixel");
+                                    // From-non-active handoff naming us: a stale
+                                    // or duplicate "come home" (the router's own
+                                    // ReturnHome already fired and parked the
+                                    // drive). We are ALREADY local — warping to
+                                    // the stale pre-exit pixel would move the
+                                    // cursor under a held shove and could
+                                    // re-open a crossing. No-op; just confirm.
+                                    tracing::debug!(?target, "duplicate peer return ignored; control is already local");
                                 }
                             }
                             eprintln!("THEKVM_STATUS local");
