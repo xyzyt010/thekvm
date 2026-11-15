@@ -36,6 +36,18 @@ pub struct Config {
     pub layout: crate::layout::Layout,
     #[serde(default = "default_allow_lock_screen_control")]
     pub allow_lock_screen_control: bool,
+    /// Pre-login / lock-screen unattended auto-connect (opt-in). When a
+    /// machine boots at the greeter with nobody logged in, the background
+    /// service would otherwise dial out to its paired peer on its own and
+    /// open a control channel on the lock screen — which strands the local
+    /// user ("controlling the lock screen from the peer" is a trap for
+    /// machines that nobody is sitting at). Default OFF: the link only
+    /// re-appears once the app (UI) itself launches, i.e. at login or on a
+    /// deliberate relaunch. Set true only on a station that is deliberately
+    /// controlled from another machine before login (kiosk, wall display,
+    /// pre-configured service controller).
+    #[serde(default = "default_allow_prelogin_auto_connect")]
+    pub allow_prelogin_auto_connect: bool,
     /// Optional fixed peer for the boot-time / startup controller path.
     /// Automatically populated when pairing or connecting while
     /// `auto_connect_enabled` is true.
@@ -133,6 +145,7 @@ impl Default for Config {
             edge_mode: EdgeMode::Double,
             layout: Default::default(),
             allow_lock_screen_control: true,
+            allow_prelogin_auto_connect: false,
             auto_connect_address: None,
             auto_connect_enabled: true,
             idle_home_secs: default_idle_home_secs(),
@@ -147,6 +160,10 @@ impl Default for Config {
 
 fn default_allow_lock_screen_control() -> bool {
     true
+}
+
+fn default_allow_prelogin_auto_connect() -> bool {
+    false
 }
 
 fn default_auto_connect_enabled() -> bool {
@@ -446,7 +463,48 @@ mod tests {
         assert!(!config.reverse_scroll);
         assert!(config.auto_discover);
         assert_eq!(config.double_edge_style, DoubleEdgeStyle::Mirror);
+        // A config without the pre-login auto-connect field never opts in.
+        assert!(!config.allow_prelogin_auto_connect);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn prelogin_auto_connect_requires_explicit_opt_in() {
+        // Files carrying the explicit false keep it.
+        let config: Config = serde_json::from_str(
+            r#"{
+                "device_name": "station",
+                "listen_port": 42110,
+                "mode": "Bidirectional",
+                "allow_prelogin_auto_connect": false
+            }"#,
+        )
+        .unwrap();
+        assert!(!config.allow_prelogin_auto_connect);
+        // Default without the field is OFF — a fresh greeter/lock screen
+        // is always local until the app launches.
+        let config: Config = serde_json::from_str(
+            r#"{
+                "device_name": "station",
+                "listen_port": 42110,
+                "mode": "Bidirectional"
+            }"#,
+        )
+        .unwrap();
+        assert!(!config.allow_prelogin_auto_connect);
+        // Default::default() agrees, so gates that read it at boot agree.
+        assert!(!Config::default().allow_prelogin_auto_connect);
+        // A station that wants it can opt in explicitly.
+        let config: Config = serde_json::from_str(
+            r#"{
+                "device_name": "station",
+                "listen_port": 42110,
+                "mode": "Bidirectional",
+                "allow_prelogin_auto_connect": true
+            }"#,
+        )
+        .unwrap();
+        assert!(config.allow_prelogin_auto_connect);
     }
 
     #[test]

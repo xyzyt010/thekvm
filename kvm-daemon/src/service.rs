@@ -10211,7 +10211,11 @@ pub async fn run() -> Result<()> {
                 // Only drive while the machine is unattended: nobody logged
                 // in AND no desktop app. A closed app next to a logged-in
                 // user means the user quit or killed it, and reconnecting
-                // there is exactly the link that refuses to die.
+                // there is exactly the link that refuses to die. The whole
+                // path is also opt-in now (allow_prelogin_auto_connect,
+                // default OFF): at a fresh greeter/lock screen the local
+                // user must always be able to drive THIS machine — the app
+                // launch re-opens the link at login instead.
                 if ui_present() || interactive_session_active() {
                     tokio::select! {
                         _ = shutdown_notifier().notified() => return,
@@ -10220,7 +10224,10 @@ pub async fn run() -> Result<()> {
                 }
                 let cfg = controller_config_lock.read().await.clone();
                 let book = controller_peers.read().await.clone();
-                let target_addr = if cfg.auto_connect_enabled && mode_allows_outgoing(cfg.mode) {
+                let target_addr = if cfg.auto_connect_enabled
+                    && cfg.allow_prelogin_auto_connect
+                    && mode_allows_outgoing(cfg.mode)
+                {
                     cfg.auto_connect_address
                         .clone()
                         .filter(|a| !a.trim().is_empty())
@@ -10289,6 +10296,10 @@ pub async fn run() -> Result<()> {
                 // Pre-login means NOBODY is logged in. A logged-in user with
                 // the app closed quit or killed it — that link stays dead
                 // until they open the app again (which clears the pause).
+                // Off by default: taking control of a machine nobody is
+                // sitting at — at its greeter/lock screen — is a trap for
+                // the local user, not a convenience. Only a deliberate
+                // allow_prelogin_auto_connect opts a station in.
                 let unattended = !present && !interactive_session_active();
                 let target_address = cfg
                     .auto_connect_address
@@ -10305,6 +10316,7 @@ pub async fn run() -> Result<()> {
                     .is_some_and(|address| address_controller_paused(&book, address));
                 let should_run = unattended
                     && cfg.auto_connect_enabled
+                    && cfg.allow_prelogin_auto_connect
                     && cfg.allow_lock_screen_control
                     && mode_allows_outgoing(cfg.mode)
                     && !target_paused

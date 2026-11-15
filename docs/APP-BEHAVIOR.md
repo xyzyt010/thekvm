@@ -168,6 +168,36 @@ The handshake enforces the matrix; one-way for both answers in a one-way
 relation on either side. **Reverse scroll** (both directions only) is a
 Settings toggle, not an own matrix entry.
 
+### 5.1 Auto-connect lifecycle (both machines)
+
+Auto-connect answers exactly one question: "when this computer becomes
+available, does it look for its paired peer on its own?" **Yes — but only
+when the app (UI) itself launches.**
+
+- **App launch (login autostart or a manual relaunch):** auto-connect
+  re-arms. Both machines try to find each other on the LAN using their
+  saved `auto_connect_address`; the twin start remains de-raced so only
+  one fresh link survives.
+- **Explicit Disconnect (Connect-tab button or the tray's Disconnect):**
+  the link is hung up on both sides and, for the rest of THIS app run,
+  auto-connect to that peer is permanently off — no startup autolink, no
+  follow-link dial-back, no redial after a settings change. The
+  persisted `auto_connect_enabled` flag and `auto_connect_address` are
+  left untouched, so the behavior is in-memory and session-scoped:
+  **quit and relaunch TheKVM and auto-connect re-arms silently.**
+- **A manual Connect after a Disconnect:** always works — pressing
+  Connect is explicit intent. It clears the session ban for that peer.
+- **Fresh boot at the greeter/lock screen:** the background service
+  listens for QUIC but **never dials out** while nobody has logged in.
+  The lock screen is always yours; pre-login control of the greeter by
+  the paired peer does not happen, even before the app has a chance to
+  launch. (A station that deliberately wants pre-login control — a
+  kiosk, wall display, or service controller — can opt in with the
+  `allow_prelogin_auto_connect` flag in `config.json`, which defaults
+  to false.)
+- **After login:** the app launches at login autostart (or when you open
+  it); auto-connect arms at that point.
+
 ---
 
 ## 6. Screen arrangement
@@ -294,18 +324,22 @@ the serving machine is configured for:
 
 TheKVM is designed to keep working on a **locked or greeting screen** on
 either machine when the user has explicitly approved it in Settings.
+Three separate behaviors are worth not conflating:
 
-| Platform | Lock screen | Greeter/login | Mechanism |
-|---|---|---|---|
-| Windows | Yes (with permission) | Yes | LocalSystem service + interactive session helper (`kvm-ui`) |
-| Linux | Yes (with permission) | Yes | systemd system unit + `uinput`/`evdev`/`libei` |
-| FreeBSD | Partial (needs testing) | Not yet | input/evdev backend |
-
-**Security boundary**: no remote user can ever inject keystrokes onto a
-lock screen unless the user explicitly enables the setting and approves
-the client-revocation policy. The default on non-interactive, pre-logged-in
-machines is to deny all remote control; the UI will show a red banner
-during those windows.
+- **Unattended pre-login remote control (greeter, nobody logged in):**
+  OFF by default. The background service listens for QUIC at boot but
+  never dials out in this state. A machine at its greeter — or a Windows
+  lock screen reached by a fresh boot — is always fully usable locally.
+  Opt-in for deliberate stations: `allow_prelogin_auto_connect` in
+  `config.json` (default `false`). Even when set, pre-login control is a
+  network-facing capability and should be paired with device-level
+  protection; nobody should enable it on a laptop that travels.
+- **Pre-logon input helper (Windows):** the LocalSystem service may
+  still spawn helpers so the peer can serve input at the lock screen —
+  but no session exists (and therefore no input flows) until the link
+  opens, which now requires the app to launch.
+- **Normal logged-in session:** everything is live — crossings,
+  clipboard, return — the moment the app launches.
 
 If the peer is holding an input request across login: the OS agent
 re-authorizes automatically; it does not require user interaction.
@@ -341,10 +375,11 @@ bounded length; unknown keys are refused, not silently dropped.
 | `mode` | one of 3 | `Bidirectional` | "Both ways"/"Control other only"/"Be controlled only" — matches wire enum |
 | `transport` | one of 2 | `Udp` | UDP is the preferred path; QUIC fallback |
 | `layout` | object | `{}` | The `x`,`y`,`width`,`height` per screen, `self_screen` |
-| `auto_connect_address` | string? | `null` | Boot-time peer for Windows controller; unset for Linux |
-| `auto_connect_enabled` | bool | `false` | Enable/disable the boot-time auto-connection |
+| `auto_connect_address` | string? | `null` | Peer the app dials automatically at launch |
+| `auto_connect_enabled` | bool | `true` | Enable/disable auto-connect at app launch |
+| `allow_prelogin_auto_connect` | bool | `false` | Allow the service to dial at machine boot while nobody is logged in (kiosk mode) |
 | `idle_home_secs` | u32 | 10 | Seconds of no outbound traffic before control auto-homes |
-| `allow_lock_screen_control` | bool | `true` | Permits peer to control from lock screen |
+| `allow_lock_screen_control` | bool | `true` | Permits peer to control from lock screen (logged-in sessions only) |
 | `clipboard_enabled` | bool | `true` | Sync clipboard both ways |
 | `clipboard_max_mb` | u32 | 2 | Hard cap (1–16) |
 | `reverse_scroll` | bool | `false` | Reverse scroll both directions for user's comfort |
@@ -369,8 +404,9 @@ daemon restart; the UI will show you that before attempting the change.
   of the user-space process.
 - "Show" on the tray always raises the visible window rather than
   opening a new one; "Open logs" opens the logs file (Windows: Notepad
-  / Linux: default text viewer); "Disconnect" releases the active link;
-  "Quit" sends Disconnect and exits the app fully.
+  / Linux: default text viewer); "Disconnect" releases the active link
+  AND bans auto-connect for that peer for the rest of this app run
+  (see §5.1); "Quit" sends Disconnect (same ban) and exits the app.
 - Closing the window with the X button hides to the tray; to exit fully
   you must use **Quit** in the tray menu.
 

@@ -151,6 +151,53 @@ fn dialback_suppressed(address: &str) -> bool {
     map.contains_key(&key)
 }
 
+/// One Disconnect shuts auto-connect down for the rest of THIS app run:
+/// nothing after that press — not a fresh login, a tray Disconnect, a
+/// settings change, an advertisement refresh, or a poll tick — auto-dials
+/// the peer again, until TheKVM is quit and relaunched. Deliberately
+/// in-memory and session-scoped: the persisted `auto_connect_enabled`
+/// and `auto_connect_address` are left untouched, so a relaunch re-arms
+/// auto-connect exactly the way the app always has. A manual Connect
+/// lifts the ban for the peer (explicit intent is intent) and is never
+/// itself refused by it.
+static PERMANENT_AUTOCONNECT_BANS: std::sync::OnceLock<
+    Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+fn permanent_bans() -> &'static Mutex<std::collections::HashSet<String>> {
+    PERMANENT_AUTOCONNECT_BANS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn ban_autoconnect_permanent(address: &str) {
+    let key = dialback_host(address).to_ascii_lowercase();
+    if key.is_empty() {
+        return;
+    }
+    if let Ok(mut set) = permanent_bans().lock() {
+        set.insert(key);
+        ui_log(&format!(
+            "autoconnect: permanently banned for {address} for this app run (quit and relaunch to re-arm)"
+        ));
+    }
+}
+
+fn autoconnect_banned(address: &str) -> bool {
+    let key = dialback_host(address).to_ascii_lowercase();
+    permanent_bans()
+        .lock()
+        .is_ok_and(|set| set.contains(&key))
+}
+
+fn clear_autoconnect_ban(address: &str) {
+    let key = dialback_host(address).to_ascii_lowercase();
+    if key.is_empty() {
+        return;
+    }
+    if let Ok(mut set) = permanent_bans().lock() {
+        set.remove(&key);
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -487,6 +534,15 @@ fn main() -> Result<()> {
             let Some(address) = target_address else {
                 return;
             };
+            // One Disconnect in this app run shuts the startup autolink for
+            // this peer: the link re-appears only after a quit + relaunch
+            // (or an explicit Connect).
+            if autoconnect_banned(&address) {
+                ui_log(&format!(
+                    "autoconnect: suppressed by this session's Disconnect — {address} stays down until TheKVM is relaunched"
+                ));
+                return;
+            }
             if child_running(&session) {
                 return;
             }
@@ -1412,6 +1468,10 @@ fn main() -> Result<()> {
             // Stop follow_link from re-dialling this peer while the daemon
             // teardown is still in flight (the exact 3ms resurrection).
             tombstone_dialback(&address);
+            // One Disconnect shuts auto-connect down for the rest of this
+            // app run — the user's request: the link stays dead until they
+            // relaunch TheKVM, then auto-connect re-arms.
+            ban_autoconnect_permanent(&address);
             let fingerprint = fingerprint_for_address(&data_dir(), &address);
             disconnect_link(fingerprint.as_deref(), Some(&address), link_id);
         }
@@ -1424,6 +1484,7 @@ fn main() -> Result<()> {
             if let Ok(ControlResponse::Status(status)) = control_request(ControlRequest::Status) {
                 for link in &status.sessions {
                     tombstone_dialback(&link.address);
+                    ban_autoconnect_permanent(&link.address);
                     disconnect_link(
                         Some(&link.fingerprint_hex),
                         Some(&link.address),
@@ -2732,6 +2793,7 @@ fn start_session_flow(
     // A manual Connect is explicit intent: lift any Disconnect tombstone
     // for this peer before the automatic-dial-back suppression is consulted.
     clear_dialback_tombstone(&address);
+    clear_autoconnect_ban(&address);
     // Reap a dead previous session first so a stale slot can never wedge
     // reconnect behind a permanent "Already connected".
     if let Ok(mut slot) = session.lock() {
@@ -4184,7 +4246,12 @@ fn follow_link(
         }
         if attempt {
             if let Some(link) = inbound {
-                if dialback_suppressed(&link.address) {
+                if autoconnect_banned(&link.address) {
+                    ui_log(&format!(
+                        "link: not dialling back {} at {} — this app run banned auto-connect for this peer (relaunch to re-arm)",
+                        link.node_name, link.address
+                    ));
+                } else if dialback_suppressed(&link.address) {
                     ui_log(&format!(
                         "link: not dialling back {} at {} — this computer just disconnected (waiting for a fresh Connect)",
                         link.node_name, link.address
@@ -6731,11 +6798,33 @@ fn peer_fingerprint(conn: &quinn::Connection) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dialable_host_port, edge_choice_from_index, edge_choice_index, edge_name, keep_live_epoch,
-        legacy_auto_peer, mode_mismatch_guidance, pair_status_text, parse_ban_epoch,
-        reciprocal_peer_side, should_dial_back,
+        autoconnect_banned, ban_autoconnect_permanent, clear_autoconnect_ban, dialable_host_port,
+        edge_choice_from_index, edge_choice_index, edge_name, keep_live_epoch, legacy_auto_peer,
+        mode_mismatch_guidance, pair_status_text, parse_ban_epoch, reciprocal_peer_side,
+        should_dial_back,
     };
     use kvm_core::{DoubleEdgeStyle, EdgeMode};
+
+    #[test]
+    fn permanent_autoconnect_ban_survives_explicit_disconnect_cycle() {
+        // Host-part normalization matches the dial-back tombstones: any
+        // address form for the same device is banned the same way.
+        let with_port = "192.0.2.77:42110";
+        ban_autoconnect_permanent(with_port);
+        assert!(autoconnect_banned(with_port));
+        assert!(autoconnect_banned("192.0.2.77"));
+        assert!(!autoconnect_banned("192.0.2.78:42110"));
+        // One manual Connect clears the ban for that peer only.
+        clear_autoconnect_ban(with_port);
+        assert!(!autoconnect_banned(with_port));
+        assert!(!autoconnect_banned("192.0.2.77"));
+        // Re-ban works and is idempotent.
+        ban_autoconnect_permanent("192.0.2.77");
+        ban_autoconnect_permanent(with_port);
+        assert!(autoconnect_banned(with_port));
+        clear_autoconnect_ban("192.0.2.77:42110");
+        assert!(!autoconnect_banned("192.0.2.77:42110"));
+    }
 
     #[test]
     fn compare_screen_names_peer_and_code() {
