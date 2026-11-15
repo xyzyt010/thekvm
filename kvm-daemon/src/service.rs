@@ -10664,6 +10664,26 @@ async fn handle_connection(
                 // boundary, so `bail!`, `return` and `?` end THIS episode
                 // with a logged reason while the association loop above keeps
                 // serving later streams.
+                // The desktop app is the gate for ANY control channel:
+                // with nobody listening for presence, NO link from the peer
+                // is admitted — any pairing state, the greeter/lock screen,
+                // or a freshly paired trusted peer. The machine is wholly
+                // local until TheKVM is opened. Same rule on every OS.
+                if !ui_present() {
+                    reject(
+                        &mut send,
+                        "the TheKVM app is not running on this computer; open it there and connect again",
+                    )
+                    .await?;
+                    audit_event(
+                        audit_dir,
+                        &format!(
+                            "session-rejected peer={peer_fingerprint} remote={} reason=local_app_not_running",
+                            conn.remote_address(),
+                        ),
+                    );
+                    bail!("incoming link refused: the local TheKVM app is not running");
+                }
                 let stream_result: Result<()> = async {
             let config_shared = config.clone();
             let config = local_config;
