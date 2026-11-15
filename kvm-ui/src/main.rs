@@ -2459,12 +2459,26 @@ fn set_peer_list(weak: &slint::Weak<AppWindow>, peers: Vec<kvm_protocol::pairing
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // Per-computer rows on the details card: the FIRST paired computer
+    // (TheKVM is currently a two-machine link) supplies its own address
+    // and fingerprint so both machines show an honest one-card tale.
+    let first = peers.first();
+    let detail_name = first
+        .map(|peer| peer.name.trim().to_owned())
+        .unwrap_or_default();
+    let detail_address = first
+        .and_then(|peer| peer.address.clone())
+        .unwrap_or_default();
+    let detail_fingerprint = first.map(|peer| peer.fingerprint_hex.clone()).unwrap_or_default();
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
                 ui.set_peer_list(SharedString::from(text));
                 ui.set_trusted_peers_advanced(SharedString::from(advanced));
+                ui.set_details_peer_name(SharedString::from(detail_name));
+                ui.set_details_peer_address(SharedString::from(detail_address));
+                ui.set_details_peer_fingerprint(SharedString::from(detail_fingerprint));
             }
         }
     });

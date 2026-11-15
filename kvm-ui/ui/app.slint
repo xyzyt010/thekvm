@@ -8,38 +8,38 @@
 // render identical pixels.
 // ---------------------------------------------------------------------
 component SpinnerArc inherits Rectangle {
-    in property <length> diameter: 18px;
-    in property <color> arc-color: #22c55e;
-    in property <color> track-color: #14532d;
+    in property <length> diameter: 20px;
+    in property <color> arc-color: #34d399;
+    in property <color> track-color: #104b2b;
     in property <int> tick: 0;
     width: diameter;
     height: diameter;
     background: transparent;
-    // Full-circle track under the moving arc.
+    // Full-circle track under the moving half-circle arc.
     Path {
         width: 100%;
         height: 100%;
         viewbox-width: 24;
         viewbox-height: 24;
         stroke: track-color;
-        stroke-width: 3.2px;
+        stroke-width: 2.1px;
         stroke-line-cap: round;
         fill: transparent;
-        commands: "M 12 3 A 9 9 0 1 1 12 21 A 9 9 0 1 1 12 3";
+        commands: "M 3.5 12 A 8.5 8.5 0 0 1 20.5 12";
     }
-    // 270° arc: one step of 45° per 90ms tick, animated across the gap
-    // so the motion never stops between steps.
+    // A half-circle arc: 90° steps so the spin reads smooth, stroke slim
+    // and airy rather than notebook-thick.
     Path {
         width: 100%;
         height: 100%;
         viewbox-width: 24;
         viewbox-height: 24;
         stroke: arc-color;
-        stroke-width: 3.2px;
+        stroke-width: 2.1px;
         stroke-line-cap: round;
         fill: transparent;
-        commands: "M 12 3 A 9 9 0 1 1 3 12";
-        transform-rotation: root.tick * 45deg;
+        commands: "M 3.5 12 A 8.5 8.5 0 0 1 20.5 12";
+        transform-rotation: root.tick * 90deg;
         animate transform-rotation { duration: 130ms; easing: linear; }
     }
 }
@@ -128,9 +128,9 @@ component RescanButton inherits Rectangle {
         commands: "M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-8 8s3.57 8 8 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z";
     }
     if scanning : SpinnerArc {
-        x: 5px;
-        y: 5px;
-        diameter: 16px;
+        x: 4px;
+        y: 4px;
+        diameter: 18px;
         tick: root.tick;
     }
 }
@@ -790,10 +790,13 @@ component EdgeModeTile inherits Rectangle {
     in property <int> peer-mode: 0;
     in property <bool> arranged-peer-on-right: true;
     callback clicked();
+    // Swap which side the linked computer sits on (keeps Single mode,
+    // flips the arrangement) - edges adapt automatically.
+    callback flip();
     // Slightly larger: the monitors inside are bigger, so the tile has to
     // be too or the diagram would be squeezed.
     width: 162px;
-    height: 110px;
+    height: 124px;
     border-radius: 10px;
     // The tile in force wears a green highlight box - the same accent the
     // live edges use - so the discipline actually applied to the link is
@@ -814,13 +817,50 @@ component EdgeModeTile inherits Rectangle {
     accessible-action-default => { if (root.enabled && !root.applying) { root.clicked(); } }
     VerticalLayout {
         padding: 7px;
-        spacing: 6px;
+        spacing: 5px;
         alignment: center;
         EdgeModeDiagram {
             mode: root.mode;
             our-mode: root.our-mode;
             peer-mode: root.peer-mode;
             peer-on-right: root.arranged-peer-on-right;
+        }
+        // Single mode only: one more way to flip the arrangement (besides
+        // drag and the chevrons). Minimal glyph, centred in the tile.
+        if root.mode == 0 : Rectangle {
+            height: 16px;
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 26px;
+                    height: 16px;
+                    border-radius: 8px;
+                    background: swap-hit.has-hover ? #14532d : #10271c;
+                    border-width: 1px;
+                    border-color: swap-hit.has-hover ? #1f5136 : #14532d;
+                    swap-hit := TouchArea {
+                        mouse-cursor: pointer;
+                        accessible-role: button;
+                        accessible-label: "Flip sides: move the linked computer to the other side";
+                        accessible-action-default => { root.flip(); }
+                        clicked => { root.flip(); }
+                    }
+                    Path {
+                        x: 8px;
+                        y: 4px;
+                        width: 10px;
+                        height: 8px;
+                        viewbox-width: 10;
+                        viewbox-height: 8;
+                        stroke: swap-hit.has-hover ? #a7f3d0 : #86efac;
+                        stroke-width: 1.4px;
+                        stroke-line-cap: round;
+                        stroke-line-join: round;
+                        fill: transparent;
+                        commands: "M 8.5 2 H 1.5 M 1.5 2 L 4 0.25 M 1.5 2 L 4 3.75 M 1.5 6 H 8.5 M 8.5 6 L 6 7.75 M 8.5 6 L 6 4.25";
+                    }
+                }
+            }
         }
         Text {
             text: root.label;
@@ -859,7 +899,8 @@ component EdgeModePicker inherits Rectangle {
     in property <int> peer-mode: 0;
     in property <bool> arranged-peer-on-right: true;
     callback picked(int);
-    height: 104px;
+    callback flip();
+    height: 124px;
     background: transparent;
     HorizontalLayout {
         spacing: 6px;
@@ -875,6 +916,7 @@ component EdgeModePicker inherits Rectangle {
             peer-mode: root.peer-mode;
             arranged-peer-on-right: root.arranged-peer-on-right;
             clicked => { root.picked(0); }
+            flip => { root.flip(); }
         }
         EdgeModeTile {
             mode: 1;
@@ -897,7 +939,7 @@ component RoleRow inherits Rectangle {
     in property <string> label: "";
     in property <bool> selected: false;
     callback picked();
-    height: 40px;
+    height: 36px;
     background: hit.has-hover ? #2a2a2a : transparent;
     border-radius: 7px;
     hit := TouchArea {
@@ -905,13 +947,14 @@ component RoleRow inherits Rectangle {
         clicked => { root.picked(); }
     }
     HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 10px;
+        padding-left: 8px;
+        padding-right: 8px;
         spacing: 8px;
         Text {
             text: root.label;
             color: root.selected ? #86efac : #e5e7eb;
-            font-size: 14px;
+            font-size: 12px;
+            font-weight: 500;
             vertical-alignment: center;
         }
         Rectangle { horizontal-stretch: 1; }
@@ -947,7 +990,7 @@ component RoleDropdown inherits Rectangle {
     callback picked(int);
     // Hugs the widest label plus the chevron with only a few px of air
     // each side; the label keeps its centred alignment inside.
-    width: 164px;
+    width: 148px;
     height: 34px;
     border-radius: 8px;
     background: hit.has-hover || popup.is-open ? #2a2a2a : #1c1c1c;
@@ -973,15 +1016,15 @@ component RoleDropdown inherits Rectangle {
     // the chevron, and the chevron is a fixed 14px square centred on the
     // control's own height - no layout to stretch it to the top.
     Text {
-        x: 9px;
+        x: 6px;
         y: (parent.height - self.height) / 2;
         // The label owns everything left of the chevron and is centred in
         // it: left-aligning leaves a dead gap between the label and
         // the arrow whenever the label is short ("Both ways").
-        width: parent.width - 9px - 24px;
+        width: parent.width - 6px - 22px;
         text: root.current;
         color: white;
-        font-size: 13px;
+        font-size: 12px;
         font-weight: 600;
         vertical-alignment: center;
         horizontal-alignment: center;
@@ -1003,10 +1046,10 @@ component RoleDropdown inherits Rectangle {
     }
     if root.applying : SpinnerArc {
         x: parent.width - 24px;
-        y: (parent.height - 14px) / 2;
-        width: 14px;
-        height: 14px;
-        diameter: 14px;
+        y: (parent.height - 16px) / 2;
+        width: 16px;
+        height: 16px;
+        diameter: 16px;
         tick: root.tick;
     }
     Timer {
@@ -1018,7 +1061,7 @@ component RoleDropdown inherits Rectangle {
         x: 0;
         y: root.height + 6px;
         width: root.width;
-        height: 136px;
+        height: 118px;
         close-policy: close-on-click-outside;
         Rectangle {
             width: 100%;
@@ -1031,7 +1074,7 @@ component RoleDropdown inherits Rectangle {
             drop-shadow-blur: 16px;
             drop-shadow-offset-y: 6px;
             VerticalLayout {
-                padding: 6px;
+                padding: 5px;
                 spacing: 2px;
                 alignment: start;
                 RoleRow {
@@ -1238,6 +1281,12 @@ export component AppWindow inherits Window {
     // a background scan detects a NEW device, so a hidden card can never
     // keep a nearby computer invisible. Listing only — never dials.
     in-out property <bool> discovery-card-visible: true;
+    // Expanded per-computer detail card on the Devices tab; peers only
+    // fill in their address/fingerprint once the daemon reports them.
+    in-out property <bool> details-expanded: false;
+    in-out property <string> details-peer-name: "";
+    in-out property <string> details-peer-address: "";
+    in-out property <string> details-peer-fingerprint: "";
     // True while a scan is in flight.
     in-out property <bool> discovery-scanning: false;
     // Scanned devices (label + dial address behind each row): refreshed by
@@ -1416,7 +1465,7 @@ export component AppWindow inherits Window {
                                             model: root.discovered-labels;
                                             current-index <=> root.discovered-index;
                                             height: 32px;
-                                            width: 320px;
+                                            horizontal-stretch: 1;
                                         }
                                         Button {
                                             text: "Connect";
@@ -1425,7 +1474,6 @@ export component AppWindow inherits Window {
                                             enabled: discovered-labels.length > 0 && !session-active;
                                             clicked => { connect-discovered(root.discovered-index); }
                                         }
-                                        Rectangle { horizontal-stretch: 1; }
                                     }
                                     if discovered-labels.length == 0 && !discovery-scanning : Text {
                                         text: "No devices found.";
@@ -1502,36 +1550,52 @@ export component AppWindow inherits Window {
                     }
 
                     // ---- Connect -----------------------------------------
+                    // With discovery ON the nearby-devices list is the way
+                    // in, so the manual address box and the pairing code
+                    // stay out of sight entirely. With discovery OFF they
+                    // return as the explicit out-of-band path.
                     Rectangle {
                         vertical-stretch: 0; height: 1px; background: #1f2937; }
-                    HorizontalLayout {
+                    if !root.auto-discover : VerticalLayout {
+                        spacing: 12px;
+                        HorizontalLayout {
+                            vertical-stretch: 0;
+                            spacing: 10px;
+                            addr := LineEdit {
+                                text <=> root.peer-address;
+                                placeholder-text: "Other computer's address";
+                                enabled: !session-active;
+                                // Fixed width, no stretch: a stretched sibling
+                                // starves the Connect button to zero width.
+                                width: 320px;
+                            }
+                            if !session-active : Button {
+                                text: "Connect";
+                                primary: true;
+                                enabled: addr.text != "";
+                                clicked => { connect-to(addr.text, code-field.text); }
+                            }
+                            if session-active : Button {
+                                text: "Disconnect";
+                                clicked => { disconnect(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                        code-field := LineEdit {
+                            vertical-stretch: 0;
+                            text <=> root.pair-code;
+                            placeholder-text: "Pairing code (optional)";
+                            enabled: !session-active;
+                        }
+                    }
+                    if root.auto-discover && session-active : HorizontalLayout {
                         vertical-stretch: 0;
                         spacing: 10px;
-                        addr := LineEdit {
-                            text <=> root.peer-address;
-                            placeholder-text: "Other computer's address";
-                            enabled: !session-active;
-                            // Fixed width, no stretch: a stretched sibling
-                            // starves the Connect button to zero width.
-                            width: 320px;
-                        }
-                        if !session-active : Button {
-                            text: "Connect";
-                            primary: true;
-                            enabled: addr.text != "";
-                            clicked => { connect-to(addr.text, code-field.text); }
-                        }
-                        if session-active : Button {
+                        Button {
                             text: "Disconnect";
                             clicked => { disconnect(); }
                         }
                         Rectangle { horizontal-stretch: 1; }
-                    }
-                    code-field := LineEdit {
-                        vertical-stretch: 0;
-                        text <=> root.pair-code;
-                        placeholder-text: "Pairing code (optional)";
-                        enabled: !session-active;
                     }
                     // Live session state: donut while the link warms up, a
                     // green dot only once the session is verified.
@@ -1539,7 +1603,7 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         spacing: 9px;
                         if link-connecting && !session-verified : SpinnerArc {
-                            diameter: 16px;
+                            diameter: 18px;
                             tick: root.spinner-tick;
                         }
                         if session-verified : Rectangle {
@@ -1739,18 +1803,96 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Computers";
                             color: white;
-                            font-size: 16px;
+                            font-size: 14px;
                             font-weight: 700;
                             vertical-alignment: center;
                         }
                         if discovery-scanning : SpinnerArc {
-                            diameter: 14px;
+                            diameter: 16px;
                             tick: root.spinner-tick;
                         }
                         Button {
                             text: "Scan";
                             enabled: !discovery-scanning;
                             clicked => { discover-lan(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Rectangle {
+                            width: 78px;
+                            height: 30px;
+                            border-radius: 7px;
+                            background: details-hit.has-hover ? #14532d : transparent;
+                            border-width: 1px;
+                            border-color: details-hit.has-hover ? #164e2b : #374151;
+                            details-hit := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.details-expanded = !root.details-expanded; }
+                            }
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 6px;
+                                padding-top: 4px;
+                                padding-bottom: 4px;
+                                alignment: center;
+                                spacing: 4px;
+                                Text {
+                                    text: "Details";
+                                    color: details-hit.has-hover ? #86efac : #9ca3af;
+                                    font-size: 11px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                                ChevronGlyph {
+                                    open: root.details-expanded;
+                                    glyph-color: details-hit.has-hover ? #86efac : #9ca3af;
+                                }
+                            }
+                        }
+                    }
+                    // Expanded per-computer detail, collapsible inline.
+                    if root.details-expanded : Rectangle {
+                        vertical-stretch: 0;
+                        background: #10161d;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: #1f2937;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: "Computer details";
+                                    color: white;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                CloseButton {
+                                    clicked => { root.details-expanded = false; }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 14px;
+                                VerticalLayout {
+                                    spacing: 3px;
+                                    Text { text: "THIS COMPUTER"; color: #6ee7b7; font-size: 9px; font-weight: 800; letter-spacing: 1.3px; }
+                                    Text { text: root.device-name == "" ? "Unknown" : root.device-name; color: white; font-size: 13px; font-weight: 700; wrap: word-wrap; }
+                                    Text { text: "LAN · " + (root.local-address == "" ? "…" : root.local-address); color: #d1d5db; font-size: 11px; wrap: word-wrap; }
+                                    Text { text: "Fingerprint · " + root.fingerprint; color: #8b949e; font-size: 9px; wrap: word-wrap; letter-spacing: 0.5px; }
+                                    Text { text: "Role · " + root.role-text; color: #9ca3af; font-size: 11px; }
+                                }
+                                Rectangle { width: 1px; background: #1f2937; vertical-stretch: 1; }
+                                VerticalLayout {
+                                    spacing: 3px;
+                                    Text { text: "LINKED COMPUTER"; color: #5eead4; font-size: 9px; font-weight: 800; letter-spacing: 1.3px; }
+                                    Text { text: root.linked-peer-name == "" ? "Not paired yet" : root.linked-peer-name; color: white; font-size: 13px; font-weight: 700; wrap: word-wrap; }
+                                    Text { text: "Address · " + (root.details-peer-address == "" ? "unknown" : root.details-peer-address); color: #d1d5db; font-size: 11px; wrap: word-wrap; }
+                                    Text { text: "Fingerprint · " + (root.details-peer-fingerprint == "" ? "unknown" : root.details-peer-fingerprint); color: #8b949e; font-size: 9px; wrap: word-wrap; letter-spacing: 0.5px; }
+                                    Text { text: "Link · " + (session-active ? "live" : "idle"); color: #9ca3af; font-size: 11px; }
+                                }
+                            }
                         }
                     }
                     if discovered-labels.length > 0 : HorizontalLayout {
@@ -1763,7 +1905,7 @@ export component AppWindow inherits Window {
                             // height inside a conditional row balloons to
                             // whatever vertical space the tab has spare.
                             height: 32px;
-                            width: 320px;
+                            horizontal-stretch: 1;
                         }
                         Button {
                             text: "Connect";
@@ -1772,7 +1914,6 @@ export component AppWindow inherits Window {
                             enabled: discovered-labels.length > 0 && !session-active;
                             clicked => { connect-discovered(root.discovered-index); }
                         }
-                        Rectangle { horizontal-stretch: 1; }
                     }
                     // (Past/present computer names deliberately not listed
                     // here: the Devices tab shows what is arranged and what
@@ -1866,6 +2007,13 @@ export component AppWindow inherits Window {
                         picked(index) => {
                             root.pending-edge-index = index;
                             set-edge-mode(index);
+                        }
+                        flip => {
+                            if (root.peer-on-right) {
+                                place-peer-left();
+                            } else {
+                                place-peer-right();
+                            }
                         }
                     }
                     if driving-text != "" : Text {

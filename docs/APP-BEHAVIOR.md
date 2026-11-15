@@ -131,8 +131,8 @@ The entire GUI is a single `AppWindow` with three tabs plus a tray.
 
 | Tab | Contents |
 |---|---|
-| **Connect** | Nearby devices, Pairing code (out) / adoption of an incoming pairing (in), the two editable addresses, the connection mode dropdown ("Both ways", "Control other only", "Be controlled only"), auto-connect toggle, link state, Disconnect/Connect button |
-| **Devices** | "Screen arrangement" monitor mesh with arrows showing crossing edges; "Crossing edges" tiles (Single, Mirror); the live mode chip in green; each tile carries its own donut when a live change is pending but not yet applied |
+| **Connect** | Nearby devices (the discovery list appears when auto-discovery is on), role dropdown ("Both ways", "Control other only", "Be controlled only"), link state, Disconnect; when auto-discovery is **off** the manual address box, pairing code, and Connect button appear as the out-of-band path |
+| **Devices** | "Screen arrangement" monitor mesh with arrows showing crossing edges; a **Details** button that expands an inline two-column card (this computer / linked computer: name, LAN address, fingerprint, role, link state); "Crossing edges" tiles (Single, Mirror) — the Single tile carries a minimal **flip-sides** glyph that swaps which side each computer sits on while keeping Single mode; the active tile wears a green highlight box; each tile carries its own donut when a live change is pending but not yet applied |
 | **Settings** | Lock-screen policy toggle, clipboard on/off, clipboard size limit, auto-discover toggle, diagnostics option, about/version info |
 
 ### Persistent elements
