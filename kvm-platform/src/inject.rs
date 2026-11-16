@@ -1528,14 +1528,21 @@ mod win32_inject {
     }
 
     /// True when absolute injection is meaningful on this machine: one
-    /// monitor and a sane announced REMOTE target. The fraction mapping
-    /// needs no local comparison at all — local physical dims cancel
-    /// out — so DPI scaling and mismatched peer sizes stay absolute
-    /// (the old equality gate pinned every scaled fleet to relative).
-    /// Multi-monitor and degenerate targets stay relative: fail-open,
-    /// never a wrong-screen warp.
+    /// monitor and a sane announced REMOTE target, AND the operator opted
+    /// in with THEKVM_ABSOLUTE_MOTION=1. Default OFF since 0.9.95: the
+    /// absolute path clamps Windows to [0,65535]->primary through the
+    /// primary monitor in a way that, on at least one machine here
+    /// (LAPTOP-A1JUOKI0), left injected input working only inside a single
+    /// foreground window — relative motion (classic SendInput MULTIPLIER,
+    /// exactly what the local mouse produces) works everywhere and is the
+    /// default; a future build can re-enable the scaled variant after the
+    /// mapping is verified against a real desktop.
     fn absolute_eligible(target: (u32, u32)) -> bool {
-        single_monitor() && target.0 >= 2 && target.1 >= 2
+        static OPTED_IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let opted_in = *OPTED_IN.get_or_init(|| {
+            std::env::var("THEKVM_ABSOLUTE_MOTION").ok().is_some_and(|v| v == "1")
+        });
+        opted_in && single_monitor() && target.0 >= 2 && target.1 >= 2
     }
 
     /// Pure verdict behind absolute_detail (state injected for tests):
@@ -1901,15 +1908,16 @@ mod win32_inject {
         /// the helper receipts): names WHY motion rides absolute or
         /// relative on this machine — the one line that settles
         /// dims/DPI/multi-monitor questions without remote debugging.
-        /// Appends the local physical dims and DPI so a scaled fleet
-        /// reads honestly (fractions still arm: only multi-monitor or
-        /// a missing target pins relative now).
         pub fn absolute_detail(&self) -> String {
             let (target, single) = match self.absolute.lock() {
                 Ok(guard) => (guard.target, single_monitor()),
                 Err(_) => (None, false),
             };
             let mut detail = describe_absolute(target, single);
+            let opted_in = std::env::var("THEKVM_ABSOLUTE_MOTION").ok().is_some_and(|v| v == "1");
+            if !opted_in {
+                detail = "relative: default (THEKVM_ABSOLUTE_MOTION unset)".to_owned();
+            }
             if let Some((width, height)) = primary_dims() {
                 detail.push_str(&format!(" (local {width}x{height} @{}dpi)", display_dpi()));
             }

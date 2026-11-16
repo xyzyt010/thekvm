@@ -1194,10 +1194,10 @@ fn main() -> Result<()> {
                     // healthy.
                     set_role_display(&weak, requested);
                     // One-way roles silently strand the other direction
-                    // (the classic trap: "Control other only" reads as
-                    // "drive the peer" but also rejects every incoming
-                    // session, so the peer can never drive back). When a
-                    // link is live, say the cost out loud at press time.
+                    // (the classic trap: "Server" reads as "drive the peer"
+                    // but also rejects every incoming session, so the peer
+                    // can never drive back). When a link is live, say the
+                    // cost out loud at press time.
                     let mut one_way_cost = String::new();
                     if requested != Mode::Bidirectional {
                         let inbound = match control_request(ControlRequest::Status) {
@@ -2257,13 +2257,15 @@ fn set_edge_mode_display(weak: &slint::Weak<AppWindow>, mode: EdgeMode, style: D
     });
 }
 
-/// Plain-language role names shown next to "Current role:" and in the
-/// connect gate message, so selection is never ambiguous.
+/// Plain-language role names shown in the dropdown and next to "Role ·".
+/// Server = this computer's keyboard and mouse drive the peer (the KVM
+/// server/"hardware" machine); Client = the peer drives this computer;
+/// Both ways = either direction.
 fn role_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Bidirectional => "Both ways",
-        Mode::ServerClient => "Control other only",
-        Mode::ClientOnly => "Be controlled only",
+        Mode::ServerClient => "Server",
+        Mode::ClientOnly => "Client",
     }
 }
 
@@ -2858,7 +2860,7 @@ fn start_session_flow(
             if status.mode == kvm_core::Mode::ClientOnly {
                 set_status(
                     &weak,
-                    "This computer is set to 'Be controlled only', so it cannot dial out. Press 'Control other only' or 'Both ways' above, then Connect again.".into(),
+                    "This computer is set to 'Client', so it cannot dial out. Press 'Server' or 'Both ways' above, then Connect again.".into(),
                 );
                 return;
             }
@@ -4097,10 +4099,10 @@ fn follow_link(
                 // Reverse-path honesty: if this computer will NOT dial its
                 // half back, say why ONCE per new link instead of silently
                 // staying one-way (the top user trap: this side set to
-                // "Be controlled only" can never drive back).
+                // "Client" can never drive back).
                 if status.mode == kvm_core::Mode::ClientOnly {
                     ui_log(&format!(
-                        "link: {} is one-way while this computer is Be-controlled-only; set Both ways to drive back",
+                        "link: {} is one-way while this computer is Client; set Both ways to drive back",
                         link.node_name
                     ));
                 } else if ceremony_open {
@@ -4492,11 +4494,11 @@ fn launch_child(
 fn mode_mismatch_guidance(detail: &str, address: &str) -> Option<String> {
     if detail.contains("controller-only") {
         Some(format!(
-            "{address} is set to 'Control other only', so it accepts no incoming control. On {address}, press 'Both ways' (or 'Be controlled only'), then Connect again here — or press Disconnect to stop retrying."
+            "{address} is set to 'Server', so it accepts no incoming control. On {address}, press 'Both ways' (or 'Client'), then Connect again here — or press Disconnect to stop retrying."
         ))
     } else if detail.contains("receiver-only") {
         Some(format!(
-            "The roles do not match ({detail}). A computer set to 'Be controlled only' cannot dial out: set THIS computer to 'Both ways' (or 'Control other only') with the role buttons above, then Connect again — or press Disconnect to stop retrying."
+            "The roles do not match ({detail}). A computer set to 'Client' cannot dial out: set THIS computer to 'Both ways' (or 'Server') with the role buttons above, then Connect again — or press Disconnect to stop retrying."
         ))
     } else {
         None
