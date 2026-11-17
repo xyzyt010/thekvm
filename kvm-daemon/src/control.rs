@@ -877,6 +877,7 @@ where
                 reverse_scroll: current.reverse_scroll,
                 auto_discover: current.auto_discover,
                 double_edge_style: current.double_edge_style,
+                manual_control_enabled: current.manual_control_enabled,
                 peer_count,
                 active_session_count: active_sessions.load(std::sync::atomic::Ordering::Relaxed),
                 sessions: crate::service::list_inbound_links(),
@@ -1302,6 +1303,7 @@ where
             auto_discover,
             double_edge_style,
             auto_connect_enabled,
+            manual_control_enabled,
         } => {
             if listen_port == Some(0) {
                 ControlResponse::Error {
@@ -1384,6 +1386,9 @@ where
                     }
                     if let Some(style) = double_edge_style {
                         updated.double_edge_style = style;
+                    }
+                    if let Some(manual) = manual_control_enabled {
+                        updated.manual_control_enabled = manual;
                     }
                     if transport.is_some() {
                         // Transport is cemented to UDP: a stale client asking

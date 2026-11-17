@@ -96,6 +96,12 @@ pub struct Config {
     /// config files without this field load as Mirror.
     #[serde(default)]
     pub double_edge_style: DoubleEdgeStyle,
+    /// Manual control (see `Config::manual_control_enabled`): when off,
+    /// this machine may not connect via manually-typed address and
+    /// pairing code at all — only auto-discovery may bring machines in.
+    /// Off by default; the Settings switch opts in.
+    #[serde(default)]
+    pub manual_control_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -154,6 +160,7 @@ impl Default for Config {
             reverse_scroll: false,
             auto_discover: true,
             double_edge_style: DoubleEdgeStyle::Mirror,
+            manual_control_enabled: false,
         }
     }
 }
@@ -463,6 +470,8 @@ mod tests {
         assert!(!config.reverse_scroll);
         assert!(config.auto_discover);
         assert_eq!(config.double_edge_style, DoubleEdgeStyle::Mirror);
+        // A config without the manual-control field never opts in.
+        assert!(!config.manual_control_enabled);
         // A config without the pre-login auto-connect field never opts in.
         assert!(!config.allow_prelogin_auto_connect);
         assert!(config.validate().is_ok());

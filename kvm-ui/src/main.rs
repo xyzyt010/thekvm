@@ -1,4 +1,4 @@
-// GUI subsystem on Windows so double-clicking the app never flashes a
+﻿// GUI subsystem on Windows so double-clicking the app never flashes a
 // console window; diagnostics go through the status line and logs.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -303,6 +303,7 @@ fn main() -> Result<()> {
         ui.set_clipboard_enabled(config.clipboard_enabled);
         ui.set_reverse_scroll(config.reverse_scroll);
         ui.set_auto_discover(config.auto_discover);
+        ui.set_manual_control_enabled(config.manual_control_enabled);
         ui.set_clipboard_max_mb(SharedString::from(config.clipboard_max_mb.to_string()));
         ui.set_device_name(SharedString::from(config.device_name.clone()));
         ui.set_auto_connect_address(SharedString::from(
@@ -945,6 +946,7 @@ fn main() -> Result<()> {
             auto_discover: None,
             double_edge_style: None,
             auto_connect_enabled: Some(enabled),
+            manual_control_enabled: None,
         }
     }
 
@@ -1178,6 +1180,7 @@ fn main() -> Result<()> {
                 auto_discover: None,
                 double_edge_style: None,
                 auto_connect_enabled: None,
+                manual_control_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     set_role_applying(&weak, false);
@@ -1193,8 +1196,9 @@ fn main() -> Result<()> {
                         None,
                         None,
                         None,
-
-                    None,);
+                        None,
+                        None,
+                    );
                     ui_log(&format!("role applied: {}", role_name(requested)));
                     // Update the green role text from the authoritative
                     // Applied result now; the poll refreshes it again when
@@ -1308,6 +1312,7 @@ fn main() -> Result<()> {
                 auto_discover: None,
                 double_edge_style: Some(requested_style),
                 auto_connect_enabled: None,
+                manual_control_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -1322,6 +1327,7 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(requested_style),
+                        None,
                     );
                     ui_log(&format!(
                         "edge crossing applied: {}",
@@ -1397,6 +1403,7 @@ fn main() -> Result<()> {
                 auto_discover: None,
                 double_edge_style: None,
                 auto_connect_enabled: None,
+                manual_control_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -1409,6 +1416,7 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(wanted),
+                        None,
                         None,
                         None,
                     );
@@ -1680,6 +1688,7 @@ fn main() -> Result<()> {
                 auto_discover: Some(wanted),
                 double_edge_style: None,
                 auto_connect_enabled: None,
+                manual_control_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -1693,8 +1702,9 @@ fn main() -> Result<()> {
                         None,
                         None,
                         Some(wanted),
-
-                    None,);
+                        None,
+                        None,
+                    );
                     let _ = slint::invoke_from_event_loop({
                         let weak = weak.clone();
                         move || {
@@ -1716,6 +1726,83 @@ fn main() -> Result<()> {
                 Ok(ControlResponse::Error { message }) => set_status(&weak, message),
                 Ok(other) => set_status(&weak, format!("Unexpected daemon response: {other:?}")),
                 Err(error) => set_status(&weak, format!("Cannot set discovery: {error}")),
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_apply_manual_control(move |wanted| {
+        let weak = weak.clone();
+        set_status(&weak, "Applying manual control…".into());
+        std::thread::spawn(move || {
+            let current = match control_request(ControlRequest::GetConfig) {
+                Ok(ControlResponse::Config(config)) => config,
+                Ok(other) => {
+                    set_status(&weak, format!("Cannot read settings: {other:?}"));
+                    return;
+                }
+                Err(error) => {
+                    set_status(
+                        &weak,
+                        control_denied_status(&error, "Background service unreachable"),
+                    );
+                    return;
+                }
+            };
+            match control_request(ControlRequest::SetConfig {
+                device_name: Some(current.device_name.clone()),
+                mode: Some(current.mode),
+                allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                listen_port: None,
+                layout: None,
+                auto_connect_address: current.auto_connect_address.clone(),
+                clear_auto_connect: current.auto_connect_address.is_none(),
+                clipboard_enabled: Some(current.clipboard_enabled),
+                clipboard_max_mb: None,
+                edge_mode: None,
+                transport: None,
+                reverse_scroll: None,
+                auto_discover: None,
+                double_edge_style: None,
+                auto_connect_enabled: None,
+                manual_control_enabled: Some(wanted),
+            }) {
+                Ok(ControlResponse::Applied { .. }) => {
+                    mirror_user_config(
+                        &current.device_name,
+                        current.mode,
+                        current.allow_lock_screen_control,
+                        current.clipboard_enabled,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(wanted),
+                    );
+                    let _ = slint::invoke_from_event_loop({
+                        let weak = weak.clone();
+                        move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_manual_control_enabled(wanted);
+                            }
+                        }
+                    });
+                    set_status(
+                        &weak,
+                        if wanted {
+                            "Manual control on: type an address and pairing code to connect."
+                                .into()
+                        } else {
+                            "Manual control off: auto-connect is the only way in.".into()
+                        },
+                    );
+                }
+                Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+                Ok(other) => set_status(&weak, format!("Unexpected daemon response: {other:?}")),
+                Err(error) => set_status(&weak, format!("Cannot set manual control: {error}")),
             }
         });
     });
@@ -1791,13 +1878,13 @@ fn main() -> Result<()> {
     });
 
     let weak = ui.as_weak();
-    ui.on_approve_incoming_pairing(move |fingerprint| {
-        decide_incoming_pairing(&weak, fingerprint.to_string(), true);
+    ui.on_approve_incoming_pairing(move |fingerprint, autoconnect| {
+        decide_incoming_pairing(&weak, fingerprint.to_string(), true, autoconnect);
     });
 
     let weak = ui.as_weak();
     ui.on_reject_incoming_pairing(move |fingerprint| {
-        decide_incoming_pairing(&weak, fingerprint.to_string(), false);
+        decide_incoming_pairing(&weak, fingerprint.to_string(), false, false);
     });
 
     let weak = ui.as_weak();
@@ -1805,7 +1892,7 @@ fn main() -> Result<()> {
     let approve_session = session_state.clone();
     let approve_pending = pending_pair.clone();
     let approve_dir = startup_dir.clone();
-    ui.on_approve_incoming_link(move |fingerprint| {
+    ui.on_approve_incoming_link(move |fingerprint, autoconnect| {
         decide_incoming_link(
             &weak,
             &links_for_approve,
@@ -1814,6 +1901,7 @@ fn main() -> Result<()> {
             &approve_dir,
             fingerprint.to_string(),
             true,
+            autoconnect,
         );
     });
 
@@ -1830,6 +1918,7 @@ fn main() -> Result<()> {
             &reject_pending,
             &reject_dir,
             fingerprint.to_string(),
+            false,
             false,
         );
     });
@@ -1926,6 +2015,7 @@ fn main() -> Result<()> {
                     None,
                     None,
                     None,
+                    None,
                 );
                 let mode = match mode_index {
                     1 => "server-client",
@@ -1980,6 +2070,7 @@ fn main() -> Result<()> {
                     auto_discover: None,
                     double_edge_style: None,
                     auto_connect_enabled: None,
+                    manual_control_enabled: None,
                 }) {
                     Ok(ControlResponse::Applied { restart_required }) => {
                         // Same truth rule as the role buttons: the green
@@ -2069,6 +2160,7 @@ fn main() -> Result<()> {
                             auto_discover: None,
                             double_edge_style: None,
                             auto_connect_enabled: None,
+                            manual_control_enabled: None,
                         })? {
                             ControlResponse::Applied { .. } => Ok(()),
                             ControlResponse::Error { message } => anyhow::bail!(message),
@@ -2369,6 +2461,7 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                 ui.set_clipboard_enabled(status.clipboard_enabled);
                 ui.set_reverse_scroll(status.reverse_scroll);
                 ui.set_auto_discover(status.auto_discover);
+                ui.set_manual_control_enabled(status.manual_control_enabled);
                 ui.set_clipboard_max_mb(SharedString::from(status.clipboard_max_mb.to_string()));
                 ui.set_device_name(SharedString::from(status.node_name));
                 ui.set_auto_connect_address(SharedString::from(
@@ -2531,9 +2624,91 @@ fn set_incoming_pairing(weak: &slint::Weak<AppWindow>, pairings: Vec<PendingPair
     });
 }
 
-fn decide_incoming_pairing(weak: &slint::Weak<AppWindow>, fingerprint: String, approved: bool) {
+/// Persist the link peer as this machine's auto-connect dial target:
+/// sets auto_connect_enabled in daemon config with the peer's address (and
+/// mirrors to the user config.json), exactly like the Settings switch. This
+/// is what the "Auto-connect this computer next time" checkbox in an approval
+/// card means: a one-time human decision, silent links from then on.
+fn remember_peer_for_auto_connect(weak: &slint::Weak<AppWindow>, address: String) {
     let weak = weak.clone();
     std::thread::spawn(move || {
+        let current = match control_request(ControlRequest::GetConfig) {
+            Ok(ControlResponse::Config(config)) => config,
+            _ => return,
+        };
+        match control_request(ControlRequest::SetConfig {
+            device_name: Some(current.device_name.clone()),
+            mode: Some(current.mode),
+            allow_lock_screen_control: Some(current.allow_lock_screen_control),
+            listen_port: None,
+            layout: None,
+            auto_connect_address: Some(address.clone()),
+            clear_auto_connect: false,
+            clipboard_enabled: Some(current.clipboard_enabled),
+            clipboard_max_mb: None,
+            edge_mode: None,
+            transport: None,
+            reverse_scroll: None,
+            auto_discover: None,
+            double_edge_style: None,
+            auto_connect_enabled: Some(true),
+            manual_control_enabled: None,
+        }) {
+            Ok(ControlResponse::Applied { .. }) => {
+                mirror_user_config(
+                    &current.device_name,
+                    current.mode,
+                    current.allow_lock_screen_control,
+                    current.clipboard_enabled,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let _ = slint::invoke_from_event_loop({
+                    let weak = weak.clone();
+                    let addr = address.clone();
+                    move || {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.set_auto_connect_on_start(true);
+                            ui.set_auto_connect_known(true);
+                            ui.set_auto_connect_address(SharedString::from(addr));
+                        }
+                    }
+                });
+                ui_log(&format!("auto-connect: remembered {address}"));
+                set_status(
+                    &weak,
+                    format!("Auto-connect armed: reconnects silently to {address} at startup."),
+                );
+            }
+            _ => {}
+        }
+    });
+}
+
+fn decide_incoming_pairing(weak: &slint::Weak<AppWindow>, fingerprint: String, approved: bool, autoconnect: bool) {
+    let weak = weak.clone();
+    std::thread::spawn(move || {
+        // Best-effort address lookup for the auto-connect remember: ask the
+        // daemon what it knows about this pending pairing. Empty address ->
+        // skip silently; the approval itself still lands.
+        let address = if approved && autoconnect {
+            match control_request(ControlRequest::ListPendingPairings) {
+                Ok(ControlResponse::PendingPairings(pairings)) => pairings
+                    .into_iter()
+                    .find(|p| p.fingerprint_hex.eq_ignore_ascii_case(&fingerprint))
+                    .map(|p| p.address)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
         let request = if approved {
             ControlRequest::ApprovePairing {
                 fingerprint_hex: fingerprint.clone(),
@@ -2547,6 +2722,9 @@ fn decide_incoming_pairing(weak: &slint::Weak<AppWindow>, fingerprint: String, a
             Ok(ControlResponse::PairingApproved { .. }) if approved => {
                 set_status(&weak, format!("Approved incoming pairing {fingerprint}"));
                 set_incoming_pairing(&weak, Vec::new());
+                if !address.is_empty() {
+                    remember_peer_for_auto_connect(&weak, address);
+                }
             }
             Ok(ControlResponse::PairingRejected { .. }) if !approved => {
                 set_status(&weak, format!("Rejected incoming pairing {fingerprint}"));
@@ -2601,6 +2779,7 @@ fn decide_incoming_link(
     data_dir: &std::path::Path,
     fingerprint: String,
     approved: bool,
+    autoconnect: bool,
 ) {
     // The daemon keys approvals by (fingerprint, epoch): look the epoch
     // AND the dial-back address up in the last polled queue. A stale click
@@ -2685,6 +2864,10 @@ fn decide_incoming_link(
                     }
                     _ => dialable_host_port(&link_address),
                 };
+                // The remember is the same dialable address used for the
+                // dial-back (never the ephemeral source port). Clone before it
+                // is moved into spawn_dial_back.
+                let remember_address = dial_address.clone();
                 let already_running = session.lock().ok().is_some_and(|slot| slot.is_some());
                 if !already_running {
                     match dial_address {
@@ -2708,6 +2891,15 @@ fn decide_incoming_link(
                     }
                 } else {
                     set_status(&weak, format!("Approved incoming link {fingerprint}"));
+                }
+                if autoconnect {
+                    // One-time approval, silent links from now on: pin the
+                    // peer as this machine's auto-connect target.
+                    let address = remember_address
+                        .or_else(|| dialable_host_port(&link_address));
+                    if let Some(address) = address {
+                        remember_peer_for_auto_connect(&weak, address);
+                    }
                 }
             }
             Ok(ControlResponse::LinkRejected { .. }) if !approved => {
@@ -3319,6 +3511,7 @@ fn remember_auto_connect_peer(data_dir: &std::path::Path, address: &str) {
                 auto_discover: None,
                 double_edge_style: None,
                 auto_connect_enabled: None,
+                manual_control_enabled: None,
             });
         }
     }
@@ -3463,6 +3656,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         auto_discover: None,
         double_edge_style: None,
         auto_connect_enabled: None,
+        manual_control_enabled: None,
     }) {
         Ok(ControlResponse::Applied { .. }) => {}
         Ok(ControlResponse::Error { message }) => anyhow::bail!("{message}"),
@@ -3476,6 +3670,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         current.clipboard_enabled,
         None,
         Some(layout.clone()),
+        None,
         None,
         None,
         None,
@@ -5775,6 +5970,7 @@ fn mirror_user_config(
     reverse_scroll: Option<bool>,
     auto_discover: Option<bool>,
     double_edge_style: Option<kvm_core::DoubleEdgeStyle>,
+    manual_control: Option<bool>,
 ) {
     let path = data_dir().join("config.json");
     let mut config = kvm_core::Config::load(&path).unwrap_or_default();
@@ -5816,6 +6012,9 @@ fn mirror_user_config(
     }
     if let Some(style) = double_edge_style {
         config.double_edge_style = style;
+    }
+    if let Some(manual) = manual_control {
+        config.manual_control_enabled = manual;
     }
     let _ = config.save(&path);
 }

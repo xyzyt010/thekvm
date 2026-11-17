@@ -2087,6 +2087,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
             } else {
                 None
             },
+            manual_control_enabled: None,
         },
     )
     .await

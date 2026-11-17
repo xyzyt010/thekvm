@@ -246,6 +246,10 @@ pub enum ControlRequest {
         /// value.
         #[serde(default)]
         auto_connect_enabled: Option<bool>,
+        /// Manual control (see `Config::manual_control_enabled`); omission
+        /// preserves the current value.
+        #[serde(default)]
+        manual_control_enabled: Option<bool>,
     },
     /// Take one chunk of the latest peer paste stashed for this
     /// logged-in session (see [`ClipboardUpdate`]): the headless
@@ -382,6 +386,10 @@ pub struct DaemonStatus {
     /// Defaults to Mirror for older daemons that predate the field.
     #[serde(default)]
     pub double_edge_style: DoubleEdgeStyle,
+    /// Manual control (see `Config::manual_control_enabled`). Defaults to
+    /// false for older daemons that predate the field.
+    #[serde(default)]
+    pub manual_control_enabled: bool,
     pub peer_count: usize,
     pub active_session_count: usize,
     pub uptime_seconds: u64,
@@ -663,6 +671,7 @@ mod tests {
             auto_discover: Some(true),
             double_edge_style: None,
             auto_connect_enabled: Some(true),
+            manual_control_enabled: Some(false),
         };
         let expected_address = "127.0.0.1:42110".to_owned();
         let sender = tokio::spawn(async move {
@@ -684,6 +693,7 @@ mod tests {
             auto_discover,
             double_edge_style,
             auto_connect_enabled,
+            manual_control_enabled,
         }) = read_request(&mut right).await.unwrap()
         else {
             panic!("expected SetConfig request");
@@ -706,6 +716,7 @@ mod tests {
         assert_eq!(auto_discover, Some(true));
         assert_eq!(double_edge_style, None);
         assert_eq!(auto_connect_enabled, Some(true));
+        assert_eq!(manual_control_enabled, Some(false));
         sender.await.unwrap();
     }
 

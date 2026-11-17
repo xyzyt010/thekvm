@@ -1,46 +1,52 @@
-﻿import { Button, ComboBox, LineEdit, Palette, Switch, TabWidget } from "std-widgets.slint";
+﻿import { Button, CheckBox, ComboBox, LineEdit, Palette, ScrollView, Switch, TabWidget } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------
-// One loading language: a donut of arc + track, rotating smoothly with
-// the shared monotonic spinner tick. Every waiting state (scan, connect
-// warm-up, edge-mode apply) uses exactly this, at the size and colours
-// its context needs. Drawn rather than font-based so Windows and Linux
-// render identical pixels.
+// One loading language: a full faint ring with a single bright comet arc
+// sweeping around it. Driven by an internal timer so the sweep is a true
+// continuous circular path (not stepped arc snaps), identical on Windows
+// and Linux, sized/coloured per its context.
 // ---------------------------------------------------------------------
 component SpinnerArc inherits Rectangle {
     in property <length> diameter: 20px;
     in property <color> arc-color: #34d399;
-    in property <color> track-color: #104b2b;
+    in property <color> track-color: #173a29;
     in property <int> tick: 0;
     width: diameter;
     height: diameter;
     background: transparent;
-    // Full-circle track under the moving half-circle arc.
+    // Full-circle faint track.
     Path {
         width: 100%;
         height: 100%;
         viewbox-width: 24;
         viewbox-height: 24;
         stroke: track-color;
-        stroke-width: 2.1px;
+        stroke-width: 2.2px;
         stroke-line-cap: round;
         fill: transparent;
-        commands: "M 3.5 12 A 8.5 8.5 0 0 1 20.5 12";
+        commands: "M 12 2.5 A 9.5 9.5 0 1 1 12 21.5 A 9.5 9.5 0 1 1 12 2.5";
     }
-    // A half-circle arc: 90° steps so the spin reads smooth, stroke slim
-    // and airy rather than notebook-thick.
+    // Comet arc (~100° of the ring) circling the track.
     Path {
         width: 100%;
         height: 100%;
         viewbox-width: 24;
         viewbox-height: 24;
         stroke: arc-color;
-        stroke-width: 2.1px;
+        stroke-width: 2.2px;
         stroke-line-cap: round;
         fill: transparent;
-        commands: "M 3.5 12 A 8.5 8.5 0 0 1 20.5 12";
-        transform-rotation: root.tick * 90deg;
-        animate transform-rotation { duration: 130ms; easing: linear; }
+        commands: "M 12 2.5 A 9.5 9.5 0 0 1 21.45 10.8";
+        transform-rotation: root.angle;
+        animate transform-rotation { duration: 30ms; easing: linear; }
+    }
+    // Continuous 360° sweep, self-timed: 6.05° per 33ms ≈ one full
+    // revolution every ~2s. `tick` stays for API compatibility.
+    in-out property <angle> angle: 0deg;
+    Timer {
+        interval: 33ms;
+        running: true;
+        triggered => { root.angle += 6.05deg; }
     }
 }
 
@@ -935,64 +941,67 @@ component EdgeModePicker inherits Rectangle {
 }
 
 // One role option inside the dropdown popup: icon, the option name and a
-// one-line plain-English explanation of what it does. Order and check
-// glyph follow the rest of the app's list idiom.
+// one-line plain-English explanation of what it does. Every element is
+// vertically centred on the row; the row itself centres its children.
 component RoleRow inherits Rectangle {
     in property <string> label: "";
     in property <string> caption: "";
     in property <int> icon: 0;
     in property <bool> selected: false;
     callback picked();
-    height: 41px;
-    background: hit.has-hover ? #262626 : transparent;
+    height: 42px;
+    background: hit.has-hover ? #262626 : (root.selected ? #14291d : transparent);
+    border-radius: 8px;
+    border-width: root.selected ? 1px : 0px;
+    border-color: root.selected ? #1f5136 : transparent;
     animate background { duration: 100ms; }
-    border-radius: 7px;
     hit := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.picked(); }
     }
     HorizontalLayout {
-        padding-left: 7px;
-        padding-right: 8px;
-        spacing: 8px;
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 10px;
         alignment: center;
-        // Icon slot, fixed square so text always starts at the same x.
+        // Icon slot: vertically centred on the row by the layout; itself a
+        // fixed 26px square so both axes stay put.
         Rectangle {
-            width: 22px;
+            width: 26px;
             height: 26px;
-            border-radius: 5px;
-            background: root.selected ? #14532d : #1f2937;
-            // Both ways: paired arrows. Client: arrow in (you are driven).
-            // Server: arrow out (you drive).
+            border-radius: 6px;
+            background: root.selected ? #14532d : #20242c;
+            // Both ways: paired arrows. Server: arrow up/out (you drive).
+            // Client: arrow down/in (the peer drives you).
             if root.icon == 0 : Path {
-                x: 3px; y: 6px; width: 16px; height: 12px;
-                viewbox-width: 16; viewbox-height: 12;
-                stroke: root.selected ? #22c55e : #9ca3af;
-                stroke-width: 1.6px;
+                x: 4px; y: 7px; width: 18px; height: 12px;
+                viewbox-width: 18; viewbox-height: 12;
+                stroke: root.selected ? #34d399 : #9ca3af;
+                stroke-width: 1.8px;
                 stroke-line-cap: round;
                 stroke-line-join: round;
                 fill: transparent;
-                commands: "M 1 4 H 15 M 15 4 L 12 1.5 M 15 4 L 12 6.5 M 15 8 H 1 M 1 8 L 4 5.5 M 1 8 L 4 10.5";
+                commands: "M 2 3.5 H 16 M 16 3.5 L 13 1 M 16 3.5 L 13 6 M 16 8.5 H 2 M 2 8.5 L 5 6 M 2 8.5 L 5 11";
             }
             if root.icon == 1 : Path {
-                x: 4px; y: 6px; width: 14px; height: 14px;
-                viewbox-width: 14; viewbox-height: 14;
-                stroke: root.selected ? #22c55e : #9ca3af;
-                stroke-width: 1.6px;
+                x: 6px; y: 5px; width: 14px; height: 16px;
+                viewbox-width: 14; viewbox-height: 16;
+                stroke: root.selected ? #34d399 : #9ca3af;
+                stroke-width: 1.8px;
                 stroke-line-cap: round;
                 stroke-line-join: round;
                 fill: transparent;
-                commands: "M 7 1 V 13 M 7 13 L 3.5 9.5 M 7 13 L 10.5 9.5";
+                commands: "M 7 15 V 1 M 7 1 L 2.75 5.25 M 7 1 L 11.25 5.25";
             }
             if root.icon == 2 : Path {
-                x: 4px; y: 6px; width: 14px; height: 14px;
-                viewbox-width: 14; viewbox-height: 14;
-                stroke: root.selected ? #22c55e : #9ca3af;
-                stroke-width: 1.6px;
+                x: 6px; y: 5px; width: 14px; height: 16px;
+                viewbox-width: 14; viewbox-height: 16;
+                stroke: root.selected ? #34d399 : #9ca3af;
+                stroke-width: 1.8px;
                 stroke-line-cap: round;
                 stroke-line-join: round;
                 fill: transparent;
-                commands: "M 7 13 V 1 M 7 1 L 3.5 4.5 M 7 1 L 10.5 4.5";
+                commands: "M 7 1 V 15 M 7 15 L 2.75 10.75 M 7 15 L 11.25 10.75";
             }
         }
         VerticalLayout {
@@ -1000,26 +1009,26 @@ component RoleRow inherits Rectangle {
             alignment: center;
             Text {
                 text: root.label;
-                color: root.selected ? #86efac : #e5e7eb;
-                font-size: 11.5px;
+                color: root.selected ? #a7f3d0 : #e5e7eb;
+                font-size: 12px;
                 font-weight: 600;
                 vertical-alignment: center;
             }
             Text {
                 text: root.caption;
-                color: #6b7280;
-                font-size: 9px;
+                color: #7c8698;
+                font-size: 9.5px;
                 font-weight: 400;
                 vertical-alignment: center;
             }
         }
         Rectangle { horizontal-stretch: 1; }
         if root.selected : Path {
-            width: 12px;
-            height: 12px;
+            width: 13px;
+            height: 13px;
             viewbox-width: 12;
             viewbox-height: 12;
-            stroke: #22c55e;
+            stroke: #34d399;
             stroke-width: 2px;
             stroke-line-cap: round;
             stroke-line-join: round;
@@ -1046,12 +1055,12 @@ component RoleDropdown inherits Rectangle {
     in-out property <bool> applied: false;
     in property <int> tick: 0;
     callback picked(int);
-    width: 132px;
-    height: 32px;
-    border-radius: 8px;
-    background: hit.has-hover || popup.is-open ? #2a2a2a : #1c1c1c;
+    width: 140px;
+    height: 36px;
+    border-radius: 9px;
+    background: hit.has-hover || popup.is-open ? #262626 : #1a1a1a;
     border-width: 1px;
-    border-color: root.applying || root.applied ? #22c55e : (popup.is-open ? #22c55e : (hit.has-hover ? #4b5563 : #2a2a2a));
+    border-color: root.applying || root.applied ? #22c55e : (popup.is-open ? #34d399 : (hit.has-hover ? #4b5563 : #2a2a2a));
     animate background { duration: 120ms; }
     animate border-color { duration: 120ms; }
     hit := TouchArea {
@@ -1068,25 +1077,71 @@ component RoleDropdown inherits Rectangle {
     accessible-label: "This computer's role";
     accessible-expanded: popup.is-open;
     accessible-action-expand => { popup.show(); }
-    // Absolute placement inside the box: the label takes the width minus
-    // the chevron, and the chevron is a fixed 13px square centred on the
-    // control's own height - no layout to stretch it to the top.
-    Text {
-        x: 4px;
-        y: (parent.height - self.height) / 2;
-        width: parent.width - 4px - 23px;
-        text: root.current;
-        color: white;
-        font-size: 12px;
-        font-weight: 600;
-        vertical-alignment: center;
-        horizontal-alignment: center;
-        overflow: elide;
+    // The icon + label group is centred as one unit in the space left of
+    // the chevron slot, both axes. The icon renders in the compressed
+    // state exactly as it does inside the popup.
+    if !root.applying : HorizontalLayout {
+        x: 0px;
+        y: 0px;
+        width: parent.width - 24px;
+        height: parent.height;
+        alignment: center;
+        spacing: 7px;
+        // Icon, sized and centred like a row glyph.
+        Rectangle {
+            width: 16px;
+            height: 16px;
+            if root.mode-index == 0 : Path {
+                width: 100%; height: 100%;
+                viewbox-width: 18; viewbox-height: 12;
+                stroke: popup.is-open ? #34d399 : #d1d5db;
+                stroke-width: 1.8px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+                fill: transparent;
+                commands: "M 2 3 H 16 M 16 3 L 13 0.75 M 16 3 L 13 5.25 M 16 9 H 2 M 2 9 L 5 6.75 M 2 9 L 5 11.25";
+            }
+            if root.mode-index == 1 : Path {
+                width: 100%; height: 100%;
+                viewbox-width: 14; viewbox-height: 16;
+                stroke: popup.is-open ? #34d399 : #d1d5db;
+                stroke-width: 1.8px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+                fill: transparent;
+                commands: "M 7 15 V 1 M 7 1 L 2.75 5.25 M 7 1 L 11.25 5.25";
+            }
+            if root.mode-index == 2 : Path {
+                width: 100%; height: 100%;
+                viewbox-width: 14; viewbox-height: 16;
+                stroke: popup.is-open ? #34d399 : #d1d5db;
+                stroke-width: 1.8px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+                fill: transparent;
+                commands: "M 7 1 V 15 M 7 15 L 2.75 10.75 M 7 15 L 11.25 10.75";
+            }
+        }
+        Text {
+            text: root.current;
+            color: #f3f4f6;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+        }
     }
-    // While applying, the chevron slot becomes a donut. When it lands,
-    // the frame goes green briefly (self-clearing).
+    if root.applying : SpinnerArc {
+        x: (parent.width - 18px) / 2;
+        y: (parent.height - 18px) / 2;
+        width: 18px;
+        height: 18px;
+        diameter: 18px;
+        tick: root.tick;
+    }
+    // Chevron pinned to the right slot; hidden while the donut occupies it.
     if !root.applying : Rectangle {
-        x: parent.width - 22px;
+        x: parent.width - 23px;
         y: (parent.height - 13px) / 2;
         width: 13px;
         height: 13px;
@@ -1094,16 +1149,8 @@ component RoleDropdown inherits Rectangle {
             width: 100%;
             height: 100%;
             open: popup.is-open;
-            glyph-color: popup.is-open ? #22c55e : #9ca3af;
+            glyph-color: popup.is-open ? #34d399 : #9ca3af;
         }
-    }
-    if root.applying : SpinnerArc {
-        x: parent.width - 24px;
-        y: (parent.height - 16px) / 2;
-        width: 16px;
-        height: 16px;
-        diameter: 16px;
-        tick: root.tick;
     }
     Timer {
         interval: 700ms;
@@ -1113,22 +1160,22 @@ component RoleDropdown inherits Rectangle {
     popup := PopupWindow {
         x: 0;
         y: root.height + 6px;
-        width: 172px;
-        height: 149px;
+        width: 178px;
+        height: 152px;
         close-policy: close-on-click-outside;
         Rectangle {
             width: 100%;
             height: 100%;
             background: #1c1c1c;
-            border-radius: 10px;
+            border-radius: 11px;
             border-width: 1px;
             border-color: #2a2a2a;
             drop-shadow-color: #000000aa;
             drop-shadow-blur: 14px;
             drop-shadow-offset-y: 5px;
             VerticalLayout {
-                padding: 5px;
-                spacing: 2px;
+                padding: 6px;
+                spacing: 3px;
                 alignment: start;
                 RoleRow {
                     label: "Both ways";
@@ -1281,6 +1328,10 @@ export component AppWindow inherits Window {
     in-out property <string> incoming-pairing: "";
     in-out property <string> incoming-pairing-fingerprint: "";
     in-out property <string> incoming-verification-code: "";
+    // One-time ceremony opt-out: when the allow card is approved with this
+    // ticked, THIS computer always reconnects to that computer silently
+    // from now on (both sides tick once, never again).
+    in-out property <bool> incoming-autoconnect: true;
     // Inbound link approval (see PendingLink): a paired peer dialing a
     // fresh epoch waits for Allow/Deny here. Set from the poll loop;
     // cleared when the queue empties.
@@ -1357,6 +1408,10 @@ export component AppWindow inherits Window {
     // Automatic LAN discovery listing (Settings, default on): listing
     // only, never dials by itself.
     in-out property <bool> auto-discover: true;
+    // Manual control (Settings ▸ This computer, default OFF): gates the
+    // typed-IP / typed-code out-of-band path and the pairing-code
+    // readout. Auto-connect needs none of it.
+    in-out property <bool> manual-control-enabled: false;
     in-out property <string> device-name: "";
     in-out property <string> auto-connect-address: "";
     in-out property <string> local-address: "";
@@ -1384,12 +1439,13 @@ export component AppWindow inherits Window {
     callback hide-discovery();
     callback connect-discovered(int /* ComboBox row */);
     callback apply-auto-discover(bool /* wanted */);
+    callback apply-manual-control(bool /* wanted */);
     callback start-daemon();
     callback confirm-pairing();
     callback cancel-pairing();
-    callback approve-incoming-pairing(string);
+    callback approve-incoming-pairing(string /* fingerprint */, bool /* also remember for auto-connect */);
     callback reject-incoming-pairing(string);
-    callback approve-incoming-link(string);
+    callback approve-incoming-link(string /* fingerprint */, bool /* also remember for auto-connect */);
     callback reject-incoming-link(string);
     callback revoke-peer(string);
     callback place-peer-left();
@@ -1463,7 +1519,9 @@ export component AppWindow inherits Window {
                 // plain VerticalLayout silently CLIPS everything past the
                 // bottom — which once hid the whole address/code/connect
                 // row with no way to reach it. Never clip again.
-                Flickable {
+                ScrollView {
+                    vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                 Rectangle {
                 // Exactly the Flickable's width: the content must never ask the
                 // viewport to be wider than the window, or the panels get
@@ -1606,14 +1664,13 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // ---- Connect -----------------------------------------
-                    // With discovery ON the nearby-devices list is the way
-                    // in, so the manual address box and the pairing code
-                    // stay out of sight entirely. With discovery OFF they
-                    // return as the explicit out-of-band path.
+                    // ---- Connect (manual out-of-band path) ----------------
+                    // Auto-discovery is the normal way in, so the typed-IP
+                    // row and the pairing code stay hidden unless the user
+                    // opted into Manual control in Settings.
                     Rectangle {
                         vertical-stretch: 0; height: 1px; background: #1f2937; }
-                    if !root.auto-discover : VerticalLayout {
+                    if root.manual-control-enabled : VerticalLayout {
                         spacing: 12px;
                         HorizontalLayout {
                             vertical-stretch: 0;
@@ -1626,15 +1683,11 @@ export component AppWindow inherits Window {
                                 // starves the Connect button to zero width.
                                 width: 320px;
                             }
-                            if !session-active : Button {
+                            Button {
                                 text: "Connect";
                                 primary: true;
-                                enabled: addr.text != "";
+                                enabled: addr.text != "" && !session-active;
                                 clicked => { connect-to(addr.text, code-field.text); }
-                            }
-                            if session-active : Button {
-                                text: "Disconnect";
-                                clicked => { disconnect(); }
                             }
                             Rectangle { horizontal-stretch: 1; }
                         }
@@ -1645,53 +1698,56 @@ export component AppWindow inherits Window {
                             enabled: !session-active;
                         }
                     }
-                    if root.auto-discover && session-active : HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        Button {
-                            text: "Disconnect";
-                            clicked => { disconnect(); }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-                    // Live session state: donut while the link warms up, a
-                    // green dot only once the session is verified.
+                    // Live session state: one unified, middle-aligned strip.
+                    // Dot = verified, amber dot + donut = warming, grey = idle.
+                    // Disconnect sits exactly on this row — nothing detached,
+                    // nothing floating elsewhere.
                     HorizontalLayout {
                         vertical-stretch: 0;
+                        height: 36px;
                         spacing: 9px;
                         if link-connecting && !session-verified : SpinnerArc {
                             diameter: 18px;
                             tick: root.spinner-tick;
                         }
-                        if session-verified : Rectangle {
-                            width: 8px;
-                            height: 8px;
-                            border-radius: 4px;
-                            background: #22c55e;
-                            y: (parent.height - 8px) / 2;
+                        if !link-connecting || session-verified : Rectangle {
+                            width: 10px;
+                            height: 10px;
+                            border-radius: 5px;
+                            background: session-verified ? #22c55e : (session-active ? #f59e0b : #3f3f46);
                         }
                         Text {
                             text: session-text;
                             color: session-active ? (session-verified ? #22c55e : #f59e0b) : #9ca3af;
                             font-size: 13px;
+                            font-weight: 500;
                             vertical-alignment: center;
                             wrap: word-wrap;
-                            horizontal-stretch: 1;
                         }
-                    }
-                    if driving-text != "" : Text {
-                        vertical-stretch: 0;
-                        text: driving-text;
-                        color: #22c55e;
-                        font-size: 12px;
-                        font-weight: 700;
+                        if driving-text != "" : Text {
+                            text: driving-text;
+                            color: #34d399;
+                            font-size: 11px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        if session-active : Button {
+                            text: "Disconnect";
+                            height: 30px;
+                            clicked => { disconnect(); }
+                        }
                     }
 
                     // ---- Pairing code ------------------------------------
-                    Rectangle {
+                    // Only meaningful for the manual path: auto-connect never
+                    // uses it. Fixed, right-eliding block — never clips.
+                    if root.manual-control-enabled : Rectangle {
                         vertical-stretch: 0; height: 1px; background: #1f2937; }
-                    HorizontalLayout {
+                    if root.manual-control-enabled : HorizontalLayout {
                         vertical-stretch: 0;
+                        height: 36px;
+                        spacing: 10px;
                         Text {
                             text: "Pairing code";
                             color: #9ca3af;
@@ -1700,12 +1756,15 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { horizontal-stretch: 1; }
                         Text {
+                            width: 150px;
                             text: root.pairing-code == "" ? "…" : root.pairing-code;
                             color: #22c55e;
-                            font-size: 24px;
+                            font-size: 21px;
                             font-weight: 800;
-                            letter-spacing: 5px;
+                            letter-spacing: 3px;
                             vertical-alignment: center;
+                            horizontal-alignment: right;
+                            overflow: elide;
                         }
                     }
 
@@ -1779,7 +1838,7 @@ export component AppWindow inherits Window {
                                 primary: true;
                                 height: 34px;
                                 min-width: 96px;
-                                clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
+                                clicked => { approve-incoming-pairing(incoming-pairing-fingerprint, root.incoming-autoconnect); }
                             }
                             Button {
                                 text: "Deny";
@@ -1787,6 +1846,10 @@ export component AppWindow inherits Window {
                                 min-width: 96px;
                                 clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
                             }
+                        }
+                        CheckBox {
+                            text: "Auto-connect this computer next time";
+                            checked <=> root.incoming-autoconnect;
                         }
                     }
                     if incoming-link != "" : VerticalLayout {
@@ -1812,7 +1875,7 @@ export component AppWindow inherits Window {
                                 primary: true;
                                 height: 34px;
                                 min-width: 96px;
-                                clicked => { approve-incoming-link(incoming-link-fingerprint); }
+                                clicked => { approve-incoming-link(incoming-link-fingerprint, root.incoming-autoconnect); }
                             }
                             Button {
                                 text: "Deny";
@@ -1820,6 +1883,10 @@ export component AppWindow inherits Window {
                                 min-width: 96px;
                                 clicked => { reject-incoming-link(incoming-link-fingerprint); }
                             }
+                        }
+                        CheckBox {
+                            text: "Auto-connect this computer next time";
+                            checked <=> root.incoming-autoconnect;
                         }
                     }
 
@@ -1842,7 +1909,9 @@ export component AppWindow inherits Window {
 
             Tab {
                 title: "Devices";
-                Flickable {
+                ScrollView {
+                    vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                 Rectangle {
                 // Exactly the Flickable's width: the content must never ask the
                 // viewport to be wider than the window, or the panels get
@@ -2094,7 +2163,9 @@ export component AppWindow inherits Window {
 
             Tab {
                 title: "Settings";
-                Flickable {
+                ScrollView {
+                    vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                 Rectangle {
                 // Exactly the Flickable's width: the content must never ask the
                 // viewport to be wider than the window, or the panels get
@@ -2190,6 +2261,31 @@ export component AppWindow inherits Window {
                             checked <=> root.auto-discover;
                             toggled => { root.apply-auto-discover(root.auto-discover); }
                         }
+                    }
+                    // Manual control gates the typed-IP + typed-code path. When
+                    // off, auto-discovery is the only way machines come in.
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: "Manual control";
+                            color: #d1d5db;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Switch {
+                            checked <=> root.manual-control-enabled;
+                            toggled => { root.apply-manual-control(root.manual-control-enabled); }
+                        }
+                    }
+                    Text {
+                        vertical-stretch: 0;
+                        text: "Typed address and pairing code for this computer; the auto-connect path never uses it.";
+                        color: #6b7280;
+                        font-size: 11px;
+                        wrap: word-wrap;
                     }
                     HorizontalLayout {
                         vertical-stretch: 0;
@@ -2387,30 +2483,37 @@ export component AppWindow inherits Window {
                         drop-shadow-color: #000000aa;
                         drop-shadow-blur: 18px;
                         drop-shadow-offset-y: 6px;
-                        HorizontalLayout {
+                        VerticalLayout {
                             padding: 10px;
-                            spacing: 10px;
-                            Text {
-                                text: "Pairing request · " + incoming-pairing + (incoming-verification-code == "" ? "" : " · code " + incoming-verification-code);
-                                color: #fde68a;
-                                font-size: 13px;
-                                font-weight: 700;
-                                vertical-alignment: center;
-                                overflow: elide;
+                            spacing: 8px;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text {
+                                    text: "Pairing request · " + incoming-pairing + (incoming-verification-code == "" ? "" : " · code " + incoming-verification-code);
+                                    color: #fde68a;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                Button {
+                                    text: "Allow";
+                                    primary: true;
+                                    height: 34px;
+                                    min-width: 96px;
+                                    clicked => { approve-incoming-pairing(incoming-pairing-fingerprint, root.incoming-autoconnect); }
+                                }
+                                Button {
+                                    text: "Deny";
+                                    height: 34px;
+                                    min-width: 96px;
+                                    clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
+                                }
                             }
-                            Rectangle { horizontal-stretch: 1; }
-                            Button {
-                                text: "Allow";
-                                primary: true;
-                                height: 34px;
-                                min-width: 96px;
-                                clicked => { approve-incoming-pairing(incoming-pairing-fingerprint); }
-                            }
-                            Button {
-                                text: "Deny";
-                                height: 34px;
-                                min-width: 96px;
-                                clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
+                            CheckBox {
+                                text: "Auto-connect this computer next time";
+                                checked <=> root.incoming-autoconnect;
                             }
                         }
                     }
@@ -2422,30 +2525,37 @@ export component AppWindow inherits Window {
                         drop-shadow-color: #000000aa;
                         drop-shadow-blur: 18px;
                         drop-shadow-offset-y: 6px;
-                        HorizontalLayout {
+                        VerticalLayout {
                             padding: 10px;
-                            spacing: 10px;
-                            Text {
-                                text: "Link request · " + incoming-link;
-                                color: #a7f3d0;
-                                font-size: 13px;
-                                font-weight: 700;
-                                vertical-alignment: center;
-                                overflow: elide;
-                                horizontal-stretch: 1;
+                            spacing: 8px;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text {
+                                    text: "Link request · " + incoming-link;
+                                    color: #a7f3d0;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                Button {
+                                    text: "Allow";
+                                    primary: true;
+                                    height: 34px;
+                                    min-width: 96px;
+                                    clicked => { approve-incoming-link(incoming-link-fingerprint, root.incoming-autoconnect); }
+                                }
+                                Button {
+                                    text: "Deny";
+                                    height: 34px;
+                                    min-width: 96px;
+                                    clicked => { reject-incoming-link(incoming-link-fingerprint); }
+                                }
                             }
-                            Button {
-                                text: "Allow";
-                                primary: true;
-                                height: 34px;
-                                min-width: 96px;
-                                clicked => { approve-incoming-link(incoming-link-fingerprint); }
-                            }
-                            Button {
-                                text: "Deny";
-                                height: 34px;
-                                min-width: 96px;
-                                clicked => { reject-incoming-link(incoming-link-fingerprint); }
+                            CheckBox {
+                                text: "Auto-connect this computer next time";
+                                checked <=> root.incoming-autoconnect;
                             }
                         }
                     }
@@ -2467,5 +2577,6 @@ export component AppWindow inherits Window {
             }
     }
 }
+
 
 
