@@ -26,5 +26,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 
 [profile.release]
-lto = "thin"
+# Whole-program LTO + single codegen unit: smaller binaries (better
+# startup, less file-backed RSS on every launch). LTO pays the compile
+# time once per release instead of per run — the right trade.
+lto = "fat"
+codegen-units = 1
 strip = true

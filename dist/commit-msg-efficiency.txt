@@ -1,0 +1,7 @@
+﻿efficiency: software renderer only, mimalloc, fat LTO
+
+kvm-ui on Linux-X11 was pulling Mesa and libLLVM (~32 MB RSS) because the default slint feature set includes the femtovg GL renderer and X11 had no accelerated GL. tiny-skia software rendering is now the only renderer linked (the app uses no GL-specific primitives); accessibility, system-tray and compat are kept and every primitive renders the same.
+
+kvm-ui gains mimalloc as the global allocator (glibc malloc stranded ~15 MB of heap in RSS; mimalloc returns idle pages eagerly).
+
+[profile.release] switches thin->fat LTO with codegen-units=1: Windows kvm-ui 24.9 -> 20.9 MB, kvm-daemon 10 -> 7.7 MB; startup faster, file-backed PSS lower everywhere. No features removed.

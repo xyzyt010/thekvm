@@ -2,6 +2,13 @@
 // console window; diagnostics go through the status line and logs.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+// mimalloc as the global allocator: glibc malloc on Linux holds freed
+// arena memory (VmRSS >> live set — measured 15+ MB heap stranded).
+// mimalloc returns idle pages to the OS promptly and matches or beats
+// glibc on Windows too. No behavioral change anywhere else.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 slint::include_modules!();
 
 mod child_guard;
