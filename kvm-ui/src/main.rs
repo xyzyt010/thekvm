@@ -585,6 +585,72 @@ fn main() -> Result<()> {
             let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match control_request(ControlRequest::Status) {
                     Ok(ControlResponse::Status(status)) => {
+                        // ---- Auto reconnect -------------------------------
+                        // The startup link is not infinite. A restart, an
+                        // ended session, or a peer Disconnect ban kills it —
+                        // and without this block BOTH sides sit "Not
+                        // connected" forever. The poll re-arms a silent
+                        // dial to the remembered peer with backoff; an
+                        // explicit Disconnect clears the remembered address
+                        // (and bans the peer for the run) so it never fights
+                        // a deliberate disconnect.
+                        if status.auto_connect_enabled && status.active_session_count == 0 {
+                            let ceremony_open = pending_for_poll
+                                .lock()
+                                .ok()
+                                .is_some_and(|slot| slot.is_some());
+                            let session_running = session_for_poll
+                                .lock()
+                                .ok()
+                                .is_some_and(|slot| slot.is_some());
+                            if !ceremony_open && !session_running {
+                                if let Some(address) = status
+                                    .auto_connect_address
+                                    .clone()
+                                    .filter(|a| !a.trim().is_empty())
+                                {
+                                    if !autoconnect_banned(&address) {
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0);
+                                        let next_allowed = AUTOLINK_RETRY_AT_MS
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                        if now_ms >= next_allowed {
+                                            let attempt = AUTOLINK_RETRY_ATTEMPTS
+                                                .load(std::sync::atomic::Ordering::Relaxed)
+                                                .saturating_add(1);
+                                            AUTOLINK_RETRY_ATTEMPTS
+                                                .store(attempt, std::sync::atomic::Ordering::Relaxed);
+                                            let backoff = if attempt <= 2 {
+                                                AUTOLINK_RETRY_INITIAL_MS
+                                            } else {
+                                                AUTOLINK_RETRY_BACKOFF_MS
+                                            };
+                                            AUTOLINK_RETRY_AT_MS.store(
+                                                now_ms.saturating_add(backoff),
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            ui_log(&format!(
+                                                "autoconnect: reconnecting remembered peer {address} (attempt {attempt})"
+                                            ));
+                                            set_link_connecting(&weak, true);
+                                            spawn_session(
+                                                &weak,
+                                                &session_for_poll,
+                                                &pending_for_poll,
+                                                &link_dir,
+                                                address,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if status.active_session_count > 0 {
+                            AUTOLINK_RETRY_ATTEMPTS
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let code_state = if status.pairing_code.is_empty() {
                             "station code unset"
                         } else {
@@ -5546,6 +5612,18 @@ static LAST_INCOMING_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// logged once with the station-code state, so a healthy-but-silent poll is
 /// distinguishable from a dead one in ui.log alone.
 static POLL_FIRST_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// When the poll may attempt the next auto reconnect (epoch ms). The poll
+/// ticks ~1 Hz but the redial after a dead link only fires after this
+/// cooldown; the backoff doubles the wait after repeated failures. A peer
+/// that silently died (restart, crashed session) is picked up by the poll
+/// itself instead of sitting "Not connected" forever.
+static AUTOLINK_RETRY_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Consecutive auto reconnect attempts; successful redial resets to 0.
+static AUTOLINK_RETRY_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const AUTOLINK_RETRY_INITIAL_MS: u64 = 20_000;
+const AUTOLINK_RETRY_BACKOFF_MS: u64 = 60_000;
 static LAST_INCOMING_LINK_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
