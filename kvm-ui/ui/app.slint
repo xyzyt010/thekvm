@@ -26,7 +26,9 @@ component SpinnerArc inherits Rectangle {
         fill: transparent;
         commands: "M 12 2.5 A 9.5 9.5 0 1 1 12 21.5 A 9.5 9.5 0 1 1 12 2.5";
     }
-    // Comet arc (~100° of the ring) circling the track.
+    // Comet arc (~100° of the ring) circling the track. No `animate`:
+    // the timer drives the rotation directly at 125 fps, so the arc
+    // sweep is unmistakably continuous, not subtle-stepped.
     Path {
         width: 100%;
         height: 100%;
@@ -38,15 +40,15 @@ component SpinnerArc inherits Rectangle {
         fill: transparent;
         commands: "M 12 2.5 A 9.5 9.5 0 0 1 21.45 10.8";
         transform-rotation: root.angle;
-        animate transform-rotation { duration: 30ms; easing: linear; }
     }
-    // Continuous 360° sweep, self-timed: 6.05° per 33ms ≈ one full
-    // revolution every ~2s. `tick` stays for API compatibility.
+    // Continuous 360° sweep, self-timed: 2.1° per 8ms ≈ 1.44s/revolution,
+    // repainted on every tick — smoother and rounder than easing-chained
+    // interpolation frames.
     in-out property <angle> angle: 0deg;
     Timer {
-        interval: 33ms;
+        interval: 8ms;
         running: true;
-        triggered => { root.angle += 6.05deg; }
+        triggered => { root.angle += 2.1deg; }
     }
 }
 
