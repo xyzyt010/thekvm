@@ -444,10 +444,14 @@ mod linux_uinput {
                 // Keycodes 250+ are outside the normal PC keyboard range and
                 // are conventionally free for temporary remaps.
                 let keycode: u8 = 250;
-                let original = connection
-                    .get_keyboard_mapping(keycode, 1)
-                    .and_then(|cookie| cookie.reply())
-                    .map_err(|error| PlatformError::Uinput(format!("X11 keymap query: {error}")))?;
+                let original = match connection.get_keyboard_mapping(keycode, 1) {
+                    Ok(cookie) => cookie
+                        .reply()
+                        .map_err(|error| PlatformError::Uinput(format!("X11 keymap reply: {error}")))?,
+                    Err(error) => {
+                        return Err(PlatformError::Uinput(format!("X11 keymap query: {error}")))
+                    }
+                };
                 for ch in text.chars() {
                     let codepoint = ch as u32;
                     let keysym = if codepoint < 0x100 {
@@ -462,12 +466,22 @@ mod linux_uinput {
                         .flush()
                         .map_err(|error| PlatformError::Uinput(format!("X11 flush: {error}")))?;
                     // X11 event types 2 = KeyPress, 3 = KeyRelease.
-                    fake_input(&connection, 2, keycode, 0, 0, 0, 0, 0)
-                        .and_then(|cookie| cookie.check())
-                        .map_err(|error| PlatformError::Uinput(format!("X11 key press: {error}")))?;
-                    fake_input(&connection, 3, keycode, 0, 0, 0, 0, 0)
-                        .and_then(|cookie| cookie.check())
-                        .map_err(|error| PlatformError::Uinput(format!("X11 key release: {error}")))?;
+                    match fake_input(&connection, 2, keycode, 0, 0, 0, 0, 0) {
+                        Ok(cookie) => cookie.check().map_err(|error| {
+                            PlatformError::Uinput(format!("X11 key press: {error}"))
+                        })?,
+                        Err(error) => {
+                            return Err(PlatformError::Uinput(format!("X11 key press: {error}")))
+                        }
+                    }
+                    match fake_input(&connection, 3, keycode, 0, 0, 0, 0, 0) {
+                        Ok(cookie) => cookie.check().map_err(|error| {
+                            PlatformError::Uinput(format!("X11 key release: {error}"))
+                        })?,
+                        Err(error) => {
+                            return Err(PlatformError::Uinput(format!("X11 key release: {error}")))
+                        }
+                    }
                 }
                 connection
                     .change_keyboard_mapping(
