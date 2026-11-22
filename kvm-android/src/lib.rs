@@ -7,9 +7,7 @@
 
 slint::include_modules!();
 
-use slint::android::android_activity;
-use android_activity::input::{InputEvent as AndroidInput, MotionAction};
-use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
+use slint::android::android_activity::AndroidApp;
 use anyhow::{anyhow, bail, Context, Result};
 use kvm_core::{ClientKind, InputEvent, InputPacket, InputState, Mode, MouseButton};
 use kvm_protocol::discovery::scan;
@@ -166,83 +164,80 @@ impl Controller {
         self.set_status(format!("Controlling {} · {} connected", name, self.connected_count()));
     }
 
-    /// Android touch -> trackpad input for the ACTIVE desktop only. Touches
-    /// inside the status bar / typing bars are ignored so typing never moves
-    /// the remote cursor. The reserved heights follow the UI's scale rule.
-    fn on_touch(&self, motion: &android_activity::input::MotionEvent<'_>) {
+    /// Slint TouchArea events -> trackpad input for the ACTIVE desktop.
+    ///
+    /// These come from Slint's own input pipeline, so they always arrive.
+    /// (An android-activity event listener never sees motion events: the
+    /// backend's `process_event` drains `input_events_iter()` first.)
+    /// Coordinates are already local to the trackpad rectangle.
+    fn on_trackpad(&self, kind: i32, x: f32, y: f32, finger: i32) {
         if self.active_session().is_none() {
             return;
         }
-        let (width, height) = APP
-            .get()
-            .map(|app| app.content_rect())
-            .map(|rect| {
-                (
-                    (rect.right - rect.left) as f32,
-                    (rect.bottom - rect.top) as f32,
-                )
-            })
-            .unwrap_or((400.0, 800.0));
-        let scale = (width / 400.0).clamp(0.8, 1.7);
-        let top_reserve = 62.0 * scale;
-        // 5-line typing bar + button row + a little slack.
-        let bottom_reserve = (5.0 * 24.0 + 14.0 + 44.0 + 14.0) * scale;
-
         let mut touch = self.touch.lock().unwrap();
-        match motion.action() {
-            MotionAction::Down | MotionAction::PointerDown => {
-                if motion.action() == MotionAction::Down {
-                    touch.points.clear();
-                    touch.multi = false;
+        match kind {
+            0 => {
+                // Down. The first finger starts a gesture; a second one
+                // turns it into a two-finger scroll / right-click gesture.
+                if touch.points.is_empty() {
                     touch.down_at = Some(Instant::now());
                     touch.moved = 0.0;
+                    touch.multi = false;
                 } else {
                     touch.multi = true;
                 }
-                let pointer = motion.pointer_at_index(motion.pointer_index());
-                touch.points.insert(pointer.pointer_id(), (pointer.x(), pointer.y()));
+                touch.points.insert(finger, (x, y));
             }
-            MotionAction::Move => {
-                for pointer in motion.pointers() {
-                    let Some((old_x, old_y)) = touch.points.get(&pointer.pointer_id()).copied() else {
-                        continue;
-                    };
-                    let dx = pointer.x() - old_x;
-                    let dy = pointer.y() - old_y;
-                    touch.moved += dx.abs() + dy.abs();
-                    touch.points.insert(pointer.pointer_id(), (pointer.x(), pointer.y()));
-                    if pointer.y() < top_reserve || pointer.y() > height - bottom_reserve {
-                        continue;
-                    }
-                    let event = if touch.points.len() >= 2 {
-                        InputEvent::SmoothWheel {
-                            x: (-dx * 3.0) as i32,
-                            y: (-dy * 3.0) as i32,
-                        }
-                    } else {
-                        InputEvent::MouseMove {
-                            dx: (dx * 1.6) as i32,
-                            dy: (dy * 1.6) as i32,
-                        }
-                    };
-                    let _ = self.events.send(event);
+            2 => {
+                // Move. Track every finger separately so interleaved
+                // multi-touch deltas stay correct.
+                let Some((old_x, old_y)) = touch.points.get(&finger).copied() else {
+                    return;
+                };
+                let dx = x - old_x;
+                let dy = y - old_y;
+                touch.moved += dx.abs() + dy.abs();
+                touch.points.insert(finger, (x, y));
+                // Dead zone filters finger jitter, but never eats a real drag.
+                if dx.abs() < 0.35 && dy.abs() < 0.35 {
+                    return;
                 }
+                let event = if touch.points.len() >= 2 {
+                    InputEvent::SmoothWheel {
+                        x: (-dx * 3.0) as i32,
+                        y: (-dy * 3.0) as i32,
+                    }
+                } else {
+                    InputEvent::MouseMove {
+                        dx: (dx * 1.6) as i32,
+                        dy: (dy * 1.6) as i32,
+                    }
+                };
+                let _ = self.events.send(event);
             }
-            MotionAction::Up | MotionAction::PointerUp | MotionAction::Cancel => {
+            1 => {
+                // Up. A short, still touch is a click; two fingers = right.
                 let tap = touch
                     .down_at
-                    .map(|at| at.elapsed() < Duration::from_millis(230) && touch.moved < 18.0)
+                    .map(|at| at.elapsed() < Duration::from_millis(260) && touch.moved < 18.0)
                     .unwrap_or(false);
-                if tap && motion.action() != MotionAction::Cancel {
+                if tap {
                     let button = if touch.multi { MouseButton::Right } else { MouseButton::Left };
                     let _ = self.events.send(InputEvent::MouseButton { button, pressed: true });
                     let _ = self.events.send(InputEvent::MouseButton { button, pressed: false });
                 }
+                touch.points.remove(&finger);
+                if touch.points.is_empty() {
+                    touch.down_at = None;
+                    touch.multi = false;
+                }
+            }
+            _ => {
+                // Cancel.
+                touch.points.clear();
                 touch.down_at = None;
                 touch.multi = false;
-                touch.points.clear();
             }
-            _ => {}
         }
     }
 
@@ -447,11 +442,6 @@ impl Controller {
     }
 }
 
-static APP: OnceLock<AndroidApp> = OnceLock::new();
-thread_local! {
-    static TOUCH: std::cell::RefCell<Option<Arc<Controller>>> = const { std::cell::RefCell::new(None) };
-}
-
 fn short_fp(fingerprint: &str) -> String {
     fingerprint.chars().take(8).collect()
 }
@@ -483,7 +473,6 @@ fn android_main(app: AndroidApp) {
         .internal_data_path()
         .unwrap_or_else(|| std::path::PathBuf::from("/data/local/tmp/thekvm"));
     let _ = std::fs::create_dir_all(&data_dir);
-    APP.set(app.clone()).ok();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -494,23 +483,9 @@ fn android_main(app: AndroidApp) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
     let store = Store::load(&data_dir);
 
-    let listener_app = app.clone();
-    slint::android::init_with_event_listener(app, move |poll| {
-        if matches!(poll, PollEvent::Main(MainEvent::InputAvailable)) {
-            let Ok(mut events) = listener_app.input_events_iter() else { return };
-            while events.next(|event| {
-                if let AndroidInput::MotionEvent(motion) = event {
-                    TOUCH.with(|slot| {
-                        if let Some(controller) = slot.borrow().as_ref() {
-                            controller.on_touch(motion);
-                        }
-                    });
-                }
-                InputStatus::Unhandled
-            }) {}
-        }
-    })
-    .expect("Slint Android backend");
+    // Slint's backend drives input itself; the trackpad TouchArea in the UI
+    // delivers every motion event to `on_trackpad` via the Rust callback.
+    slint::android::init(app).expect("Slint Android backend");
 
     let ui = App::new().expect("create UI");
     let controller = Arc::new(Controller {
@@ -524,7 +499,6 @@ fn android_main(app: AndroidApp) {
         ui: OnceLock::new(),
     });
     controller.ui.set(ui.as_weak()).ok();
-    TOUCH.with(|slot| *slot.borrow_mut() = Some(controller.clone()));
 
     // Sequence-numbered input frames go to the ACTIVE desktop only.
     let pump = controller.clone();
@@ -608,6 +582,10 @@ fn android_main(app: AndroidApp) {
         }
     });
     ui.on_send_text({ let c = controller.clone(); move |text| c.send_text(text.to_string()) });
+    ui.on_trackpad_event({
+        let c = controller.clone();
+        move |kind, x, y, finger| c.on_trackpad(kind, x, y, finger)
+    });
 
     ui.set_paste_mode(store.paste_mode);
     ui.set_phase(SharedString::from("devices"));

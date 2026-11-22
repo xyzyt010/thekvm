@@ -208,6 +208,8 @@ export component App inherits Window {
     callback forget(string);
     callback toggle-paste();
     callback send-text(string);
+    // kind: 0=down 1=up 2=move 3=cancel; x/y are trackpad-local; id=finger
+    callback trackpad-event(int, length, length, int);
 
     // Approximate wrapped line count so the bar grows 1 → 5 lines.
     property <int> chars-per-line: max(1, floor((root.width - 48px * root.scale) / (8.2px * root.scale)));
@@ -378,6 +380,22 @@ export component App inherits Window {
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 wrap: word-wrap;
+            }
+            // Slint's own touch area: unlike android-activity's native
+            // iterator (which the backend drains before any listener can
+            // see it), these events always arrive. Coordinates are local
+            // to the trackpad, so typing-bar taps can never move the cursor.
+            TouchArea {
+                pointer-event(event) => {
+                    root.trackpad-event(
+                        event.kind == PointerEventKind.down ? 0 :
+                        event.kind == PointerEventKind.up ? 1 :
+                        event.kind == PointerEventKind.move ? 2 : 3,
+                        self.mouse-x,
+                        self.mouse-y,
+                        event.touch-finger-id
+                    );
+                }
             }
         }
 
