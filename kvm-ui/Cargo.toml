@@ -24,7 +24,11 @@ slint = { version = "1.8", default-features = false, features = [
     "compat-1-2",
     "system-tray",
 ] }
-mimalloc = "0.1"
+# Pinned deliberately: 0.1.49+ builds mimalloc v3.3.x, whose Windows
+# allocator path crashes with STATUS_ACCESS_VIOLATION (fault inside
+# mi_bitmap_try_find_and_claim, seen repeatedly in kvm-ui.exe). 0.1.48
+# stays on the stable v2 line and keeps the same RAM behaviour.
+mimalloc = "=0.1.48"
 tray-icon = "0.2"
 tokio = { workspace = true }
 quinn = { workspace = true }

@@ -966,44 +966,51 @@ component RoleRow inherits Rectangle {
         padding-right: 9px;
         spacing: 10px;
         alignment: center;
-        // Icon slot: vertically centred on the row by the layout; itself a
-        // fixed 26px square so both axes stay put.
-        Rectangle {
+        // Icon slot: a full-height centering cell. `alignment: center` on
+        // the HorizontalLayout only centres along its main (horizontal)
+        // axis, so a fixed-height icon otherwise sits at the top of the
+        // 42px row. This wrapper owns the row height and centres the 26px
+        // glyph box vertically on both axes.
+        VerticalLayout {
             width: 26px;
-            height: 26px;
-            border-radius: 6px;
-            background: root.selected ? #14532d : #20242c;
-            // Both ways: paired arrows. Server: arrow up/out (you drive).
-            // Client: arrow down/in (the peer drives you).
-            if root.icon == 0 : Path {
-                x: 4px; y: 7px; width: 18px; height: 12px;
-                viewbox-width: 18; viewbox-height: 12;
-                stroke: root.selected ? #34d399 : #9ca3af;
-                stroke-width: 1.8px;
-                stroke-line-cap: round;
-                stroke-line-join: round;
-                fill: transparent;
-                commands: "M 2 3.5 H 16 M 16 3.5 L 13 1 M 16 3.5 L 13 6 M 16 8.5 H 2 M 2 8.5 L 5 6 M 2 8.5 L 5 11";
-            }
-            if root.icon == 1 : Path {
-                x: 6px; y: 5px; width: 14px; height: 16px;
-                viewbox-width: 14; viewbox-height: 16;
-                stroke: root.selected ? #34d399 : #9ca3af;
-                stroke-width: 1.8px;
-                stroke-line-cap: round;
-                stroke-line-join: round;
-                fill: transparent;
-                commands: "M 7 15 V 1 M 7 1 L 2.75 5.25 M 7 1 L 11.25 5.25";
-            }
-            if root.icon == 2 : Path {
-                x: 6px; y: 5px; width: 14px; height: 16px;
-                viewbox-width: 14; viewbox-height: 16;
-                stroke: root.selected ? #34d399 : #9ca3af;
-                stroke-width: 1.8px;
-                stroke-line-cap: round;
-                stroke-line-join: round;
-                fill: transparent;
-                commands: "M 7 1 V 15 M 7 15 L 2.75 10.75 M 7 15 L 11.25 10.75";
+            alignment: center;
+            Rectangle {
+                width: 26px;
+                height: 26px;
+                border-radius: 6px;
+                background: root.selected ? #14532d : #20242c;
+                // Both ways: paired arrows. Server: arrow up/out (you drive).
+                // Client: arrow down/in (the peer drives you).
+                if root.icon == 0 : Path {
+                    x: 4px; y: 7px; width: 18px; height: 12px;
+                    viewbox-width: 18; viewbox-height: 12;
+                    stroke: root.selected ? #34d399 : #9ca3af;
+                    stroke-width: 1.8px;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                    fill: transparent;
+                    commands: "M 2 3.5 H 16 M 16 3.5 L 13 1 M 16 3.5 L 13 6 M 16 8.5 H 2 M 2 8.5 L 5 6 M 2 8.5 L 5 11";
+                }
+                if root.icon == 1 : Path {
+                    x: 6px; y: 5px; width: 14px; height: 16px;
+                    viewbox-width: 14; viewbox-height: 16;
+                    stroke: root.selected ? #34d399 : #9ca3af;
+                    stroke-width: 1.8px;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                    fill: transparent;
+                    commands: "M 7 15 V 1 M 7 1 L 2.75 5.25 M 7 1 L 11.25 5.25";
+                }
+                if root.icon == 2 : Path {
+                    x: 6px; y: 5px; width: 14px; height: 16px;
+                    viewbox-width: 14; viewbox-height: 16;
+                    stroke: root.selected ? #34d399 : #9ca3af;
+                    stroke-width: 1.8px;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                    fill: transparent;
+                    commands: "M 7 1 V 15 M 7 15 L 2.75 10.75 M 7 15 L 11.25 10.75";
+                }
             }
         }
         VerticalLayout {
@@ -1025,17 +1032,21 @@ component RoleRow inherits Rectangle {
             }
         }
         Rectangle { horizontal-stretch: 1; }
-        if root.selected : Path {
+        if root.selected : VerticalLayout {
             width: 13px;
-            height: 13px;
-            viewbox-width: 12;
-            viewbox-height: 12;
-            stroke: #34d399;
-            stroke-width: 2px;
-            stroke-line-cap: round;
-            stroke-line-join: round;
-            fill: transparent;
-            commands: "M 2 6 L 5 9 L 10 3";
+            alignment: center;
+            Path {
+                width: 13px;
+                height: 13px;
+                viewbox-width: 12;
+                viewbox-height: 12;
+                stroke: #34d399;
+                stroke-width: 2px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+                fill: transparent;
+                commands: "M 2 6 L 5 9 L 10 3";
+            }
         }
     }
 }
@@ -1089,48 +1100,56 @@ component RoleDropdown inherits Rectangle {
         height: parent.height;
         alignment: center;
         spacing: 7px;
-        // Icon, sized and centred like a row glyph.
-        Rectangle {
+        // Icon, in a full-height centering cell: the 36px pill's fixed
+        // 16px glyph must sit on the text's centre line, not the top.
+        VerticalLayout {
             width: 16px;
-            height: 16px;
-            if root.mode-index == 0 : Path {
-                width: 100%; height: 100%;
-                viewbox-width: 18; viewbox-height: 12;
-                stroke: popup.is-open ? #34d399 : #d1d5db;
-                stroke-width: 1.8px;
-                stroke-line-cap: round;
-                stroke-line-join: round;
-                fill: transparent;
-                commands: "M 2 3 H 16 M 16 3 L 13 0.75 M 16 3 L 13 5.25 M 16 9 H 2 M 2 9 L 5 6.75 M 2 9 L 5 11.25";
-            }
-            if root.mode-index == 1 : Path {
-                width: 100%; height: 100%;
-                viewbox-width: 14; viewbox-height: 16;
-                stroke: popup.is-open ? #34d399 : #d1d5db;
-                stroke-width: 1.8px;
-                stroke-line-cap: round;
-                stroke-line-join: round;
-                fill: transparent;
-                commands: "M 7 15 V 1 M 7 1 L 2.75 5.25 M 7 1 L 11.25 5.25";
-            }
-            if root.mode-index == 2 : Path {
-                width: 100%; height: 100%;
-                viewbox-width: 14; viewbox-height: 16;
-                stroke: popup.is-open ? #34d399 : #d1d5db;
-                stroke-width: 1.8px;
-                stroke-line-cap: round;
-                stroke-line-join: round;
-                fill: transparent;
-                commands: "M 7 1 V 15 M 7 15 L 2.75 10.75 M 7 15 L 11.25 10.75";
+            alignment: center;
+            Rectangle {
+                width: 16px;
+                height: 16px;
+                if root.mode-index == 0 : Path {
+                    width: 100%; height: 100%;
+                    viewbox-width: 18; viewbox-height: 12;
+                    stroke: popup.is-open ? #34d399 : #d1d5db;
+                    stroke-width: 1.8px;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                    fill: transparent;
+                    commands: "M 2 3 H 16 M 16 3 L 13 0.75 M 16 3 L 13 5.25 M 16 9 H 2 M 2 9 L 5 6.75 M 2 9 L 5 11.25";
+                }
+                if root.mode-index == 1 : Path {
+                    width: 100%; height: 100%;
+                    viewbox-width: 14; viewbox-height: 16;
+                    stroke: popup.is-open ? #34d399 : #d1d5db;
+                    stroke-width: 1.8px;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                    fill: transparent;
+                    commands: "M 7 15 V 1 M 7 1 L 2.75 5.25 M 7 1 L 11.25 5.25";
+                }
+                if root.mode-index == 2 : Path {
+                    width: 100%; height: 100%;
+                    viewbox-width: 14; viewbox-height: 16;
+                    stroke: popup.is-open ? #34d399 : #d1d5db;
+                    stroke-width: 1.8px;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                    fill: transparent;
+                    commands: "M 7 1 V 15 M 7 15 L 2.75 10.75 M 7 15 L 11.25 10.75";
+                }
             }
         }
-        Text {
-            text: root.current;
-            color: #f3f4f6;
-            font-size: 13px;
-            font-weight: 600;
-            vertical-alignment: center;
-            overflow: elide;
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.current;
+                color: #f3f4f6;
+                font-size: 13px;
+                font-weight: 600;
+                vertical-alignment: center;
+                overflow: elide;
+            }
         }
     }
     if root.applying : SpinnerArc {
@@ -1708,15 +1727,23 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         height: 36px;
                         spacing: 9px;
-                        if link-connecting && !session-verified : SpinnerArc {
-                            diameter: 18px;
-                            tick: root.spinner-tick;
+                        if link-connecting && !session-verified : VerticalLayout {
+                            width: 18px;
+                            alignment: center;
+                            SpinnerArc {
+                                diameter: 18px;
+                                tick: root.spinner-tick;
+                            }
                         }
-                        if !link-connecting || session-verified : Rectangle {
+                        if !link-connecting || session-verified : VerticalLayout {
                             width: 10px;
-                            height: 10px;
-                            border-radius: 5px;
-                            background: session-verified ? #22c55e : (session-active ? #f59e0b : #3f3f46);
+                            alignment: center;
+                            Rectangle {
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                background: session-verified ? #22c55e : (session-active ? #f59e0b : #3f3f46);
+                            }
                         }
                         Text {
                             text: session-text;
@@ -1734,10 +1761,13 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
-                        if session-active : Button {
-                            text: "Disconnect";
-                            height: 30px;
-                            clicked => { disconnect(); }
+                        if session-active : VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Disconnect";
+                                height: 30px;
+                                clicked => { disconnect(); }
+                            }
                         }
                     }
 
