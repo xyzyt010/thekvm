@@ -47,15 +47,15 @@ component SpinnerArc inherits Rectangle {
             commands: "M 12 2.5 A 9.5 9.5 0 0 1 21.45 10.8";
         }
     }
-    // One calm revolution every ~2.9s (2° per 16ms). The angle is wrapped
-    // at 360° instead of growing forever: an unbounded angle loses float
-    // precision after long uptimes and the sweep starts to stutter/jump.
+    // One calm revolution every ~5.8s (1° per 16ms — half the old speed).
+    // The angle is wrapped at 360° instead of growing forever: an unbounded
+    // angle loses float precision on long uptimes and the sweep stutters.
     in-out property <angle> angle: 0deg;
     Timer {
         interval: 16ms;
         running: true;
         triggered => {
-            root.angle = (root.angle + 2deg >= 360deg) ? (root.angle + 2deg - 360deg) : (root.angle + 2deg);
+            root.angle = (root.angle + 1deg >= 360deg) ? (root.angle + 1deg - 360deg) : (root.angle + 1deg);
         }
     }
 }
