@@ -19,6 +19,8 @@ slint = { version = "1.8", default-features = false, features = [
 ] }
 tokio = { workspace = true }
 quinn = { workspace = true }
+sha2 = "0.10"
+rustls-pki-types = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
