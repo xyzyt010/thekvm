@@ -26,29 +26,37 @@ component SpinnerArc inherits Rectangle {
         fill: transparent;
         commands: "M 12 2.5 A 9.5 9.5 0 1 1 12 21.5 A 9.5 9.5 0 1 1 12 2.5";
     }
-    // Comet arc (~100° of the ring) circling the track. No `animate`:
-    // the timer drives the rotation directly at 125 fps, so the arc
-    // sweep is unmistakably continuous, not subtle-stepped.
-    Path {
+    // Comet arc (~90° of the ring) circling the track. The rotation is
+    // applied to a Rectangle wrapper, NOT to the Path itself: rotating a
+    // Path directly made the software renderer jump the arc to a new
+    // position instead of sweeping it around the ring. The wrapper keeps
+    // the centre fixed and the arc turns in place.
+    Rectangle {
         width: 100%;
         height: 100%;
-        viewbox-width: 24;
-        viewbox-height: 24;
-        stroke: arc-color;
-        stroke-width: 2.2px;
-        stroke-line-cap: round;
-        fill: transparent;
-        commands: "M 12 2.5 A 9.5 9.5 0 0 1 21.45 10.8";
         transform-rotation: root.angle;
+        Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            stroke: arc-color;
+            stroke-width: 2.2px;
+            stroke-line-cap: round;
+            fill: transparent;
+            commands: "M 12 2.5 A 9.5 9.5 0 0 1 21.45 10.8";
+        }
     }
-    // Continuous 360° sweep, self-timed: 2.1° per 8ms ≈ 1.44s/revolution,
-    // repainted on every tick — smoother and rounder than easing-chained
-    // interpolation frames.
+    // One calm revolution every ~2.9s (2° per 16ms). The angle is wrapped
+    // at 360° instead of growing forever: an unbounded angle loses float
+    // precision after long uptimes and the sweep starts to stutter/jump.
     in-out property <angle> angle: 0deg;
     Timer {
-        interval: 8ms;
+        interval: 16ms;
         running: true;
-        triggered => { root.angle += 2.1deg; }
+        triggered => {
+            root.angle = (root.angle + 2deg >= 360deg) ? (root.angle + 2deg - 360deg) : (root.angle + 2deg);
+        }
     }
 }
 
