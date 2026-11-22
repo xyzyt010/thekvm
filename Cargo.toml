@@ -6,6 +6,7 @@ members = [
     "kvm-platform",
     "kvm-daemon",
     "kvm-ui",
+    "kvm-android",
 ]
 
 [workspace.package]

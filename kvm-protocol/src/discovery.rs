@@ -5,7 +5,7 @@
 //! never authenticates a peer or authorizes input. Pairing must still show and
 //! confirm the fingerprint through the normal QUIC ceremony.
 
-use kvm_core::{Mode, MAX_DEVICE_NAME_BYTES};
+use kvm_core::{ClientKind, Mode, MAX_DEVICE_NAME_BYTES};
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -26,6 +26,11 @@ pub struct Advertisement {
     /// can never bypass mode enforcement.
     #[serde(default = "default_advertised_mode")]
     pub mode: Mode,
+    /// What kind of peer is advertising. Defaults to Desktop so old
+    /// responders stay visible; Android clients use `Android` and filter
+    /// each other out (an Android device can never control another one).
+    #[serde(default)]
+    pub kind: ClientKind,
 }
 
 fn default_advertised_mode() -> Mode {
@@ -250,6 +255,7 @@ mod tests {
             listen_port: 42110,
             fingerprint_hex: "ab".repeat(32),
             mode: Mode::ServerClient,
+            kind: ClientKind::Desktop,
         };
         let encoded = encode_advertisement(&expected).unwrap();
         assert_eq!(decode_advertisement(&encoded).unwrap(), expected);

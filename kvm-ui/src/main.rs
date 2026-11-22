@@ -5974,6 +5974,7 @@ fn pair_prepare(
             &WireMessage::PairRequest {
                 node_name: node_name.to_owned(),
                 fingerprint_hex: identity.fingerprint_hex(),
+                client_kind: kvm_core::ClientKind::Desktop,
                 pairing_code: pairing_code
                     .as_deref()
                     .map(str::trim)

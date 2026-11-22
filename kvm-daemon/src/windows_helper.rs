@@ -23,6 +23,9 @@ const HELPER_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Debug, Serialize, Deserialize)]
 enum HelperMessage {
     Input(InputEvent),
+    /// Unicode text from an Android controller. `paste` chooses real
+    /// keystrokes (false) or clipboard + Ctrl+V (true).
+    TextInput { text: String, paste: bool },
     ReleaseAll,
     WarpCursor {
         x: u32,
@@ -218,6 +221,21 @@ impl ServiceInputProxy {
             &mut self.streams,
             &mut self.desktops,
             "send event to Windows helper",
+            &message,
+        )
+        .map(|_| ())
+    }
+
+    pub fn send_text(&mut self, text: &str, paste: bool) -> Result<()> {
+        self.ensure_session()?;
+        let message = serde_json::to_vec(&HelperMessage::TextInput {
+            text: text.to_owned(),
+            paste,
+        })?;
+        fan_out(
+            &mut self.streams,
+            &mut self.desktops,
+            "send text to Windows helper",
             &message,
         )
         .map(|_| ())
@@ -828,6 +846,22 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
             }
         };
         match message {
+            HelperMessage::TextInput { text, paste } => {
+                match current_desktop_is_input() {
+                    Ok(true) => match injector.send_text(&text, paste) {
+                        Ok(()) => receipt_ok(),
+                        Err(error) => {
+                            tracing::warn!(%error, "helper text injection failed");
+                            receipt_failed(error.to_string());
+                        }
+                    },
+                    Ok(false) => { let _ = injector.release_all(); }
+                    Err(error) => {
+                        tracing::warn!(%error, "helper desktop check failed on text");
+                        receipt_failed(error.to_string());
+                    }
+                }
+            }
             HelperMessage::Input(event) => {
                 // Both helpers stay alive so a desktop transition does not
                 // require tearing down the QUIC session. SendInput is a

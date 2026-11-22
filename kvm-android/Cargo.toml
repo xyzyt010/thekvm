@@ -1,0 +1,49 @@
+[package]
+name = "kvm-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "kvm_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+kvm-core = { path = "../kvm-core" }
+kvm-protocol = { path = "../kvm-protocol" }
+slint = { version = "1.8", default-features = false, features = [
+    "std",
+    "backend-android-activity-06",
+    "renderer-software",
+    "compat-1-2",
+] }
+tokio = { workspace = true }
+quinn = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+slint-build = "1.8"
+
+[package.metadata.android]
+package = "dev.thekvm.android"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "TheKVM"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
+[package.metadata.android.signing.release]
+path = "release.keystore"
+keystore_password = "android"

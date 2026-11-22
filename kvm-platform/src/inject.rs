@@ -398,6 +398,96 @@ mod linux_uinput {
             Ok(())
         }
 
+        /// Inject arbitrary Unicode text from a controller-only client.
+        /// `paste = true` stages the text on the clipboard and sends Ctrl+V
+        /// through the uinput keyboard. Otherwise (default) each character is
+        /// typed for real on X11 by temporarily remapping a scratch keycode
+        /// to its Unicode keysym and faking a press/release with XTest.
+        pub fn send_text(&mut self, text: &str, paste: bool) -> Result<(), PlatformError> {
+            if paste || !cfg!(target_os = "linux") {
+                let mut clipboard = crate::clipboard::SystemClipboard::create()?;
+                clipboard.set_text(text.to_owned())?;
+                for (usage, down) in [(0xE0u16, true), (0x1Au16, true), (0x1Au16, false), (0xE0u16, false)] {
+                    self.send(InputEvent::Key(KeyEvent { usage, pressed: down, repeat: false }))?;
+                }
+                return Ok(());
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                use x11rb::connection::Connection;
+                use x11rb::protocol::xproto::ConnectionExt as Xproto;
+                use x11rb::protocol::xtest::{fake_input, ConnectionExt as Xtest};
+
+                // Wayland (or a headless session) has no X keymap to remap.
+                // Fall back to clipboard + Ctrl+V there so text still lands.
+                let (connection, _) = match x11rb::connect(None) {
+                    Ok(connection) => connection,
+                    Err(_) => {
+                        let mut clipboard = crate::clipboard::SystemClipboard::create()?;
+                        clipboard.set_text(text.to_owned())?;
+                        for (usage, down) in [
+                            (0xE0u16, true),
+                            (0x1Au16, true),
+                            (0x1Au16, false),
+                            (0xE0u16, false),
+                        ] {
+                            self.send(InputEvent::Key(KeyEvent {
+                                usage,
+                                pressed: down,
+                                repeat: false,
+                            }))?;
+                        }
+                        return Ok(());
+                    }
+                };
+                // Keycodes 250+ are outside the normal PC keyboard range and
+                // are conventionally free for temporary remaps.
+                let keycode: u8 = 250;
+                let original = connection
+                    .get_keyboard_mapping(keycode, 1)
+                    .and_then(|cookie| cookie.reply())
+                    .map_err(|error| PlatformError::Uinput(format!("X11 keymap query: {error}")))?;
+                for ch in text.chars() {
+                    let codepoint = ch as u32;
+                    let keysym = if codepoint < 0x100 {
+                        codepoint
+                    } else {
+                        0x0100_0000 | codepoint
+                    };
+                    connection
+                        .change_keyboard_mapping(1, keycode, 1, &[keysym])
+                        .map_err(|error| PlatformError::Uinput(format!("X11 keymap change: {error}")))?;
+                    connection
+                        .flush()
+                        .map_err(|error| PlatformError::Uinput(format!("X11 flush: {error}")))?;
+                    // X11 event types 2 = KeyPress, 3 = KeyRelease.
+                    fake_input(&connection, 2, keycode, 0, 0, 0, 0, 0)
+                        .and_then(|cookie| cookie.check())
+                        .map_err(|error| PlatformError::Uinput(format!("X11 key press: {error}")))?;
+                    fake_input(&connection, 3, keycode, 0, 0, 0, 0, 0)
+                        .and_then(|cookie| cookie.check())
+                        .map_err(|error| PlatformError::Uinput(format!("X11 key release: {error}")))?;
+                }
+                connection
+                    .change_keyboard_mapping(
+                        1,
+                        keycode,
+                        original.keysyms_per_keycode,
+                        &original.keysyms,
+                    )
+                    .map_err(|error| PlatformError::Uinput(format!("X11 keymap restore: {error}")))?;
+                connection
+                    .flush()
+                    .map_err(|error| PlatformError::Uinput(format!("X11 flush: {error}")))?;
+                Ok(())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                unreachable!()
+            }
+        }
+
         /// Render one inbound pinch delta as a native two-finger touch
         /// gesture (see UinputTouch). ONLY used when the receiver opts in
         /// via `THEKVM_LINUX_PINCH_VIEWPORT=1`; the default rendering is
@@ -1387,7 +1477,7 @@ mod win32_inject {
     use windows::Win32::Foundation::{GetLastError, HANDLE, HWND, POINT, RECT};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
         MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
         MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
         MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
@@ -2085,6 +2175,63 @@ mod win32_inject {
             Ok(())
         }
 
+        /// Inject arbitrary Unicode text from a controller-only client.
+        /// `paste = false` synthesizes true keystrokes with KEYEVENTF_UNICODE
+        /// (one down+up per UTF-16 code unit) — works in every app, even ones
+        /// that ignore WM_CHAR. `paste = true` stages the text on the clipboard
+        /// and sends Ctrl+V, for apps where unicode keystrokes are unwanted.
+        pub fn send_text(&self, text: &str, paste: bool) -> Result<(), PlatformError> {
+            if paste {
+                let mut clipboard = crate::clipboard::SystemClipboard::create()?;
+                clipboard.set_text(text.to_owned())?;
+                let ctrl_down = keybd_input(0x11, 0, false, true);
+                let v_down = keybd_input(0x56, 0, false, true);
+                let v_up = keybd_input(0x56, 0, false, false);
+                let ctrl_up = keybd_input(0x11, 0, false, false);
+                let inputs = [ctrl_down, v_down, v_up, ctrl_up];
+                let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+                if sent as usize != inputs.len() {
+                    return Err(PlatformError::Win32(format!(
+                        "SendInput (paste) failed: {}",
+                        unsafe { GetLastError().0 }
+                    )));
+                }
+                return Ok(());
+            }
+
+            let units: Vec<u16> = text.encode_utf16().collect();
+            for chunk in units.chunks(16) {
+                let mut inputs = Vec::with_capacity(chunk.len() * 2);
+                for &unit in chunk {
+                    for flags in [
+                        KEYEVENTF_UNICODE,
+                        KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                    ] {
+                        inputs.push(INPUT {
+                            r#type: INPUT_KEYBOARD,
+                            Anonymous: INPUT_0 {
+                                ki: KEYBDINPUT {
+                                    wVk: VIRTUAL_KEY(0),
+                                    wScan: unit,
+                                    dwFlags: flags,
+                                    time: 0,
+                                    dwExtraInfo: crate::ECHO_TAG,
+                                },
+                            },
+                        });
+                    }
+                }
+                let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+                if sent as usize != inputs.len() {
+                    return Err(PlatformError::Win32(format!(
+                        "SendInput (unicode text) failed: {}",
+                        unsafe { GetLastError().0 }
+                    )));
+                }
+            }
+            Ok(())
+        }
+
         pub fn release_all(&self) -> Result<(), PlatformError> {
             // A session that ends mid-pinch must not leave touch contacts
             // down (or the fallback Ctrl held): lift everything first,
@@ -2638,6 +2785,12 @@ impl UnsupportedInjector {
     }
 
     pub fn send(&self, _event: kvm_core::InputEvent) -> Result<(), PlatformError> {
+        Err(PlatformError::Uinput(
+            "no native input injector is implemented for this operating system".into(),
+        ))
+    }
+
+    pub fn send_text(&self, _text: &str, _paste: bool) -> Result<(), PlatformError> {
         Err(PlatformError::Uinput(
             "no native input injector is implemented for this operating system".into(),
         ))

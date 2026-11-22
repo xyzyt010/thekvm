@@ -2228,6 +2228,7 @@ pub async fn pair(address: &str) -> Result<()> {
         &WireMessage::PairRequest {
             node_name: local_node_name(&config),
             fingerprint_hex: identity.fingerprint_hex(),
+            client_kind: kvm_core::ClientKind::Desktop,
             pairing_code: None,
         },
     )
@@ -2320,6 +2321,7 @@ pub async fn pair_for_daemon(
         &WireMessage::PairRequest {
             node_name: local_node_name(&config),
             fingerprint_hex: identity.fingerprint_hex(),
+            client_kind: kvm_core::ClientKind::Desktop,
             pairing_code: None,
         },
     )
@@ -10482,6 +10484,7 @@ fn spawn_discovery_responder(
                 listen_port,
                 fingerprint_hex: identity.fingerprint_hex(),
                 mode: kvm_core::Mode::Bidirectional,
+                kind: kvm_core::ClientKind::Desktop,
             },
         )
         .unwrap_or_default();
@@ -10506,6 +10509,7 @@ fn spawn_discovery_responder(
                                 listen_port: config.listen_port,
                                 fingerprint_hex: identity.fingerprint_hex(),
                                 mode: config.mode,
+                                kind: kvm_core::ClientKind::Desktop,
                             },
                         )
                         .unwrap_or_default()
@@ -10637,6 +10641,7 @@ async fn handle_connection(
                 node_name,
                 fingerprint_hex,
                 pairing_code,
+                ..
             } => {
                 handle_pairing(
                     &conn,
@@ -11299,6 +11304,18 @@ async fn handle_connection(
                             WireMessage::StateSync(state) => {
                                 sync_state(&state)?;
                                 injector.sync_state(&state)?;
+                            }
+                            WireMessage::TextInput { text, paste } => {
+                                // Controller-only client (Android typing bar).
+                                // Never type into the local user's session
+                                // after a handoff/park.
+                                if remote_idle {
+                                    continue;
+                                }
+                                injector.send_text(&text, paste)?;
+                                key_count += text.chars().count() as u64;
+                                remote_idle = false;
+                                note_inbound_activity(&link_input_events, &link_last_input);
                             }
                             WireMessage::Input(packet) => {
                                 match packet.event {
@@ -11993,6 +12010,15 @@ async fn handle_connection(
                                 // Priming frame sent by open_episode_stream
                                 // so Quinn transmits the STREAM header
                                 // immediately on open: absorbed quietly.
+                            }
+                            WireMessage::TextInput { text, paste } => {
+                                if remote_idle {
+                                    continue;
+                                }
+                                injector.send_text(&text, paste)?;
+                                key_count += text.chars().count() as u64;
+                                remote_idle = false;
+                                note_inbound_activity(&link_input_events, &link_last_input);
                             }
                             WireMessage::Input(packet) => {
                                 // Byte-identical handling to the episode
@@ -12799,6 +12825,14 @@ impl ReceiverInjector {
             Self::Native(injector) => injector.send(event).map_err(Into::into),
             #[cfg(target_os = "windows")]
             Self::Service(proxy) => proxy.send(event),
+        }
+    }
+
+    fn send_text(&mut self, text: &str, paste: bool) -> Result<()> {
+        match self {
+            Self::Native(injector) => injector.send_text(text, paste).map_err(Into::into),
+            #[cfg(target_os = "windows")]
+            Self::Service(proxy) => proxy.send_text(text, paste),
         }
     }
 
@@ -13674,6 +13708,7 @@ async fn open_episode_stream(
         &WireMessage::Hello(Hello {
             node_name: node_name.to_owned(),
             mode,
+            client_kind: kvm_core::ClientKind::Desktop,
             lock_screen_requested: request_lock_screen,
             clipboard_enabled,
             screen_geometry,

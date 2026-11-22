@@ -2,9 +2,11 @@
 
 pub mod config;
 pub mod event;
+pub mod kind;
 pub mod layout;
 
 pub use config::{Config, EdgeMode, Mode, TransportProtocol, MAX_DEVICE_NAME_BYTES};
+pub use kind::ClientKind;
 pub use event::{HidUsage, InputEvent, InputPacket, InputState, KeyEvent, MouseButton, WheelDelta};
 pub use layout::{
     edge_overflow, ClampReason, ClampStamp, DoubleEdgeStyle, Edge, EdgeHandoff, EdgeRouter, Layout,

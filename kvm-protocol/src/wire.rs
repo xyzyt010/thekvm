@@ -1,6 +1,6 @@
 //! Length-delimited application messages carried over QUIC streams.
 
-use kvm_core::{InputEvent, InputPacket, InputState, Mode, WheelDelta};
+use kvm_core::{ClientKind, InputEvent, InputPacket, InputState, Mode, WheelDelta};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -159,6 +159,10 @@ pub struct ScreenGeometry {
 pub struct Hello {
     pub node_name: String,
     pub mode: Mode,
+    /// Controller-only Android clients never capture local input. Defaults
+    /// to Desktop so older peers stay compatible.
+    #[serde(default)]
+    pub client_kind: ClientKind,
     /// Requests permission to operate while the receiver is locked or at the
     /// login greeter. The receiver must independently enable this locally.
     pub lock_screen_requested: bool,
@@ -209,6 +213,8 @@ pub enum WireMessage {
     PairRequest {
         node_name: String,
         fingerprint_hex: String,
+        #[serde(default)]
+        client_kind: ClientKind,
         /// Typed station code (the digits shown on the other computer's
         /// screen), when the user entered one. Absent for classic
         /// compare-codes pairing and for older peers. The station verifies
@@ -265,6 +271,16 @@ pub enum WireMessage {
         udp_motion: bool,
     },
     Input(InputPacket),
+    /// Arbitrary Unicode text from a controller-only client (the Android
+    /// typing bar). `paste` selects the injection method: false = synthesize
+    /// real keystrokes at the cursor, true = put the text on the desktop
+    /// clipboard for an explicit paste. New variant; desktop peers built
+    /// before this field simply never send it.
+    TextInput {
+        text: String,
+        #[serde(default)]
+        paste: bool,
+    },
     /// Reliable sender state snapshot, sent before the first event on every
     /// newly established input session.
     StateSync(InputState),
@@ -444,6 +460,7 @@ pub fn validate_message(message: &WireMessage) -> std::io::Result<()> {
             node_name,
             fingerprint_hex,
             pairing_code,
+            ..
         } => {
             validate_node_name(node_name)?;
             validate_fingerprint(fingerprint_hex)?;
@@ -506,6 +523,20 @@ pub fn validate_message(message: &WireMessage) -> std::io::Result<()> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "screen geometry exceeds maximum dimension",
+            ));
+        }
+    }
+    if let WireMessage::TextInput { text, .. } = message {
+        if text.is_empty() || text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "text input is empty or exceeds maximum size",
+            ));
+        }
+        if text.chars().any(|c| c == '\0') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "text input contains a NUL byte",
             ));
         }
     }
@@ -978,6 +1009,7 @@ mod tests {
         assert!(validate_message(&WireMessage::Hello(Hello {
             node_name: "node".into(),
             mode: Mode::Bidirectional,
+            client_kind: ClientKind::Desktop,
             lock_screen_requested: false,
             clipboard_enabled: false,
             screen_geometry: Some(ScreenGeometry {
@@ -999,6 +1031,7 @@ mod tests {
         assert!(validate_message(&WireMessage::Hello(Hello {
             node_name: "bad\nname".into(),
             mode: Mode::Bidirectional,
+            client_kind: ClientKind::Desktop,
             lock_screen_requested: false,
             clipboard_enabled: false,
             screen_geometry: None,
@@ -1012,6 +1045,7 @@ mod tests {
         assert!(validate_message(&WireMessage::PairRequest {
             node_name: "node".into(),
             fingerprint_hex: "not-a-fingerprint".into(),
+            client_kind: ClientKind::Desktop,
             pairing_code: None,
         })
         .is_err());
