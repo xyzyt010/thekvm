@@ -2,10 +2,14 @@
 // console window; diagnostics go through the status line and logs.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-// mimalloc as the global allocator: glibc malloc on Linux holds freed
-// arena memory (VmRSS >> live set — measured 15+ MB heap stranded).
-// mimalloc returns idle pages to the OS promptly and matches or beats
-// glibc on Windows too. No behavioral change anywhere else.
+// mimalloc as the global allocator on Linux only: glibc malloc holds freed
+// arena memory (VmRSS >> live set — measured 15+ MB heap stranded), while
+// mimalloc returns idle pages promptly. On Windows the OS allocator is used:
+// full crash dumps proved the long-idle STATUS_ACCESS_VIOLATION crashes were
+// inside mimalloc's free-page walk (reading a -1 next-pointer), across both
+// the v2 and v3 lines. Keeping it Linux-only preserves the memory win there
+// without the Windows crash. Everything else is allocator-independent.
+#[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

@@ -847,18 +847,16 @@ fn menu_command_id(message: u32, wparam: usize, lparam: isize) -> Option<u32> {
         let id = (wparam & 0xffff) as u32;
         return tray_bridge::command_for_id(id).map(|_| id);
     }
-    // WM_MENUCOMMAND: wparam is either the item id or its position inside
-    // the menu named by lparam; resolve a position through the menu.
-    let direct = wparam as u32;
-    if tray_bridge::command_for_id(direct).is_some() {
-        return Some(direct);
-    }
+    // WM_MENUCOMMAND: wparam is the item POSITION inside the menu named by
+    // lparam, never the command id. Resolve the position through the menu;
+    // treating the position as an id made row 2 fire row 1's command (and
+    // so on) because muda numbers its items 1, 2, 3, 4.
     let menu = HMENU(lparam as *mut _);
     let position = wparam as i32;
     if !menu.0.is_null() {
         let id = unsafe { GetMenuItemID(menu, position) };
         if id != u32::MAX && id != 0 {
-            return Some(id);
+            return tray_bridge::command_for_id(id).map(|_| id);
         }
     }
     None

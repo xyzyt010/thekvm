@@ -24,11 +24,6 @@ slint = { version = "1.8", default-features = false, features = [
     "compat-1-2",
     "system-tray",
 ] }
-# Pinned deliberately: 0.1.49+ builds mimalloc v3.3.x, whose Windows
-# allocator path crashes with STATUS_ACCESS_VIOLATION (fault inside
-# mi_bitmap_try_find_and_claim, seen repeatedly in kvm-ui.exe). 0.1.48
-# stays on the stable v2 line and keeps the same RAM behaviour.
-mimalloc = "=0.1.48"
 tray-icon = "0.2"
 tokio = { workspace = true }
 quinn = { workspace = true }
@@ -40,6 +35,14 @@ tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# glibc malloc strands freed arena pages on Linux (VmRSS >> live set,
+# measured 15+ MB). mimalloc returns them promptly there. Windows uses the
+# OS allocator: full crash dumps showed kvm-ui dying for hours on end
+# inside mimalloc's metadata walk (a -1 next-pointer read in
+# mi_find_free_page), on both the v2 and v3 lines. Keeping mimalloc
+# Linux-only preserves the memory win where it helps without the crash.
+# Pinned: 0.1.49+ switched to mimalloc v3.3.x.
+mimalloc = "=0.1.48"
 gtk = "0.15"
 # Activation (_NET_ACTIVE_WINDOW) of our window when the Linux tray menu's
 # "Show" is clicked: raises the window to the foreground instead of opening
