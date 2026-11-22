@@ -26,52 +26,63 @@ component SpinnerArc inherits Rectangle {
         fill: transparent;
         commands: "M 12 2.5 A 9.5 9.5 0 1 1 12 21.5 A 9.5 9.5 0 1 1 12 2.5";
     }
-    // Comet arc (~90° of the ring) circling the track. The rotation is
-    // applied to a Rectangle wrapper, NOT to the Path itself: rotating a
-    // Path directly made the software renderer jump the arc to a new
-    // position instead of sweeping it around the ring. The wrapper keeps
-    // the centre fixed and the arc turns in place.
-    Rectangle {
+    // Comet arc (~90° of the ring) circling the track. Its endpoint
+    // coordinates are recomputed from the angle every tick: the software
+    // renderer repaints when `commands` changes, but ignores
+    // transform-rotation on a Path (the arc used to sit completely still).
+    Path {
         width: 100%;
         height: 100%;
-        transform-rotation: root.angle;
-        Path {
-            width: 100%;
-            height: 100%;
-            viewbox-width: 24;
-            viewbox-height: 24;
-            stroke: arc-color;
-            stroke-width: 2.2px;
-            stroke-line-cap: round;
-            fill: transparent;
-            commands: "M 12 2.5 A 9.5 9.5 0 0 1 21.45 10.8";
-        }
+        viewbox-width: 24;
+        viewbox-height: 24;
+        stroke: arc-color;
+        stroke-width: 2.2px;
+        stroke-line-cap: round;
+        fill: transparent;
+        commands: "M "
+            + (round((12 + 9.5 * cos(root.angle)) * 100) / 100) + " "
+            + (round((12 + 9.5 * sin(root.angle)) * 100) / 100)
+            + " A 9.5 9.5 0 0 1 "
+            + (round((12 + 9.5 * cos(root.angle + 90deg)) * 100) / 100) + " "
+            + (round((12 + 9.5 * sin(root.angle + 90deg)) * 100) / 100);
     }
-    // One calm revolution every ~5.8s (1° per 16ms — half the old speed).
-    // The angle is wrapped at 360° instead of growing forever: an unbounded
-    // angle loses float precision on long uptimes and the sweep stutters.
+    // One revolution every ~3.8s (1.5° per 16ms). The angle wraps at 360°
+    // so long uptimes cannot lose float precision and stutter.
     in-out property <angle> angle: 0deg;
     Timer {
         interval: 16ms;
         running: true;
         triggered => {
-            root.angle = (root.angle + 1deg >= 360deg) ? (root.angle + 1deg - 360deg) : (root.angle + 1deg);
+            root.angle = (root.angle + 1.5deg >= 360deg) ? (root.angle + 1.5deg - 360deg) : (root.angle + 1.5deg);
         }
     }
 }
 
-// Drawn chevron (no font glyph): classic V pointing DOWN when closed and
-// the exact same V turned 180° (pointing UP) when open. Both strokes are
-// drawn explicitly instead of animating `transform-rotation` on a Path:
-// the software renderer did not reliably repaint the rotated path, so the
-// arrow kept pointing down in the expanded state.
+// Drawn chevron (no font glyph): one V that turns a smooth 180° — pointing
+// DOWN when closed, UP when open. The angle is animated and the three V
+// points are recomputed from it every frame; `transform-rotation` cannot be
+// used here because the software renderer does not repaint a rotated Path
+// (the arrow stayed static, or snapped only when something else redrew).
 component ChevronGlyph inherits Rectangle {
     in property <bool> open: false;
     in property <color> glyph-color: #9ca3af;
     width: 14px;
     height: 14px;
     background: transparent;
-    if !root.open : Path {
+    in-out property <angle> sweep: root.open ? 180deg : 0deg;
+    animate sweep { duration: 200ms; easing: ease-in-out; }
+    // cos/sin of the animated angle, reused by all three rotated points.
+    property <float> c: cos(root.sweep);
+    property <float> s: sin(root.sweep);
+    // Down V is (2.5,4.5) (6,8) (9.5,4.5), rotated about the glyph centre
+    // (6,6). At sweep=180deg this is exactly the inverted V.
+    property <float> ax: 6 - 3.5 * root.c + 1.5 * root.s;
+    property <float> ay: 6 - 3.5 * root.s - 1.5 * root.c;
+    property <float> bx: 6 - 2 * root.s;
+    property <float> by: 6 + 2 * root.c;
+    property <float> cx: 6 + 3.5 * root.c + 1.5 * root.s;
+    property <float> cy: 6 + 3.5 * root.s - 1.5 * root.c;
+    Path {
         width: 100%;
         height: 100%;
         viewbox-width: 12;
@@ -81,20 +92,9 @@ component ChevronGlyph inherits Rectangle {
         stroke-line-cap: round;
         stroke-line-join: round;
         fill: transparent;
-        commands: "M 2.5 4.5 L 6 8 L 9.5 4.5";
-    }
-    if root.open : Path {
-        width: 100%;
-        height: 100%;
-        viewbox-width: 12;
-        viewbox-height: 12;
-        stroke: root.glyph-color;
-        stroke-width: 1.8px;
-        stroke-line-cap: round;
-        stroke-line-join: round;
-        fill: transparent;
-        // (2.5,4.5)->(9.5,7.5), (6,8)->(6,4), (9.5,4.5)->(2.5,7.5)
-        commands: "M 9.5 7.5 L 6 4 L 2.5 7.5";
+        commands: "M " + (round(root.ax * 100) / 100) + " " + (round(root.ay * 100) / 100)
+            + " L " + (round(root.bx * 100) / 100) + " " + (round(root.by * 100) / 100)
+            + " L " + (round(root.cx * 100) / 100) + " " + (round(root.cy * 100) / 100);
     }
 }
 
