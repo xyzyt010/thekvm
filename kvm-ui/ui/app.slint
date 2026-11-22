@@ -52,14 +52,18 @@ component SpinnerArc inherits Rectangle {
     }
 }
 
-// Drawn chevron (no font glyph): points down; rotates 180° when open.
+// Drawn chevron (no font glyph): classic V pointing DOWN when closed and
+// the exact same V turned 180° (pointing UP) when open. Both strokes are
+// drawn explicitly instead of animating `transform-rotation` on a Path:
+// the software renderer did not reliably repaint the rotated path, so the
+// arrow kept pointing down in the expanded state.
 component ChevronGlyph inherits Rectangle {
     in property <bool> open: false;
     in property <color> glyph-color: #9ca3af;
     width: 14px;
     height: 14px;
     background: transparent;
-    Path {
+    if !root.open : Path {
         width: 100%;
         height: 100%;
         viewbox-width: 12;
@@ -70,8 +74,19 @@ component ChevronGlyph inherits Rectangle {
         stroke-line-join: round;
         fill: transparent;
         commands: "M 2.5 4.5 L 6 8 L 9.5 4.5";
-        transform-rotation: root.open ? 180deg : 0deg;
-        animate transform-rotation { duration: 160ms; easing: ease-out; }
+    }
+    if root.open : Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 12;
+        viewbox-height: 12;
+        stroke: root.glyph-color;
+        stroke-width: 1.8px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        fill: transparent;
+        // (2.5,4.5)->(9.5,7.5), (6,8)->(6,4), (9.5,4.5)->(2.5,7.5)
+        commands: "M 9.5 7.5 L 6 4 L 2.5 7.5";
     }
 }
 
@@ -962,9 +977,11 @@ component RoleRow inherits Rectangle {
         clicked => { root.picked(); }
     }
     HorizontalLayout {
-        padding-left: 9px;
-        padding-right: 9px;
-        spacing: 10px;
+        // Tight pockets and gaps so a row still has room for the 15px role
+        // name inside a popup that is exactly as wide as the 140px pill.
+        padding-left: 5px;
+        padding-right: 5px;
+        spacing: 4px;
         alignment: center;
         // Icon slot: a full-height centering cell. `alignment: center` on
         // the HorizontalLayout only centres along its main (horizontal)
@@ -972,17 +989,17 @@ component RoleRow inherits Rectangle {
         // 42px row. This wrapper owns the row height and centres the 26px
         // glyph box vertically on both axes.
         VerticalLayout {
-            width: 26px;
+            width: 22px;
             alignment: center;
             Rectangle {
-                width: 26px;
-                height: 26px;
+                width: 22px;
+                height: 22px;
                 border-radius: 6px;
                 background: root.selected ? #14532d : #20242c;
                 // Both ways: paired arrows. Server: arrow up/out (you drive).
                 // Client: arrow down/in (the peer drives you).
                 if root.icon == 0 : Path {
-                    x: 4px; y: 7px; width: 18px; height: 12px;
+                    x: 2px; y: 5px; width: 18px; height: 12px;
                     viewbox-width: 18; viewbox-height: 12;
                     stroke: root.selected ? #34d399 : #9ca3af;
                     stroke-width: 1.8px;
@@ -992,7 +1009,7 @@ component RoleRow inherits Rectangle {
                     commands: "M 2 3.5 H 16 M 16 3.5 L 13 1 M 16 3.5 L 13 6 M 16 8.5 H 2 M 2 8.5 L 5 6 M 2 8.5 L 5 11";
                 }
                 if root.icon == 1 : Path {
-                    x: 6px; y: 5px; width: 14px; height: 16px;
+                    x: 4px; y: 3px; width: 14px; height: 16px;
                     viewbox-width: 14; viewbox-height: 16;
                     stroke: root.selected ? #34d399 : #9ca3af;
                     stroke-width: 1.8px;
@@ -1002,7 +1019,7 @@ component RoleRow inherits Rectangle {
                     commands: "M 7 15 V 1 M 7 1 L 2.75 5.25 M 7 1 L 11.25 5.25";
                 }
                 if root.icon == 2 : Path {
-                    x: 6px; y: 5px; width: 14px; height: 16px;
+                    x: 4px; y: 3px; width: 14px; height: 16px;
                     viewbox-width: 14; viewbox-height: 16;
                     stroke: root.selected ? #34d399 : #9ca3af;
                     stroke-width: 1.8px;
@@ -1019,25 +1036,29 @@ component RoleRow inherits Rectangle {
             Text {
                 text: root.label;
                 color: root.selected ? #a7f3d0 : #e5e7eb;
-                font-size: 12px;
+                // Exactly the compressed control's 15px: the role name is
+                // the same size closed and expanded.
+                font-size: 15px;
                 font-weight: 600;
                 vertical-alignment: center;
+                overflow: elide;
             }
             Text {
                 text: root.caption;
                 color: #7c8698;
-                font-size: 9.5px;
+                font-size: 9px;
                 font-weight: 400;
                 vertical-alignment: center;
+                overflow: elide;
             }
         }
         Rectangle { horizontal-stretch: 1; }
         if root.selected : VerticalLayout {
-            width: 13px;
+            width: 11px;
             alignment: center;
             Path {
-                width: 13px;
-                height: 13px;
+                width: 11px;
+                height: 11px;
                 viewbox-width: 12;
                 viewbox-height: 12;
                 stroke: #34d399;
@@ -1054,8 +1075,8 @@ component RoleRow inherits Rectangle {
 // Role selection as a proper dropdown with a drawn chevron. The popup is
 // a PopupWindow, so it floats above the tab content and closes on an
 // outside click; the chevron flips while it is open. The control itself
-// is a compact 132×32 pill that sits level with its neighbours; the open
-// list carries the explained options.
+// is a compact 140×36 pill that sits level with its neighbours, and the
+// popup is exactly the same width — no horizontal jump when it opens.
 component RoleDropdown inherits Rectangle {
     in property <string> current: "Both ways";
     in property <int> mode-index: 0;
@@ -1064,7 +1085,8 @@ component RoleDropdown inherits Rectangle {
     // slot so the press visibly took effect. Cleared when the daemon
     // confirms (or refuses).
     in property <bool> applying: false;
-    // The role just landed: brief green frame on the dropdown.
+    // The role just landed (kept for the applied-state timer; no green
+    // frame is drawn — the control stays neutral in every state).
     in-out property <bool> applied: false;
     in property <int> tick: 0;
     callback picked(int);
@@ -1073,7 +1095,9 @@ component RoleDropdown inherits Rectangle {
     border-radius: 9px;
     background: hit.has-hover || popup.is-open ? #262626 : #1a1a1a;
     border-width: 1px;
-    border-color: root.applying || root.applied ? #22c55e : (popup.is-open ? #34d399 : (hit.has-hover ? #4b5563 : #2a2a2a));
+    // Neutral outline in every state: no green frame on apply, on the
+    // brief "applied" flash, or while the popup is open.
+    border-color: popup.is-open ? #3f3f46 : (hit.has-hover ? #4b5563 : #2a2a2a);
     animate background { duration: 120ms; }
     animate border-color { duration: 120ms; }
     hit := TouchArea {
@@ -1111,7 +1135,7 @@ component RoleDropdown inherits Rectangle {
                 if root.mode-index == 0 : Path {
                     width: 100%; height: 100%;
                     viewbox-width: 18; viewbox-height: 12;
-                    stroke: popup.is-open ? #34d399 : #d1d5db;
+                    stroke: #d1d5db;
                     stroke-width: 1.8px;
                     stroke-line-cap: round;
                     stroke-line-join: round;
@@ -1121,7 +1145,7 @@ component RoleDropdown inherits Rectangle {
                 if root.mode-index == 1 : Path {
                     width: 100%; height: 100%;
                     viewbox-width: 14; viewbox-height: 16;
-                    stroke: popup.is-open ? #34d399 : #d1d5db;
+                    stroke: #d1d5db;
                     stroke-width: 1.8px;
                     stroke-line-cap: round;
                     stroke-line-join: round;
@@ -1131,7 +1155,7 @@ component RoleDropdown inherits Rectangle {
                 if root.mode-index == 2 : Path {
                     width: 100%; height: 100%;
                     viewbox-width: 14; viewbox-height: 16;
-                    stroke: popup.is-open ? #34d399 : #d1d5db;
+                    stroke: #d1d5db;
                     stroke-width: 1.8px;
                     stroke-line-cap: round;
                     stroke-line-join: round;
@@ -1145,7 +1169,9 @@ component RoleDropdown inherits Rectangle {
             Text {
                 text: root.current;
                 color: #f3f4f6;
-                font-size: 13px;
+                // Same 15px size as the row labels inside the popup: the
+                // role name never changes size between closed and open.
+                font-size: 15px;
                 font-weight: 600;
                 vertical-alignment: center;
                 overflow: elide;
@@ -1170,7 +1196,7 @@ component RoleDropdown inherits Rectangle {
             width: 100%;
             height: 100%;
             open: popup.is-open;
-            glyph-color: popup.is-open ? #34d399 : #9ca3af;
+            glyph-color: popup.is-open ? #d1d5db : #9ca3af;
         }
     }
     Timer {
@@ -1181,8 +1207,10 @@ component RoleDropdown inherits Rectangle {
     popup := PopupWindow {
         x: 0;
         y: root.height + 6px;
-        width: 178px;
-        height: 152px;
+        // Exactly the compressed pill's width: opening the list must not
+        // make the control look wider or shift its right edge.
+        width: root.width;
+        height: 142px;
         close-policy: close-on-click-outside;
         Rectangle {
             width: 100%;
@@ -1195,8 +1223,8 @@ component RoleDropdown inherits Rectangle {
             drop-shadow-blur: 14px;
             drop-shadow-offset-y: 5px;
             VerticalLayout {
-                padding: 6px;
-                spacing: 3px;
+                padding: 4px;
+                spacing: 2px;
                 alignment: start;
                 RoleRow {
                     label: "Both ways";
