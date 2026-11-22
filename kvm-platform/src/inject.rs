@@ -149,6 +149,20 @@ mod linux_uinput {
             result
         }
 
+        pub fn send_text(&mut self, text: &str, paste: bool) -> Result<(), PlatformError> {
+            let mut slot = shared_uinput_slot()
+                .lock()
+                .map_err(|_| PlatformError::Uinput("uinput lock poisoned".into()))?;
+            if slot.is_none() {
+                *slot = Some(RawUinputDevice::create()?);
+            }
+            let result = slot.as_mut().expect("just initialized").send_text(text, paste);
+            if result.is_err() {
+                *slot = None;
+            }
+            result
+        }
+
         pub fn inject_pinch(&mut self, delta: i32, display: Option<&str>) -> bool {
             let Ok(mut slot) = shared_uinput_slot().lock() else {
                 return false;
