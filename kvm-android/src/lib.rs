@@ -118,6 +118,7 @@ struct Controller {
     // Live diagnostics: touch events received vs frames actually written.
     touch_count: AtomicU64,
     frame_count: AtomicU64,
+    gesture_count: AtomicU64,
     last_delta: Mutex<(i32, i32)>,
 }
 
@@ -151,7 +152,8 @@ impl Controller {
         let touch = self.touch_count.load(Ordering::Relaxed);
         let frames = self.frame_count.load(Ordering::Relaxed);
         let (dx, dy) = *self.last_delta.lock().unwrap();
-        let line = format!("touch {touch} · sent {frames} · last {dx},{dy}");
+        let gestures = self.gesture_count.load(Ordering::Relaxed);
+        let line = format!("touch {touch} · sent {frames} · gest {gestures} · last {dx},{dy}");
         self.notify_ui(move |ui| ui.set_touch_debug(SharedString::from(line)));
     }
 
@@ -355,6 +357,10 @@ impl Controller {
     }
 
     fn gesture_update(&self, x: f32, y: f32, scale: f32) {
+        let count = self.gesture_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count % 6 == 0 {
+            self.publish_diag();
+        }
         let (dx, dy, zoom) = {
             let mut g = self.gesture.lock().unwrap();
             if !g.active {
@@ -715,6 +721,7 @@ fn android_main(app: AndroidApp) {
         ui: OnceLock::new(),
         touch_count: AtomicU64::new(0),
         frame_count: AtomicU64::new(0),
+        gesture_count: AtomicU64::new(0),
         last_delta: Mutex::new((0, 0)),
     });
     controller.ui.set(ui.as_weak()).ok();

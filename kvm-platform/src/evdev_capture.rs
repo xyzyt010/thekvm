@@ -448,15 +448,17 @@ impl Device {
                             if sx.abs() <= 300 && sy.abs() <= 300 && (sx != 0 || sy != 0) {
                                 // Two-finger pan in 120ths: moving fingers up
                                 // (sy < 0) scrolls up (+y), moving right
-                                // (sx > 0) scrolls right (+x).
-                                if sy.abs() >= sx.abs() {
-                                    self.scroll_y_120ths = self
-                                        .scroll_y_120ths
-                                        .saturating_add((-sy).saturating_mul(4));
-                                } else {
-                                    self.scroll_x_120ths =
-                                        self.scroll_x_120ths.saturating_add(sx.saturating_mul(4));
-                                }
+                                // (sx > 0) scrolls right (+x). BOTH axes are
+                                // forwarded every frame: the old either/or
+                                // pick dropped the minority axis, so a
+                                // horizontal pan with any vertical wobble
+                                // lost its horizontal component entirely and
+                                // cross-OS horizontal scroll never arrived.
+                                self.scroll_y_120ths = self
+                                    .scroll_y_120ths
+                                    .saturating_add((-sy).saturating_mul(4));
+                                self.scroll_x_120ths =
+                                    self.scroll_x_120ths.saturating_add(sx.saturating_mul(4));
                             }
                         }
                         self.touchpad.last_two_mid = Some((mx, my));
@@ -1186,6 +1188,47 @@ mod tests {
         assert_eq!(
             device.process(syn),
             vec![InputEvent::SmoothWheel { x: 0, y: 80 }]
+        );
+    }
+
+    #[test]
+    fn horizontal_pan_with_vertical_wobble_keeps_both_axes() {
+        let mut device = test_device();
+        device.is_touchpad = true;
+        let ev = |type_, code, value| RawInputEvent {
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_,
+            code,
+            value,
+        };
+        let syn = ev(EV_SYN, SYN_REPORT, 0);
+        // Two contacts down.
+        let _ = device.process(ev(EV_KEY, BTN_TOUCH, 1));
+        let _ = device.process(ev(EV_KEY, BTN_TOOL_DOUBLETAP, 1));
+        let _ = device.process(ev(EV_ABS, ABS_MT_SLOT, 0));
+        let _ = device.process(ev(EV_ABS, ABS_MT_TRACKING_ID, 1));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_X, 100));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_Y, 200));
+        let _ = device.process(ev(EV_ABS, ABS_MT_SLOT, 1));
+        let _ = device.process(ev(EV_ABS, ABS_MT_TRACKING_ID, 2));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_X, 200));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_Y, 200));
+        assert!(device.process(syn).is_empty());
+        // Pan right 30 units with 4 units of vertical wobble. The old
+        // either/or axis pick dropped x entirely whenever |sy| >= |sx|;
+        // both axes must now survive so horizontal scroll reaches the peer.
+        let _ = device.process(ev(EV_ABS, ABS_MT_SLOT, 0));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_X, 130));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_Y, 196));
+        let _ = device.process(ev(EV_ABS, ABS_MT_SLOT, 1));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_X, 230));
+        let _ = device.process(ev(EV_ABS, ABS_MT_POSITION_Y, 196));
+        assert_eq!(
+            device.process(syn),
+            vec![InputEvent::SmoothWheel { x: 120, y: 16 }]
         );
     }
 

@@ -848,7 +848,7 @@ pub fn run_helper(port: u16, token: &str, desktop: &str) -> Result<()> {
         match message {
             HelperMessage::TextInput { text, paste } => {
                 match current_desktop_is_input() {
-                    Ok(true) => match injector.send_text(&text, paste) {
+                    Ok(true) => match injector.send_text(&text, paste, None) {
                         Ok(()) => receipt_ok(),
                         Err(error) => {
                             tracing::warn!(%error, "helper text injection failed");

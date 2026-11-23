@@ -480,9 +480,45 @@ pub fn focus_main_window() {
         }
     }
     let Some(hwnd) = target else { return };
+
+    // A bare _NET_ACTIVE_WINDOW is not enough when another app owns the
+    // screen: the window may be unmapped (hide-on-close), and WMs honour
+    // focus-stealing prevention against a plain activation. Unmap->map,
+    // raise above siblings, clear the hidden state, then activate and take
+    // focus explicitly. This is what lets Show win over a fullscreen app.
+    let _ = connection.map_window(hwnd);
+    let _ = connection.configure_window(
+        hwnd,
+        &xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
+    );
+
+    if let (Some(atom_state), Some(atom_hidden), Some(atom_above)) = (
+        intern(b"_NET_WM_STATE"),
+        intern(b"_NET_WM_STATE_HIDDEN"),
+        intern(b"_NET_WM_STATE_ABOVE"),
+    ) {
+        // 0 = remove, 1 = add, 2 = toggle.
+        for (action, state) in [(0u32, atom_hidden), (1u32, atom_above)] {
+            let data: [u32; 5] = [action, state, 0, 2, 0];
+            let _ = connection.send_event(
+                false,
+                root,
+                xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+                xproto::ClientMessageEvent {
+                    response_type: 33,
+                    format: 32,
+                    sequence: 0,
+                    window: hwnd,
+                    type_: atom_state,
+                    data: xproto::ClientMessageData::from(data),
+                },
+            );
+        }
+    }
+
     // _NET_ACTIVE_WINDOW message to the root window asks the WM to activate
-    // (raise + focus) our window.
-    let data: [u32; 5] = [2, 0, 0, 0, 0];
+    // (raise + focus) our window. Source 2 = direct user action.
+    let data: [u32; 5] = [2, xproto::CURRENT_TIME, 0, 0, 0];
     let _ = connection.send_event(
         false,
         root,
@@ -496,6 +532,7 @@ pub fn focus_main_window() {
             data: xproto::ClientMessageData::from(data),
         },
     );
+    let _ = connection.set_input_focus(xproto::InputFocus::POINTER_ROOT, hwnd, xproto::CURRENT_TIME);
     let _ = connection.flush();
 }
 

@@ -11312,8 +11312,15 @@ async fn handle_connection(
                                 if remote_idle {
                                     continue;
                                 }
-                                injector.send_text(&text, paste)?;
-                                key_count += text.chars().count() as u64;
+                                // A failed injection must NOT end the session:
+                                // the phone would drop back to its device list
+                                // and every later gesture would look dead.
+                                match injector.send_text(&text, paste, recv_display.as_deref()) {
+                                    Ok(()) => key_count += text.chars().count() as u64,
+                                    Err(error) => {
+                                        tracing::warn!(%error, "text injection failed; session stays up");
+                                    }
+                                }
                                 remote_idle = false;
                                 note_inbound_activity(&link_input_events, &link_last_input);
                             }
@@ -12015,8 +12022,12 @@ async fn handle_connection(
                                 if remote_idle {
                                     continue;
                                 }
-                                injector.send_text(&text, paste)?;
-                                key_count += text.chars().count() as u64;
+                                match injector.send_text(&text, paste, recv_display.as_deref()) {
+                                    Ok(()) => key_count += text.chars().count() as u64,
+                                    Err(error) => {
+                                        tracing::warn!(%error, "text injection failed; session stays up");
+                                    }
+                                }
                                 remote_idle = false;
                                 note_inbound_activity(&link_input_events, &link_last_input);
                             }
@@ -12828,9 +12839,9 @@ impl ReceiverInjector {
         }
     }
 
-    fn send_text(&mut self, text: &str, paste: bool) -> Result<()> {
+    fn send_text(&mut self, text: &str, paste: bool, display: Option<&str>) -> Result<()> {
         match self {
-            Self::Native(injector) => injector.send_text(text, paste).map_err(Into::into),
+            Self::Native(injector) => injector.send_text(text, paste, display).map_err(Into::into),
             #[cfg(target_os = "windows")]
             Self::Service(proxy) => proxy.send_text(text, paste),
         }

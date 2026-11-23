@@ -149,18 +149,21 @@ mod linux_uinput {
             result
         }
 
-        pub fn send_text(&mut self, text: &str, paste: bool) -> Result<(), PlatformError> {
+        pub fn send_text(
+            &mut self,
+            text: &str,
+            paste: bool,
+            display: Option<&str>,
+        ) -> Result<(), PlatformError> {
             let mut slot = shared_uinput_slot()
                 .lock()
                 .map_err(|_| PlatformError::Uinput("uinput lock poisoned".into()))?;
             if slot.is_none() {
                 *slot = Some(RawUinputDevice::create()?);
             }
-            let result = slot.as_mut().expect("just initialized").send_text(text, paste);
-            if result.is_err() {
-                *slot = None;
-            }
-            result
+            // A text failure (no X session, clipboard unavailable) does NOT
+            // mean the uinput devices are dead — keep them for pointer/keys.
+            slot.as_mut().expect("just initialized").send_text(text, paste, display)
         }
 
         pub fn inject_pinch(&mut self, delta: i32, display: Option<&str>) -> bool {
@@ -417,7 +420,12 @@ mod linux_uinput {
         /// through the uinput keyboard. Otherwise (default) each character is
         /// typed for real on X11 by temporarily remapping a scratch keycode
         /// to its Unicode keysym and faking a press/release with XTest.
-        pub fn send_text(&mut self, text: &str, paste: bool) -> Result<(), PlatformError> {
+        pub fn send_text(
+            &mut self,
+            text: &str,
+            paste: bool,
+            display: Option<&str>,
+        ) -> Result<(), PlatformError> {
             if paste || !cfg!(target_os = "linux") {
                 let mut clipboard = crate::clipboard::SystemClipboard::create()?;
                 clipboard.set_text(text.to_owned())?;
@@ -433,9 +441,19 @@ mod linux_uinput {
                 use x11rb::protocol::xproto::ConnectionExt as Xproto;
                 use x11rb::protocol::xtest::{fake_input, ConnectionExt as Xtest};
 
-                // Wayland (or a headless session) has no X keymap to remap.
+                // A headless daemon has no $DISPLAY, so connect(None) alone
+                // always fails there. Try the session display published by
+                // the UI sidecar (the xhost localuser grant authorizes it).
+                let connected = match x11rb::connect(None) {
+                    Ok(connection) => Ok(connection),
+                    Err(first) => match display {
+                        Some(name) => x11rb::connect(Some(name)),
+                        None => Err(first),
+                    },
+                };
+                // Wayland (or no reachable X server) has no keymap to remap.
                 // Fall back to clipboard + Ctrl+V there so text still lands.
-                let (connection, _) = match x11rb::connect(None) {
+                let (connection, _) = match connected {
                     Ok(connection) => connection,
                     Err(_) => {
                         let mut clipboard = crate::clipboard::SystemClipboard::create()?;
@@ -2208,7 +2226,12 @@ mod win32_inject {
         /// (one down+up per UTF-16 code unit) — works in every app, even ones
         /// that ignore WM_CHAR. `paste = true` stages the text on the clipboard
         /// and sends Ctrl+V, for apps where unicode keystrokes are unwanted.
-        pub fn send_text(&self, text: &str, paste: bool) -> Result<(), PlatformError> {
+        pub fn send_text(
+            &self,
+            text: &str,
+            paste: bool,
+            _display: Option<&str>,
+        ) -> Result<(), PlatformError> {
             if paste {
                 let mut clipboard = crate::clipboard::SystemClipboard::create()?;
                 clipboard.set_text(text.to_owned())?;
@@ -2818,7 +2841,12 @@ impl UnsupportedInjector {
         ))
     }
 
-    pub fn send_text(&self, _text: &str, _paste: bool) -> Result<(), PlatformError> {
+    pub fn send_text(
+        &self,
+        _text: &str,
+        _paste: bool,
+        _display: Option<&str>,
+    ) -> Result<(), PlatformError> {
         Err(PlatformError::Uinput(
             "no native input injector is implemented for this operating system".into(),
         ))
