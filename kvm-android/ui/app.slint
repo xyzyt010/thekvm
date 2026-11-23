@@ -193,6 +193,7 @@ export component App inherits Window {
     in-out property <int> selected: -1;
     in property <string> status: "Scanning…";
     in property <string> connected-name: "";
+    in property <string> touch-debug: "";
     in property <[KnownItem]> remembered: [];
     in property <bool> paste-mode: false;
     in-out property <string> draft: "";
@@ -380,6 +381,13 @@ export component App inherits Window {
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 wrap: word-wrap;
+            }
+            Text {
+                text: root.touch-debug;
+                color: #4b5563;
+                font-size: 11px * root.scale;
+                horizontal-alignment: center;
+                vertical-alignment: bottom;
             }
             // Slint's own touch area: unlike android-activity's native
             // iterator (which the backend drains before any listener can

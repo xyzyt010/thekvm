@@ -85,6 +85,10 @@ struct Controller {
     events: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     paste_mode: Mutex<bool>,
     ui: OnceLock<Weak<App>>,
+    // Live diagnostics: touch events received vs frames actually written.
+    touch_count: AtomicU64,
+    frame_count: AtomicU64,
+    last_delta: Mutex<(i32, i32)>,
 }
 
 impl Controller {
@@ -111,6 +115,14 @@ impl Controller {
     fn set_connected_name(&self, name: String) {
         let value = SharedString::from(name);
         self.notify_ui(move |ui| ui.set_connected_name(value));
+    }
+
+    fn publish_diag(&self) {
+        let touch = self.touch_count.load(Ordering::Relaxed);
+        let frames = self.frame_count.load(Ordering::Relaxed);
+        let (dx, dy) = *self.last_delta.lock().unwrap();
+        let line = format!("touch {touch} · sent {frames} · last {dx},{dy}");
+        self.notify_ui(move |ui| ui.set_touch_debug(SharedString::from(line)));
     }
 
     fn store(&self) -> Store {
@@ -171,14 +183,15 @@ impl Controller {
     /// backend's `process_event` drains `input_events_iter()` first.)
     /// Coordinates are already local to the trackpad rectangle.
     fn on_trackpad(&self, kind: i32, x: f32, y: f32, finger: i32) {
+        let count = self.touch_count.fetch_add(1, Ordering::Relaxed) + 1;
         if self.active_session().is_none() {
             return;
         }
         let mut touch = self.touch.lock().unwrap();
         match kind {
             0 => {
-                // Down. The first finger starts a gesture; a second one
-                // turns it into a two-finger scroll / right-click gesture.
+                // Down. First finger starts a gesture; a second makes it a
+                // two-finger scroll / right-click gesture.
                 if touch.points.is_empty() {
                     touch.down_at = Some(Instant::now());
                     touch.moved = 0.0;
@@ -189,37 +202,39 @@ impl Controller {
                 touch.points.insert(finger, (x, y));
             }
             2 => {
-                // Move. Track every finger separately so interleaved
-                // multi-touch deltas stay correct.
-                let Some((old_x, old_y)) = touch.points.get(&finger).copied() else {
-                    return;
+                // If Down was missed for any reason, seed the finger here so
+                // the very next move still produces motion instead of nothing.
+                let old = match touch.points.get(&finger).copied() {
+                    Some(pos) => pos,
+                    None => {
+                        touch.down_at.get_or_insert_with(Instant::now);
+                        touch.points.insert(finger, (x, y));
+                        return;
+                    }
                 };
-                let dx = x - old_x;
-                let dy = y - old_y;
+                let dx = x - old.0;
+                let dy = y - old.1;
                 touch.moved += dx.abs() + dy.abs();
                 touch.points.insert(finger, (x, y));
-                // Dead zone filters finger jitter, but never eats a real drag.
-                if dx.abs() < 0.35 && dy.abs() < 0.35 {
-                    return;
-                }
-                let event = if touch.points.len() >= 2 {
-                    InputEvent::SmoothWheel {
-                        x: (-dx * 3.0) as i32,
-                        y: (-dy * 3.0) as i32,
-                    }
+                let (out_dx, out_dy) = if touch.points.len() >= 2 {
+                    ((-dx * 3.0) as i32, (-dy * 3.0) as i32)
                 } else {
-                    InputEvent::MouseMove {
-                        dx: (dx * 1.6) as i32,
-                        dy: (dy * 1.6) as i32,
-                    }
+                    ((dx * 2.0) as i32, (dy * 2.0) as i32)
                 };
-                let _ = self.events.send(event);
+                *self.last_delta.lock().unwrap() = (out_dx, out_dy);
+                if out_dx != 0 || out_dy != 0 {
+                    let event = if touch.points.len() >= 2 {
+                        InputEvent::SmoothWheel { x: out_dx, y: out_dy }
+                    } else {
+                        InputEvent::MouseMove { dx: out_dx, dy: out_dy }
+                    };
+                    let _ = self.events.send(event);
+                }
             }
             1 => {
-                // Up. A short, still touch is a click; two fingers = right.
                 let tap = touch
                     .down_at
-                    .map(|at| at.elapsed() < Duration::from_millis(260) && touch.moved < 18.0)
+                    .map(|at| at.elapsed() < Duration::from_millis(300) && touch.moved < 20.0)
                     .unwrap_or(false);
                 if tap {
                     let button = if touch.multi { MouseButton::Right } else { MouseButton::Left };
@@ -233,11 +248,14 @@ impl Controller {
                 }
             }
             _ => {
-                // Cancel.
                 touch.points.clear();
                 touch.down_at = None;
                 touch.multi = false;
             }
+        }
+        // Refresh the on-screen counter often enough to see it, not every frame.
+        if count % 8 == 0 {
+            self.publish_diag();
         }
     }
 
@@ -497,6 +515,9 @@ fn android_main(app: AndroidApp) {
         events: event_tx,
         paste_mode: Mutex::new(store.paste_mode),
         ui: OnceLock::new(),
+        touch_count: AtomicU64::new(0),
+        frame_count: AtomicU64::new(0),
+        last_delta: Mutex::new((0, 0)),
     });
     controller.ui.set(ui.as_weak()).ok();
 
@@ -508,10 +529,28 @@ fn android_main(app: AndroidApp) {
                 let Some(session) = pump.active_session() else { continue };
                 (session.send.clone(), session.sequence.fetch_add(1, Ordering::Relaxed))
             };
+            let counter = pump.clone();
             tokio::spawn(async move {
                 let mut stream = send.lock().await;
-                let _ = write_frame(&mut *stream, &WireMessage::Input(InputPacket { sequence, event })).await;
+                let ok = write_frame(&mut *stream, &WireMessage::Input(InputPacket { sequence, event })).await.is_ok();
+                if ok {
+                    counter.frame_count.fetch_add(1, Ordering::Relaxed);
+                }
             });
+        }
+    });
+
+    // The receiver expires an input lease after ~45s of no inbound input.
+    // A zero-delta motion frame is harmless to inject and keeps the session
+    // alive while the phone is idle (reading the screen, typing, switching).
+    let keepalive = controller.clone();
+    let keepalive_tx = keepalive.events.clone();
+    controller.runtime.spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            if keepalive.active_session().is_some() {
+                let _ = keepalive_tx.send(InputEvent::MouseMove { dx: 0, dy: 0 });
+            }
         }
     });
 
