@@ -112,6 +112,8 @@ struct Controller {
     /// True while a multi-finger gesture is in progress; suppresses the
     /// stray left click Slint synthesizes when a second finger arrives.
     multi_finger: Arc<AtomicBool>,
+    /// Fingerprints whose session died and should reconnect on the next poll.
+    retry_now: Mutex<Vec<String>>,
     ui: OnceLock<Weak<App>>,
     // Live diagnostics: touch events received vs frames actually written.
     touch_count: AtomicU64,
@@ -412,7 +414,7 @@ impl Controller {
 
     /// Connect to one desktop. `known = None` means first contact: complete
     /// the desktop's Allow/Deny ceremony before opening the input stream.
-    fn connect(&self, address: String, known: Option<KnownDevice>, display_name: String) {
+    fn connect(self: Arc<Self>, address: String, known: Option<KnownDevice>, display_name: String) {
         let fingerprint_hint = known.as_ref().map(|device| device.fingerprint.clone());
         if let Some(hint) = &fingerprint_hint {
             if self.is_connected(hint) {
@@ -424,7 +426,8 @@ impl Controller {
             self.set_status(format!("Already connected to the maximum of {MAX_DEVICES} computers"));
             return;
         }
-        let result: Result<(Session, String, String)> = self.runtime.block_on(async {
+        let watcher = self.clone();
+        let result: Result<(Arc<Session>, String, String)> = self.runtime.block_on(async {
             let identity = Identity::load_or_create(&self.data_dir)?;
             let endpoint = match known.as_ref() {
                 Some(device) => transport::make_pinned_client_endpoint(&identity, &device.fingerprint)?,
@@ -519,6 +522,14 @@ impl Controller {
 
             let send = Arc::new(AsyncMutex::new(send));
             let ping_send = send.clone();
+            let session = Arc::new(Session {
+                _connection: connection,
+                send,
+                sequence: AtomicU64::new(1),
+            });
+            let watch = session.clone();
+            let watch_fp = fingerprint.clone();
+            let watch_controller = watcher.clone();
             tokio::spawn(async move {
                 while let Ok(Some(message)) = read_frame(&mut recv).await {
                     if let WireMessage::Ping { nonce } = message {
@@ -526,12 +537,11 @@ impl Controller {
                         let _ = write_frame(&mut *stream, &WireMessage::Pong { nonce }).await;
                     }
                 }
+                // Stream closed: the desktop ended the session. Drop the
+                // stale entry so discovery reconnects instead of wedging.
+                watch_controller.on_session_lost(&watch_fp, &watch);
             });
-            Ok((
-                Session { _connection: connection, send, sequence: AtomicU64::new(1) },
-                fingerprint,
-                peer_name,
-            ))
+            Ok((session, fingerprint, peer_name))
         });
 
         match result {
@@ -542,7 +552,7 @@ impl Controller {
                     ConnectedDevice {
                         name: name.clone(),
                         address: address.clone(),
-                        session: Arc::new(session),
+                        session,
                     },
                 );
                 *self.active.lock().unwrap() = Some(fingerprint.clone());
@@ -586,6 +596,39 @@ impl Controller {
             self.set_connected_name(String::new());
             self.set_phase("devices");
             self.set_status("Disconnected".into());
+        }
+    }
+
+    /// Called from the stream watcher when the desktop closes the session.
+    /// Only removes the entry if it is still the same session object, so a
+    /// reconnect that already happened is never torn down by a stale watcher.
+    fn on_session_lost(&self, fingerprint: &str, session: &Arc<Session>) {
+        let removed = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let same = sessions
+                .get(fingerprint)
+                .map(|device| Arc::ptr_eq(&device.session, session))
+                .unwrap_or(false);
+            if same {
+                sessions.remove(fingerprint);
+                true
+            } else {
+                false
+            }
+        };
+        if !removed {
+            return;
+        }
+        self.retry_now.lock().unwrap().push(fingerprint.to_owned());
+        let fallback = self.sessions.lock().unwrap().keys().next().cloned();
+        *self.active.lock().unwrap() = fallback.clone();
+        self.refresh_remembered();
+        if let Some(next) = fallback {
+            self.activate(&next);
+        } else {
+            self.set_connected_name(String::new());
+            self.set_phase("devices");
+            self.set_status("Connection dropped — reconnecting…".into());
         }
     }
 
@@ -668,6 +711,7 @@ fn android_main(app: AndroidApp) {
         paste_mode: Mutex::new(store.paste_mode),
         horizontal_mode: Mutex::new(store.horizontal_mode),
         multi_finger: Arc::new(AtomicBool::new(false)),
+        retry_now: Mutex::new(Vec::new()),
         ui: OnceLock::new(),
         touch_count: AtomicU64::new(0),
         frame_count: AtomicU64::new(0),
@@ -822,6 +866,10 @@ fn discovery_loop(controller: Arc<Controller>) {
     let mut last_auto: HashMap<String, Instant> = HashMap::new();
     let mut discovered: Vec<(String, String, String, bool)> = Vec::new();
     loop {
+        // A dropped session should retry immediately, not after the 20s backoff.
+        for fingerprint in controller.retry_now.lock().unwrap().drain(..) {
+            last_auto.remove(&fingerprint);
+        }
         let found = controller
             .runtime
             .block_on(scan(Duration::from_millis(900)))
