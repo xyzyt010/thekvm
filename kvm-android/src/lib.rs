@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, Weak};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
 use std::time::{Duration, Instant};
@@ -40,6 +40,7 @@ struct KnownDevice {
 struct Store {
     devices: Vec<KnownDevice>,
     paste_mode: bool,
+    horizontal_mode: bool,
 }
 
 impl Store {
@@ -74,6 +75,28 @@ struct TouchState {
     down_at: Option<Instant>,
     moved: f32,
     multi: bool,
+    /// True once a long press has turned the gesture into a button drag.
+    dragging: bool,
+}
+
+struct GestureState {
+    active: bool,
+    last_center: (f32, f32),
+    last_scale: f32,
+    started_at: Instant,
+    moved: f32,
+}
+
+impl Default for GestureState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            last_center: (0.0, 0.0),
+            last_scale: 1.0,
+            started_at: Instant::now(),
+            moved: 0.0,
+        }
+    }
 }
 
 struct Controller {
@@ -82,8 +105,13 @@ struct Controller {
     sessions: Mutex<HashMap<String, ConnectedDevice>>,
     active: Mutex<Option<String>>,
     touch: Mutex<TouchState>,
+    gesture: Mutex<GestureState>,
     events: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     paste_mode: Mutex<bool>,
+    horizontal_mode: Mutex<bool>,
+    /// True while a multi-finger gesture is in progress; suppresses the
+    /// stray left click Slint synthesizes when a second finger arrives.
+    multi_finger: Arc<AtomicBool>,
     ui: OnceLock<Weak<App>>,
     // Live diagnostics: touch events received vs frames actually written.
     touch_count: AtomicU64,
@@ -182,6 +210,30 @@ impl Controller {
     /// (An android-activity event listener never sees motion events: the
     /// backend's `process_event` drains `input_events_iter()` first.)
     /// Coordinates are already local to the trackpad rectangle.
+    /// Rotate a delta 90° when the phone is in "side" (landscape) mode.
+    fn rotate(&self, dx: f32, dy: f32) -> (f32, f32) {
+        if *self.horizontal_mode.lock().unwrap() {
+            (dy, -dx)
+        } else {
+            (dx, dy)
+        }
+    }
+
+    /// Emit a click unless a second finger arrived in the meantime. Slint
+    /// synthesizes a release for the primary finger when finger 2 lands,
+    /// so a short delay is the only reliable way to avoid a stray left click.
+    fn click_unless_multi(&self, button: MouseButton) {
+        let events = self.events.clone();
+        let multi = self.multi_finger.clone();
+        self.runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            if !multi.load(Ordering::Relaxed) {
+                let _ = events.send(InputEvent::MouseButton { button, pressed: true });
+                let _ = events.send(InputEvent::MouseButton { button, pressed: false });
+            }
+        });
+    }
+
     fn on_trackpad(&self, kind: i32, x: f32, y: f32, finger: i32) {
         let count = self.touch_count.fetch_add(1, Ordering::Relaxed) + 1;
         if self.active_session().is_none() {
@@ -190,20 +242,20 @@ impl Controller {
         let mut touch = self.touch.lock().unwrap();
         match kind {
             0 => {
-                // Down. First finger starts a gesture; a second makes it a
-                // two-finger scroll / right-click gesture.
                 if touch.points.is_empty() {
                     touch.down_at = Some(Instant::now());
                     touch.moved = 0.0;
                     touch.multi = false;
+                    touch.dragging = false;
                 } else {
+                    // Second finger: mark multi so the synthesized release
+                    // of finger 1 does not produce a left click.
                     touch.multi = true;
+                    self.multi_finger.store(true, Ordering::Relaxed);
                 }
                 touch.points.insert(finger, (x, y));
             }
             2 => {
-                // If Down was missed for any reason, seed the finger here so
-                // the very next move still produces motion instead of nothing.
                 let old = match touch.points.get(&finger).copied() {
                     Some(pos) => pos,
                     None => {
@@ -216,47 +268,146 @@ impl Controller {
                 let dy = y - old.1;
                 touch.moved += dx.abs() + dy.abs();
                 touch.points.insert(finger, (x, y));
-                let (out_dx, out_dy) = if touch.points.len() >= 2 {
-                    ((-dx * 3.0) as i32, (-dy * 3.0) as i32)
-                } else {
-                    ((dx * 2.0) as i32, (dy * 2.0) as i32)
-                };
-                *self.last_delta.lock().unwrap() = (out_dx, out_dy);
-                if out_dx != 0 || out_dy != 0 {
-                    let event = if touch.points.len() >= 2 {
-                        InputEvent::SmoothWheel { x: out_dx, y: out_dy }
-                    } else {
-                        InputEvent::MouseMove { dx: out_dx, dy: out_dy }
-                    };
-                    let _ = self.events.send(event);
+
+                // One finger only: move the pointer, with optional drag.
+                if touch.points.len() == 1 && !self.multi_finger.load(Ordering::Relaxed) {
+                    let held = touch
+                        .down_at
+                        .map(|at| at.elapsed() > Duration::from_millis(260))
+                        .unwrap_or(false);
+                    if held && !touch.dragging {
+                        // Long press + move: hold the left button and drag.
+                        touch.dragging = true;
+                        let _ = self.events.send(InputEvent::MouseButton {
+                            button: MouseButton::Left,
+                            pressed: true,
+                        });
+                    }
+                    let (rx, ry) = self.rotate(dx, dy);
+                    let out_dx = (rx * 2.0) as i32;
+                    let out_dy = (ry * 2.0) as i32;
+                    *self.last_delta.lock().unwrap() = (out_dx, out_dy);
+                    if out_dx != 0 || out_dy != 0 {
+                        let _ = self.events.send(InputEvent::MouseMove { dx: out_dx, dy: out_dy });
+                    }
                 }
             }
             1 => {
-                let tap = touch
-                    .down_at
-                    .map(|at| at.elapsed() < Duration::from_millis(300) && touch.moved < 20.0)
-                    .unwrap_or(false);
-                if tap {
-                    let button = if touch.multi { MouseButton::Right } else { MouseButton::Left };
-                    let _ = self.events.send(InputEvent::MouseButton { button, pressed: true });
-                    let _ = self.events.send(InputEvent::MouseButton { button, pressed: false });
+                if touch.dragging {
+                    let _ = self.events.send(InputEvent::MouseButton {
+                        button: MouseButton::Left,
+                        pressed: false,
+                    });
+                    touch.dragging = false;
+                } else {
+                    let tap = touch
+                        .down_at
+                        .map(|at| at.elapsed() < Duration::from_millis(300) && touch.moved < 20.0)
+                        .unwrap_or(false);
+                    // Right-click is produced by the two-finger gesture end;
+                    // here we only handle the single-finger click.
+                    if tap && !touch.multi {
+                        self.click_unless_multi(MouseButton::Left);
+                    }
                 }
                 touch.points.remove(&finger);
                 if touch.points.is_empty() {
                     touch.down_at = None;
                     touch.multi = false;
+                    // Let the delayed click check run before clearing the flag.
+                    let multi = self.multi_finger.clone();
+                    self.runtime.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        multi.store(false, Ordering::Relaxed);
+                    });
                 }
             }
             _ => {
+                if touch.dragging {
+                    let _ = self.events.send(InputEvent::MouseButton {
+                        button: MouseButton::Left,
+                        pressed: false,
+                    });
+                }
                 touch.points.clear();
                 touch.down_at = None;
                 touch.multi = false;
+                touch.dragging = false;
+                self.multi_finger.store(false, Ordering::Relaxed);
             }
         }
-        // Refresh the on-screen counter often enough to see it, not every frame.
         if count % 8 == 0 {
             self.publish_diag();
         }
+    }
+
+    // ---- Two-finger gestures: centre movement scrolls, scale zooms ----
+    fn gesture_start(&self, x: f32, y: f32) {
+        let mut g = self.gesture.lock().unwrap();
+        g.active = true;
+        g.last_center = (x, y);
+        g.last_scale = 1.0;
+        g.started_at = Instant::now();
+        g.moved = 0.0;
+        self.multi_finger.store(true, Ordering::Relaxed);
+    }
+
+    fn gesture_update(&self, x: f32, y: f32, scale: f32) {
+        let (dx, dy, zoom) = {
+            let mut g = self.gesture.lock().unwrap();
+            if !g.active {
+                return;
+            }
+            let dx = x - g.last_center.0;
+            let dy = y - g.last_center.1;
+            g.moved += dx.abs() + dy.abs();
+            g.last_center = (x, y);
+            // Slint scale is cumulative; convert the change to 120ths.
+            let zoom = (scale - g.last_scale) * 240.0;
+            g.last_scale = scale;
+            (dx, dy, zoom)
+        };
+        let (rx, ry) = self.rotate(dx, dy);
+        let sx = (-rx * 2.0) as i32;
+        let sy = (-ry * 2.0) as i32;
+        if sx != 0 || sy != 0 {
+            let _ = self.events.send(InputEvent::SmoothWheel { x: sx, y: sy });
+        }
+        if zoom.abs() >= 1.0 {
+            let _ = self.events.send(InputEvent::Pinch { delta: zoom as i32 });
+        }
+    }
+
+    fn gesture_end(&self) {
+        let (short, moved) = {
+            let mut g = self.gesture.lock().unwrap();
+            if !g.active {
+                return;
+            }
+            g.active = false;
+            (
+                g.started_at.elapsed() < Duration::from_millis(320),
+                g.moved < 16.0,
+            )
+        };
+        // A quick two-finger tap is a right click.
+        if short && moved {
+            let _ = self.events.send(InputEvent::MouseButton {
+                button: MouseButton::Right,
+                pressed: true,
+            });
+            let _ = self.events.send(InputEvent::MouseButton {
+                button: MouseButton::Right,
+                pressed: false,
+            });
+        }
+        // Always release the synthetic Ctrl held by a pinch expansion.
+        let _ = self.events.send(InputEvent::PinchEnd);
+        let multi = self.multi_finger.clone();
+        self.runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            multi.store(false, Ordering::Relaxed);
+        });
     }
 
     /// Connect to one desktop. `known = None` means first contact: complete
@@ -512,8 +663,11 @@ fn android_main(app: AndroidApp) {
         sessions: Mutex::new(HashMap::new()),
         active: Mutex::new(None),
         touch: Mutex::new(TouchState::default()),
+        gesture: Mutex::new(GestureState::default()),
         events: event_tx,
         paste_mode: Mutex::new(store.paste_mode),
+        horizontal_mode: Mutex::new(store.horizontal_mode),
+        multi_finger: Arc::new(AtomicBool::new(false)),
         ui: OnceLock::new(),
         touch_count: AtomicU64::new(0),
         frame_count: AtomicU64::new(0),
@@ -522,6 +676,9 @@ fn android_main(app: AndroidApp) {
     controller.ui.set(ui.as_weak()).ok();
 
     // Sequence-numbered input frames go to the ACTIVE desktop only.
+    // Writes are strictly serial here: spawning one task per event reordered
+    // frames, made the receiver drop them as stale, and piled up thousands of
+    // tasks behind one mutex — the source of the growing delay and dropouts.
     let pump = controller.clone();
     controller.runtime.spawn(async move {
         while let Some(event) = event_rx.recv().await {
@@ -529,14 +686,17 @@ fn android_main(app: AndroidApp) {
                 let Some(session) = pump.active_session() else { continue };
                 (session.send.clone(), session.sequence.fetch_add(1, Ordering::Relaxed))
             };
-            let counter = pump.clone();
-            tokio::spawn(async move {
-                let mut stream = send.lock().await;
-                let ok = write_frame(&mut *stream, &WireMessage::Input(InputPacket { sequence, event })).await.is_ok();
-                if ok {
-                    counter.frame_count.fetch_add(1, Ordering::Relaxed);
-                }
-            });
+            let mut stream = send.lock().await;
+            let ok = write_frame(
+                &mut *stream,
+                &WireMessage::Input(InputPacket { sequence, event }),
+            )
+            .await
+            .is_ok();
+            drop(stream);
+            if ok {
+                pump.frame_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
     });
 
@@ -625,8 +785,32 @@ fn android_main(app: AndroidApp) {
         let c = controller.clone();
         move |kind, x, y, finger| c.on_trackpad(kind, x, y, finger)
     });
+    ui.on_gesture_start({
+        let c = controller.clone();
+        move |x, y| c.gesture_start(x, y)
+    });
+    ui.on_gesture_update({
+        let c = controller.clone();
+        move |x, y, scale| c.gesture_update(x, y, scale)
+    });
+    ui.on_gesture_end({ let c = controller.clone(); move || c.gesture_end() });
+    ui.on_toggle_horizontal({
+        let c = controller.clone();
+        move || {
+            let value = {
+                let mut mode = c.horizontal_mode.lock().unwrap();
+                *mode = !*mode;
+                *mode
+            };
+            let mut store = c.store();
+            store.horizontal_mode = value;
+            store.save(&c.data_dir);
+            c.notify_ui(move |ui| ui.set_horizontal_mode(value));
+        }
+    });
 
     ui.set_paste_mode(store.paste_mode);
+    ui.set_horizontal_mode(store.horizontal_mode);
     ui.set_phase(SharedString::from("devices"));
     ui.set_status("Scanning for computers…".into());
     controller.refresh_remembered();

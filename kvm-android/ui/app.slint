@@ -196,6 +196,7 @@ export component App inherits Window {
     in property <string> touch-debug: "";
     in property <[KnownItem]> remembered: [];
     in property <bool> paste-mode: false;
+    in-out property <bool> horizontal-mode: false;
     in-out property <string> draft: "";
     in-out property <length> text-offset: 0px;
 
@@ -211,6 +212,11 @@ export component App inherits Window {
     callback send-text(string);
     // kind: 0=down 1=up 2=move 3=cancel; x/y are trackpad-local; id=finger
     callback trackpad-event(int, length, length, int);
+    callback toggle-horizontal();
+    // Two-finger gesture: centre movement = scroll, scale = pinch zoom.
+    callback gesture-start(length, length);
+    callback gesture-update(length, length, float);
+    callback gesture-end();
 
     // Approximate wrapped line count so the bar grows 1 → 5 lines.
     property <int> chars-per-line: max(1, floor((root.width - 48px * root.scale) / (8.2px * root.scale)));
@@ -353,8 +359,15 @@ export component App inherits Window {
                 }
                 PillButton {
                     scale: root.scale;
+                    label: root.horizontal-mode ? "↻ Side" : "↻ Flat";
+                    width: 78px * root.scale;
+                    height: 34px * root.scale;
+                    clicked => { root.toggle-horizontal(); }
+                }
+                PillButton {
+                    scale: root.scale;
                     label: "Devices";
-                    width: 84px * root.scale;
+                    width: 78px * root.scale;
                     height: 34px * root.scale;
                     clicked => { root.open-devices(); }
                 }
@@ -375,9 +388,10 @@ export component App inherits Window {
             min-height: 60px;
             background: #0a0a0a;
             Text {
-                text: "Trackpad\n\nDrag to move · Tap to click\nTwo-finger tap = right click\nTwo-finger drag = scroll";
-                color: #303030;
-                font-size: 13px * root.scale;
+                text: (root.horizontal-mode ? "TRACKPAD · SIDE\n\n" : "TRACKPAD\n\n")
+                    + "Drag = move · Tap = click\nHold + drag = drag\nTwo-finger tap = right click\nTwo-finger drag = scroll · Pinch = zoom";
+                color: #3a3a3a;
+                font-size: 12px * root.scale;
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 wrap: word-wrap;
@@ -389,10 +403,8 @@ export component App inherits Window {
                 horizontal-alignment: center;
                 vertical-alignment: bottom;
             }
-            // Slint's own touch area: unlike android-activity's native
-            // iterator (which the backend drains before any listener can
-            // see it), these events always arrive. Coordinates are local
-            // to the trackpad, so typing-bar taps can never move the cursor.
+            // One finger: move / click / drag. Coordinates are local to the
+            // trackpad, so bars above and below can never move the cursor.
             TouchArea {
                 pointer-event(event) => {
                     root.trackpad-event(
@@ -405,11 +417,20 @@ export component App inherits Window {
                     );
                 }
             }
+            // Two fingers: Slint converts them to pinch/rotate events and
+            // stops sending plain Move events, so track scroll and zoom here.
+            gestures := ScaleRotateGestureHandler {
+                started => { root.gesture-start(gestures.center.x, gestures.center.y); }
+                updated => { root.gesture-update(gestures.center.x, gestures.center.y, gestures.scale); }
+                ended => { root.gesture-end(); }
+                cancelled => { root.gesture-end(); }
+            }
         }
 
         // Bottom typing bar: grows 1 → 5 lines, then scrolls by touch.
         Rectangle {
-            height: min(root.bar-lines, 5) * 24px * root.scale + 14px * root.scale;
+            height: root.horizontal-mode ? 38px * root.scale
+                : min(root.bar-lines, 5) * 24px * root.scale + 14px * root.scale;
             background: #161616;
             border-width: 1px;
             border-color: #333333;
@@ -422,12 +443,12 @@ export component App inherits Window {
                     y: -root.text-offset;
                     x: 8px * root.scale;
                     width: parent.width - 24px * root.scale;
-                    height: 5 * 24px * root.scale;
+                    height: root.horizontal-mode ? 30px * root.scale : 5 * 24px * root.scale;
                     text <=> root.draft;
                     color: #f3f4f6;
                     font-size: 15px * root.scale;
-                    wrap: word-wrap;
-                    single-line: false;
+                    wrap: root.horizontal-mode ? no-wrap : word-wrap;
+                    single-line: root.horizontal-mode;
                     accepted => { root.send-text(root.draft); root.draft = ""; }
                 }
                 scroll := TouchArea {
