@@ -518,7 +518,7 @@ pub fn focus_main_window() {
 
     // _NET_ACTIVE_WINDOW message to the root window asks the WM to activate
     // (raise + focus) our window. Source 2 = direct user action.
-    let data: [u32; 5] = [2, xproto::CURRENT_TIME, 0, 0, 0];
+    let data: [u32; 5] = [2, x11rb::CURRENT_TIME, 0, 0, 0];
     let _ = connection.send_event(
         false,
         root,
@@ -532,7 +532,7 @@ pub fn focus_main_window() {
             data: xproto::ClientMessageData::from(data),
         },
     );
-    let _ = connection.set_input_focus(xproto::InputFocus::POINTER_ROOT, hwnd, xproto::CURRENT_TIME);
+    let _ = connection.set_input_focus(xproto::InputFocus::POINTER_ROOT, hwnd, x11rb::CURRENT_TIME);
     let _ = connection.flush();
 }
 
