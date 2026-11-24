@@ -2011,6 +2011,30 @@ fn main() -> Result<()> {
             }
         });
     }
+    // Delete confirmation (Settings trash): the popup asks first; only
+    // confirm revokes the peer, cancel clears the pending state.
+    {
+        let weak = ui.as_weak();
+        ui.on_confirm_delete(move || {
+            let peer = ui_pending_delete(&weak);
+            if let Some(ui) = weak.upgrade() {
+                ui.set_pending_delete(SharedString::new());
+                ui.set_pending_delete_name(SharedString::new());
+            }
+            if let Some(fingerprint) = peer {
+                revoke_peer_now(&weak, &fingerprint);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_cancel_delete(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_pending_delete(SharedString::new());
+                ui.set_pending_delete_name(SharedString::new());
+            }
+        });
+    }
 
     // Startup scan: the card is visible from the first frame, so populate
     // it immediately instead of waiting for the first poll tick.
@@ -2346,39 +2370,7 @@ fn main() -> Result<()> {
 
     let weak = ui.as_weak();
     ui.on_revoke_peer(move |fingerprint| {
-        let weak = weak.clone();
-        let fingerprint = fingerprint.to_string();
-        std::thread::spawn(move || {
-            match control_request(ControlRequest::Unpair {
-                fingerprint_hex: fingerprint.clone(),
-            }) {
-                Ok(ControlResponse::Unpaired { .. }) => {
-                    // Revocation must clear BOTH books: the user book would
-                    // otherwise resurrect the trust at the next automatic
-                    // setup pass (which mirrors user pins into the daemon).
-                    if let Ok(mut book) =
-                        kvm_protocol::pairing::PeerBook::load_or_create(&data_dir())
-                    {
-                        match book.unpin(&fingerprint) {
-                            Ok(true) => ui_log("revoke: removed peer from user book too"),
-                            Ok(false) => {}
-                            Err(error) => {
-                                ui_log(&format!("revoke: user book removal failed: {error:#}"))
-                            }
-                        }
-                    }
-                    set_status(&weak, format!("Revoked peer {fingerprint}"));
-                    if let Ok(ControlResponse::Peers(peers)) =
-                        control_request(ControlRequest::ListPeers)
-                    {
-                        set_peer_list(&weak, peers);
-                    }
-                }
-                Ok(ControlResponse::Error { message }) => set_status(&weak, message),
-                Ok(other) => set_status(&weak, format!("Unexpected revoke response: {other:?}")),
-                Err(error) => set_status(&weak, format!("Peer revocation failed: {error}")),
-            }
-        });
+        revoke_peer_now(&weak, &fingerprint.to_string());
     });
 
     let weak = ui.as_weak();
@@ -3103,6 +3095,56 @@ fn save_mesh_layout_local(entries: &[MeshEntry]) {
     layout.self_screen = self_screen;
     config.layout = layout;
     let _ = config.save(&path);
+}
+
+/// Read the pending-delete fingerprint off the Slint side. Runs on the
+/// Slint event loop (inside a callback), so a direct upgrade read is
+/// exact; empty means nothing was pending.
+fn ui_pending_delete(weak: &slint::Weak<AppWindow>) -> Option<String> {
+    let fingerprint = weak
+        .upgrade()
+        .map(|ui| ui.get_pending_delete().to_string())
+        .unwrap_or_default();
+    (!fingerprint.is_empty()).then_some(fingerprint)
+}
+
+/// Delete a peer (Advanced Remove + Settings trash confirmation):
+/// unpair at the daemon AND clear the user book, then refresh the
+/// peer list (which repopulates Allowed connections too).
+fn revoke_peer_now(weak: &slint::Weak<AppWindow>, fingerprint: &str) {
+    let weak = weak.clone();
+    let fingerprint = fingerprint.to_owned();
+    std::thread::spawn(move || {
+        match control_request(ControlRequest::Unpair {
+            fingerprint_hex: fingerprint.clone(),
+        }) {
+            Ok(ControlResponse::Unpaired { .. }) => {
+                // Revocation must clear BOTH books: the user book would
+                // otherwise resurrect the trust at the next automatic
+                // setup pass (which mirrors user pins into the daemon).
+                if let Ok(mut book) =
+                    kvm_protocol::pairing::PeerBook::load_or_create(&data_dir())
+                {
+                    match book.unpin(&fingerprint) {
+                        Ok(true) => ui_log("revoke: removed peer from user book too"),
+                        Ok(false) => {}
+                        Err(error) => {
+                            ui_log(&format!("revoke: user book removal failed: {error:#}"))
+                        }
+                    }
+                }
+                set_status(&weak, format!("Revoked peer {fingerprint}"));
+                if let Ok(ControlResponse::Peers(peers)) =
+                    control_request(ControlRequest::ListPeers)
+                {
+                    set_peer_list(&weak, peers);
+                }
+            }
+            Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+            Ok(other) => set_status(&weak, format!("Unexpected revoke response: {other:?}")),
+            Err(error) => set_status(&weak, format!("Peer revocation failed: {error}")),
+        }
+    });
 }
 
 fn set_peer_list(weak: &slint::Weak<AppWindow>, peers: Vec<kvm_protocol::pairing::Peer>) {

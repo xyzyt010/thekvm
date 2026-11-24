@@ -177,17 +177,28 @@ component IconButton inherits Rectangle {
     }
 }
 
-// Delete: a minimal lidded bin. The 2px-wide lid overhangs the tub;
-// two vertical ribs read as "bin" without any clutter.
+// Delete: Material Symbols "delete" (outlined style), drawn by
+// hand for Slint: a lidded bin with three vertical ribs — the
+// ribs are background-colored cutouts over the filled tub, like
+// the webui original. Same silhouette, no extra details.
 component TrashIcon inherits Rectangle {
-    width: 16px;
+    width: 18px;
     height: 18px;
     background: transparent;
-    Rectangle { x: 1px; y: 0px; width: 14px; height: 2px; border-radius: 1px; background: #f87171; }
-    Rectangle { x: 5px; y: 3px; width: 6px; height: 2px; border-radius: 1px; background: #f87171; }
-    Rectangle { x: 2px; y: 5px; width: 12px; height: 13px; border-radius: 2px; background: transparent; border-width: 1.5px; border-color: #f87171; }
-    Rectangle { x: 5.5px; y: 7px; width: 1.6px; height: 9px; background: #f87171; }
-    Rectangle { x: 8.9px; y: 7px; width: 1.6px; height: 9px; background: #f87171; }
+    Path {
+        x: 0px;
+        y: 0px;
+        width: 18px;
+        height: 18px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        fill: #f87171;
+        commands: "M 6 19 c0 1.1 0.9 2 2 2 h 8 c1.1 0 2 -0.9 2 -2 V 7 H 6 Z M 19 4 h -1 V 2 h -4 v 2 H 10 V 2 H 6 v 2 H 5 c-1.1 0 -2 0.9 -2 2 v 1 h 18 V 6 c0 -1.1 -0.9 -2 -2 -2 Z";
+    }
+    // Three rib cutouts through the tub.
+    Rectangle { x: 6px; y: 8.25px; width: 1.5px; height: 4.5px; background: Theme.bg; }
+    Rectangle { x: 8.25px; y: 8.25px; width: 1.5px; height: 4.5px; background: Theme.bg; }
+    Rectangle { x: 10.5px; y: 8.25px; width: 1.5px; height: 4.5px; background: Theme.bg; }
 }
 
 // Discovery radar: concentric green rings with one bright comet arc
@@ -270,6 +281,7 @@ component ToggleSwitch inherits Rectangle {
 component KvmButton inherits Rectangle {
     in property <string> text: "";
     in property <bool> primary: false;
+    in property <bool> danger: false;
     in property <bool> enabled: true;
     // Wider floor for side-by-side pairs (Allow/Deny): same idea as
     // the old std Button min-width, under a name Slint allows.
@@ -278,10 +290,12 @@ component KvmButton inherits Rectangle {
     height: 36px;
     border-radius: 8px;
     background: !enabled ? Theme.bg
+        : danger ? #dc2626
         : primary ? Theme.accent-strong
         : hit.has-hover ? Theme.hover : Theme.bg;
     border-width: 1px;
     border-color: !enabled ? Theme.border
+        : danger ? #dc2626
         : primary ? Theme.accent-strong : Theme.border;
     // Width hugs the label, floored at btn-width when set.
     width: max(root.btn-width, label.preferred-width + 28px);
@@ -296,7 +310,7 @@ component KvmButton inherits Rectangle {
     label := Text {
         width: parent.width;
         text: root.text;
-        color: root.primary && root.enabled ? #ffffff : Theme.text;
+        color: (root.primary || root.danger) && root.enabled ? #ffffff : Theme.text;
         font-size: 13px;
         font-weight: 600;
         vertical-alignment: center;
@@ -545,7 +559,7 @@ component MonitorCard inherits Rectangle {
                 width: 126px;
                 text: root.name == "" ? "…" : root.name;
                 color: white;
-                font-size: 12px;
+                font-size: 14px;
                 font-weight: 700;
                 horizontal-alignment: center;
                 overflow: elide;
@@ -1739,6 +1753,8 @@ export component AppWindow inherits Window {
     callback toggle-multi-node();
     callback open-discovery();
     callback close-discovery();
+    callback confirm-delete();
+    callback cancel-delete();
     callback set-mesh-mode(string);
     callback open-mesh-grid();
     callback close-mesh-grid();
@@ -1753,6 +1769,10 @@ export component AppWindow inherits Window {
     // Allowed connections (Settings): structured rows with a red trash
     // icon per computer, fed from the same peer book as Advanced.
     in-out property <[TrustedPeer]> trusted-peers: [];
+    // Pending deletion: set to the peer's fingerprint on trash tap;
+    // the popup asks first, then revokes.
+    in-out property <string> pending-delete: "";
+    in-out property <string> pending-delete-name: "";
     // Discovery sheet (Settings +): green radar sweep while scanning,
     // then the found devices as tappable rows.
     in-out property <bool> discovery-open: false;
@@ -1857,14 +1877,14 @@ export component AppWindow inherits Window {
                 Text {
                     text: "⚠ Background service is offline";
                     color: #fbbf24;
-                    font-size: 12px;
+                    font-size: 14px;
                     font-weight: 700;
                     vertical-alignment: center;
                 }
                 Text {
                     text: "the link cannot work until it is running";
                     color: #fcd34d;
-                    font-size: 12px;
+                    font-size: 14px;
                     vertical-alignment: center;
                     overflow: elide;
                 }
@@ -1981,7 +2001,7 @@ export component AppWindow inherits Window {
                             Text {
                                 text: root.discovery-scanning ? "Scanning…" : root.discovery-text;
                                 color: root.discovery-scanning ? #6ee7b7 : Theme.faint;
-                                font-size: 12px;
+                                font-size: 14px;
                                 wrap: word-wrap;
                             }
                             // The ONE button, two faces: Connect when idle
@@ -2120,7 +2140,7 @@ export component AppWindow inherits Window {
                         if driving-text != "" : Text {
                             text: driving-text;
                             color: #34d399;
-                            font-size: 12px;
+                            font-size: 14px;
                             font-weight: 600;
                             vertical-alignment: center;
                         }
@@ -2347,7 +2367,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: "Details";
                                     color: details-hit.has-hover ? #86efac : Theme.faint;
-                                    font-size: 12px;
+                                    font-size: 14px;
                                     font-weight: 600;
                                     vertical-alignment: center;
                                 }
@@ -2388,18 +2408,18 @@ export component AppWindow inherits Window {
                                     spacing: 3px;
                                     Text { text: "THIS COMPUTER"; color: #6ee7b7; font-size: 9px; font-weight: 800; letter-spacing: 1.3px; }
                                     Text { text: root.device-name == "" ? "Unknown" : root.device-name; color: Theme.text; font-size: 13px; font-weight: 700; wrap: word-wrap; }
-                                    Text { text: "LAN · " + (root.local-address == "" ? "…" : root.local-address); color: Theme.text-2; font-size: 12px; wrap: word-wrap; }
+                                    Text { text: "LAN · " + (root.local-address == "" ? "…" : root.local-address); color: Theme.text-2; font-size: 14px; wrap: word-wrap; }
                                     Text { text: "Fingerprint · " + root.fingerprint; color: Theme.muted; font-size: 9px; wrap: word-wrap; letter-spacing: 0.5px; }
-                                    Text { text: "Role · " + root.role-text; color: Theme.faint; font-size: 12px; }
+                                    Text { text: "Role · " + root.role-text; color: Theme.faint; font-size: 14px; }
                                 }
                                 Rectangle { width: 1px; background: Theme.border; vertical-stretch: 1; }
                                 VerticalLayout {
                                     spacing: 3px;
                                     Text { text: "LINKED COMPUTER"; color: #5eead4; font-size: 9px; font-weight: 800; letter-spacing: 1.3px; }
                                     Text { text: root.linked-peer-name == "" ? "Not paired yet" : root.linked-peer-name; color: Theme.text; font-size: 13px; font-weight: 700; wrap: word-wrap; }
-                                    Text { text: "Address · " + (root.details-peer-address == "" ? "unknown" : root.details-peer-address); color: Theme.text-2; font-size: 12px; wrap: word-wrap; }
+                                    Text { text: "Address · " + (root.details-peer-address == "" ? "unknown" : root.details-peer-address); color: Theme.text-2; font-size: 14px; wrap: word-wrap; }
                                     Text { text: "Fingerprint · " + (root.details-peer-fingerprint == "" ? "unknown" : root.details-peer-fingerprint); color: Theme.muted; font-size: 9px; wrap: word-wrap; letter-spacing: 0.5px; }
-                                    Text { text: "Link · " + (session-active ? "live" : "idle"); color: Theme.faint; font-size: 12px; }
+                                    Text { text: "Link · " + (session-active ? "live" : "idle"); color: Theme.faint; font-size: 14px; }
                                 }
                             }
                         }
@@ -2429,7 +2449,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: root.edge-mode-index == 0 ? "Single" : "Mirror";
                             color: #22c55e;
-                            font-size: 12px;
+                            font-size: 14px;
                             font-weight: 700;
                             vertical-alignment: center;
                         }
@@ -2454,12 +2474,12 @@ export component AppWindow inherits Window {
                     if root.outbound-driving : Text {
                         vertical-stretch: 0;
                         text: "You are driving " + root.linked-peer-name;
-                        color: #22c55e; font-size: 12px; font-weight: 700;
+                        color: #22c55e; font-size: 14px; font-weight: 700;
                     }
                     if !root.outbound-driving && root.inbound-driving : Text {
                         vertical-stretch: 0;
                         text: root.linked-peer-name + " is driving this computer";
-                        color: #5eead4; font-size: 12px; font-weight: 700;
+                        color: #5eead4; font-size: 14px; font-weight: 700;
                     }
 
                     Rectangle {
@@ -2479,7 +2499,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: root.edge-mode-index == 0 ? "Single" : "Mirror";
                             color: #22c55e;
-                            font-size: 12px;
+                            font-size: 14px;
                             font-weight: 700;
                             vertical-alignment: center;
                         }
@@ -2513,7 +2533,7 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         text: driving-text;
                         color: #22c55e;
-                        font-size: 12px;
+                        font-size: 14px;
                         font-weight: 700;
                     }
 
@@ -2531,7 +2551,7 @@ export component AppWindow inherits Window {
                             x: 12px; y: 5px;
                             text: "Multi-node grid";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 16px;
                             font-weight: 600;
                         }
                         Text {
@@ -2554,21 +2574,21 @@ export component AppWindow inherits Window {
                             border-radius: 8px;
                             background: root.mesh-mode == "bidirectional" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("bidirectional"); } }
-                            Text { text: "Both ways"; color: root.mesh-mode == "bidirectional" ? Theme.accent-text : Theme.faint; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "Both ways"; color: root.mesh-mode == "bidirectional" ? Theme.accent-text : Theme.faint; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                         }
                         Rectangle {
                             x: parent.width / 3; width: parent.width / 3; height: 32px;
                             border-radius: 8px;
                             background: root.mesh-mode == "server_client" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("server_client"); } }
-                            Text { text: "One server"; color: root.mesh-mode == "server_client" ? Theme.accent-text : Theme.faint; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "One server"; color: root.mesh-mode == "server_client" ? Theme.accent-text : Theme.faint; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                         }
                         Rectangle {
                             x: parent.width * 2 / 3; width: parent.width / 3; height: 32px;
                             border-radius: 8px;
                             background: root.mesh-mode == "client_only" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("client_only"); } }
-                            Text { text: "Clients"; color: root.mesh-mode == "client_only" ? Theme.accent-text : Theme.faint; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "Clients"; color: root.mesh-mode == "client_only" ? Theme.accent-text : Theme.faint; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
                     if root.multi-node : KvmButton {
@@ -2611,7 +2631,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Computer name";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 16px;
                             vertical-alignment: center;
                         }
                         name := LineEdit {
@@ -2634,7 +2654,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Control login and lock screens";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 16px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2650,7 +2670,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Sync text clipboard";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 16px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2666,7 +2686,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Reverse scroll on the other computer";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 16px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2682,7 +2702,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Find nearby computers";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 16px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2700,7 +2720,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Manual control";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 16px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2713,7 +2733,7 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         text: "Typed address and pairing code for this computer; the auto-connect path never uses it.";
                         color: Theme.faint;
-                        font-size: 12px;
+                        font-size: 14px;
                         wrap: word-wrap;
                     }
                     HorizontalLayout {
@@ -2737,7 +2757,7 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         text: autostart-note;
                         color: #fbbf24;
-                        font-size: 12px;
+                        font-size: 14px;
                         wrap: word-wrap;
                     }
                     HorizontalLayout {
@@ -2747,7 +2767,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Reconnect at startup";
                             color: root.auto-connect-known && !root.auto-connect-busy ? Theme.text-2 : Theme.faint;
-                            font-size: 14px;
+                            font-size: 16px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2761,14 +2781,14 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         text: "Reconnects to last connected device";
                         color: #fbbf24;
-                        font-size: 12px;
+                        font-size: 14px;
                         wrap: word-wrap;
                     }
                     if auto-connect-note != "" : Text {
                         vertical-stretch: 0;
                         text: auto-connect-note;
                         color: #fbbf24;
-                        font-size: 12px;
+                        font-size: 14px;
                         wrap: word-wrap;
                     }
                     HorizontalLayout {
@@ -2778,7 +2798,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: root.dark-mode ? "Dark theme (#121212)" : "Light theme (white / blue)";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 16px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2794,7 +2814,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Clipboard limit (MB)";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 16px;
                             vertical-alignment: center;
                         }
                         clipboard-max := LineEdit {
@@ -2835,34 +2855,16 @@ export component AppWindow inherits Window {
                     }
                     for peer in root.trusted-peers : Rectangle {
                         vertical-stretch: 0;
-                        height: 40px;
+                        height: 48px;
                         border-radius: 10px;
                         background: Theme.bg;
                         border-width: 1px;
                         border-color: Theme.border;
                         HorizontalLayout {
-                            padding-left: 12px;
-                            padding-right: 6px;
-                            spacing: 8px;
+                            padding-left: 6px;
+                            padding-right: 12px;
+                            spacing: 10px;
                             alignment: center;
-                            VerticalLayout {
-                                spacing: 1px;
-                                alignment: center;
-                                Text {
-                                    text: peer.name == "" ? "Unnamed computer" : peer.name;
-                                    color: Theme.text;
-                                    font-size: 13px;
-                                    font-weight: 600;
-                                    overflow: elide;
-                                }
-                                Text {
-                                    text: peer.address == "" ? peer.fingerprint : peer.address;
-                                    color: Theme.faint;
-                                    font-size: 12px;
-                                    overflow: elide;
-                                }
-                            }
-                            Rectangle { horizontal-stretch: 1; }
                             Rectangle {
                                 width: 34px;
                                 height: 34px;
@@ -2870,15 +2872,31 @@ export component AppWindow inherits Window {
                                 background: del-hit.has-hover ? #f8717118 : transparent;
                                 del-hit := TouchArea {
                                     mouse-cursor: pointer;
-                                    clicked => { revoke-peer(peer.fingerprint); }
+                                    clicked => {
+                                        root.pending-delete = peer.fingerprint;
+                                        root.pending-delete-name = peer.name == "" ? "Unnamed computer" : peer.name;
+                                    }
                                 }
                                 accessible-role: button;
                                 accessible-label: "Remove " + peer.name;
-                                accessible-action-default => { revoke-peer(peer.fingerprint); }
+                                accessible-action-default => {
+                                    root.pending-delete = peer.fingerprint;
+                                    root.pending-delete-name = peer.name == "" ? "Unnamed computer" : peer.name;
+                                }
                                 TrashIcon {
-                                    x: 9px;
+                                    x: 8px;
                                     y: 8px;
                                 }
+                            }
+                            Text {
+                                text: (peer.name == "" ? "Unnamed computer" : peer.name)
+                                    + (peer.address == "" ? "" : "  ·  " + peer.address);
+                                color: Theme.text;
+                                font-size: 16px;
+                                font-weight: 600;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
                             }
                         }
                     }
@@ -2886,7 +2904,50 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         text: "No allowed connections yet.";
                         color: Theme.faint;
-                        font-size: 12px;
+                        font-size: 14px;
+                    }
+
+                    // Delete confirmation: nothing is removed until the
+                    // user confirms in this popup.
+                    if root.pending-delete != "" : Rectangle {
+                        vertical-stretch: 0;
+                        background: Theme.bg;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: #f87171;
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+                            alignment: start;
+                            Text {
+                                text: "Are you sure you want to remove " + root.pending-delete-name + "?";
+                                color: Theme.text;
+                                font-size: 14px;
+                                font-weight: 700;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "This computer will no longer be allowed to connect automatically.";
+                                color: Theme.faint;
+                                font-size: 14px;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: 8px;
+                                KvmButton {
+                                    text: "Cancel";
+                                    btn-width: 96px;
+                                    clicked => { cancel-delete(); }
+                                }
+                                KvmButton {
+                                    text: "Delete";
+                                    danger: true;
+                                    btn-width: 96px;
+                                    clicked => { confirm-delete(); }
+                                }
+                            }
+                        }
                     }
 
                     // Discovery sheet: green radar sweep while scanning,
@@ -2935,12 +2996,12 @@ export component AppWindow inherits Window {
                             Text {
                                 text: "Tap a device to connect it";
                                 color: Theme.faint;
-                                font-size: 12px;
+                                font-size: 14px;
                             }
                             if !root.discovery-scanning && root.discovered-labels.length == 0 : Text {
                                 text: "Press the refresh icon to search again";
                                 color: Theme.faint;
-                                font-size: 12px;
+                                font-size: 14px;
                             }
                             for label[i] in root.discovered-labels : Rectangle {
                                 vertical-stretch: 0;
@@ -2983,18 +3044,18 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Fingerprint";
                             color: Theme.faint;
-                            font-size: 12px;
+                            font-size: 14px;
                         }
                         Text {
                             text: fingerprint;
                             color: #f87171;
-                            font-size: 12px;
+                            font-size: 14px;
                             wrap: word-wrap;
                         }
                         if trusted-peers-advanced != "" : Text {
                             text: "Trusted computers";
                             color: Theme.faint;
-                            font-size: 12px;
+                            font-size: 14px;
                         }
                         if trusted-peers-advanced != "" : Text {
                             text: trusted-peers-advanced;
@@ -3055,7 +3116,7 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         text: "TheKVM " + app-version;
                         color: Theme.faint;
-                        font-size: 12px;
+                        font-size: 14px;
                     }
                 
                     // Absorbs all spare vertical space so every row above
@@ -3197,7 +3258,7 @@ export component AppWindow inherits Window {
                     Text {
                         text: "Drag a screen into a cell, or select one below then click a cell. Adjacent cells cross into each other.";
                         color: Theme.faint;
-                        font-size: 12px;
+                        font-size: 14px;
                         wrap: word-wrap;
                     }
                     Rectangle {
@@ -3287,7 +3348,7 @@ export component AppWindow inherits Window {
                     Text {
                         text: root.grid-pending != "" ? "Now click a cell to place the selected computer" : "Computers (tap to select, or drag from the grid)";
                         color: Theme.faint;
-                        font-size: 12px;
+                        font-size: 14px;
                     }
                     Flickable {
                         height: 46px;
@@ -3302,7 +3363,7 @@ export component AppWindow inherits Window {
                                     border-width: 1px;
                                     border-color: root.grid-pending == node.fingerprint ? Theme.accent-strong : Theme.border;
                                     TouchArea { mouse-cursor: pointer; clicked => { root.grid-peer-tap(node.fingerprint); } }
-                                    Text { text: node.name; color: Theme.text-2; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                                    Text { text: node.name; color: Theme.text-2; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
                                 }
                             }
                             if root.grid-drag != "" : Rectangle {
@@ -3312,7 +3373,7 @@ export component AppWindow inherits Window {
                                 border-width: 1px;
                                 border-color: Theme.border;
                                 TouchArea { mouse-cursor: pointer; clicked => { root.grid-remove(root.grid-drag); } }
-                                Text { text: "Unplace"; color: Theme.text-2; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                                Text { text: "Unplace"; color: Theme.text-2; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
                             }
                         }
                     }
@@ -3334,7 +3395,7 @@ export component AppWindow inherits Window {
                     width: parent.width - 28px;
                     text: root.status-notice;
                     color: Theme.faint;
-                    font-size: 12px;
+                    font-size: 14px;
                     vertical-alignment: center;
                     overflow: elide;
                 }
