@@ -166,6 +166,9 @@ struct PinchState {
     units_per_detent: i64,
     engaged: bool,
     scroll_streak: u32,
+    /// Consecutive spread-dominant reports (PTP parity): the engage
+    /// gate needs a sustained verdict, not a wobble flicker.
+    dominant_streak: u32,
 }
 
 impl PinchState {
@@ -178,6 +181,7 @@ impl PinchState {
             self.acc = 0;
             self.engaged = false;
             self.scroll_streak = 0;
+            self.dominant_streak = 0;
             return (0, ended);
         }
         let spread = (i64::from(contacts[0].0) - i64::from(contacts[1].0)).abs()
@@ -203,6 +207,7 @@ impl PinchState {
         // never accumulate to the engage gate and mute scrolling.
         if mid_step >= SCROLL_NOISE_FLOOR && mid_step > spread_step.abs() * SCROLL_DOMINANCE {
             self.scroll_streak += 1;
+            self.dominant_streak = 0;
             self.anchor = Some(spread);
             if self.engaged && self.scroll_streak >= TAKEOVER_FRAMES {
                 self.engaged = false;
@@ -213,6 +218,10 @@ impl PinchState {
             return (0, false);
         }
         self.scroll_streak = 0;
+        self.dominant_streak += 1;
+        if self.dominant_streak < 6 {
+            return (0, false);
+        }
         if !self.engaged && (spread - anchor).abs() >= PINCH_ENGAGE_UNITS {
             self.engaged = true;
         }
@@ -343,6 +352,7 @@ impl MtPinchTap {
                 units_per_detent: (span.max(1) / DETENTS_PER_SPAN).max(1),
                 engaged: false,
                 scroll_streak: 0,
+                dominant_streak: 0,
             },
             pending: None,
         })
@@ -417,6 +427,7 @@ mod tests {
             units_per_detent: 10,
             engaged: false,
             scroll_streak: 0,
+            dominant_streak: 0,
         }
     }
 
@@ -433,14 +444,16 @@ mod tests {
         let mut pinch = state();
         assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
         assert!(!pinch.engaged);
-        // Below the engage gate (192): still scrolling fingers.
-        assert_eq!(pinch.feed(&[(0, 0), (120, 0)]), (0, false));
-        assert!(!pinch.engaged);
+        // Sustained verdict: five dominant frames is not yet a pinch.
+        for spread in [150, 200, 250, 300, 350] {
+            assert_eq!(pinch.feed(&[(0, 0), (spread, 0)]), (0, false));
+            assert!(!pinch.engaged);
+        }
         // Past the gate: engaged, spread change emits zoom-in (+).
-        // Anchor 100, prev 120, spread 300: acc 180 => 18 detents.
-        assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2160, false));
+        // The engage frame banks its 50 step: 5 detents.
+        assert_eq!(pinch.feed(&[(0, 0), (400, 0)]), (600, false));
         assert!(pinch.engaged);
-        assert_eq!(pinch.feed(&[(0, 0), (210, 0)]), (-1080, false));
+        assert_eq!(pinch.feed(&[(0, 0), (310, 0)]), (-1080, false));
     }
 
     #[test]
@@ -474,15 +487,18 @@ mod tests {
     fn scroll_takeover_ends_an_engaged_pinch() {
         let mut pinch = state();
         assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
-        // Net +200 past the gate with a near-still midpoint: 20 detents.
-        assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2400, false));
+        for spread in [150, 200, 250, 300, 350] {
+            assert_eq!(pinch.feed(&[(0, 0), (spread, 0)]), (0, false));
+            assert!(!pinch.engaged);
+        }
+        assert_eq!(pinch.feed(&[(0, 0), (400, 0)]), (600, false));
         assert!(pinch.engaged);
         for step in 1..5 {
             let y = -step * 20;
-            assert_eq!(pinch.feed(&[(0, y), (300, y)]), (0, false));
+            assert_eq!(pinch.feed(&[(0, y), (400, y)]), (0, false));
             assert!(pinch.engaged);
         }
-        assert_eq!(pinch.feed(&[(0, -100), (300, -100)]), (0, true));
+        assert_eq!(pinch.feed(&[(0, -100), (400, -100)]), (0, true));
         assert!(!pinch.engaged);
         assert_eq!(pinch.feed(&[]), (0, false));
     }
@@ -491,7 +507,11 @@ mod tests {
     fn lift_after_pinch_ends_once_then_reanchors() {
         let mut pinch = state();
         assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
-        assert_eq!(pinch.feed(&[(0, 0), (300, 0)]), (2400, false));
+        for spread in [150, 200, 250, 300, 350] {
+            assert_eq!(pinch.feed(&[(0, 0), (spread, 0)]), (0, false));
+            assert!(!pinch.engaged);
+        }
+        assert_eq!(pinch.feed(&[(0, 0), (400, 0)]), (600, false));
         assert_eq!(pinch.feed(&[]), (0, true));
         assert_eq!(pinch.feed(&[]), (0, false));
         assert_eq!(pinch.feed(&[(0, 0), (100, 0)]), (0, false));
@@ -527,11 +547,18 @@ mod tests {
         device.ingest(ev(EV_ABS, ABS_MT_POSITION_Y, 0));
         device.ingest(ev(EV_SYN, SYN_REPORT, 0));
         assert_eq!(device.pending, None);
-        // Spread 100 -> 300: net +200 past the gate, 20 detents.
+        // Spread ramps 100 -> 400 across sustained dominant frames:
+        // engages on the sixth, banking its 50 step (5 detents).
+        for spread in [150, 200, 250, 300, 350] {
+            device.ingest(ev(EV_ABS, ABS_MT_SLOT, 1));
+            device.ingest(ev(EV_ABS, ABS_MT_POSITION_X, spread));
+            device.ingest(ev(EV_SYN, SYN_REPORT, 0));
+            assert_eq!(device.pending, None);
+        }
         device.ingest(ev(EV_ABS, ABS_MT_SLOT, 1));
-        device.ingest(ev(EV_ABS, ABS_MT_POSITION_X, 300));
+        device.ingest(ev(EV_ABS, ABS_MT_POSITION_X, 400));
         device.ingest(ev(EV_SYN, SYN_REPORT, 0));
-        assert_eq!(device.pending, Some(InputEvent::Pinch { delta: 2400 }));
+        assert_eq!(device.pending, Some(InputEvent::Pinch { delta: 600 }));
         device.pending = None;
         // Lift slot 1: single contact left, gesture ends.
         device.ingest(ev(EV_ABS, ABS_MT_SLOT, 1));

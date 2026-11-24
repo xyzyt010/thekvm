@@ -1,4 +1,4 @@
-import { Button, CheckBox, LineEdit, Palette, ScrollView, TabWidget } from "std-widgets.slint";
+import { CheckBox, LineEdit, Palette, ScrollView, TabWidget } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------
 // One loading language: a full faint ring with a single bright comet arc
@@ -104,11 +104,15 @@ component ChevronGlyph inherits Rectangle {
 // and monitor-graphic colours are fixed and intentionally not themed.
 export global Theme {
     in-out property <bool> dark: true;
+    // ONE CANVAS: every surface is the same color. Structure comes
+    // from hairline borders, never from filled panel boxes. `hover`
+    // is the single slightly-raised tone for pressed/hovered chrome.
     out property <color> bg: dark ? #121212 : #ffffff;
-    out property <color> surface: dark ? #1e1e1e : #f3f5f9;
-    out property <color> surface-2: dark ? #262626 : #e8edf5;
-    out property <color> surface-3: dark ? #141414 : #ffffff;
-    out property <color> border: dark ? #333333 : #d3dae5;
+    out property <color> surface: dark ? #121212 : #ffffff;
+    out property <color> surface-2: dark ? #121212 : #ffffff;
+    out property <color> surface-3: dark ? #121212 : #ffffff;
+    out property <color> hover: dark ? #1e1e1e : #eef2f8;
+    out property <color> border: dark ? #262626 : #d3dae5;
     out property <color> border-strong: dark ? #3a3a3a : #b9c4d4;
     out property <color> text: dark ? #f3f4f6 : #121212;
     out property <color> text-2: dark ? #e5e7eb : #1f2937;
@@ -157,7 +161,48 @@ component ToggleSwitch inherits Rectangle {
         height: 20px;
         border-radius: 10px;
         background: #ffffff;
-        animate x { duration: 140ms; easing: ease-in-out; }
+    }
+}
+
+// The ONE button in the app: same height, radius, border and type
+// scale as every dropdown, so nothing reads as foreign chrome.
+// Primary = the action (Connect/Allow/Apply); silent = secondary.
+// Width hugs its label (min-width forces a wider floor when needed).
+component KvmButton inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    // Wider floor for side-by-side pairs (Allow/Deny): same idea as
+    // the old std Button min-width, under a name Slint allows.
+    in property <length> btn-width: 0px;
+    callback clicked();
+    height: 36px;
+    border-radius: 8px;
+    background: !enabled ? Theme.bg
+        : primary ? Theme.accent-strong
+        : hit.has-hover ? Theme.hover : Theme.bg;
+    border-width: 1px;
+    border-color: !enabled ? Theme.border
+        : primary ? Theme.accent-strong : Theme.border;
+    // Width hugs the label, floored at btn-width when set.
+    width: max(root.btn-width, label.preferred-width + 28px);
+    opacity: enabled ? 1 : 0.55;
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    label := Text {
+        width: parent.width;
+        text: root.text;
+        color: root.primary && root.enabled ? #ffffff : Theme.text;
+        font-size: 13px;
+        font-weight: 600;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+        overflow: elide;
     }
 }
 
@@ -170,11 +215,11 @@ component DeviceDropdown inherits Rectangle {
     in property <bool> enabled: true;
     height: 36px;
     border-radius: 9px;
-    background: hit.has-hover || popup.is-open ? Theme.surface-2 : Theme.surface;
+    background: hit.has-hover || popup.is-open ? Theme.hover : Theme.bg;
     border-width: 1px;
     border-color: popup.is-open ? Theme.border-strong : (hit.has-hover ? Theme.border-strong : Theme.border);
     opacity: enabled ? 1 : 0.5;
-    animate background { duration: 120ms; }
+
     hit := TouchArea {
         mouse-cursor: pointer;
         clicked => {
@@ -216,9 +261,7 @@ component DeviceDropdown inherits Rectangle {
             border-radius: 11px;
             border-width: 1px;
             border-color: Theme.border;
-            drop-shadow-color: #00000099;
-            drop-shadow-blur: 14px;
-            drop-shadow-offset-y: 5px;
+
             clip: true;
             VerticalLayout {
                 padding: 4px;
@@ -364,9 +407,7 @@ component MonitorCard inherits Rectangle {
         border-radius: 9px;
         border-width: 1.5px;
         border-color: root.local ? (root.hovered || root.dragging ? #4ade80 : (root.powered ? #22c55e : #57534e)) : (root.hovered || root.dragging ? #a8a29e : (root.powered ? #5eead4 : Theme.border-strong));
-        drop-shadow-color: #00000088;
-        drop-shadow-blur: 10px;
-        drop-shadow-offset-y: 3px;
+
         Rectangle {
             x: 7px;
             y: 7px;
@@ -993,10 +1034,9 @@ component EdgeModeTile inherits Rectangle {
     background: root.selected ? Theme.accent-bg : Theme.surface-2;
     border-width: root.selected ? 2px : 1.5px;
     border-color: root.selected ? #22c55e : (hit.has-hover && root.enabled ? Theme.faint : Theme.border);
-    drop-shadow-color: root.selected ? #22c55e33 : #00000000;
-    drop-shadow-blur: root.selected ? 12px : 0px;
+
     opacity: root.enabled ? 1 : 0.4;
-    animate background { duration: 140ms; }
+
     hit := TouchArea {
         mouse-cursor: pointer;
         clicked => { if (root.enabled && !root.applying) { root.clicked(); } }
@@ -1133,11 +1173,11 @@ component RoleRow inherits Rectangle {
     in property <bool> selected: false;
     callback picked();
     height: 42px;
-    background: hit.has-hover ? Theme.surface-2 : (root.selected ? #14291d : transparent);
+    background: hit.has-hover ? Theme.hover : (root.selected ? #14291d : transparent);
     border-radius: 8px;
     border-width: root.selected ? 1px : 0px;
     border-color: root.selected ? Theme.accent-border : transparent;
-    animate background { duration: 100ms; }
+
     hit := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.picked(); }
@@ -1202,9 +1242,9 @@ component RoleRow inherits Rectangle {
             Text {
                 text: root.label;
                 color: root.selected ? #a7f3d0 : #e5e7eb;
-                // Exactly the compressed control's 15px: the role name is
+                // Same 13px size as every other label: the role name is
                 // the same size closed and expanded.
-                font-size: 15px;
+                font-size: 13px;
                 font-weight: 600;
                 vertical-alignment: center;
                 overflow: elide;
@@ -1259,13 +1299,13 @@ component RoleDropdown inherits Rectangle {
     width: 140px;
     height: 36px;
     border-radius: 9px;
-    background: hit.has-hover || popup.is-open ? Theme.surface-2 : Theme.surface;
+    background: hit.has-hover || popup.is-open ? Theme.hover : Theme.bg;
     border-width: 1px;
     // Neutral outline in every state: no green frame on apply, on the
     // brief "applied" flash, or while the popup is open.
     border-color: popup.is-open ? Theme.border-strong : (hit.has-hover ? Theme.faint : Theme.border);
-    animate background { duration: 120ms; }
-    animate border-color { duration: 120ms; }
+
+
     hit := TouchArea {
         mouse-cursor: pointer;
         clicked => {
@@ -1335,9 +1375,9 @@ component RoleDropdown inherits Rectangle {
             Text {
                 text: root.current;
                 color: Theme.text;
-                // Same 15px size as the row labels inside the popup: the
-                // role name never changes size between closed and open.
-                font-size: 15px;
+                // Same 13px size as the closed pill: the role name never
+                // changes size between closed and open.
+                font-size: 13px;
                 font-weight: 600;
                 vertical-alignment: center;
                 overflow: elide;
@@ -1385,9 +1425,7 @@ component RoleDropdown inherits Rectangle {
             border-radius: 11px;
             border-width: 1px;
             border-color: Theme.border;
-            drop-shadow-color: #000000aa;
-            drop-shadow-blur: 14px;
-            drop-shadow-offset-y: 5px;
+
             VerticalLayout {
                 padding: 4px;
                 spacing: 2px;
@@ -1440,7 +1478,7 @@ component Disclosure inherits Rectangle {
         Text {
             text: root.label;
             color: Theme.text-2;
-            font-size: 14px;
+            font-size: 13px;
             font-weight: 700;
             vertical-alignment: center;
         }
@@ -1728,7 +1766,7 @@ export component AppWindow inherits Window {
                     overflow: elide;
                 }
                 Rectangle { horizontal-stretch: 1; }
-                Button {
+                KvmButton {
                     text: "Start service";
                     clicked => { root.start-daemon(); }
                 }
@@ -1769,74 +1807,60 @@ export component AppWindow inherits Window {
                     spacing: 12px;
 
                     // ---- Nearby devices ----------------------------------
+                    // ONE canvas, NO boxes inside boxes: a single hairline
+                    // row. The dropdown only selects; the session strip's
+                    // Connect/Disconnect below is the only action button.
                     if discovery-card-visible : Rectangle {
                         vertical-stretch: 0;
-                        background: Theme.surface-3;
+                        // Explicit height: a layout-managed Rectangle in a
+                        // viewport-tall Flickable gets stretched to the
+                        // viewport and reads as a giant empty panel.
+                        // Content is 26 header + 14 status + 36 dropdown
+                        // + padding/spacing = 118.
+                        height: 118px;
+                        background: Theme.bg;
                         border-radius: 10px;
                         border-width: 1px;
                         border-color: Theme.border;
                         VerticalLayout {
-                            padding: 8px;
-                            spacing: 5px;
-                            // Inner panel one step lighter for contrast.
-                            Rectangle {
-                                background: Theme.surface;
-                                border-radius: 7px;
-                                border-width: 1px;
-                                border-color: Theme.surface-2;
-                                VerticalLayout {
-                                    padding: 7px;
-                                    spacing: 5px;
-                                    HorizontalLayout {
-                                        spacing: 6px;
-                                        Text {
-                                            text: "Nearby devices";
-                                            color: white;
-                                            font-size: 13px;
-                                            font-weight: 700;
-                                            vertical-alignment: center;
-                                        }
-                                        Rectangle { horizontal-stretch: 1; }
-                                        RescanButton {
-                                            scanning: root.discovery-scanning;
-                                            tick: root.spinner-tick;
-                                            clicked => { discover-lan(); }
-                                        }
-                                        CloseButton {
-                                            clicked => { hide-discovery(); }
-                                        }
-                                    }
-                                    Text {
-                                        text: root.discovery-scanning ? "Scanning…" : root.discovery-text;
-                                        color: root.discovery-scanning ? #6ee7b7 : Theme.faint;
-                                        font-size: 11px;
-                                        wrap: word-wrap;
-                                    }
-                                    if discovered-labels.length > 0 : HorizontalLayout {
-                                        spacing: 8px;
-                                        found2 := DeviceDropdown {
-                                            labels: root.discovered-labels;
-                                            current-index <=> root.discovered-index;
-                                            height: 32px;
-                                            horizontal-stretch: 1;
-                                        }
-                                        // Hidden while linked: the session strip's
-                                        // Connect/Disconnect toggle is the only
-                                        // action button then.
-                                        if !session-active : Button {
-                                            text: "Connect";
-                                            primary: true;
-                                            height: 32px;
-                                            enabled: discovered-labels.length > 0;
-                                            clicked => { connect-discovered(root.discovered-index); }
-                                        }
-                                    }
-                                    if discovered-labels.length == 0 && !discovery-scanning : Text {
-                                        text: "No devices found.";
-                                        color: Theme.faint;
-                                        font-size: 11px;
-                                    }
+                            padding: 10px;
+                            spacing: 8px;
+                            alignment: start;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "Nearby devices";
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
                                 }
+                                Rectangle { horizontal-stretch: 1; }
+                                RescanButton {
+                                    scanning: root.discovery-scanning;
+                                    tick: root.spinner-tick;
+                                    clicked => { discover-lan(); }
+                                }
+                                CloseButton {
+                                    clicked => { hide-discovery(); }
+                                }
+                            }
+                            Text {
+                                text: root.discovery-scanning ? "Scanning…" : root.discovery-text;
+                                color: root.discovery-scanning ? #6ee7b7 : Theme.faint;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            if discovered-labels.length > 0 : DeviceDropdown {
+                                labels: root.discovered-labels;
+                                current-index <=> root.discovered-index;
+                                height: 36px;
+                                horizontal-stretch: 1;
+                            }
+                            if discovered-labels.length == 0 && !discovery-scanning : Text {
+                                text: "No devices found.";
+                                color: Theme.faint;
+                                font-size: 11px;
                             }
                         }
                     }
@@ -1870,7 +1894,8 @@ export component AppWindow inherits Window {
                     // dropdown to zero width.)
                     HorizontalLayout {
                         vertical-stretch: 0;
-                        horizontal-stretch: 0;
+                        horizontal-stretch: 1;
+                        alignment: start;
                         spacing: 10px;
                         Text {
                             // This computer's name AND live LAN address: the
@@ -1922,7 +1947,7 @@ export component AppWindow inherits Window {
                                 // starves the Connect button to zero width.
                                 width: 320px;
                             }
-                            Button {
+                            KvmButton {
                                 text: "Connect";
                                 primary: true;
                                 enabled: addr.text != "" && !session-active;
@@ -1985,10 +2010,9 @@ export component AppWindow inherits Window {
                             // the selected nearby computer), Disconnect while
                             // linked (ends the whole link). No second
                             // disconnect button anywhere.
-                            Button {
+                            KvmButton {
                                 text: session-active ? "Disconnect" : "Connect";
                                 primary: !session-active;
-                                height: 30px;
                                 enabled: session-active || discovered-labels.length > 0;
                                 clicked => {
                                     if (session-active) {
@@ -2052,17 +2076,15 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 12px;
                             alignment: center;
-                            Button {
+                            KvmButton {
                                 text: "Codes match";
                                 primary: true;
-                                height: 34px;
-                                min-width: 110px;
+                                btn-width: 110px;
                                 clicked => { confirm-pairing(); }
                             }
-                            Button {
+                            KvmButton {
                                 text: "Cancel";
-                                height: 34px;
-                                min-width: 96px;
+                                btn-width: 96px;
                                 clicked => { cancel-pairing(); }
                             }
                         }
@@ -2095,17 +2117,15 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 12px;
                             alignment: center;
-                            Button {
+                            KvmButton {
                                 text: "Allow";
                                 primary: true;
-                                height: 34px;
-                                min-width: 96px;
+                                btn-width: 96px;
                                 clicked => { approve-incoming-pairing(incoming-pairing-fingerprint, root.incoming-autoconnect); }
                             }
-                            Button {
+                            KvmButton {
                                 text: "Deny";
-                                height: 34px;
-                                min-width: 96px;
+                                btn-width: 96px;
                                 clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
                             }
                         }
@@ -2132,17 +2152,15 @@ export component AppWindow inherits Window {
                             spacing: 12px;
                             alignment: center;
                             Rectangle { horizontal-stretch: 1; }
-                            Button {
+                            KvmButton {
                                 text: "Allow";
                                 primary: true;
-                                height: 34px;
-                                min-width: 96px;
+                                btn-width: 96px;
                                 clicked => { approve-incoming-link(incoming-link-fingerprint, root.incoming-autoconnect); }
                             }
-                            Button {
+                            KvmButton {
                                 text: "Deny";
-                                height: 34px;
-                                min-width: 96px;
+                                btn-width: 96px;
                                 clicked => { reject-incoming-link(incoming-link-fingerprint); }
                             }
                         }
@@ -2152,7 +2170,7 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if !connected : Button {
+                    if !connected : KvmButton {
                         vertical-stretch: 0;
                         text: "Start background service";
                         clicked => { start-daemon(); }
@@ -2187,8 +2205,8 @@ export component AppWindow inherits Window {
                         spacing: 10px;
                         Text {
                             text: "Computers";
-                            color: white;
-                            font-size: 14px;
+                            color: Theme.text;
+                            font-size: 13px;
                             font-weight: 700;
                             vertical-alignment: center;
                         }
@@ -2196,7 +2214,7 @@ export component AppWindow inherits Window {
                             diameter: 16px;
                             tick: root.spinner-tick;
                         }
-                        Button {
+                        KvmButton {
                             text: "Scan";
                             enabled: !discovery-scanning;
                             clicked => { discover-lan(); }
@@ -2248,7 +2266,7 @@ export component AppWindow inherits Window {
                                 spacing: 8px;
                                 Text {
                                     text: "Computer details";
-                                    color: white;
+                                    color: Theme.text;
                                     font-size: 13px;
                                     font-weight: 700;
                                     vertical-alignment: center;
@@ -2263,7 +2281,7 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     spacing: 3px;
                                     Text { text: "THIS COMPUTER"; color: #6ee7b7; font-size: 9px; font-weight: 800; letter-spacing: 1.3px; }
-                                    Text { text: root.device-name == "" ? "Unknown" : root.device-name; color: white; font-size: 13px; font-weight: 700; wrap: word-wrap; }
+                                    Text { text: root.device-name == "" ? "Unknown" : root.device-name; color: Theme.text; font-size: 13px; font-weight: 700; wrap: word-wrap; }
                                     Text { text: "LAN · " + (root.local-address == "" ? "…" : root.local-address); color: Theme.text-2; font-size: 11px; wrap: word-wrap; }
                                     Text { text: "Fingerprint · " + root.fingerprint; color: Theme.muted; font-size: 9px; wrap: word-wrap; letter-spacing: 0.5px; }
                                     Text { text: "Role · " + root.role-text; color: Theme.faint; font-size: 11px; }
@@ -2272,7 +2290,7 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     spacing: 3px;
                                     Text { text: "LINKED COMPUTER"; color: #5eead4; font-size: 9px; font-weight: 800; letter-spacing: 1.3px; }
-                                    Text { text: root.linked-peer-name == "" ? "Not paired yet" : root.linked-peer-name; color: white; font-size: 13px; font-weight: 700; wrap: word-wrap; }
+                                    Text { text: root.linked-peer-name == "" ? "Not paired yet" : root.linked-peer-name; color: Theme.text; font-size: 13px; font-weight: 700; wrap: word-wrap; }
                                     Text { text: "Address · " + (root.details-peer-address == "" ? "unknown" : root.details-peer-address); color: Theme.text-2; font-size: 11px; wrap: word-wrap; }
                                     Text { text: "Fingerprint · " + (root.details-peer-fingerprint == "" ? "unknown" : root.details-peer-fingerprint); color: Theme.muted; font-size: 9px; wrap: word-wrap; letter-spacing: 0.5px; }
                                     Text { text: "Link · " + (session-active ? "live" : "idle"); color: Theme.faint; font-size: 11px; }
@@ -2280,26 +2298,13 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    if discovered-labels.length > 0 : HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        found := DeviceDropdown {
-                            labels: root.discovered-labels;
-                            current-index <=> root.discovered-index;
-                            height: 32px;
-                            horizontal-stretch: 1;
-                        }
-                        if !session-active : Button {
-                            text: "Connect";
-                            primary: true;
-                            height: 32px;
-                            enabled: discovered-labels.length > 0;
-                            clicked => { connect-discovered(root.discovered-index); }
-                        }
-                    }
+                    // Nearby devices + the single Connect/Disconnect button
+                    // live on the Connect tab. This tab stays arrangement
+                    // only, so there is exactly one action button in
+                    // the whole window.
                     // (Past/present computer names deliberately not listed
-                    // here: the Devices tab shows what is arranged and what
-                    // is nearby. Remembered names/addresses come later.)
+                    // here: the Devices tab shows what is arranged.
+                    // Remembered names/addresses come later.)
 
                     Rectangle {
                         vertical-stretch: 0; height: 1px; background: Theme.border; }
@@ -2310,8 +2315,8 @@ export component AppWindow inherits Window {
                         spacing: 10px;
                         Text {
                             text: "Screen arrangement";
-                            color: white;
-                            font-size: 14px;
+                            color: Theme.text;
+                            font-size: 13px;
                             font-weight: 700;
                             vertical-alignment: center;
                         }
@@ -2360,8 +2365,8 @@ export component AppWindow inherits Window {
                         spacing: 10px;
                         Text {
                             text: "Crossing edges";
-                            color: white;
-                            font-size: 14px;
+                            color: Theme.text;
+                            font-size: 13px;
                             font-weight: 700;
                             vertical-alignment: center;
                         }
@@ -2437,30 +2442,30 @@ export component AppWindow inherits Window {
                     }
                     if root.multi-node : Rectangle {
                         vertical-stretch: 0;
-                        height: 34px;
+                        height: 36px;
                         Rectangle {
-                            width: parent.width / 3; height: 30px;
+                            width: parent.width / 3; height: 32px;
                             border-radius: 8px;
-                            background: root.mesh-mode == "bidirectional" ? Theme.accent-panel : Theme.surface-2;
+                            background: root.mesh-mode == "bidirectional" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("bidirectional"); } }
                             Text { text: "Both ways"; color: root.mesh-mode == "bidirectional" ? Theme.accent-text : Theme.faint; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                         }
                         Rectangle {
-                            x: parent.width / 3; width: parent.width / 3; height: 30px;
+                            x: parent.width / 3; width: parent.width / 3; height: 32px;
                             border-radius: 8px;
-                            background: root.mesh-mode == "server_client" ? Theme.accent-panel : Theme.surface-2;
+                            background: root.mesh-mode == "server_client" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("server_client"); } }
                             Text { text: "One server"; color: root.mesh-mode == "server_client" ? Theme.accent-text : Theme.faint; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                         }
                         Rectangle {
-                            x: parent.width * 2 / 3; width: parent.width / 3; height: 30px;
+                            x: parent.width * 2 / 3; width: parent.width / 3; height: 32px;
                             border-radius: 8px;
-                            background: root.mesh-mode == "client_only" ? Theme.accent-panel : Theme.surface-2;
+                            background: root.mesh-mode == "client_only" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("client_only"); } }
                             Text { text: "Clients"; color: root.mesh-mode == "client_only" ? Theme.accent-text : Theme.faint; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
-                    if root.multi-node : Button {
+                    if root.multi-node : KvmButton {
                         vertical-stretch: 0;
                         text: "Configure grid";
                         primary: true;
@@ -2495,16 +2500,16 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Computer name";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 13px;
                             vertical-alignment: center;
                         }
                         name := LineEdit {
-                            height: 32px;
+                            height: 36px;
                             text <=> root.device-name;
                             placeholder-text: "friendly name";
                             width: 230px;
                         }
-                        Button {
+                        KvmButton {
                             text: "Save";
                             enabled: name.text != "";
                             clicked => { apply-config(lock-screen-control, mode-index, name.text, auto-connect-address, clipboard-enabled, root.clipboard-max-mb); }
@@ -2518,7 +2523,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Control login and lock screens";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 13px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2534,7 +2539,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Sync text clipboard";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 13px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2550,7 +2555,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Reverse scroll on the other computer";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 13px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2566,7 +2571,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Find nearby computers";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 13px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2584,7 +2589,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Manual control";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 13px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2607,7 +2612,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Start when I log in";
                             color: root.autostart-supported && !root.autostart-busy ? Theme.text-2 : Theme.faint;
-                            font-size: 14px;
+                            font-size: 13px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2631,7 +2636,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Reconnect at startup";
                             color: root.auto-connect-known && !root.auto-connect-busy ? Theme.text-2 : Theme.faint;
-                            font-size: 14px;
+                            font-size: 13px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2655,7 +2660,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: root.dark-mode ? "Dark theme (#121212)" : "Light theme (white / blue)";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 13px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2671,16 +2676,16 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Clipboard limit (MB)";
                             color: Theme.text-2;
-                            font-size: 14px;
+                            font-size: 13px;
                             vertical-alignment: center;
                         }
                         clipboard-max := LineEdit {
-                            height: 32px;
+                            height: 36px;
                             text <=> root.clipboard-max-mb;
                             placeholder-text: "2";
                             width: 64px;
                         }
-                        Button {
+                        KvmButton {
                             text: "Save";
                             clicked => { apply-config(root.lock-screen-control, root.mode_index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
                         }
@@ -2723,12 +2728,12 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 10px;
                             revoke := LineEdit {
-                                height: 32px;
+                                height: 36px;
                                 text <=> root.revoke-fingerprint;
                                 placeholder-text: "Fingerprint to remove";
                                 width: 320px;
                             }
-                            Button {
+                            KvmButton {
                                 text: "Remove";
                                 enabled: revoke.text != "";
                                 clicked => { revoke-peer(revoke.text); }
@@ -2738,12 +2743,12 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 10px;
                             startup := LineEdit {
-                                height: 32px;
+                                height: 36px;
                                 text <=> root.auto-connect-address;
                                 placeholder-text: "Startup address";
                                 width: 320px;
                             }
-                            Button {
+                            KvmButton {
                                 text: "Save";
                                 clicked => { apply-config(lock-screen-control, mode-index, device-name, startup.text, clipboard-enabled, root.clipboard-max-mb); }
                             }
@@ -2752,19 +2757,19 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 10px;
                             path := LineEdit {
-                                height: 32px;
+                                height: 36px;
                                 text <=> root.layout-path;
                                 placeholder-text: "Layout file";
                                 width: 320px;
                             }
-                            Button {
+                            KvmButton {
                                 text: "Import";
                                 enabled: path.text != "";
                                 clicked => { import-layout(path.text); }
                             }
                             Rectangle { horizontal-stretch: 1; }
                         }
-                        Button {
+                        KvmButton {
                             text: "Open log folder";
                             clicked => { open-log-folder(); }
                         }
@@ -2806,9 +2811,7 @@ export component AppWindow inherits Window {
                         border-radius: 10px;
                         border-width: 1px;
                         border-color: #f59e0b;
-                        drop-shadow-color: #000000aa;
-                        drop-shadow-blur: 18px;
-                        drop-shadow-offset-y: 6px;
+
                         VerticalLayout {
                             padding: 10px;
                             spacing: 8px;
@@ -2823,17 +2826,15 @@ export component AppWindow inherits Window {
                                     overflow: elide;
                                 }
                                 Rectangle { horizontal-stretch: 1; }
-                                Button {
+                                KvmButton {
                                     text: "Allow";
                                     primary: true;
-                                    height: 34px;
-                                    min-width: 96px;
+                                    btn-width: 96px;
                                     clicked => { approve-incoming-pairing(incoming-pairing-fingerprint, root.incoming-autoconnect); }
                                 }
-                                Button {
+                                KvmButton {
                                     text: "Deny";
-                                    height: 34px;
-                                    min-width: 96px;
+                                    btn-width: 96px;
                                     clicked => { reject-incoming-pairing(incoming-pairing-fingerprint); }
                                 }
                             }
@@ -2848,9 +2849,7 @@ export component AppWindow inherits Window {
                         border-radius: 10px;
                         border-width: 1px;
                         border-color: #22c55e;
-                        drop-shadow-color: #000000aa;
-                        drop-shadow-blur: 18px;
-                        drop-shadow-offset-y: 6px;
+
                         VerticalLayout {
                             padding: 10px;
                             spacing: 8px;
@@ -2865,17 +2864,15 @@ export component AppWindow inherits Window {
                                     overflow: elide;
                                     horizontal-stretch: 1;
                                 }
-                                Button {
+                                KvmButton {
                                     text: "Allow";
                                     primary: true;
-                                    height: 34px;
-                                    min-width: 96px;
+                                    btn-width: 96px;
                                     clicked => { approve-incoming-link(incoming-link-fingerprint, root.incoming-autoconnect); }
                                 }
-                                Button {
+                                KvmButton {
                                     text: "Deny";
-                                    height: 34px;
-                                    min-width: 96px;
+                                    btn-width: 96px;
                                     clicked => { reject-incoming-link(incoming-link-fingerprint); }
                                 }
                             }
@@ -3042,7 +3039,7 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    Button {
+                    KvmButton {
                         text: root.mesh-applying ? "Applying…" : "Apply to all computers";
                         primary: !root.mesh-applying;
                         enabled: !root.mesh-applying;
