@@ -98,10 +98,40 @@ impl Layout {
         };
         let tx = mine.x + dx;
         let ty = mine.y + dy;
-        self.screens
+        if let Some(id) = self
+            .screens
             .iter()
             .find(|s| s.x == tx && s.y == ty)
             .map(|s| s.id)
+        {
+            return Some(id);
+        }
+        // Multi-node wrap-around: with three or more machines the last
+        // computer on a row re-enters the first computer's left edge (and
+        // vice versa). Two-device links deliberately keep strict clamping —
+        // wrapping there would let a right-edge brush teleport home.
+        if self.screens.len() >= 3 {
+            let row: Vec<&Screen> = self
+                .screens
+                .iter()
+                .filter(|s| s.y == mine.y)
+                .collect();
+            let min_x = row.iter().map(|s| s.x).min();
+            let max_x = row.iter().map(|s| s.x).max();
+            let wrapped = match edge {
+                Edge::Right if max_x == Some(mine.x) => min_x,
+                Edge::Left if min_x == Some(mine.x) => max_x,
+                _ => None,
+            };
+            if let Some(x) = wrapped {
+                return self
+                    .screens
+                    .iter()
+                    .find(|s| s.x == x && s.y == mine.y)
+                    .map(|s| s.id);
+            }
+        }
+        None
     }
 
     /// True when the layout links exactly one peer screen (the normal
@@ -2038,6 +2068,32 @@ mod tests {
             height: 1080,
             peer_fingerprint: None,
         }
+    }
+
+    #[test]
+    fn multi_node_right_edge_wraps_to_first_on_the_row() {
+        let layout = Layout {
+            screens: vec![
+                screen(1, "a", 0, 0),
+                screen(2, "b", 1, 0),
+                screen(3, "c", 2, 0),
+            ],
+            self_screen: Some(ScreenId(1)),
+        };
+        assert_eq!(
+            layout.neighbor_for_edge(ScreenId(3), Edge::Right),
+            Some(ScreenId(1))
+        );
+        assert_eq!(
+            layout.neighbor_for_edge(ScreenId(1), Edge::Left),
+            Some(ScreenId(3))
+        );
+        // Two-device links must never wrap.
+        let two = Layout {
+            screens: vec![screen(1, "a", 0, 0), screen(2, "b", 1, 0)],
+            self_screen: Some(ScreenId(1)),
+        };
+        assert_eq!(two.neighbor_for_edge(ScreenId(2), Edge::Right), None);
     }
 
     #[test]

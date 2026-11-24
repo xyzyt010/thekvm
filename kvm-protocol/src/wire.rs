@@ -207,9 +207,34 @@ pub struct Hello {
     pub udp_motion: bool,
 }
 
+/// One machine placed in the multi-node grid. `col`/`row` are 0-based
+/// cells in the 5x3 grid; a fingerprint may occur only once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshScreen {
+    pub fingerprint_hex: String,
+    pub node_name: String,
+    pub col: i32,
+    pub row: i32,
+}
+
+/// Distribute an entire multi-node arrangement to a linked desktop.
+/// The receiver rebuilds its layout from these placements: adjacent cells
+/// face each other, the rightmost cell wraps to the leftmost cell on the
+/// same row, and the local machine occupies the cell carrying its own
+/// fingerprint (so it needs no peer entry for itself).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshConfig {
+    /// kvm_core::Mode as its snake-case name: bidirectional / server_client
+    /// / client_only. The receiver derives its own effective role from it.
+    pub mode: String,
+    #[serde(default)]
+    pub screens: Vec<MeshScreen>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WireMessage {
     Hello(Hello),
+    MeshConfig(MeshConfig),
     PairRequest {
         node_name: String,
         fingerprint_hex: String,

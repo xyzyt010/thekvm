@@ -370,6 +370,10 @@ fn main() -> Result<()> {
         "UI started; user state at {}",
         startup_dir.display()
     ));
+    // A fresh app launch is the ONLY thing that re-arms the auto-connect
+    // pauses recorded by a manual Disconnect. Presence-lease renewals do
+    // not: they must never resurrect a link the user deliberately ended.
+    let _ = control_request(ControlRequest::ResumeControllers);
     // Let the headless system daemon place entry warps on this session's
     // X server: without the grant its receiver drives unplaced (entries
     // land mid-screen). Localhost-only, warp-scoped in practice, and best
@@ -3079,6 +3083,12 @@ fn start_session_flow(
     // for this peer before the automatic-dial-back suppression is consulted.
     clear_dialback_tombstone(&address);
     clear_autoconnect_ban(&address);
+    // Lift the daemon's inbound Disconnect latch for this peer. Without
+    // this, a manual Connect would be one-way: we could drive out but the
+    // peer's dial-back would be refused as "locally disconnected".
+    if let Some(fingerprint) = fingerprint_for_address(data_dir, &address) {
+        let _ = control_request(ControlRequest::ClearDisconnect { fingerprint_hex: fingerprint });
+    }
     // Reap a dead previous session first so a stale slot can never wedge
     // reconnect behind a permanent "Already connected".
     if let Ok(mut slot) = session.lock() {

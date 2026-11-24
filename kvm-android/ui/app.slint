@@ -24,12 +24,52 @@ struct KnownItem {
     connected: bool,
 }
 
+/// One machine in the multi-node grid. col/row = -1 means not placed yet.
+struct GridNode {
+    name: string,
+    fingerprint: string,
+    col: int,
+    row: int,
+}
+
+/// Single source of truth for both themes. Dark is the default and uses a
+/// soft #121212 grey rather than pure black; light is white with black
+/// text and blue highlights. Every colour in the app resolves through here.
+export global Theme {
+    in-out property <bool> dark: true;
+
+    out property <color> bg: dark ? #121212 : #ffffff;
+    out property <color> surface: dark ? #1e1e1e : #f3f5f9;
+    out property <color> surface-2: dark ? #262626 : #e8edf5;
+    out property <color> surface-3: dark ? #141414 : #ffffff;
+    out property <color> border: dark ? #333333 : #d3dae5;
+    out property <color> border-strong: dark ? #3a3a3a : #b9c4d4;
+    out property <color> text: dark ? #f3f4f6 : #121212;
+    out property <color> text-2: dark ? #e5e7eb : #1f2937;
+    out property <color> muted: dark ? #8b949e : #5b6675;
+    out property <color> faint: dark ? #7c8698 : #6b7685;
+    out property <color> hint: dark ? #474747 : #c2cbd8;
+
+    out property <color> accent: dark ? #34d399 : #2563eb;
+    out property <color> accent-strong: dark ? #22c55e : #1d4ed8;
+    out property <color> accent-bg: dark ? #14291d : #e8f0ff;
+    out property <color> accent-panel: dark ? #14532d : #dbeafe;
+    out property <color> accent-border: dark ? #1f5136 : #93b4f7;
+    out property <color> accent-text: dark ? #dcfce7 : #1e3a8a;
+    out property <color> danger-bg: dark ? #3a1d1d : #fee2e2;
+    out property <color> danger-text: dark ? #fca5a5 : #b91c1c;
+
+    out property <color> screen: dark ? #1e40af : #3b82f6;
+    out property <color> screen-glow: dark ? #172554 : #dbeafe;
+    out property <color> bezel: dark ? #0f0f0f : #cbd5e1;
+}
+
 // Chevron that turns a smooth 180 degrees. Path coordinates are recomputed
 // from an animated angle: Slint's software renderer ignores transform-rotation.
 component Chevron inherits Rectangle {
     in property <float> scale: 1;
     in property <bool> open: false;
-    in property <color> glyph-color: #9ca3af;
+    in property <color> glyph-color: Theme.faint;
     in property <length> size: 14px;
     width: root.size;
     height: root.size;
@@ -64,9 +104,9 @@ component PillButton inherits Rectangle {
     in property <bool> enabled: true;
     height: 44px * root.scale;
     border-radius: 10px * root.scale;
-    background: !root.enabled ? #161616 : (root.primary ? #14532d : (area.has-hover ? #262626 : #1e1e1e));
+    background: !root.enabled ? Theme.surface-3 : (root.primary ? Theme.accent-panel : (area.has-hover ? Theme.surface-2 : Theme.surface));
     border-width: 1px;
-    border-color: root.primary ? #22c55e : #2e2e2e;
+    border-color: root.primary ? Theme.accent-strong : Theme.border;
     opacity: root.enabled ? 1 : 0.5;
     area := TouchArea {
         clicked => { if (root.enabled) { root.clicked(); } }
@@ -74,7 +114,7 @@ component PillButton inherits Rectangle {
     callback clicked();
     Text {
         text: root.label;
-        color: root.primary ? #dcfce7 : #e5e7eb;
+        color: root.primary ? Theme.accent-text : Theme.text-2;
         font-size: 14px * root.scale;
         font-weight: 600;
         horizontal-alignment: center;
@@ -90,9 +130,9 @@ component DeviceDropdown inherits Rectangle {
     width: 100%;
     height: 56px * root.scale;
     border-radius: 11px * root.scale;
-    background: popup.is-open ? #262626 : #1a1a1a;
+    background: popup.is-open ? Theme.surface-2 : Theme.surface;
     border-width: 1px;
-    border-color: #3a3a3a;
+    border-color: Theme.border-strong;
     TouchArea {
         clicked => { if (popup.is-open) { popup.close(); } else { popup.show(); } }
     }
@@ -101,7 +141,7 @@ component DeviceDropdown inherits Rectangle {
         width: parent.width - 52px * root.scale;
         text: root.selected >= 0 && root.selected < root.devices.length
             ? root.devices[root.selected].name : "Choose a computer…";
-        color: #f3f4f6;
+        color: Theme.text;
         font-size: 14px * root.scale;
         font-weight: 600;
         vertical-alignment: center;
@@ -113,7 +153,7 @@ component DeviceDropdown inherits Rectangle {
         width: parent.width - 52px * root.scale;
         text: root.selected >= 0 && root.selected < root.devices.length
             ? root.devices[root.selected].address : "Nearby Windows / Linux computers";
-        color: #7c8698;
+        color: Theme.faint;
         font-size: 10px * root.scale;
         vertical-alignment: center;
         overflow: elide;
@@ -123,7 +163,7 @@ component DeviceDropdown inherits Rectangle {
         y: (parent.height - 14px * root.scale) / 2;
         width: 14px * root.scale;
         height: 14px * root.scale;
-        Chevron { scale: root.scale; open: popup.is-open; glyph-color: #9ca3af; size: 14px * root.scale; }
+        Chevron { scale: root.scale; open: popup.is-open; glyph-color: Theme.faint; size: 14px * root.scale; }
     }
     popup := PopupWindow {
         x: 0;
@@ -133,10 +173,10 @@ component DeviceDropdown inherits Rectangle {
         close-policy: close-on-click-outside;
         Rectangle {
             width: 100%; height: 100%;
-            background: #1c1c1c;
+            background: Theme.surface;
             border-radius: 11px * root.scale;
             border-width: 1px;
-            border-color: #333333;
+            border-color: Theme.border;
             clip: true;
             VerticalLayout {
                 padding: 5px * root.scale;
@@ -144,7 +184,7 @@ component DeviceDropdown inherits Rectangle {
                 alignment: start;
                 if root.devices.length == 0 : Text {
                     text: "Scanning…";
-                    color: #7c8698;
+                    color: Theme.faint;
                     font-size: 14px * root.scale;
                     horizontal-alignment: center;
                     vertical-alignment: center;
@@ -152,7 +192,7 @@ component DeviceDropdown inherits Rectangle {
                 for device[i] in root.devices : Rectangle {
                     height: 52px * root.scale;
                     border-radius: 8px * root.scale;
-                    background: row.has-hover ? #2a2a2a : (i == root.selected ? #14291d : transparent);
+                    background: row.has-hover ? Theme.surface-2 : (i == root.selected ? Theme.accent-bg : transparent);
                     row := TouchArea {
                         clicked => { root.selected = i; popup.close(); }
                     }
@@ -160,7 +200,7 @@ component DeviceDropdown inherits Rectangle {
                         x: 12px * root.scale; y: 6px * root.scale;
                         width: parent.width - 24px * root.scale;
                         text: (device.connected ? "● " : "") + device.name;
-                        color: device.connected ? #34d399 : #e5e7eb;
+                        color: device.connected ? Theme.accent : Theme.text-2;
                         font-size: 13px * root.scale;
                         font-weight: 600;
                         overflow: elide;
@@ -169,7 +209,7 @@ component DeviceDropdown inherits Rectangle {
                         x: 12px * root.scale; y: 27px * root.scale;
                         width: parent.width - 24px * root.scale;
                         text: device.address + (device.known ? "   · remembered" : "");
-                        color: device.known ? #34d399 : #7c8698;
+                        color: device.known ? Theme.accent : Theme.faint;
                         font-size: 10px * root.scale;
                         overflow: elide;
                     }
@@ -181,7 +221,7 @@ component DeviceDropdown inherits Rectangle {
 
 export component App inherits Window {
     title: "TheKVM";
-    background: #0a0a0a;
+    background: Theme.bg;
     default-font-family: "Roboto, Noto Sans, Sans-Serif";
 
     // Fill the screen; scale everything from its width. 400 logical px is the
@@ -199,6 +239,26 @@ export component App inherits Window {
     in-out property <bool> horizontal-mode: false;
     in-out property <string> draft: "";
     in-out property <length> text-offset: 0px;
+
+    // Multi-node configuration (5x3 grid, up to 15 machines).
+    in-out property <bool> multi-node: false;
+    in-out property <string> mesh-mode: "bidirectional";
+    in-out property <[GridNode]> grid-nodes: [];
+    in-out property <bool> grid-open: false;
+    in-out property <bool> mesh-applying: false;
+    in-out property <bool> dark-mode: true;
+
+    callback toggle-theme();
+    callback toggle-multi-node();
+    callback set-mesh-mode(string);
+    callback open-mesh-grid();
+    callback close-mesh-grid();
+    callback grid-device-tap(string);
+    callback grid-cell-down(int, int);
+    callback grid-cell-move(int, int);
+    callback grid-cell-up(int, int);
+    callback apply-mesh();
+    callback remove-grid-node(string);
 
     callback connect-selected();
     callback disconnect();
@@ -224,7 +284,7 @@ export component App inherits Window {
 
     // ---------- Devices (first page) ----------
     if root.phase == "devices" : Flickable {
-        viewport-height: max(root.height, 430px * root.scale);
+        viewport-height: max(root.height, (root.multi-node ? 610px : 400px) * root.scale + root.devices.length * 46px * root.scale);
         VerticalLayout {
             width: root.width;
             padding-left: 18px * root.scale + root.safe-area-insets.left;
@@ -235,14 +295,14 @@ export component App inherits Window {
 
             Text {
                 text: "TheKVM";
-                color: #f3f4f6;
+                color: Theme.text;
                 font-size: 27px * root.scale;
                 font-weight: 700;
                 horizontal-alignment: center;
             }
             Text {
                 text: "Control a Windows or Linux computer from your phone";
-                color: #8b949e;
+                color: Theme.muted;
                 font-size: 11px * root.scale;
                 horizontal-alignment: center;
                 wrap: word-wrap;
@@ -251,73 +311,160 @@ export component App inherits Window {
             DeviceDropdown { scale: root.scale; devices <=> root.devices; selected <=> root.selected; }
             Text {
                 text: root.status;
-                color: #7c8698;
+                color: Theme.faint;
                 font-size: 11px * root.scale;
                 horizontal-alignment: center;
                 wrap: word-wrap;
             }
 
-            // Currently connected computers — switch without re-pairing.
+            // Connected machines: compact cards instead of large boxes.
             if root.connected-name != "" : Rectangle {
-                height: 30px * root.scale;
+                height: 22px * root.scale;
                 Text {
                     text: "CONNECTED NOW";
-                    color: #34d399;
+                    color: Theme.accent;
                     font-size: 10px * root.scale;
                     font-weight: 700;
                     vertical-alignment: center;
                 }
             }
-            for device[i] in root.devices : Rectangle {
+            for device in root.devices : Rectangle {
                 if device.connected : Rectangle {
-                    height: 50px * root.scale;
-                    border-radius: 9px * root.scale;
-                    background: #142219;
+                    height: 46px * root.scale;
+                    border-radius: 10px * root.scale;
+                    background: Theme.accent-bg;
                     border-width: 1px;
-                    border-color: #1f5136;
+                    border-color: Theme.accent-border;
+                    Rectangle {
+                        x: 11px * root.scale;
+                        y: (parent.height - 8px * root.scale) / 2;
+                        width: 8px * root.scale;
+                        height: 8px * root.scale;
+                        border-radius: 4px * root.scale;
+                        background: Theme.accent;
+                    }
                     Text {
-                        x: 10px * root.scale;
+                        x: 26px * root.scale;
                         width: parent.width - 150px * root.scale;
                         text: device.name;
-                        color: #e5e7eb;
+                        color: Theme.text-2;
                         font-size: 13px * root.scale;
                         font-weight: 600;
                         vertical-alignment: center;
                         overflow: elide;
                     }
                     Rectangle {
-                        x: parent.width - 142px * root.scale;
-                        y: 8px * root.scale;
-                        width: 64px * root.scale;
-                        height: 32px * root.scale;
-                        border-radius: 7px * root.scale;
-                        background: #14532d;
+                        x: parent.width - 138px * root.scale;
+                        y: 7px * root.scale;
+                        width: 62px * root.scale;
+                        height: 30px * root.scale;
+                        border-radius: 8px * root.scale;
+                        background: Theme.accent-panel;
                         TouchArea { clicked => { root.switch-device(device.fingerprint); } }
                         Text {
                             text: "Control";
-                            color: #dcfce7;
+                            color: Theme.accent-text;
                             font-size: 11px * root.scale;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }
                     }
                     Rectangle {
-                        x: parent.width - 72px * root.scale;
-                        y: 8px * root.scale;
-                        width: 64px * root.scale;
-                        height: 32px * root.scale;
-                        border-radius: 7px * root.scale;
-                        background: #3a1d1d;
+                        x: parent.width - 70px * root.scale;
+                        y: 7px * root.scale;
+                        width: 60px * root.scale;
+                        height: 30px * root.scale;
+                        border-radius: 8px * root.scale;
+                        background: Theme.danger-bg;
                         TouchArea { clicked => { root.stop-device(device.fingerprint); } }
                         Text {
                             text: "Stop";
-                            color: #fca5a5;
+                            color: Theme.danger-text;
                             font-size: 11px * root.scale;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }
                     }
                 }
+            }
+
+            // Multi-node grid configuration. The two-device UI above stays
+            // untouched; this section only appears when the user opts in.
+            Rectangle {
+                height: 48px * root.scale;
+                border-radius: 10px * root.scale;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+                Text {
+                    x: 12px * root.scale;
+                    y: 5px * root.scale;
+                    text: "Multi-node grid";
+                    color: Theme.text-2;
+                    font-size: 13px * root.scale;
+                    font-weight: 600;
+                }
+                Text {
+                    x: 12px * root.scale;
+                    y: 25px * root.scale;
+                    text: root.multi-node ? "Up to 15 computers · arrange on a 5 × 3 grid"
+                        : "Two-device mode";
+                    color: Theme.faint;
+                    font-size: 10px * root.scale;
+                }
+                Rectangle {
+                    x: parent.width - 56px * root.scale;
+                    y: 9px * root.scale;
+                    width: 44px * root.scale;
+                    height: 25px * root.scale;
+                    border-radius: 13px * root.scale;
+                    background: root.multi-node ? Theme.accent-strong : Theme.border-strong;
+                    TouchArea { clicked => { root.toggle-multi-node(); } }
+                    Rectangle {
+                        x: root.multi-node ? 23px * root.scale : 3px * root.scale;
+                        y: 3px * root.scale;
+                        width: 19px * root.scale;
+                        height: 19px * root.scale;
+                        border-radius: 10px * root.scale;
+                        background: #ffffff;
+                        animate x { duration: 150ms; easing: ease-in-out; }
+                    }
+                }
+            }
+            if root.multi-node : Rectangle {
+                height: 34px * root.scale;
+                Rectangle {
+                    width: parent.width / 3;
+                    height: 28px * root.scale;
+                    border-radius: 8px * root.scale;
+                    background: root.mesh-mode == "bidirectional" ? Theme.accent-panel : Theme.surface-2;
+                    TouchArea { clicked => { root.set-mesh-mode("bidirectional"); } }
+                    Text { text: "Both ways"; color: root.mesh-mode == "bidirectional" ? Theme.accent-text : Theme.muted; font-size: 11px * root.scale; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    x: parent.width / 3;
+                    width: parent.width / 3;
+                    height: 28px * root.scale;
+                    border-radius: 8px * root.scale;
+                    background: root.mesh-mode == "server_client" ? Theme.accent-panel : Theme.surface-2;
+                    TouchArea { clicked => { root.set-mesh-mode("server_client"); } }
+                    Text { text: "One server"; color: root.mesh-mode == "server_client" ? Theme.accent-text : Theme.muted; font-size: 11px * root.scale; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    x: parent.width * 2 / 3;
+                    width: parent.width / 3;
+                    height: 28px * root.scale;
+                    border-radius: 8px * root.scale;
+                    background: root.mesh-mode == "client_only" ? Theme.accent-panel : Theme.surface-2;
+                    TouchArea { clicked => { root.set-mesh-mode("client_only"); } }
+                    Text { text: "Clients"; color: root.mesh-mode == "client_only" ? Theme.accent-text : Theme.muted; font-size: 11px * root.scale; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+            if root.multi-node : PillButton {
+                scale: root.scale;
+                label: "Configure grid";
+                enabled: !root.mesh-applying;
+                clicked => { root.open-mesh-grid(); }
             }
 
             Rectangle { vertical-stretch: 1; }
@@ -336,6 +483,235 @@ export component App inherits Window {
         }
     }
 
+    // ---------- Multi-node grid popup ----------
+    in-out property <string> drag-fingerprint: "";
+    in-out property <bool> drag-active: false;
+    in-out property <string> pending-device: "";
+    in-out property <int> hover-col: -1;
+    in-out property <int> hover-row: -1;
+    in-out property <length> grid-width: min(root.width - 34px * root.scale, 480px * root.scale);
+    in-out property <length> cell-w: root.grid-width / 5;
+    in-out property <length> cell-h: root.cell-w * 0.72;
+    in-out property <angle> spin: 0deg;
+
+    if root.grid-open : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        Timer {
+            interval: 90ms;
+            running: root.mesh-applying;
+            triggered => {
+                root.spin += 30deg;
+                if (root.spin >= 360deg) { root.spin -= 360deg; }
+            }
+        }
+        Rectangle {
+            width: 100%; height: 100%;
+            background: Theme.bg;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalLayout {
+                padding-left: 14px * root.scale + root.safe-area-insets.left;
+                padding-right: 14px * root.scale + root.safe-area-insets.right;
+                padding-top: 14px * root.scale + root.safe-area-insets.top;
+                padding-bottom: 14px * root.scale + root.safe-area-insets.bottom;
+                spacing: 10px * root.scale;
+
+                Rectangle {
+                    height: 32px * root.scale;
+                    Text {
+                        text: "Arrange computers";
+                        color: Theme.text;
+                        font-size: 18px * root.scale;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        x: parent.width - 74px * root.scale;
+                        y: 2px * root.scale;
+                        width: 30px * root.scale;
+                        height: 28px * root.scale;
+                        border-radius: 8px * root.scale;
+                        background: Theme.surface-2;
+                        TouchArea { clicked => { root.close-mesh-grid(); } }
+                        Text { text: "×"; color: Theme.text-2; font-size: 20px * root.scale; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    if root.mesh-applying : Rectangle {
+                        x: parent.width - 110px * root.scale;
+                        y: 7px * root.scale;
+                        width: 18px * root.scale;
+                        height: 18px * root.scale;
+                        for i in 3 : Rectangle {
+                            x: 9px * root.scale + 6px * root.scale * cos(root.spin + i * 120deg);
+                            y: 9px * root.scale + 6px * root.scale * sin(root.spin + i * 120deg);
+                            width: 4px * root.scale; height: 4px * root.scale;
+                            border-radius: 2px * root.scale;
+                            background: Theme.accent-strong;
+                            opacity: 0.4 + 0.6 * abs(cos(root.spin + i * 120deg));
+                        }
+                    }
+                }
+                Text {
+                    text: "Drag a screen into a cell · rightmost wraps to the left · nearby cells cross into each other";
+                    color: Theme.faint;
+                    font-size: 10px * root.scale;
+                    wrap: word-wrap;
+                }
+
+                // The 5x3 grid with visible grid lines.
+                Rectangle {
+                    width: root.grid-width;
+                    height: root.cell-h * 3;
+                    background: Theme.surface-3;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    border-radius: 10px * root.scale;
+                    clip: true;
+                    for c in 5 : Rectangle {
+                        x: c * root.cell-w;
+                        y: 0;
+                        width: 1px;
+                        height: 100%;
+                        background: Theme.border;
+                    }
+                    for r in 3 : Rectangle {
+                        x: 0;
+                        y: r * root.cell-h;
+                        width: 100%;
+                        height: 1px;
+                        background: Theme.border;
+                    }
+                    // Wrap cue on the right edge.
+                    Text {
+                        x: parent.width - 18px * root.scale;
+                        y: parent.height / 2 - 8px * root.scale;
+                        text: "↺";
+                        color: Theme.accent;
+                        font-size: 14px * root.scale;
+                    }
+                    if root.drag-active && root.hover-col >= 0 : Rectangle {
+                        x: root.hover-col * root.cell-w;
+                        y: root.hover-row * root.cell-h;
+                        width: root.cell-w;
+                        height: root.cell-h;
+                        background: Theme.accent-bg;
+                        border-width: 2px;
+                        border-color: Theme.accent-strong;
+                    }
+                    for node in root.grid-nodes : Rectangle {
+                        if node.col >= 0 && node.row >= 0 && !(root.drag-active && node.fingerprint == root.drag-fingerprint) : Rectangle {
+                            x: node.col * root.cell-w + 5px * root.scale;
+                            y: node.row * root.cell-h + 5px * root.scale;
+                            width: root.cell-w - 10px * root.scale;
+                            height: root.cell-h - 10px * root.scale;
+                            // Monitor: bezel, glowing screen, stand, name.
+                            Rectangle {
+                                width: 100%;
+                                height: 72%;
+                                border-radius: 4px * root.scale;
+                                background: Theme.bezel;
+                                Rectangle {
+                                    x: 3px * root.scale; y: 3px * root.scale;
+                                    width: parent.width - 6px * root.scale;
+                                    height: parent.height - 6px * root.scale;
+                                    border-radius: 2px * root.scale;
+                                    background: Theme.screen;
+                                    Text {
+                                        text: "▰ ▰ ▱";
+                                        color: Theme.screen-glow;
+                                        font-size: 8px * root.scale;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                x: parent.width * 0.4; y: parent.height * 0.72;
+                                width: parent.width * 0.2; height: parent.height * 0.1;
+                                background: Theme.bezel;
+                            }
+                            Rectangle {
+                                x: parent.width * 0.24; y: parent.height * 0.82;
+                                width: parent.width * 0.52; height: parent.height * 0.04;
+                                border-radius: 2px * root.scale;
+                                background: Theme.bezel;
+                            }
+                            Text {
+                                y: parent.height * 0.87;
+                                width: 100%;
+                                text: node.name;
+                                color: Theme.text-2;
+                                font-size: 9px * root.scale;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                    // One touch surface owns the whole grid so dragging is
+                    // computed from cell coordinates, never from a child.
+                    TouchArea {
+                        pointer-event(event) => {
+                            if (event.kind == PointerEventKind.down) {
+                                root.grid-cell-down(floor(self.mouse-x / root.cell-w), floor(self.mouse-y / root.cell-h));
+                            } else if (event.kind == PointerEventKind.move) {
+                                root.grid-cell-move(clamp(floor(self.mouse-x / root.cell-w), 0, 4), clamp(floor(self.mouse-y / root.cell-h), 0, 2));
+                            } else if (event.kind == PointerEventKind.up) {
+                                root.grid-cell-up(clamp(floor(self.mouse-x / root.cell-w), 0, 4), clamp(floor(self.mouse-y / root.cell-h), 0, 2));
+                            } else {
+                                root.grid-cell-up(-1, -1);
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.pending-device != "" ? "Tap a cell to place the selected computer" : "Unplaced computers · tap to select";
+                    color: Theme.faint;
+                    font-size: 10px * root.scale;
+                }
+                Flickable {
+                    height: 54px * root.scale;
+                    viewport-width: max(root.grid-width, root.grid-nodes.length * 80px * root.scale);
+                    HorizontalLayout {
+                        spacing: 6px * root.scale;
+                        for node in root.grid-nodes : Rectangle {
+                            if node.col < 0 : Rectangle {
+                                width: 76px * root.scale;
+                                height: 34px * root.scale;
+                                border-radius: 8px * root.scale;
+                                background: root.pending-device == node.fingerprint ? Theme.accent-panel : Theme.surface-2;
+                                border-width: 1px;
+                                border-color: root.pending-device == node.fingerprint ? Theme.accent-strong : Theme.border;
+                                TouchArea { clicked => { root.grid-device-tap(node.fingerprint); } }
+                                Text { text: node.name; color: Theme.text-2; font-size: 10px * root.scale; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                            }
+                        }
+                        if root.drag-fingerprint != "" : Rectangle {
+                            width: 68px * root.scale;
+                            height: 34px * root.scale;
+                            border-radius: 8px * root.scale;
+                            background: Theme.danger-bg;
+                            TouchArea { clicked => { root.remove-grid-node(root.drag-fingerprint); } }
+                            Text { text: "Remove"; color: Theme.danger-text; font-size: 10px * root.scale; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+                PillButton {
+                    scale: root.scale;
+                    label: root.mesh-applying ? "Applying…" : "Apply to all computers";
+                    primary: true;
+                    enabled: !root.mesh-applying;
+                    clicked => { root.apply-mesh(); }
+                }
+            }
+        }
+    }
+
     // ---------- Control (after connecting) ----------
     if root.phase == "control" : VerticalLayout {
         padding-top: root.safe-area-insets.top;
@@ -343,14 +719,14 @@ export component App inherits Window {
 
         Rectangle {
             height: 54px * root.scale;
-            background: #141414;
+            background: Theme.surface-3;
             HorizontalLayout {
                 padding-left: 12px * root.scale;
                 padding-right: 12px * root.scale;
                 spacing: 6px * root.scale;
                 Text {
                     text: "● " + root.connected-name;
-                    color: #34d399;
+                    color: Theme.accent;
                     font-size: 13px * root.scale;
                     font-weight: 600;
                     vertical-alignment: center;
@@ -386,11 +762,11 @@ export component App inherits Window {
         Rectangle {
             vertical-stretch: 1;
             min-height: 60px;
-            background: #0a0a0a;
+            background: Theme.bg;
             Text {
                 text: (root.horizontal-mode ? "TRACKPAD · SIDE\n\n" : "TRACKPAD\n\n")
                     + "Drag = move · Tap = click\nHold + drag = drag\nTwo-finger tap = right click\nTwo-finger drag = scroll · Pinch = zoom";
-                color: #3a3a3a;
+                color: Theme.border-strong;
                 font-size: 12px * root.scale;
                 horizontal-alignment: center;
                 vertical-alignment: center;
@@ -398,7 +774,7 @@ export component App inherits Window {
             }
             Text {
                 text: root.touch-debug;
-                color: #4b5563;
+                color: Theme.faint;
                 font-size: 11px * root.scale;
                 horizontal-alignment: center;
                 vertical-alignment: bottom;
@@ -431,9 +807,9 @@ export component App inherits Window {
         Rectangle {
             height: root.horizontal-mode ? 38px * root.scale
                 : min(root.bar-lines, 5) * 24px * root.scale + 14px * root.scale;
-            background: #161616;
+            background: Theme.surface-3;
             border-width: 1px;
-            border-color: #333333;
+            border-color: Theme.border;
             Rectangle {
                 x: 4px; y: 4px;
                 width: parent.width - 8px;
@@ -445,7 +821,7 @@ export component App inherits Window {
                     width: parent.width - 24px * root.scale;
                     height: root.horizontal-mode ? 30px * root.scale : 5 * 24px * root.scale;
                     text <=> root.draft;
-                    color: #f3f4f6;
+                    color: Theme.text;
                     font-size: 15px * root.scale;
                     wrap: root.horizontal-mode ? no-wrap : word-wrap;
                     single-line: root.horizontal-mode;
@@ -490,7 +866,7 @@ export component App inherits Window {
 
     // ---------- Settings ----------
     if root.phase == "settings" : Flickable {
-        viewport-height: max(root.height, 270px * root.scale + root.remembered.length * 54px * root.scale);
+        viewport-height: max(root.height, 340px * root.scale + root.remembered.length * 54px * root.scale);
         VerticalLayout {
             width: root.width;
             padding-left: 18px * root.scale + root.safe-area-insets.left;
@@ -501,42 +877,82 @@ export component App inherits Window {
 
             Text {
                 text: "Settings";
-                color: #f3f4f6;
+                color: Theme.text;
                 font-size: 27px * root.scale;
                 font-weight: 700;
                 horizontal-alignment: center;
             }
             Text {
                 text: "Remembered computers · auto-connect is on";
-                color: #8b949e;
+                color: Theme.muted;
                 font-size: 11px * root.scale;
                 horizontal-alignment: center;
                 wrap: word-wrap;
             }
             Rectangle {
+                height: 48px * root.scale;
+                border-radius: 10px * root.scale;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+                Text {
+                    x: 12px * root.scale;
+                    y: 5px * root.scale;
+                    text: "Appearance";
+                    color: Theme.text-2;
+                    font-size: 13px * root.scale;
+                    font-weight: 600;
+                }
+                Text {
+                    x: 12px * root.scale;
+                    y: 25px * root.scale;
+                    text: root.dark-mode ? "Dark · #121212" : "Light · white / blue";
+                    color: Theme.faint;
+                    font-size: 10px * root.scale;
+                }
+                Rectangle {
+                    x: parent.width - 56px * root.scale;
+                    y: 9px * root.scale;
+                    width: 44px * root.scale;
+                    height: 25px * root.scale;
+                    border-radius: 13px * root.scale;
+                    background: root.dark-mode ? Theme.accent-strong : Theme.border-strong;
+                    TouchArea { clicked => { root.toggle-theme(); } }
+                    Rectangle {
+                        x: root.dark-mode ? 23px * root.scale : 3px * root.scale;
+                        y: 3px * root.scale;
+                        width: 19px * root.scale;
+                        height: 19px * root.scale;
+                        border-radius: 10px * root.scale;
+                        background: #ffffff;
+                        animate x { duration: 150ms; easing: ease-in-out; }
+                    }
+                }
+            }
+            Rectangle {
                 vertical-stretch: 1;
                 min-height: 80px;
                 border-radius: 10px * root.scale;
-                background: #141414;
+                background: Theme.surface-3;
                 VerticalLayout {
                     padding: 8px * root.scale;
                     spacing: 4px * root.scale;
                     alignment: start;
                     if root.remembered.length == 0 : Text {
                         text: "No remembered computers yet.";
-                        color: #7c8698;
+                        color: Theme.faint;
                         font-size: 14px * root.scale;
                         horizontal-alignment: center;
                     }
                     for item[i] in root.remembered : Rectangle {
                         height: 50px * root.scale;
                         border-radius: 8px * root.scale;
-                        background: #1e1e1e;
+                        background: Theme.surface;
                         Text {
                             x: 10px * root.scale; y: 5px * root.scale;
                             width: parent.width - 92px * root.scale;
                             text: (item.connected ? "● " : "") + item.name;
-                            color: #e5e7eb;
+                            color: Theme.text-2;
                             font-size: 13px * root.scale;
                             overflow: elide;
                         }
@@ -544,7 +960,7 @@ export component App inherits Window {
                             x: 10px * root.scale; y: 26px * root.scale;
                             width: parent.width - 92px * root.scale;
                             text: item.fingerprint;
-                            color: #7c8698;
+                            color: Theme.faint;
                             font-size: 10px * root.scale;
                             overflow: elide;
                         }
@@ -554,11 +970,11 @@ export component App inherits Window {
                             width: 66px * root.scale;
                             height: 32px * root.scale;
                             border-radius: 8px * root.scale;
-                            background: #3a1d1d;
+                            background: Theme.danger-bg;
                             TouchArea { clicked => { root.forget(item.fingerprint); } }
                             Text {
                                 text: "Forget";
-                                color: #fca5a5;
+                                color: Theme.danger-text;
                                 font-size: 11px * root.scale;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;

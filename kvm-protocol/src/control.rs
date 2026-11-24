@@ -138,6 +138,12 @@ pub enum ControlRequest {
     PausePeerController {
         fingerprint_hex: String,
     },
+    /// Lift the inbound "locally disconnected" latch for one peer. Sent by
+    /// the desktop app when the user explicitly clicks Connect again in the
+    /// same app run. A fresh app launch clears all latches instead.
+    ClearDisconnect {
+        fingerprint_hex: String,
+    },
     /// Clear every controller pause: the desktop app just launched, which is
     /// explicit user intent to use the links again. The reply is `Applied`.
     ResumeControllers,

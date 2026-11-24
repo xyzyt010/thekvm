@@ -2,14 +2,14 @@
 
 use anyhow::{bail, Context, Result};
 use kvm_core::{
-    ClampReason, Config, EdgeRouter, HidUsage, InputEvent, InputPacket, InputState, Mode,
-    MouseButton, RoutedEvent, ScreenId, WheelDelta,
+    ClampReason, Config, EdgeRouter, HidUsage, InputEvent, InputPacket, InputState, Layout, Mode,
+    MouseButton, RoutedEvent, Screen, ScreenId, WheelDelta,
 };
 use kvm_platform::inject::Injector;
 use kvm_protocol::pairing::{Identity, PeerBook};
 use kvm_protocol::transport;
 use kvm_protocol::wire::{
-    decode_input_datagram, read_frame, write_frame, DatagramInput, Hello, ScreenGeometry,
+    decode_input_datagram, read_frame, write_frame, DatagramInput, Hello, MeshConfig, ScreenGeometry,
     WireMessage,
 };
 use kvm_protocol::DEFAULT_PORT;
@@ -1425,6 +1425,56 @@ fn persist_paused_peers(dir: &std::path::Path) {
     if let Err(error) = std::fs::write(paused_peers_path(dir), body) {
         tracing::debug!(path = %paused_peers_path(dir).display(), %error, "cannot persist controller pauses");
     }
+}
+
+/// Peers this machine's user explicitly Disconnected. Inbound control from
+/// them is refused until the desktop app is restarted (or the user clicks
+/// Connect again). Deliberately process-local: a daemon restart alone must
+/// not re-arm a link the user meant to keep dead, while a fresh app launch
+/// clears every latch.
+static DISCONNECTED_PEERS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn disconnected_peers() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
+    DISCONNECTED_PEERS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
+
+pub(crate) fn mark_disconnected(peer_fingerprint: &str) {
+    let Some(fingerprint) = normalize_fingerprint(peer_fingerprint) else {
+        return;
+    };
+    if let Ok(mut set) = disconnected_peers().lock() {
+        set.insert(fingerprint.clone());
+        tracing::info!(
+            peer = %fingerprint,
+            "local Disconnect: inbound control stands down until the app restarts"
+        );
+    }
+}
+
+pub(crate) fn clear_disconnect(peer_fingerprint: &str) {
+    let Some(fingerprint) = normalize_fingerprint(peer_fingerprint) else {
+        return;
+    };
+    if let Ok(mut set) = disconnected_peers().lock() {
+        set.remove(&fingerprint);
+    }
+}
+
+pub(crate) fn clear_all_disconnects() {
+    if let Ok(mut set) = disconnected_peers().lock() {
+        set.clear();
+    }
+}
+
+pub(crate) fn peer_disconnected(peer_fingerprint: &str) -> bool {
+    let Some(fingerprint) = normalize_fingerprint(peer_fingerprint) else {
+        return false;
+    };
+    disconnected_peers()
+        .lock()
+        .map(|set| set.contains(&fingerprint))
+        .unwrap_or(false)
 }
 
 /// Pinned peer fingerprint that owns a dial address (exact match first, then
@@ -5274,6 +5324,11 @@ fn spawn_suppression_watchdog() {
                 WATCHDOG_ACTED_MS.store(now, Ordering::Relaxed);
                 #[cfg(target_os = "windows")]
                 {
+                    // Clearing only BLOCK_LOCAL is not enough: the capture
+                    // loop re-arms it from the shared exclusive flag every
+                    // 100ms. Latch the force-release so local input stays
+                    // alive until a fresh drive explicitly re-engages.
+                    kvm_platform::capture::force_release_local_input();
                     kvm_platform::capture::set_exclusive(false);
                     tracing::error!(
                         stale_ms,
@@ -10702,6 +10757,25 @@ async fn handle_connection(
                 reject(&mut send, "peer is not paired").await?;
                 bail!("untrusted peer fingerprint {peer_fingerprint}");
             }
+            // A local Disconnect latches "no reconnect" for this app run.
+            // Without this gate the peer keeps auto-dialing us, so we end up
+            // in the one-way state: they enter our desktop while our own
+            // controller is stood down and cannot cross back.
+            if peer_disconnected(&peer_fingerprint) {
+                reject(
+                    &mut send,
+                    "this computer disconnected from you; restart TheKVM there or press Connect again",
+                )
+                .await?;
+                audit_event(
+                    audit_dir,
+                    &format!(
+                        "session-rejected peer={peer_fingerprint} remote={} reason=locally_disconnected",
+                        conn.remote_address(),
+                    ),
+                );
+                bail!("inbound link refused: locally disconnected until app restart");
+            }
             // A banned epoch is a deliberate local Disconnect: reject the
             // stale redial so the dead link stays dead instead of
             // resurrecting as a zombie. The dialer's child exits on this
@@ -11301,6 +11375,15 @@ async fn handle_connection(
                         last_activity = Instant::now();
                         injector.ensure_session()?;
                         match message {
+                            WireMessage::MeshConfig(mesh) => {
+                                // Distributed by the controller: rebuild this
+                                // machine's layout from the shared 5x3 grid.
+                                // Admission above already proved the sender is
+                                // a pinned peer, so this is trusted config.
+                                if let Err(error) = apply_mesh_config(&mesh, &config_shared).await {
+                                    tracing::warn!(%error, "mesh configuration from controller rejected");
+                                }
+                            }
                             WireMessage::StateSync(state) => {
                                 sync_state(&state)?;
                                 injector.sync_state(&state)?;
@@ -12414,6 +12497,70 @@ fn receiver_edge_truth_veto(
 /// only after a local settings change, never per input event. Placement
 /// edits never overwrite measured geometry: dimensions this session has
 /// already learned for a screen id win over the config file's fallback.
+
+/// Apply a controller-distributed multi-node grid to this machine's live
+/// config. The grid carries every peer's fingerprint and cell; the machine
+/// whose fingerprint matches our own becomes the local screen, and every
+/// other placed machine becomes a peer screen. The existing edge router
+/// then derives adjacency (including right-edge wrap) from grid positions.
+async fn apply_mesh_config(mesh: &MeshConfig, shared: &tokio::sync::RwLock<Config>) -> Result<()> {
+    if mesh.screens.len() > 15 {
+        bail!("mesh arrangement exceeds 15 machines");
+    }
+    let mut seen = BTreeSet::new();
+    for screen in &mesh.screens {
+        if !seen.insert(screen.fingerprint_hex.to_ascii_lowercase()) {
+            bail!("duplicate machine in mesh arrangement");
+        }
+        if !(0..5).contains(&screen.col) || !(0..3).contains(&screen.row) {
+            bail!("mesh cell outside the 5x3 grid");
+        }
+    }
+    let me = Identity::load_or_create(&data_dir())?.fingerprint_hex().to_ascii_lowercase();
+    let mut layout = Layout::default();
+    let mut self_screen = None;
+    for (index, entry) in mesh.screens.iter().enumerate() {
+        let fingerprint = entry.fingerprint_hex.to_ascii_lowercase();
+        let is_me = fingerprint == me;
+        layout.screens.push(Screen {
+            id: ScreenId(index as u32 + 1),
+            name: entry.node_name.clone(),
+            x: entry.col,
+            y: entry.row,
+            width: 1920,
+            height: 1080,
+            peer_fingerprint: if is_me { None } else { Some(fingerprint) },
+        });
+        if is_me {
+            self_screen = Some(ScreenId(index as u32 + 1));
+        }
+    }
+    layout.self_screen = self_screen;
+    layout.validate().map_err(anyhow::Error::msg)?;
+
+    let mode = match mesh.mode.as_str() {
+        "bidirectional" => Mode::Bidirectional,
+        "server_client" => Mode::ServerClient,
+        "client_only" => Mode::ClientOnly,
+        other => bail!("unknown mesh mode {other}"),
+    };
+    {
+        let mut config = shared.write().await;
+        config.layout = layout;
+        // In one-way modes every node derives its role from the first
+        // placed machine, which is the designated server.
+        config.mode = match mode {
+            Mode::Bidirectional => Mode::Bidirectional,
+            _ if self_screen == Some(ScreenId(1)) => Mode::ServerClient,
+            _ => Mode::ClientOnly,
+        };
+        config.save(&data_dir().join("config.json"))?;
+    }
+    bump_config_revision();
+    tracing::info!(mode = ?mode, nodes = mesh.screens.len(), "mesh arrangement applied");
+    Ok(())
+}
+
 async fn refresh_live_edge_config(
     config: &mut Config,
     config_shared: &tokio::sync::RwLock<Config>,
@@ -13707,6 +13854,12 @@ async fn open_episode_stream(
         link_id,
         udp_motion,
     } = policy;
+    // Warm topology crossings call this directly (bypassing dial_session's
+    // connect_input gate). Without the same check here, a receiver-only
+    // node sends a Hello the peer is required to reject — one-way control.
+    if !mode_allows_outgoing(mode) {
+        bail!("receiver-only mode cannot initiate an input session");
+    }
     let (mut send, mut recv) = conn.open_bi().await?;
     // UDP fast-path motion needs a link epoch to derive its key from; without
     // one the handshake stays on the episode stream even when requested.
@@ -14482,10 +14635,12 @@ fn validate_input_capability(config: &Config, lock_screen_requested: bool) -> Re
     // elsewhere, so a one-sided checkbox can never silently kill reverse
     // control of ordinary desktop sessions.
     if lock_screen_requested && !config.allow_lock_screen_control {
-        if cfg!(target_os = "windows") {
-            return Ok(false);
-        }
-        bail!("privileged remote input is disabled locally");
+        // Symmetric on every OS. A sender whose checkbox is on must never
+        // kill an otherwise valid desktop session on the receiver: that
+        // produced the exact "Mint can cross into Windows, Windows cannot
+        // cross into Mint" asymmetry. Downgrade to an ordinary session
+        // everywhere instead.
+        return Ok(false);
     }
     Ok(lock_screen_requested && config.allow_lock_screen_control)
 }

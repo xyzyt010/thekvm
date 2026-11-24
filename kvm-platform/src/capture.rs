@@ -85,6 +85,18 @@ pub fn set_exclusive(exclusive: bool) {
     win32_hooks::set_exclusive(exclusive);
 }
 
+/// Emergency, process-wide release of local input. Unlike `set_exclusive`,
+/// this survives the capture backend's per-poll re-assert loop: a latch
+/// makes `Win32Capture::next_event` stop re-arming `BLOCK_LOCAL` until a
+/// fresh `set_exclusive(true)` explicitly re-engages a drive.
+#[cfg(target_os = "windows")]
+pub fn force_release_local_input() {
+    win32_hooks::force_release_local_input();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn force_release_local_input() {}
+
 #[cfg(not(target_os = "windows"))]
 pub fn set_exclusive(_exclusive: bool) {
     #[cfg(target_os = "linux")]
@@ -664,6 +676,11 @@ mod win32_hooks {
     // they keep our own injected wheel from looping back as a phantom
     // drive, which is the same visible symptom from the opposite side.
     static BLOCK_LOCAL: AtomicBool = AtomicBool::new(false);
+    /// Set by the suppression watchdog (or any emergency teardown). While
+    /// set, the capture loop must not re-arm `BLOCK_LOCAL` from the shared
+    /// exclusive flag — that re-arm used to undo the watchdog within 100ms
+    /// and leave the desktop's keyboard and mouse dead indefinitely.
+    static SUPPRESSION_FORCE_RELEASE: AtomicBool = AtomicBool::new(false);
     static RAW_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
     // Hook-thread rendezvous for the trackpad-scroll suppression toggle:
     // the daemon flips exclusivity from any thread, but RawInput
@@ -750,7 +767,11 @@ mod win32_hooks {
     }
 
     pub(super) fn set_exclusive(exclusive: bool) {
-        BLOCK_LOCAL.store(exclusive, Ordering::Release);
+        // A fresh drive explicitly re-engages; anything else that releases
+        // (normal teardown OR the watchdog) arms the latch so a wedged
+        // capture loop cannot silently swallow local input again.
+        SUPPRESSION_FORCE_RELEASE.store(!exclusive, Ordering::Release);
+        BLOCK_LOCAL.store(exclusive && !SUPPRESSION_FORCE_RELEASE.load(Ordering::Acquire), Ordering::Release);
         // Precision-touchpad scroll never produces a hook-visible wheel
         // event, so the hook swallow above cannot stop it reaching local
         // windows. Ask the hook thread (which owns the RawInput window)
@@ -776,6 +797,14 @@ mod win32_hooks {
                 }
             }
         }
+    }
+
+    /// Emergency release used by the watchdog. Latch first, then clear the
+    /// flag: the latch wins even if the capture loop is midway through a
+    /// re-assert from the shared `exclusive` flag.
+    pub(super) fn force_release_local_input() {
+        SUPPRESSION_FORCE_RELEASE.store(true, Ordering::Release);
+        BLOCK_LOCAL.store(false, Ordering::Release);
     }
 
     fn sender() -> &'static Mutex<Option<Sender<InputEvent>>> {
@@ -832,7 +861,8 @@ mod win32_hooks {
             _release: &AtomicBool,
         ) -> Result<InputEvent, PlatformError> {
             loop {
-                let is_exclusive = exclusive.load(Ordering::Acquire);
+                let is_exclusive = exclusive.load(Ordering::Acquire)
+                    && !SUPPRESSION_FORCE_RELEASE.load(Ordering::Acquire);
                 BLOCK_LOCAL.store(is_exclusive, Ordering::Release);
                 // Slow-path cursor/pixel glue (see slow_glue_tick): every
                 // iteration while exclusive, so a cursor that escaped past
@@ -2584,27 +2614,16 @@ mod win32_hooks {
             // jump in the "wrong" direction.
             let units_x = self.units_per_detent_x.max(1);
             let units_y = self.units_per_detent_y.max(1);
-            let (out_x, out_y) = match self.lock {
-                Some(PanAxis::X) => {
-                    self.acc_y = 0;
-                    let out_x = (self.acc_x.saturating_mul(120) / units_x).clamp(-120_000, 120_000);
-                    self.acc_x -= out_x.saturating_mul(units_x) / 120;
-                    (out_x, 0)
-                }
-                Some(PanAxis::Y) => {
-                    self.acc_x = 0;
-                    let out_y = (self.acc_y.saturating_mul(120) / units_y).clamp(-120_000, 120_000);
-                    self.acc_y -= out_y.saturating_mul(units_y) / 120;
-                    (0, out_y)
-                }
-                None => {
-                    let out_x = (self.acc_x.saturating_mul(120) / units_x).clamp(-120_000, 120_000);
-                    let out_y = (self.acc_y.saturating_mul(120) / units_y).clamp(-120_000, 120_000);
-                    self.acc_x -= out_x.saturating_mul(units_x) / 120;
-                    self.acc_y -= out_y.saturating_mul(units_y) / 120;
-                    (out_x, out_y)
-                }
-            };
+            // Both axes are ALWAYS forwarded. A dominant-axis verdict may
+            // still mark the gesture "owned" for pinch arbitration, but it
+            // must never zero the other axis: a horizontal pan with normal
+            // vertical finger wobble lost its entire x component here,
+            // which is why Windows->Mint horizontal scroll died while
+            // Mint->Windows worked. The Linux evdev path already does this.
+            let out_x = (self.acc_x.saturating_mul(120) / units_x).clamp(-120_000, 120_000);
+            let out_y = (self.acc_y.saturating_mul(120) / units_y).clamp(-120_000, 120_000);
+            self.acc_x -= out_x.saturating_mul(units_x) / 120;
+            self.acc_y -= out_y.saturating_mul(units_y) / 120;
             (out_x as i32, out_y as i32)
         }
 
@@ -2631,7 +2650,7 @@ mod win32_hooks {
     /// Five, not eight: a mis-engaged pinch must release a wobbly
     /// horizontal scroll mid-gesture instead of holding pan hostage
     /// until the fingers lift.
-    const TAKEOVER_FRAMES: u32 = 5;
+    const TAKEOVER_FRAMES: u32 = 2;
 
     /// Two-finger pinch → zoom accumulator. Pure apart from construction,
     /// so the gesture math is unit-tested without HID hardware. Fed the
@@ -3372,14 +3391,17 @@ mod win32_hooks {
                 send(InputEvent::PinchEnd);
             }
             let (x, y) = ptp_pan_slot().feed(&contacts);
-            if pinching {
+            // A pinched gesture that just released must forward its pan
+            // delta immediately; dropping this frame is what made a wobbly
+            // horizontal pan feel like it "worked a few times then stopped".
+            if pinching && !pinch_ended {
                 continue;
             }
-            // Match the local touchpad feel (see ptp_scroll_invert):
-            // saturating negation is overflow-safe by construction
-            // (feed clamps to +-1000 detents before scaling).
+            // Vertical direction follows the local touchpad feel. Horizontal
+            // keeps the canonical cross-device sign (positive = right) so
+            // Windows, Linux and the Android controller all agree.
             let (x, y) = if scroll_invert {
-                (x.saturating_neg(), y.saturating_neg())
+                (x, y.saturating_neg())
             } else {
                 (x, y)
             };
@@ -3483,36 +3505,27 @@ mod win32_hooks {
         }
 
         #[test]
-        fn ptp_horizontal_pan_locks_out_vertical_wobble() {
-            // The native feel: a horizontal pan with vertical finger
-            // wobble must not scroll the peer diagonally. Before the
-            // verdict both axes emit; past 60 x-units at 2:1 the
-            // gesture locks horizontal and the wobble is eaten.
+        fn ptp_horizontal_pan_keeps_both_axes_through_vertical_wobble() {
+            // Regression: the dominant-axis lock used to zero y (and, in a
+            // vertical-locked gesture, x) for the rest of the stroke. That
+            // killed horizontal scroll whenever a pan had any wobble.
+            // Both axes must flow for the whole gesture.
             let mut pan = PtpPan::new();
             pan.units_per_detent_x = 10;
             pan.units_per_detent_y = 10;
             assert_eq!(pan.feed(&[(100, 100), (100, 100)]), (0, 0));
-            for step in 1..6 {
+            for step in 1..16 {
                 let p = 100 + 10 * step;
                 let q = 100 + 2 * step;
                 assert_eq!(pan.feed(&[(p, q), (p, q)]), (120, -24));
             }
-            for step in 6..16 {
-                let p = 100 + 10 * step;
-                let q = 100 + 2 * step;
-                assert_eq!(pan.feed(&[(p, q), (p, q)]), (120, 0));
-            }
-            // Lift ends the lock: a fresh vertical pan with x wobble
-            // locks vertical instead, eating the x.
+            // Lift and a fresh vertical pan with x wobble: x must still
+            // survive alongside the dominant y axis.
             assert_eq!(pan.feed(&[]), (0, 0));
             assert_eq!(pan.feed(&[(0, 100), (0, 100)]), (0, 0));
-            for step in 1..12 {
+            for step in 1..15 {
                 let q = 100 - 10 * step;
                 assert_eq!(pan.feed(&[(step, q), (step, q)]), (12, 120));
-            }
-            for step in 12..15 {
-                let q = 100 - 10 * step;
-                assert_eq!(pan.feed(&[(step, q), (step, q)]), (0, 120));
             }
         }
 
@@ -3725,10 +3738,10 @@ mod win32_hooks {
             assert_eq!(pinch.feed(&[(0, 0), (100, 0)], false), (0, false));
             assert_eq!(pinch.feed(&[(0, 0), (300, 0)], false), (2400, false));
             assert!(pinch.engaged());
-            // Then the fingers go back to scrolling together: after 5
+            // Then the fingers go back to scrolling together: after 2
             // sustained scroll-dominated frames the pinch ends (pan kept
             // feeding underneath, so it resumes without a jump).
-            for step in 1..5 {
+            for step in 1..2 {
                 let y = -step * 20;
                 assert_eq!(pinch.feed(&[(0, y), (300, y)], false), (0, false));
                 assert!(pinch.engaged());

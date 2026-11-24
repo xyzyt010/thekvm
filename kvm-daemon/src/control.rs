@@ -800,6 +800,7 @@ where
                 // a fresh explicit Connect (which clears the pause).
                 if let Some(fingerprint) = fingerprint_hex.as_deref() {
                     crate::service::pause_peer_controller(fingerprint);
+                    crate::service::mark_disconnected(fingerprint);
                 }
                 ControlResponse::Disconnected {
                     fingerprint_hex,
@@ -1139,6 +1140,7 @@ where
                 // The user just kicked this peer off: our controller must not
                 // auto-dial them again until a fresh explicit Connect.
                 crate::service::pause_peer_controller(&fingerprint_hex);
+                crate::service::mark_disconnected(&fingerprint_hex);
                 crate::service::audit_event(
                     &data_dir,
                     &format!("session-dropped-and-link-ended fingerprint={fingerprint_hex}"),
@@ -1234,8 +1236,22 @@ where
                 }
             }
         }
+        ControlRequest::ClearDisconnect { fingerprint_hex } => {
+            if !is_fingerprint(&fingerprint_hex) {
+                ControlResponse::Error {
+                    message: "peer fingerprint must contain 64 hexadecimal characters".into(),
+                }
+            } else {
+                crate::service::clear_disconnect(&fingerprint_hex);
+                ControlResponse::Applied {
+                    restart_required: false,
+                }
+            }
+        }
         ControlRequest::ResumeControllers => {
             crate::service::resume_all_controllers();
+            // A fresh app launch is explicit intent to use the links again.
+            crate::service::clear_all_disconnects();
             ControlResponse::Applied {
                 restart_required: false,
             }

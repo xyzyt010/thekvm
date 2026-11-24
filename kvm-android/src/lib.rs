@@ -13,10 +13,10 @@ use kvm_core::{ClientKind, InputEvent, InputPacket, InputState, Mode, MouseButto
 use kvm_protocol::discovery::scan;
 use kvm_protocol::pairing::Identity;
 use kvm_protocol::transport;
-use kvm_protocol::wire::{read_frame, write_frame, Hello, WireMessage};
+use kvm_protocol::wire::{read_frame, write_frame, Hello, MeshConfig, MeshScreen, WireMessage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, Weak};
+use slint::{ComponentHandle, Global, Model, ModelRc, SharedString, VecModel, Weak};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,7 +24,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use std::time::{Duration, Instant};
 
 const NODE_NAME: &str = "Android controller";
-const MAX_DEVICES: usize = 10;
+const MAX_DEVICES: usize = 15;
 const DEFAULT_PORT: u16 = 42110;
 /// Long enough for a human to notice the desktop card and click Allow.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -36,11 +36,39 @@ struct KnownDevice {
     fingerprint: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct GridEntry {
+    name: String,
+    fingerprint: String,
+    col: i32,
+    row: i32,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Store {
     devices: Vec<KnownDevice>,
     paste_mode: bool,
     horizontal_mode: bool,
+    /// Fingerprints explicitly deleted by the user. A deleted pairing is
+    /// never restored to the auto-connect list, even after a restart.
+    #[serde(default)]
+    deleted: Vec<String>,
+    #[serde(default = "default_true")]
+    dark_mode: bool,
+    #[serde(default)]
+    multi_node: bool,
+    #[serde(default = "default_mesh_mode")]
+    mesh_mode: String,
+    #[serde(default)]
+    mesh_grid: Vec<GridEntry>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_mesh_mode() -> String {
+    "bidirectional".to_owned()
 }
 
 impl Store {
@@ -58,9 +86,28 @@ impl Store {
 }
 
 struct Session {
-    _connection: quinn::Connection,
+    connection: quinn::Connection,
     send: Arc<AsyncMutex<quinn::SendStream>>,
     sequence: AtomicU64,
+}
+
+impl Session {
+    /// Close the underlying QUIC connection. Dropping our Arc alone leaves
+    /// the peer's inbound link alive, which lets it dial back into us after
+    /// a manual Disconnect — the one-way "they can enter, we cannot" state.
+    fn close(&self) {
+        self.connection
+            .close(quinn::VarInt::from_u32(0), b"manual disconnect");
+    }
+
+    /// Push the whole multi-node arrangement to this desktop on its own
+    /// stream, so it never interleaves with ordered input frames.
+    async fn send_mesh(&self, mesh: MeshConfig) -> Result<()> {
+        let (mut send, _recv) = self.connection.open_bi().await?;
+        write_frame(&mut send, &WireMessage::MeshConfig(mesh)).await?;
+        send.finish()?;
+        Ok(())
+    }
 }
 
 struct ConnectedDevice {
@@ -114,6 +161,16 @@ struct Controller {
     multi_finger: Arc<AtomicBool>,
     /// Fingerprints whose session died and should reconnect on the next poll.
     retry_now: Mutex<Vec<String>>,
+    /// Latched by any manual Disconnect/Stop. Cleared only by a fresh app
+    /// process (or an explicit Connect by the user). While set, NO automatic
+    /// reconnect — outgoing or incoming — is attempted.
+    auto_disconnected: AtomicBool,
+    /// Fingerprint selected in the grid popup for tap-to-place.
+    pending_device: Mutex<String>,
+    /// Fingerprint currently being dragged in the grid popup.
+    dragging: Mutex<String>,
+    /// Last discovery snapshot, used to rebuild the grid popup model.
+    discovered_rows: Mutex<Vec<(String, String, String, bool)>>,
     ui: OnceLock<Weak<App>>,
     // Live diagnostics: touch events received vs frames actually written.
     touch_count: AtomicU64,
@@ -420,9 +477,24 @@ impl Controller {
 
     /// Connect to one desktop. `known = None` means first contact: complete
     /// the desktop's Allow/Deny ceremony before opening the input stream.
-    fn connect(self: Arc<Self>, address: String, known: Option<KnownDevice>, display_name: String) {
+    fn connect(
+        self: Arc<Self>,
+        address: String,
+        known: Option<KnownDevice>,
+        display_name: String,
+        auto: bool,
+    ) {
         let fingerprint_hint = known.as_ref().map(|device| device.fingerprint.clone());
+        // A manual Disconnect latches "no automatic reconnect" for this
+        // process. Explicit Connect (auto = false) is the only way to re-arm
+        // it short of restarting the app.
+        if auto && self.auto_disconnected.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(hint) = &fingerprint_hint {
+            if auto && self.store().deleted.contains(hint) {
+                return;
+            }
             if self.is_connected(hint) {
                 self.activate(hint);
                 return;
@@ -529,7 +601,7 @@ impl Controller {
             let send = Arc::new(AsyncMutex::new(send));
             let ping_send = send.clone();
             let session = Arc::new(Session {
-                _connection: connection,
+                connection,
                 send,
                 sequence: AtomicU64::new(1),
             });
@@ -553,6 +625,18 @@ impl Controller {
         match result {
             Ok((session, fingerprint, peer_name)) => {
                 let name = if known.is_some() { display_name } else { peer_name };
+                // An in-flight auto-connect may finish after a manual Stop.
+                // Never resurrect a session or re-arm auto-connect in that
+                // case — close it and leave the Disconnect intact.
+                if auto && self.auto_disconnected.load(Ordering::Relaxed) {
+                    session.close();
+                    return;
+                }
+                if !auto {
+                    // An explicit Connect is fresh user intent: auto-connect
+                    // is allowed again from here on.
+                    self.auto_disconnected.store(false, Ordering::Relaxed);
+                }
                 self.sessions.lock().unwrap().insert(
                     fingerprint.clone(),
                     ConnectedDevice {
@@ -563,13 +647,17 @@ impl Controller {
                 );
                 *self.active.lock().unwrap() = Some(fingerprint.clone());
                 let mut store = self.store();
-                store.devices.retain(|d| d.fingerprint != fingerprint);
-                store.devices.insert(
-                    0,
-                    KnownDevice { name: name.clone(), address, fingerprint: fingerprint.clone() },
-                );
-                store.devices.truncate(MAX_DEVICES);
-                store.save(&self.data_dir);
+                // A deleted pairing can be used manually but is NEVER
+                // written back to the auto-connect list.
+                if !store.deleted.contains(&fingerprint) {
+                    store.devices.retain(|d| d.fingerprint != fingerprint);
+                    store.devices.insert(
+                        0,
+                        KnownDevice { name: name.clone(), address, fingerprint: fingerprint.clone() },
+                    );
+                    store.devices.truncate(MAX_DEVICES);
+                    store.save(&self.data_dir);
+                }
                 self.set_connected_name(format!("{} · {}", name, short_fp(&fingerprint)));
                 self.set_phase("control");
                 self.set_status(format!("Controlling {name} · {} connected", self.connected_count()));
@@ -582,26 +670,39 @@ impl Controller {
     /// Stop one device (empty fingerprint = the active one) and either fall
     /// back to another live session or return to the Devices page.
     fn stop(&self, fingerprint: String) {
-        let fingerprint = if fingerprint.is_empty() {
-            self.active.lock().unwrap().clone().unwrap_or_default()
-        } else {
-            fingerprint
+        // A deliberate Disconnect means: stay disconnected until the user
+        // reconnects explicitly or restarts the app. Latch it BEFORE closing
+        // anything so watcher-driven reconnects see it.
+        self.auto_disconnected.store(true, Ordering::Relaxed);
+        self.retry_now.lock().unwrap().clear();
+        let targets: Vec<String> = {
+            let sessions = self.sessions.lock().unwrap();
+            if fingerprint.is_empty() {
+                sessions.keys().cloned().collect()
+            } else {
+                vec![fingerprint]
+            }
         };
-        self.sessions.lock().unwrap().remove(&fingerprint);
+        for target in &targets {
+            let removed = self.sessions.lock().unwrap().remove(target);
+            if let Some(device) = removed {
+                // Dropping our Arc is not enough: close the QUIC connection
+                // so the peer cannot dial back into a half-dead link.
+                device.session.close();
+            }
+        }
         let fallback = {
             let sessions = self.sessions.lock().unwrap();
             sessions.keys().next().cloned()
         };
-        let mut active = self.active.lock().unwrap();
-        *active = fallback.clone();
-        drop(active);
+        *self.active.lock().unwrap() = fallback.clone();
         self.refresh_remembered();
         if let Some(next) = fallback {
             self.activate(&next);
         } else {
             self.set_connected_name(String::new());
             self.set_phase("devices");
-            self.set_status("Disconnected".into());
+            self.set_status("Disconnected · auto-connect resumes after restart or Connect".into());
         }
     }
 
@@ -625,7 +726,11 @@ impl Controller {
         if !removed {
             return;
         }
-        self.retry_now.lock().unwrap().push(fingerprint.to_owned());
+        if !self.auto_disconnected.load(Ordering::Relaxed)
+            && !self.store().deleted.iter().any(|fp| fp == fingerprint)
+        {
+            self.retry_now.lock().unwrap().push(fingerprint.to_owned());
+        }
         let fallback = self.sessions.lock().unwrap().keys().next().cloned();
         *self.active.lock().unwrap() = fallback.clone();
         self.refresh_remembered();
@@ -638,15 +743,243 @@ impl Controller {
         }
     }
 
+    /// Delete a pairing permanently. The peer is removed from the
+    /// auto-connect list and tombstoned so neither an in-flight connect nor
+    /// a session-drop retry can restore it, now or after a restart.
     fn forget(&self, fingerprint: String) {
         let mut store = self.store();
         store.devices.retain(|d| d.fingerprint != fingerprint);
+        if !store.deleted.contains(&fingerprint) {
+            store.deleted.push(fingerprint.clone());
+        }
         store.save(&self.data_dir);
+        self.retry_now.lock().unwrap().retain(|fp| fp != &fingerprint);
         if self.is_connected(&fingerprint) {
-            self.stop(fingerprint);
+            self.stop(fingerprint.clone());
         } else {
             self.refresh_remembered();
         }
+        self.set_status(format!(
+            "Pairing deleted · {} will not auto-connect",
+            short_fp(&fingerprint)
+        ));
+    }
+
+    /// Rebuild the grid popup's machine list from discovery + saved cells.
+    fn publish_grid(&self, discovered: &[(String, String, String, bool)]) {
+        *self.discovered_rows.lock().unwrap() = discovered.to_vec();
+        let store = self.store();
+        let mut rows: Vec<GridNode> = Vec::new();
+        for (name, _, fingerprint, _) in discovered {
+            if rows.iter().any(|row| row.fingerprint.as_str() == fingerprint) {
+                continue;
+            }
+            let cell = store.mesh_grid.iter().find(|entry| entry.fingerprint == *fingerprint);
+            rows.push(GridNode {
+                name: SharedString::from(name.clone()),
+                fingerprint: SharedString::from(fingerprint.clone()),
+                col: cell.map(|entry| entry.col).unwrap_or(-1),
+                row: cell.map(|entry| entry.row).unwrap_or(-1),
+            });
+        }
+        for entry in &store.mesh_grid {
+            if !rows.iter().any(|row| row.fingerprint.as_str() == entry.fingerprint) {
+                rows.push(GridNode {
+                    name: SharedString::from(entry.name.clone()),
+                    fingerprint: SharedString::from(entry.fingerprint.clone()),
+                    col: entry.col,
+                    row: entry.row,
+                });
+            }
+        }
+        self.notify_ui(move |ui| ui.set_grid_nodes(ModelRc::new(VecModel::from(rows))));
+    }
+
+    fn refresh_grid(&self) {
+        let rows = self.discovered_rows.lock().unwrap().clone();
+        self.publish_grid(&rows);
+    }
+
+    fn toggle_theme(&self) {
+        let mut store = self.store();
+        store.dark_mode = !store.dark_mode;
+        store.save(&self.data_dir);
+        let dark = store.dark_mode;
+        self.notify_ui(move |ui| {
+            Theme::get(ui).set_dark(dark);
+            ui.set_dark_mode(dark);
+        });
+    }
+
+    fn toggle_multi_node(&self) {
+        let mut store = self.store();
+        store.multi_node = !store.multi_node;
+        store.save(&self.data_dir);
+        let enabled = store.multi_node;
+        self.notify_ui(move |ui| ui.set_multi_node(enabled));
+        self.refresh_grid();
+    }
+
+    fn set_mesh_mode(&self, mode: String) {
+        if !matches!(mode.as_str(), "bidirectional" | "server_client" | "client_only") {
+            return;
+        }
+        let mut store = self.store();
+        store.mesh_mode = mode.clone();
+        store.save(&self.data_dir);
+        self.notify_ui(move |ui| ui.set_mesh_mode(SharedString::from(mode)));
+    }
+
+    fn grid_device_tap(&self, fingerprint: String) {
+        let mut pending = self.pending_device.lock().unwrap();
+        *pending = if *pending == fingerprint { String::new() } else { fingerprint.clone() };
+        let value = pending.clone();
+        drop(pending);
+        self.notify_ui(move |ui| ui.set_pending_device(SharedString::from(value)));
+    }
+
+    fn grid_cell_down(&self, col: i32, row: i32) {
+        if !(0..5).contains(&col) || !(0..3).contains(&row) {
+            return;
+        }
+        let store = self.store();
+        let occupant = store
+            .mesh_grid
+            .iter()
+            .find(|entry| entry.col == col && entry.row == row)
+            .map(|entry| entry.fingerprint.clone());
+        if let Some(fingerprint) = occupant {
+            *self.dragging.lock().unwrap() = fingerprint.clone();
+            let fp = SharedString::from(fingerprint);
+            self.notify_ui(move |ui| {
+                ui.set_drag_fingerprint(fp);
+                ui.set_drag_active(true);
+            });
+        } else {
+            let pending = self.pending_device.lock().unwrap().clone();
+            if !pending.is_empty() {
+                self.place_node(&pending, col, row);
+                *self.pending_device.lock().unwrap() = String::new();
+                self.notify_ui(|ui| ui.set_pending_device(SharedString::from("")));
+            }
+        }
+        let (c, r) = (col, row);
+        self.notify_ui(move |ui| { ui.set_hover_col(c); ui.set_hover_row(r); });
+    }
+
+    fn grid_cell_move(&self, col: i32, row: i32) {
+        if self.dragging.lock().unwrap().is_empty() {
+            return;
+        }
+        self.notify_ui(move |ui| { ui.set_hover_col(col); ui.set_hover_row(row); });
+    }
+
+    fn grid_cell_up(&self, col: i32, row: i32) {
+        let fingerprint = std::mem::take(&mut *self.dragging.lock().unwrap());
+        self.notify_ui(|ui| ui.set_drag_active(false));
+        if fingerprint.is_empty() || !(0..5).contains(&col) || !(0..3).contains(&row) {
+            self.refresh_grid();
+            return;
+        }
+        self.place_node(&fingerprint, col, row);
+    }
+
+    /// Place one machine in a cell, evicting whatever occupied it so every
+    /// cell holds at most one machine.
+    fn place_node(&self, fingerprint: &str, col: i32, row: i32) {
+        let mut store = self.store();
+        let name = store
+            .mesh_grid
+            .iter()
+            .find(|entry| entry.fingerprint == fingerprint)
+            .map(|entry| entry.name.clone())
+            .or_else(|| {
+                self.discovered_rows
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row.2 == fingerprint)
+                    .map(|row| row.0.clone())
+            })
+            .unwrap_or_else(|| short_fp(fingerprint));
+        store.mesh_grid.retain(|entry| {
+            !(entry.fingerprint == fingerprint) && !(entry.col == col && entry.row == row)
+        });
+        if store.mesh_grid.len() >= 15 {
+            self.set_status("The grid holds at most 15 computers".into());
+            return;
+        }
+        store.mesh_grid.push(GridEntry {
+            name,
+            fingerprint: fingerprint.to_owned(),
+            col,
+            row,
+        });
+        store.save(&self.data_dir);
+        self.refresh_grid();
+    }
+
+    fn remove_grid_node(&self, fingerprint: String) {
+        let mut store = self.store();
+        store.mesh_grid.retain(|entry| entry.fingerprint != fingerprint);
+        store.save(&self.data_dir);
+        *self.dragging.lock().unwrap() = String::new();
+        *self.pending_device.lock().unwrap() = String::new();
+        self.notify_ui(|ui| {
+            ui.set_drag_active(false);
+            ui.set_pending_device(SharedString::from(""));
+        });
+        self.refresh_grid();
+    }
+
+    /// Apply the grid to every connected desktop. Each one rebuilds its
+    /// layout from the same placements, so adjacent cells cross into each
+    /// other and the right edge wraps to the left edge of its row.
+    fn apply_mesh(self: Arc<Self>) {
+        let store = self.store();
+        let screens: Vec<MeshScreen> = store
+            .mesh_grid
+            .iter()
+            .map(|entry| MeshScreen {
+                fingerprint_hex: entry.fingerprint.to_ascii_lowercase(),
+                node_name: entry.name.clone(),
+                col: entry.col,
+                row: entry.row,
+            })
+            .collect();
+        let mesh = MeshConfig {
+            mode: store.mesh_mode.clone(),
+            screens,
+        };
+        self.notify_ui(|ui| ui.set_mesh_applying(true));
+        let controller = self.clone();
+        std::thread::spawn(move || {
+            let sessions: Vec<Arc<Session>> = controller
+                .sessions
+                .lock()
+                .unwrap()
+                .values()
+                .map(|device| device.session.clone())
+                .collect();
+            let mut applied = 0usize;
+            let mut failed = 0usize;
+            for session in sessions {
+                match controller.runtime.block_on(session.send_mesh(mesh.clone())) {
+                    Ok(()) => applied += 1,
+                    Err(error) => {
+                        failed += 1;
+                        tracing::warn!(%error, "mesh config push failed");
+                    }
+                }
+            }
+            let status = if applied == 0 {
+                "Grid saved locally — connect a computer to apply it everywhere".to_owned()
+            } else {
+                format!("Grid applied to {applied} computer(s){}, right edge wraps around", if failed > 0 { format!(" · {failed} failed") } else { String::new() })
+            };
+            controller.set_status(status);
+            controller.notify_ui(|ui| ui.set_mesh_applying(false));
+        });
     }
 
     fn send_text(&self, text: String) {
@@ -718,6 +1051,10 @@ fn android_main(app: AndroidApp) {
         horizontal_mode: Mutex::new(store.horizontal_mode),
         multi_finger: Arc::new(AtomicBool::new(false)),
         retry_now: Mutex::new(Vec::new()),
+        auto_disconnected: AtomicBool::new(false),
+        pending_device: Mutex::new(String::new()),
+        dragging: Mutex::new(String::new()),
+        discovered_rows: Mutex::new(Vec::new()),
         ui: OnceLock::new(),
         touch_count: AtomicU64::new(0),
         frame_count: AtomicU64::new(0),
@@ -788,9 +1125,29 @@ fn android_main(app: AndroidApp) {
                 .find(|entry| entry.fingerprint == fingerprint);
             controller.set_status("Connecting…".into());
             let controller = controller.clone();
-            std::thread::spawn(move || controller.connect(address, known, name));
+            std::thread::spawn(move || controller.connect(address, known, name, false));
         }
     });
+    ui.on_toggle_theme({ let c = controller.clone(); move || c.toggle_theme() });
+    ui.on_toggle_multi_node({ let c = controller.clone(); move || c.toggle_multi_node() });
+    ui.on_set_mesh_mode({ let c = controller.clone(); move |mode| c.set_mesh_mode(mode.to_string()) });
+    ui.on_open_mesh_grid({
+        let c = controller.clone();
+        move || { c.refresh_grid(); c.notify_ui(|ui| ui.set_grid_open(true)); }
+    });
+    ui.on_close_mesh_grid({
+        let c = controller.clone();
+        move || c.notify_ui(|ui| ui.set_grid_open(false))
+    });
+    ui.on_grid_device_tap({ let c = controller.clone(); move |fp| c.grid_device_tap(fp.to_string()) });
+    ui.on_grid_cell_down({ let c = controller.clone(); move |col, row| c.grid_cell_down(col, row) });
+    ui.on_grid_cell_move({ let c = controller.clone(); move |col, row| c.grid_cell_move(col, row) });
+    ui.on_grid_cell_up({ let c = controller.clone(); move |col, row| c.grid_cell_up(col, row) });
+    ui.on_apply_mesh({
+        let c = controller.clone();
+        move || { let c = c.clone(); c.apply_mesh(); }
+    });
+    ui.on_remove_grid_node({ let c = controller.clone(); move |fp| c.remove_grid_node(fp.to_string()) });
     ui.on_disconnect({ let c = controller.clone(); move || c.stop(String::new()) });
     ui.on_stop_device({ let c = controller.clone(); move |fp| c.stop(fp.to_string()) });
     ui.on_switch_device({ let c = controller.clone(); move |fp| c.activate(&fp.to_string()) });
@@ -860,6 +1217,11 @@ fn android_main(app: AndroidApp) {
         }
     });
 
+    Theme::get(&ui).set_dark(store.dark_mode);
+    ui.set_dark_mode(store.dark_mode);
+    ui.set_multi_node(store.multi_node);
+    ui.set_mesh_mode(SharedString::from(store.mesh_mode.clone()));
+    controller.refresh_grid();
     ui.set_paste_mode(store.paste_mode);
     ui.set_horizontal_mode(store.horizontal_mode);
     ui.set_phase(SharedString::from("devices"));
@@ -913,7 +1275,7 @@ fn discovery_loop(controller: Arc<Controller>) {
                         // Use the address from THIS discovery, not possibly
                         // stale persisted data (DHCP / network changes).
                         let live_address = address.to_string();
-                        std::thread::spawn(move || c.connect(live_address, Some(device), name));
+                        std::thread::spawn(move || c.connect(live_address, Some(device), name, true));
                     }
                 }
             }
@@ -934,6 +1296,7 @@ fn discovery_loop(controller: Arc<Controller>) {
             }
         }
 
+        controller.publish_grid(&discovered);
         let count = discovered.len();
         let rows: Vec<(String, String, String, bool)> = discovered.clone();
         let connected: Vec<bool> = rows
