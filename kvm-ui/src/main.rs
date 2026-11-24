@@ -221,9 +221,15 @@ fn main() -> Result<()> {
     // TCP bind is the lock: the OS holds it while we live and releases it
     // on ANY death, so unlike a pidfile it can never go stale. Port 42109
     // is reserved for this lock (42110 sessions, 42111 discovery).
+    // THEKVM_UI_LOCK_PORT lets a sidecar/test instance use its own port;
+    // production launches always take the default.
     // Fail-open: on exotic machines without loopback we run unguarded
     // rather than refuse to start.
-    let instance_lock = match std::net::TcpListener::bind("127.0.0.1:42109") {
+    let lock_port: u16 = std::env::var("THEKVM_UI_LOCK_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(42109);
+    let instance_lock = match std::net::TcpListener::bind(("127.0.0.1", lock_port)) {
         Ok(listener) => Some(listener),
         Err(error) => {
             ui_log(&format!(
@@ -238,7 +244,7 @@ fn main() -> Result<()> {
         // instance answers by re-showing its window (see below), so a
         // second launch from the desktop icon never looks like a no-op now
         // that closing the window leaves the app in the tray.
-        if std::net::TcpStream::connect("127.0.0.1:42109").is_ok() {
+        if std::net::TcpStream::connect(("127.0.0.1", lock_port)).is_ok() {
             ui_log("second UI instance: the running one re-shows its window");
             return Ok(());
         }

@@ -213,10 +213,12 @@ component RadarIcon inherits Rectangle {
     background: transparent;
     in-out property <angle> angle: 0deg;
     Timer {
-        interval: 30ms;
+        // ~1 second per revolution: the pace of a normal player,
+        // not a slow planet.
+        interval: 20ms;
         running: root.sweeping;
         triggered => {
-            root.angle = (root.angle + 5deg >= 360deg) ? (root.angle + 5deg - 360deg) : (root.angle + 5deg);
+            root.angle = (root.angle + 7deg >= 360deg) ? (root.angle + 7deg - 360deg) : (root.angle + 7deg);
         }
     }
     // Three rings, center dot, and the comet arm.
@@ -2003,7 +2005,7 @@ export component AppWindow inherits Window {
                             }
                             Text {
                                 text: root.discovery-scanning ? "Scanning…" : root.discovery-text;
-                                color: root.discovery-scanning ? #6ee7b7 : Theme.faint;
+                                color: root.discovery-scanning ? Theme.text-2 : Theme.faint;
                                 font-size: 14px;
                                 wrap: word-wrap;
                             }
@@ -2573,21 +2575,21 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         height: 36px;
                         Rectangle {
-                            width: parent.width / 3; height: 32px;
+                            width: (parent.width - 16px) / 3; height: 32px;
                             border-radius: 8px;
                             background: root.mesh-mode == "bidirectional" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("bidirectional"); } }
                             Text { text: "Both ways"; color: root.mesh-mode == "bidirectional" ? Theme.accent-text : Theme.faint; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                         }
                         Rectangle {
-                            x: parent.width / 3; width: parent.width / 3; height: 32px;
+                            x: (parent.width - 16px) / 3 + 8px; width: (parent.width - 16px) / 3; height: 32px;
                             border-radius: 8px;
                             background: root.mesh-mode == "server_client" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("server_client"); } }
                             Text { text: "One server"; color: root.mesh-mode == "server_client" ? Theme.accent-text : Theme.faint; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                         }
                         Rectangle {
-                            x: parent.width * 2 / 3; width: parent.width / 3; height: 32px;
+                            x: (parent.width - 16px) / 3 * 2 + 16px; width: (parent.width - 16px) / 3; height: 32px;
                             border-radius: 8px;
                             background: root.mesh-mode == "client_only" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("client_only"); } }
@@ -2980,7 +2982,7 @@ export component AppWindow inherits Window {
                                         : root.discovered-labels.length == 0
                                             ? "No devices found yet"
                                             : root.discovered-labels.length == 1 ? "1 device found" : root.discovered-labels.length + " devices found";
-                                    color: root.discovery-scanning ? #6ee7b7 : Theme.text-2;
+                                    color: Theme.text-2;
                                     font-size: 13px;
                                     font-weight: 600;
                                     vertical-alignment: center;
