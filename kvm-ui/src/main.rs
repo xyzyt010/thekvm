@@ -28,7 +28,7 @@ use kvm_protocol::pairing::Identity;
 use kvm_protocol::transport;
 use kvm_protocol::wire::{read_frame, write_frame, WireMessage};
 use sha2::{Digest, Sha256};
-use slint::{ComponentHandle, SharedString};
+use slint::{ComponentHandle, Global, ModelRc, SharedString, VecModel};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -271,6 +271,20 @@ fn main() -> Result<()> {
         "v{}",
         env!("CARGO_PKG_VERSION")
     )));
+    // Theme (dark #121212 / light white-blue). Stored UI-local so the
+    // daemon never has to know; both the global palette and the toggle
+    // are driven from the same value.
+    let dark = load_dark_mode();
+    Theme::get(&ui).set_dark(dark);
+    ui.set_dark_mode(dark);
+    // Multi-node grid state (Devices). Placed machines persist locally;
+    // applying pushes the whole arrangement to every pinned peer.
+    let mesh_state = Arc::new(Mutex::new(load_mesh_state()));
+    ui.set_multi_node(mesh_state.lock().ok().is_some_and(|state| state.multi_node));
+    ui.set_mesh_mode(SharedString::from(
+        mesh_state.lock().ok().map(|state| state.mode.clone()).unwrap_or_else(|| "bidirectional".into()),
+    ));
+    refresh_grid_peers(&ui.as_weak(), &mesh_state);
 
     // A GUI-subsystem app has no console: without this hook any panicking
     // background thread dies silently and the UI just looks "dead" (this is
@@ -1601,6 +1615,302 @@ fn main() -> Result<()> {
     });
 
     let weak = ui.as_weak();
+    ui.on_toggle_theme(move || {
+        let dark = !load_dark_mode();
+        let _ = std::fs::write(ui_theme_path(), if dark { "dark" } else { "light" });
+        let weak = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_dark_mode(dark);
+                Theme::get(&ui).set_dark(dark);
+            }
+        });
+        ui_log(&format!("theme: {}", if dark { "dark" } else { "light" }));
+    });
+
+    let weak = ui.as_weak();
+    let mesh_for_toggle = mesh_state.clone();
+    ui.on_toggle_multi_node(move || {
+        if let Ok(mut state) = mesh_for_toggle.lock() {
+            state.multi_node = !state.multi_node;
+            save_mesh_state(&state);
+            let enabled = state.multi_node;
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_multi_node(enabled);
+                }
+            });
+            ui_log(&format!("multi-node: {}", if enabled { "on" } else { "off" }));
+        }
+    });
+
+    let weak = ui.as_weak();
+    let mesh_for_mode = mesh_state.clone();
+    ui.on_set_mesh_mode(move |mode| {
+        let mode = mode.trim().to_lowercase();
+        if !matches!(
+            mode.as_str(),
+            "bidirectional" | "server_client" | "client_only"
+        ) {
+            return;
+        }
+        if let Ok(mut state) = mesh_for_mode.lock() {
+            state.mode = mode.clone();
+            save_mesh_state(&state);
+        }
+        let weak = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_mesh_mode(SharedString::from(mode));
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let mesh_for_open = mesh_state.clone();
+    ui.on_open_mesh_grid(move || {
+        refresh_grid_peers(&weak, &mesh_for_open);
+        let weak = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_grid_open(true);
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_close_mesh_grid(move || {
+        let weak = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_grid_open(false);
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let mesh_for_tap = mesh_state.clone();
+    ui.on_grid_peer_tap(move |fingerprint| {
+        let fingerprint = fingerprint.to_string();
+        if let Ok(mut state) = mesh_for_tap.lock() {
+            let pending = if state.grid_pending == fingerprint {
+                String::new()
+            } else {
+                fingerprint.clone()
+            };
+            state.grid_pending = pending;
+        }
+        let pending = mesh_for_tap
+            .lock()
+            .ok()
+            .map(|state| state.grid_pending.clone())
+            .unwrap_or_default();
+        let weak = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_grid_pending(SharedString::from(pending));
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let mesh_for_cell = mesh_state.clone();
+    ui.on_grid_cell_down(move |col, row| {
+        let (col, row) = (col as i32, row as i32);
+        if !(0..5).contains(&col) || !(0..3).contains(&row) {
+            return;
+        }
+        let mut placed = false;
+        let mut dragged = String::new();
+        if let Ok(mut state) = mesh_for_cell.lock() {
+            let occupant = state
+                .entries
+                .iter()
+                .find(|entry| entry.col == col && entry.row == row)
+                .map(|entry| entry.fingerprint.clone());
+            if let Some(fingerprint) = occupant {
+                state.grid_drag = Some(fingerprint.clone());
+                dragged = fingerprint;
+            } else if !state.grid_pending.is_empty() {
+                let fingerprint = state.grid_pending.clone();
+                state.grid_pending = String::new();
+                let name = state
+                    .entries
+                    .iter()
+                    .find(|entry| entry.fingerprint == fingerprint)
+                    .map(|entry| entry.name.clone())
+                    .unwrap_or_else(|| fingerprint[..8.min(fingerprint.len())].to_owned());
+                state.entries.retain(|entry| {
+                    entry.fingerprint != fingerprint && !(entry.col == col && entry.row == row)
+                });
+                if state.entries.len() < 15 {
+                    state.entries.push(MeshEntry {
+                        name,
+                        fingerprint,
+                        col,
+                        row,
+                    });
+                    save_mesh_state(&state);
+                    placed = true;
+                }
+            }
+        }
+        if placed {
+            refresh_grid_peers(&weak, &mesh_for_cell);
+        }
+        let (drag, pending, col, row) = {
+            let state = mesh_for_cell.lock().ok();
+            (
+                state.as_ref().and_then(|state| state.grid_drag.clone()).unwrap_or_default(),
+                state.as_ref().map(|state| state.grid_pending.clone()).unwrap_or_default(),
+                col,
+                row,
+            )
+        };
+        let weak = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_grid_drag(SharedString::from(drag));
+                ui.set_grid_pending(SharedString::from(pending));
+                ui.set_hover_col(col);
+                ui.set_hover_row(row);
+            }
+        });
+        let _ = dragged;
+    });
+
+    let weak = ui.as_weak();
+    ui.on_grid_cell_move(move |col, row| {
+        let weak = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_hover_col(col);
+                ui.set_hover_row(row);
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let mesh_for_up = mesh_state.clone();
+    ui.on_grid_cell_up(move |col, row| {
+        let (col, row) = (col as i32, row as i32);
+        let fingerprint = mesh_for_up
+            .lock()
+            .ok()
+            .and_then(|mut state| state.grid_drag.take());
+        let placed = match (fingerprint, !(0..5).contains(&col) || !(0..3).contains(&row)) {
+            (Some(fingerprint), false) => {
+                if let Ok(mut state) = mesh_for_up.lock() {
+                    let name = state
+                        .entries
+                        .iter()
+                        .find(|entry| entry.fingerprint == fingerprint)
+                        .map(|entry| entry.name.clone())
+                        .unwrap_or_else(|| fingerprint[..8.min(fingerprint.len())].to_owned());
+                    state.entries.retain(|entry| {
+                        entry.fingerprint != fingerprint && !(entry.col == col && entry.row == row)
+                    });
+                    if state.entries.len() < 15 {
+                        state.entries.push(MeshEntry {
+                            name,
+                            fingerprint,
+                            col,
+                            row,
+                        });
+                        save_mesh_state(&state);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if placed {
+            refresh_grid_peers(&weak, &mesh_for_up);
+        }
+        let weak = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_grid_drag(SharedString::new());
+                ui.set_hover_col(-1);
+                ui.set_hover_row(-1);
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let mesh_for_remove = mesh_state.clone();
+    ui.on_grid_remove(move |fingerprint| {
+        let fingerprint = fingerprint.to_string();
+        if let Ok(mut state) = mesh_for_remove.lock() {
+            state.entries.retain(|entry| entry.fingerprint != fingerprint);
+            state.grid_drag = None;
+            state.grid_pending = String::new();
+            save_mesh_state(&state);
+        }
+        refresh_grid_peers(&weak, &mesh_for_remove);
+        let weak = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_grid_drag(SharedString::new());
+                ui.set_grid_pending(SharedString::new());
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let mesh_for_apply = mesh_state.clone();
+    ui.on_apply_mesh(move || {
+        let entries = mesh_for_apply.lock().ok().map(|state| state.entries.clone()).unwrap_or_default();
+        let mode = mesh_for_apply.lock().ok().map(|state| state.mode.clone()).unwrap_or_else(|| "bidirectional".into());
+        let placed: Vec<MeshEntry> = entries.into_iter().filter(|entry| entry.col >= 0 && entry.row >= 0).collect();
+        if placed.len() < 2 {
+            set_status(&weak, "Place at least two computers in the grid first".into());
+            return;
+        }
+        let weak = weak.clone();
+        let _ = slint::invoke_from_event_loop({
+            let weak = weak.clone();
+            move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_mesh_applying(true);
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            save_mesh_layout_local(&placed);
+            let screens = placed
+                .iter()
+                .map(|entry| kvm_protocol::wire::MeshScreen {
+                    fingerprint_hex: entry.fingerprint.to_ascii_lowercase(),
+                    node_name: entry.name.clone(),
+                    col: entry.col,
+                    row: entry.row,
+                })
+                .collect::<Vec<_>>();
+            let mesh = kvm_protocol::wire::MeshConfig { mode: mode.clone(), screens };
+            let result = control_request(ControlRequest::PushMesh { mesh });
+            let message = match result {
+                Ok(ControlResponse::Applied { .. }) => format!("Grid applied · {} computers · right edge wraps around", placed.len()),
+                Ok(other) => format!("Mesh push unexpected reply: {other:?}"),
+                Err(error) => format!("Mesh push failed (saved locally): {error}"),
+            };
+            ui_log(&format!("mesh: {message}"));
+            set_status(&weak, message);
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_mesh_applying(false);
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
     let pending_for_invite = pending_pair.clone();
     let invite_data_dir = startup_dir.clone();
     let invite_session = session_state.clone();
@@ -2599,6 +2909,163 @@ fn set_daemon_offline(weak: &slint::Weak<AppWindow>, message: String) {
             }
         }
     });
+}
+
+/// Multi-node grid state (Devices ▸ Multi-node grid). Persisted beside the
+/// UI config so placements survive restarts independently of the daemon
+/// config, which only learns them via PushMesh (daemon distributes the
+/// whole arrangement to every pinned peer).
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct MeshEntry {
+    name: String,
+    fingerprint: String,
+    col: i32,
+    row: i32,
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct MeshStoreFile {
+    multi_node: bool,
+    mode: String,
+    entries: Vec<MeshEntry>,
+}
+
+struct MeshState {
+    multi_node: bool,
+    mode: String,
+    entries: Vec<MeshEntry>,
+    grid_drag: Option<String>,
+    grid_pending: String,
+}
+
+fn mesh_store_path() -> std::path::PathBuf {
+    data_dir().join("mesh-grid.json")
+}
+
+fn load_mesh_state() -> MeshState {
+    let raw = std::fs::read_to_string(mesh_store_path()).unwrap_or_default();
+    let file: MeshStoreFile = serde_json::from_str(&raw).unwrap_or_default();
+    MeshState {
+        multi_node: file.multi_node,
+        mode: if matches!(
+            file.mode.as_str(),
+            "bidirectional" | "server_client" | "client_only"
+        ) {
+            file.mode
+        } else {
+            "bidirectional".to_owned()
+        },
+        entries: file.entries,
+        grid_drag: None,
+        grid_pending: String::new(),
+    }
+}
+
+fn save_mesh_state(state: &MeshState) {
+    let file = MeshStoreFile {
+        multi_node: state.multi_node,
+        mode: state.mode.clone(),
+        entries: state.entries.clone(),
+    };
+    if let Ok(text) = serde_json::to_string_pretty(&file) {
+        let _ = std::fs::write(mesh_store_path(), text);
+    }
+}
+
+fn ui_theme_path() -> std::path::PathBuf {
+    data_dir().join("ui-theme.txt")
+}
+
+fn load_dark_mode() -> bool {
+    std::fs::read_to_string(ui_theme_path())
+        .map(|content| content.trim() != "light")
+        .unwrap_or(true)
+}
+
+/// Publish the grid popup rows: this computer plus every pinned peer, each
+/// with its saved cell (or -1 when unplaced).
+fn refresh_grid_peers(weak: &slint::Weak<AppWindow>, state: &Arc<Mutex<MeshState>>) {
+    let peers = match control_request(ControlRequest::ListPeers) {
+        Ok(ControlResponse::Peers(peers)) => peers,
+        _ => Vec::new(),
+    };
+    let own_fp = Identity::load_or_create(&data_dir())
+        .map(|identity| identity.fingerprint_hex())
+        .unwrap_or_default();
+    let own_name = kvm_core::Config::load(&data_dir().join("config.json"))
+        .map(|config| config.device_name)
+        .unwrap_or_else(|_| "This computer".to_owned());
+    let entries = state.lock().ok().map(|guard| guard.entries.clone()).unwrap_or_default();
+    let cell = |fingerprint: &str| -> (i32, i32) {
+        entries
+            .iter()
+            .find(|entry| entry.fingerprint == fingerprint)
+            .map(|entry| (entry.col, entry.row))
+            .unwrap_or((-1, -1))
+    };
+    let mut rows: Vec<GridPeer> = Vec::new();
+    if !own_fp.is_empty() {
+        let (col, row) = cell(&own_fp);
+        rows.push(GridPeer {
+            name: SharedString::from(own_name),
+            fingerprint: SharedString::from(own_fp.clone()),
+            col,
+            row,
+        });
+    }
+    for peer in peers {
+        if peer.fingerprint_hex == own_fp {
+            continue;
+        }
+        let (col, row) = cell(&peer.fingerprint_hex);
+        let name = if peer.name.trim().is_empty() {
+            "Unnamed computer".to_owned()
+        } else {
+            peer.name.trim().to_owned()
+        };
+        rows.push(GridPeer {
+            name: SharedString::from(name),
+            fingerprint: SharedString::from(peer.fingerprint_hex.clone()),
+            col,
+            row,
+        });
+    }
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_grid_peers(ModelRc::new(VecModel::from(rows)));
+        }
+    });
+}
+
+fn save_mesh_layout_local(entries: &[MeshEntry]) {
+    let path = data_dir().join("config.json");
+    let Ok(mut config) = kvm_core::Config::load(&path) else {
+        return;
+    };
+    let mut layout = kvm_core::Layout::default();
+    let mut self_screen = None;
+    for (index, entry) in entries.iter().enumerate() {
+        let is_me = config.device_name == entry.name;
+        layout.screens.push(kvm_core::Screen {
+            id: kvm_core::ScreenId(index as u32 + 1),
+            name: entry.name.clone(),
+            x: entry.col,
+            y: entry.row,
+            width: 1920,
+            height: 1080,
+            peer_fingerprint: if is_me { None } else { Some(entry.fingerprint.to_ascii_lowercase()) },
+        });
+        if is_me {
+            self_screen = Some(kvm_core::ScreenId(index as u32 + 1));
+        }
+    }
+    if self_screen.is_none() {
+        self_screen = layout.screens.first().map(|screen| screen.id);
+    }
+    layout.self_screen = self_screen;
+    config.layout = layout;
+    let _ = config.save(&path);
 }
 
 fn set_peer_list(weak: &slint::Weak<AppWindow>, peers: Vec<kvm_protocol::pairing::Peer>) {

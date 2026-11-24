@@ -418,11 +418,11 @@ fn absolute_delta(last: Option<(f64, f64)>, x: f64, y: f64) -> (Option<(f64, f64
 /// negative 120ths (buttons 4/6 are +120). Returns None when no scroll
 /// valuator on this device moved a whole unit yet.
 ///
-/// Axis lock first: the verdict reads banked gesture intent per device
-/// (see ScrollPhase), so a horizontal pan's vertical wobble is dropped
-/// instead of emitted — the peer scrolls where the fingers meant, not
-/// diagonally. A locked-out axis neither banks nor emits: wobble can
-/// never surface later as a jump.
+/// Both axes always forward: a dominant-axis lock that zeroes the wobble
+/// axis killed horizontal scroll whenever a pan had any vertical finger
+/// wobble (the same failure class fixed on Windows PTP). Gesture intent
+/// is still tracked for phase segmentation, but neither axis is ever
+/// gated, banked away, or discarded.
 fn derive_scroll_wheel(
     sourceid: xinput::DeviceId,
     mask: &[u32],
@@ -470,12 +470,9 @@ fn derive_scroll_wheel(
     phase.last = now;
     phase.gest_x += intent_x.abs();
     phase.gest_y += intent_y.abs();
-    // Horizontal locks FIRST (half the vertical floor): trackpad pans
-    // are short and wobbly, so a symmetric 120-unit verdict lets
-    // vertical wobble starve or out-race the horizontal axis and the pan
-    // reads dead or late. A pure vertical gesture can never trip the
-    // X arm (X needs twice the accumulated Y), so vertical is
-    // unaffected; true diagonals still never lock.
+    // Phase segmentation only (gest totals reset after a 300ms pause so a
+    // resumed gesture re-proves intent). The verdict is recorded but NEVER
+    // gates emission: both axes flow on every event.
     const LOCK_MIN_X_120THS: f64 = 60.0;
     const LOCK_MIN_Y_120THS: f64 = 120.0;
     const LOCK_RATIO: f64 = 2.0;
@@ -486,18 +483,9 @@ fn derive_scroll_wheel(
             phase.lock = Some(ScrollLock::Y);
         }
     }
-    let allow_x = matches!(phase.lock, None | Some(ScrollLock::X));
-    let allow_y = matches!(phase.lock, None | Some(ScrollLock::Y));
     let mut wheel_x = 0i32;
     let mut wheel_y = 0i32;
     for axis in axes {
-        let allowed = if axis.horizontal { allow_x } else { allow_y };
-        if !allowed {
-            // Locked out: drop the wobble AND its banked remainder so
-            // it can never flush as a jump on unlock.
-            banks.remove(&(sourceid, axis.axis));
-            continue;
-        }
         let Some(delta) = axis_value(mask, values, axis.axis) else {
             continue;
         };
@@ -1919,12 +1907,10 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_scroll_phase_locks_out_vertical_wobble() {
-        // Same native axis lock as the Windows tap, per device: a
-        // horizontal pan locks to x on the very first detent (120
-        // x-120ths at 2:1, exactly the PTP tap's verdict), so short
-        // horizontal pans never spend their whole gesture unlocked and
-        // diagonal — the "horizontal is harder than native" shape.
+    fn horizontal_scroll_keeps_both_axes_through_vertical_wobble() {
+        // Both axes always forward: a horizontal pan with vertical
+        // wobble must emit x AND the wobble, never zero the x (or the
+        // y) axis for the rest of the gesture.
         use super::{derive_scroll_wheel, ScrollAxis};
         use std::collections::HashMap;
         // XInput valuators 2 and 3 deliver X then Y in ascending axis
@@ -1962,10 +1948,8 @@ mod tests {
             integral: 0,
             frac: 1_073_741_824,
         };
-        // First detent verdict (horizontal locks at 60 x-120ths at
-        // 2:1, half the vertical floor): the wobble is eaten from the
-        // very first frame, and its banked remainder is dropped
-        // with it — no later jump.
+        // Every frame forwards both axes: x one detent (120), y the
+        // 0.25-unit wobble (30).
         for _ in 0..4 {
             assert_eq!(
                 derive_scroll_wheel(
@@ -1976,10 +1960,10 @@ mod tests {
                     &mut banks,
                     &mut phases
                 ),
-                Some(InputEvent::SmoothWheel { x: -120, y: 0 })
+                Some(InputEvent::SmoothWheel { x: -120, y: -30 })
             );
         }
-        // A true 1:1 diagonal on another device never locks.
+        // A true 1:1 diagonal on another device forwards both at once.
         let mut banks = HashMap::new();
         let mut phases = HashMap::new();
         for _ in 0..5 {
@@ -1991,12 +1975,9 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_verdict_locks_before_vertical_floor() {
-        // Trackpad pans are short: a half-detent horizontal intent (60
-        // 120ths) with wobble locks X on the very first frame and eats
-        // the wobble, while the same intent vertically would still be
-        // undecided. Pure vertical keeps the full 120 floor (see the
-        // signed-wheels test above).
+    fn half_detent_horizontal_forwards_both_axes() {
+        // A half-detent horizontal intent (60 120ths) plus 0.25-unit
+        // wobble forwards both axes immediately — no lock, no gating.
         use super::{derive_scroll_wheel, ScrollAxis};
         use std::collections::HashMap;
         let axes = vec![
@@ -2032,7 +2013,7 @@ mod tests {
                     &mut banks,
                     &mut phases
                 ),
-                Some(InputEvent::SmoothWheel { x: -60, y: 0 })
+                Some(InputEvent::SmoothWheel { x: -60, y: -30 })
             );
         }
     }

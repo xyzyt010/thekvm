@@ -220,3 +220,49 @@ Open questions answered by the user:
 - **C1/C2:** global `Theme` palette with both themes, Settings toggle, and
   a modernised compact Devices list. The dropdown and control bars keep
   their structure.
+
+## Desktop round (same requirements applied to Windows/Linux UI)
+
+### Second-round root causes (logs + code, 2026-11-24)
+- **Watchdog log spam (Windows + Mint):** the OS-thread watchdog fired on a
+  stale heartbeat (`< 4s`) while the drive keep-alive interval is 5s. Every
+  idle cycle therefore read as "drive task wedged" with `stale_ms` growing
+  forever on Mint and oscillating ~4s on Windows. Raised the OS-watchdog
+  threshold to 12s; the capture-thread watchdog (which already gates on the
+  exclusive flag) is unchanged.
+- **X11 horizontal scroll:** the same dominant-axis lock as the Windows PTP
+  bug also existed in `kvm-platform/src/x11_capture.rs`: on a horizontal
+  pan, vertical wobble locked `Y` and zeroed X for the gesture (and vice
+  versa). Both axes now forward on every event; regression tests updated.
+- **Version proof:** workspace version bumped `0.9.94` → `0.9.95`, so daemon
+  logs show the new build ("did you launch the older version?" answered by
+  the version string, not by trust).
+
+### Desktop GUI (Windows-first, verified by screenshot loop)
+- **Theme:** shared `Theme` palette (same values as Android): dark
+  `#121212` / light white + black text + blue accents. Settings toggle
+  persisted in `ui-theme.txt`; native widgets follow `Palette` in both
+  modes.
+- **Toggles:** all 7 std-widgets `Switch` replacements replaced with a
+  custom smooth `ToggleSwitch` (pill + knob, no stair-step aliasing).
+- **Dropdowns:** both std-widgets `ComboBox` replaced with a custom
+  `DeviceDropdown` using the same pill/popup language as the role dropdown.
+- **One Connect/Disconnect button:** the Connect-tab session strip is now
+  a single toggle button (Connect ⇔ Disconnect). Nearby-device Connect
+  rows hide while linked.
+- **Advanced unreachable:** the trailing `vertical-stretch: 1` spacers made
+  every tab's content exactly viewport-high, so nothing ever overflowed and
+  `ScrollView` never scrolled. Replaced with a fixed 28px spacer, so the
+  Advanced disclosure is reachable by scrolling. Verify by screenshot.
+- **Multi-node on desktop:** Devices gains the same opt-in toggle, three
+  mode chips, and a 5×3 grid overlay (grid lines, monitor-style cards with
+  names, drag/tap-to-place, spinner). `Apply to all computers` sends a new
+  `ControlRequest::PushMesh`; the daemon pushes bare `MeshConfig` frames
+  (pinned, no input session, same fingerprint-checked pattern as
+  `LinkEnded`) to every pinned peer, and each receiver rebuilds its
+  `Layout` from the shared grid. Placements also persist locally so
+  navigation works even if a peer is offline at apply time.
+- **Not in this build (deliberate):** a desktop grid push requires peers'
+  apps to be running (presence gate, as for any link). Peers that miss the
+  push apply the identical grid from their own peer book when their user
+  opens it.

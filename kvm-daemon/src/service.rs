@@ -5294,15 +5294,16 @@ fn task_heartbeat_stale_ms() -> Option<u64> {
 
 /// Independent suppression watchdog: a plain OS thread OUTSIDE tokio and
 /// outside the capture thread, so it keeps ticking when a wedged drive
-/// task stalls everything else. Past 4s without a stamp it fires (at
+/// task stalls everything else. Past 12s without a stamp it fires (at
 /// most one volley per 30s): on Windows it force-releases the process
 /// hook suppression directly (the helper has its own send-stall release,
 /// see run_capture_helper); elsewhere it logs loudly — the capture
 /// thread owns the real backend release there (see start_capture).
 /// A healthy task stamps every ≤5s (keep-alive), usually every event, so
-/// a firing watchdog is proof of a wedge, never a slow drive. (4s, not
-/// 10: cold opens run ~1.5s, so 4s cannot false-fire on a slow cross
-/// while still freeing a frozen desktop fast.)
+/// a firing watchdog is proof of a wedge, never a slow drive. (12s, not
+/// 4: the 5s keep-alive interval made 4s fire on every idle cycle —
+/// log spam with zero wedges. 12s is still far below the 45s input
+/// lease, so a genuinely frozen desktop frees fast.)
 fn spawn_suppression_watchdog() {
     static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     STARTED.get_or_init(|| {
@@ -5313,7 +5314,7 @@ fn spawn_suppression_watchdog() {
                 let Some(stale_ms) = task_heartbeat_stale_ms() else {
                     continue;
                 };
-                if stale_ms < 4_000 {
+                if stale_ms < 12_000 {
                     continue;
                 }
                 use std::sync::atomic::Ordering;
@@ -12299,6 +12300,33 @@ async fn handle_connection(
                     tracing::debug!(%error, "episode stream ended");
                 }
             }
+            WireMessage::MeshConfig(mesh) => {
+                // Bare config push from a pinned peer (daemon PushMesh or
+                // the Android controller): accepted WITHOUT opening an
+                // input session, exactly like a bare LinkEnded — no Hello,
+                // no session lease, no drive side effects. Pinned peers
+                // only; the arrangement is validated before it lands.
+                if !peers.read().await.is_pinned(&peer_fingerprint) {
+                    bail!("untrusted peer fingerprint {peer_fingerprint}");
+                }
+                let _ = send.finish();
+                match apply_mesh_config(&mesh, &config).await {
+                    Ok(()) => {
+                        audit_event(
+                            audit_dir,
+                            &format!(
+                                "mesh-config-received peer={peer_fingerprint} remote={} nodes={}",
+                                conn.remote_address(),
+                                mesh.screens.len(),
+                            ),
+                        );
+                        tracing::info!(peer = %peer_fingerprint, nodes = mesh.screens.len(), "mesh arrangement applied from peer push");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, peer = %peer_fingerprint, "mesh arrangement from peer rejected");
+                    }
+                }
+            }
             WireMessage::LinkEnded { link_id } => {
                 // The peer's user pressed Disconnect: end the link on THIS
                 // side too, so one Disconnect lands on both computers even
@@ -13541,6 +13569,39 @@ pub(crate) async fn notify_peer_ended_at(
         .context("notify stream open timed out")?
         .context("notify stream open")?;
     write_frame(&mut send, &WireMessage::LinkEnded { link_id }).await?;
+    let _ = send.finish();
+    Ok(())
+}
+
+/// Push one multi-node arrangement to one pinned peer (see
+/// [`ControlRequest::PushMesh`]): fresh pinned connection, one bare
+/// MeshConfig frame, close. No Hello, so no input session is ever opened
+/// and no drive state is disturbed. Best-effort with tight caps.
+pub(crate) async fn push_mesh_to_peer(
+    peers: &PeerBook,
+    fingerprint_hex: &str,
+    mesh: &MeshConfig,
+    dir: &std::path::Path,
+) -> Result<()> {
+    let address = peers
+        .peers
+        .iter()
+        .find(|peer| peer.fingerprint_hex == fingerprint_hex)
+        .and_then(|peer| peer.address.clone())
+        .context("no dialable address for peer")?;
+    let identity = Identity::load_or_create(dir)?;
+    let endpoint = transport::make_pinned_client_endpoint(&identity, fingerprint_hex)?;
+    let addr = normalize_addr(&address)?;
+    let connecting = endpoint.connect(addr, "thekvm").context("mesh push connect")?;
+    let conn = tokio::time::timeout(Duration::from_secs(5), connecting)
+        .await
+        .context("mesh push handshake timed out")?
+        .context("mesh push handshake")?;
+    let (mut send, _recv) = tokio::time::timeout(Duration::from_secs(3), conn.open_bi())
+        .await
+        .context("mesh push stream open timed out")?
+        .context("mesh push stream open")?;
+    write_frame(&mut send, &WireMessage::MeshConfig(mesh.clone())).await?;
     let _ = send.finish();
     Ok(())
 }

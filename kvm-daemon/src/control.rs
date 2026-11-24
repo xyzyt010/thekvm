@@ -1256,6 +1256,47 @@ where
                 restart_required: false,
             }
         }
+        ControlRequest::PushMesh { mesh } => {
+            // Deliver the shared 5x3 arrangement to every pinned peer that
+            // has a dialable address. Best-effort per peer: a peer that is
+            // off, unapproved, or link-approval-gated simply misses this
+            // push — it applies the same grid on its own when its user
+            // opens the grid (identical peer book ⇒ identical cells).
+            let targets: Vec<String> = peers
+                .read()
+                .await
+                .peers
+                .iter()
+                .filter(|peer| peer.address.is_some())
+                .map(|peer| peer.fingerprint_hex.clone())
+                .collect();
+            let mut applied = 0usize;
+            for fingerprint in targets {
+                let result = {
+                    let book = peers.read().await;
+                    crate::service::push_mesh_to_peer(&book, &fingerprint, &mesh, &data_dir).await
+                };
+                match result {
+                    Ok(()) => {
+                        applied += 1;
+                        crate::service::audit_event(
+                            &data_dir,
+                            &format!(
+                                "mesh-config-pushed peer={fingerprint} nodes={}",
+                                mesh.screens.len()
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, peer = %fingerprint, "mesh push to peer failed");
+                    }
+                }
+            }
+            tracing::info!(applied, "mesh arrangement push complete");
+            ControlResponse::Applied {
+                restart_required: false,
+            }
+        }
         ControlRequest::PinPeer {
             fingerprint_hex,
             node_name,

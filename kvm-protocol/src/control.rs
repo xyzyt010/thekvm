@@ -138,6 +138,10 @@ pub enum ControlRequest {
     PausePeerController {
         fingerprint_hex: String,
     },
+    /// Push a whole multi-node arrangement to every pinned peer: the daemon
+    /// opens a fresh pinned connection to each, sends `MeshConfig`, and each
+    /// receiver rebuilds its layout from the shared 5x3 grid.
+    PushMesh { mesh: crate::wire::MeshConfig },
     /// Lift the inbound "locally disconnected" latch for one peer. Sent by
     /// the desktop app when the user explicitly clicks Connect again in the
     /// same app run. A fresh app launch clears all latches instead.
