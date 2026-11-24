@@ -1812,7 +1812,7 @@ export component AppWindow inherits Window {
                                         font-size: 11px;
                                         wrap: word-wrap;
                                     }
-                                    if discovered-labels.length > 0 && !session-active : HorizontalLayout {
+                                    if discovered-labels.length > 0 : HorizontalLayout {
                                         spacing: 8px;
                                         found2 := DeviceDropdown {
                                             labels: root.discovered-labels;
@@ -1820,11 +1820,14 @@ export component AppWindow inherits Window {
                                             height: 32px;
                                             horizontal-stretch: 1;
                                         }
-                                        Button {
+                                        // Hidden while linked: the session strip's
+                                        // Connect/Disconnect toggle is the only
+                                        // action button then.
+                                        if !session-active : Button {
                                             text: "Connect";
                                             primary: true;
                                             height: 32px;
-                                            enabled: discovered-labels.length > 0 && !session-active;
+                                            enabled: discovered-labels.length > 0;
                                             clicked => { connect-discovered(root.discovered-index); }
                                         }
                                     }
@@ -2277,23 +2280,20 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    if discovered-labels.length > 0 && !session-active : HorizontalLayout {
+                    if discovered-labels.length > 0 : HorizontalLayout {
                         vertical-stretch: 0;
                         spacing: 10px;
                         found := DeviceDropdown {
                             labels: root.discovered-labels;
                             current-index <=> root.discovered-index;
-                            // Explicit height: a native ComboBox with no
-                            // height inside a conditional row balloons to
-                            // whatever vertical space the tab has spare.
                             height: 32px;
                             horizontal-stretch: 1;
                         }
-                        Button {
+                        if !session-active : Button {
                             text: "Connect";
                             primary: true;
                             height: 32px;
-                            enabled: discovered-labels.length > 0 && !session-active;
+                            enabled: discovered-labels.length > 0;
                             clicked => { connect-discovered(root.discovered-index); }
                         }
                     }
