@@ -246,16 +246,19 @@ component RadarIcon inherits Rectangle {
 // Smooth custom toggle: pill + knob, no stair-step aliasing from the
 // std-widgets Switch on the software renderer. Same two-way contract:
 // `checked <=> root.<prop>`, plus `toggled` on user interaction.
+// Anti-aliasing: the pill has NO border at all — a 1px border under a
+// 13px radius is what stair-stepped on the software renderer. The
+// knob is a pure circle (diameter = radius x 2) with exact integer
+// pixel travel: 3px insets on both ends, 48x28 pill, 22px knob, so
+// no sub-pixel offset ever misaligns the round in the pill.
 component ToggleSwitch inherits Rectangle {
     in-out property <bool> checked: false;
     in property <bool> enabled: true;
     callback toggled();
-    width: 46px;
-    height: 26px;
-    border-radius: 13px;
+    width: 48px;
+    height: 28px;
+    border-radius: 14px;
     background: !enabled ? Theme.surface-2 : (checked ? Theme.accent-strong : Theme.border-strong);
-    border-width: 1px;
-    border-color: !enabled ? Theme.border : (checked ? Theme.accent-strong : Theme.border);
     opacity: enabled ? 1 : 0.55;
     hit := TouchArea {
         mouse-cursor: pointer;
@@ -265,11 +268,11 @@ component ToggleSwitch inherits Rectangle {
     accessible-checked: root.checked;
     accessible-action-default => { if (root.enabled) { root.checked = !root.checked; root.toggled(); } }
     Rectangle {
-        x: checked ? 23px : 3px;
+        x: root.checked ? 23px : 3px;
         y: 3px;
-        width: 20px;
-        height: 20px;
-        border-radius: 10px;
+        width: 22px;
+        height: 22px;
+        border-radius: 11px;
         background: #ffffff;
     }
 }
