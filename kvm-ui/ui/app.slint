@@ -1920,7 +1920,7 @@ export component AppWindow inherits Window {
                 // bottom — which once hid the whole address/code/connect
                 // row with no way to reach it. Never clip again.
                 ScrollView {
-                    vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                    vertical-scrollbar-policy: ScrollBarPolicy.always-on;
                     horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                 Rectangle {
                 // Exactly the Flickable's width: the content must never ask the
@@ -2311,7 +2311,7 @@ export component AppWindow inherits Window {
             Tab {
                 title: "Devices";
                 ScrollView {
-                    vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                    vertical-scrollbar-policy: ScrollBarPolicy.always-on;
                     horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                 Rectangle {
                 // Exactly the Flickable's width: the content must never ask the
@@ -2611,7 +2611,7 @@ export component AppWindow inherits Window {
             Tab {
                 title: "Settings";
                 ScrollView {
-                    vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                    vertical-scrollbar-policy: ScrollBarPolicy.always-on;
                     horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                 Rectangle {
                 // Exactly the Flickable's width: the content must never ask the
