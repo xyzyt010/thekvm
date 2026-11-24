@@ -1974,6 +1974,43 @@ fn main() -> Result<()> {
         set_discovery_scanning(&weak, false);
         ui_log("discovery: nearby-devices card hidden");
     });
+    // Discovery sheet (Settings +): opens the radar panel and starts a
+    // scan; closing it hides the panel (results stay cached).
+    {
+        let weak = ui.as_weak();
+        let discovered_for_sheet = discovered.clone();
+        ui.on_open_discovery(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_discovery_open(true);
+            }
+            set_discovery_scanning(&weak, true);
+            set_discovery(
+                &weak,
+                "Scanning… devices appear below as they answer".into(),
+                None,
+            );
+            let weak = weak.clone();
+            let discovered_for_scan = discovered_for_sheet.clone();
+            std::thread::spawn(move || {
+                let found = scan_lan_devices();
+                ui_log(&format!(
+                    "discovery: sheet scan found {} device(s)",
+                    found.len()
+                ));
+                let single = found.len() == 1;
+                store_discovered(&weak, &discovered_for_scan, found, single);
+                set_discovery_scanning(&weak, false);
+            });
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_close_discovery(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_discovery_open(false);
+            }
+        });
+    }
 
     // Startup scan: the card is visible from the first frame, so populate
     // it immediately instead of waiting for the first poll tick.
@@ -3113,11 +3150,25 @@ fn set_peer_list(weak: &slint::Weak<AppWindow>, peers: Vec<kvm_protocol::pairing
         .and_then(|peer| peer.address.clone())
         .unwrap_or_default();
     let detail_fingerprint = first.map(|peer| peer.fingerprint_hex.clone()).unwrap_or_default();
+    let mut structured: Vec<TrustedPeer> = Vec::new();
+    for peer in &peers {
+        let name = if peer.name.trim().is_empty() {
+            "Unnamed computer".to_owned()
+        } else {
+            peer.name.trim().to_owned()
+        };
+        structured.push(TrustedPeer {
+            name: SharedString::from(name),
+            address: SharedString::from(peer.address.clone().unwrap_or_default()),
+            fingerprint: SharedString::from(peer.fingerprint_hex.clone()),
+        });
+    }
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
                 ui.set_peer_list(SharedString::from(text));
+                ui.set_trusted_peers(ModelRc::new(VecModel::from(structured)));
                 ui.set_trusted_peers_advanced(SharedString::from(advanced));
                 ui.set_details_peer_name(SharedString::from(detail_name));
                 ui.set_details_peer_address(SharedString::from(detail_address));

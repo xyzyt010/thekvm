@@ -133,6 +133,105 @@ struct GridPeer {
     row: int,
 }
 
+struct TrustedPeer {
+    name: string,
+    address: string,
+    fingerprint: string,
+}
+
+// Minimal modern line icons: plus (add), trash (delete), radar
+// (discovery). All drawn, no font glyphs, no word-buttons.
+component IconButton inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <string> glyph: "+";
+    in property <color> glyph-color: Theme.text-2;
+    callback clicked();
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    background: hit.has-hover && enabled ? Theme.hover : transparent;
+    border-width: 1px;
+    border-color: hit.has-hover && enabled ? Theme.border : transparent;
+    opacity: enabled ? 1 : 0.45;
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+    accessible-role: button;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    if root.glyph == "+" : Rectangle {
+        x: 11px;
+        y: 7px;
+        width: 12px;
+        height: 2px;
+        border-radius: 1px;
+        background: root.glyph-color;
+    }
+    if root.glyph == "+" : Rectangle {
+        x: 16px;
+        y: 2px;
+        width: 2px;
+        height: 12px;
+        border-radius: 1px;
+        background: root.glyph-color;
+    }
+}
+
+// Delete: a minimal lidded bin. The 2px-wide lid overhangs the tub;
+// two vertical ribs read as "bin" without any clutter.
+component TrashIcon inherits Rectangle {
+    width: 16px;
+    height: 18px;
+    background: transparent;
+    Rectangle { x: 1px; y: 0px; width: 14px; height: 2px; border-radius: 1px; background: #f87171; }
+    Rectangle { x: 5px; y: 3px; width: 6px; height: 2px; border-radius: 1px; background: #f87171; }
+    Rectangle { x: 2px; y: 5px; width: 12px; height: 13px; border-radius: 2px; background: transparent; border-width: 1.5px; border-color: #f87171; }
+    Rectangle { x: 5.5px; y: 7px; width: 1.6px; height: 9px; background: #f87171; }
+    Rectangle { x: 8.9px; y: 7px; width: 1.6px; height: 9px; background: #f87171; }
+}
+
+// Discovery radar: concentric green rings with one bright comet arc
+// sweeping around. Unlike the status donut this is a screen, not a
+// ring: three rings + center dot + rotating wedge, drawn fresh every
+// tick (the software renderer ignores Path transforms).
+component RadarIcon inherits Rectangle {
+    in property <bool> sweeping: false;
+    in property <int> tick: 0;
+    width: 46px;
+    height: 46px;
+    background: transparent;
+    in-out property <angle> angle: 0deg;
+    Timer {
+        interval: 30ms;
+        running: root.sweeping;
+        triggered => {
+            root.angle = (root.angle + 5deg >= 360deg) ? (root.angle + 5deg - 360deg) : (root.angle + 5deg);
+        }
+    }
+    // Three rings, center dot, and the comet arm.
+    Rectangle { x: 3px; y: 3px; width: 40px; height: 40px; border-radius: 20px; border-width: 1px; border-color: #22c55e55; }
+    Rectangle { x: 10px; y: 10px; width: 26px; height: 26px; border-radius: 13px; border-width: 1px; border-color: #22c55e66; }
+    Rectangle { x: 18px; y: 18px; width: 10px; height: 10px; border-radius: 5px; background: #22c55e; }
+    if root.sweeping : Path {
+        x: 3px;
+        y: 3px;
+        width: 40px;
+        height: 40px;
+        viewbox-width: 40;
+        viewbox-height: 40;
+        stroke: #22c55e;
+        stroke-width: 2px;
+        stroke-line-cap: round;
+        fill: transparent;
+        commands: "M "
+            + (round((20 + 19 * cos(root.angle)) * 100) / 100) + " "
+            + (round((20 + 19*sin(root.angle)) * 100) / 100)
+            + " A 19 19 0 0 1 "
+            + (round((20 + 19 * cos(root.angle + 70deg)) * 100) / 100) + " "
+            + (round((20 + 19 * sin(root.angle + 70deg)) * 100) / 100);
+    }
+}
+
 // Smooth custom toggle: pill + knob, no stair-step aliasing from the
 // std-widgets Switch on the software renderer. Same two-way contract:
 // `checked <=> root.<prop>`, plus `toggled` on user interaction.
@@ -276,9 +375,7 @@ component DeviceDropdown inherits Rectangle {
                 for label[i] in root.labels : Rectangle {
                     height: 36px;
                     border-radius: 8px;
-                    background: row-hit.has-hover ? Theme.surface-2 : (i == root.current-index ? Theme.accent-bg : transparent);
-                    border-width: i == root.current-index ? 1px : 0px;
-                    border-color: i == root.current-index ? Theme.accent-border : transparent;
+                    background: row-hit.has-hover || i == root.current-index ? Theme.hover : transparent;
                     row-hit := TouchArea {
                         mouse-cursor: pointer;
                         clicked => { root.current-index = i; popup.close(); }
@@ -287,7 +384,7 @@ component DeviceDropdown inherits Rectangle {
                         x: 10px;
                         width: parent.width - 20px;
                         text: label;
-                        color: i == root.current-index ? Theme.accent : Theme.text-2;
+                        color: Theme.text-2;
                         font-size: 13px;
                         font-weight: i == root.current-index ? 700 : 500;
                         vertical-alignment: center;
@@ -1173,10 +1270,8 @@ component RoleRow inherits Rectangle {
     in property <bool> selected: false;
     callback picked();
     height: 42px;
-    background: hit.has-hover ? Theme.hover : (root.selected ? #14291d : transparent);
+    background: hit.has-hover || root.selected ? Theme.hover : transparent;
     border-radius: 8px;
-    border-width: root.selected ? 1px : 0px;
-    border-color: root.selected ? Theme.accent-border : transparent;
 
     hit := TouchArea {
         mouse-cursor: pointer;
@@ -1201,13 +1296,13 @@ component RoleRow inherits Rectangle {
                 width: 22px;
                 height: 22px;
                 border-radius: 6px;
-                background: root.selected ? Theme.accent-panel : #20242c;
+                background: root.selected ? Theme.hover : Theme.hover;
                 // Both ways: paired arrows. Server: arrow up/out (you drive).
                 // Client: arrow down/in (the peer drives you).
                 if root.icon == 0 : Path {
                     x: 2px; y: 5px; width: 18px; height: 12px;
                     viewbox-width: 18; viewbox-height: 12;
-                    stroke: root.selected ? #34d399 : Theme.faint;
+                    stroke: Theme.text-2;
                     stroke-width: 1.8px;
                     stroke-line-cap: round;
                     stroke-line-join: round;
@@ -1217,7 +1312,7 @@ component RoleRow inherits Rectangle {
                 if root.icon == 1 : Path {
                     x: 4px; y: 3px; width: 14px; height: 16px;
                     viewbox-width: 14; viewbox-height: 16;
-                    stroke: root.selected ? #34d399 : Theme.faint;
+                    stroke: Theme.text-2;
                     stroke-width: 1.8px;
                     stroke-line-cap: round;
                     stroke-line-join: round;
@@ -1227,7 +1322,7 @@ component RoleRow inherits Rectangle {
                 if root.icon == 2 : Path {
                     x: 4px; y: 3px; width: 14px; height: 16px;
                     viewbox-width: 14; viewbox-height: 16;
-                    stroke: root.selected ? #34d399 : Theme.faint;
+                    stroke: Theme.text-2;
                     stroke-width: 1.8px;
                     stroke-line-cap: round;
                     stroke-line-join: round;
@@ -1241,7 +1336,7 @@ component RoleRow inherits Rectangle {
             alignment: center;
             Text {
                 text: root.label;
-                color: root.selected ? #a7f3d0 : #e5e7eb;
+                color: Theme.text;
                 // Same 13px size as every other label: the role name is
                 // the same size closed and expanded.
                 font-size: 13px;
@@ -1267,7 +1362,7 @@ component RoleRow inherits Rectangle {
                 height: 11px;
                 viewbox-width: 12;
                 viewbox-height: 12;
-                stroke: #34d399;
+                stroke: Theme.faint;
                 stroke-width: 2px;
                 stroke-line-cap: round;
                 stroke-line-join: round;
@@ -1642,6 +1737,8 @@ export component AppWindow inherits Window {
     in-out property <int> hover-row: -1;
     callback toggle-theme();
     callback toggle-multi-node();
+    callback open-discovery();
+    callback close-discovery();
     callback set-mesh-mode(string);
     callback open-mesh-grid();
     callback close-mesh-grid();
@@ -1653,6 +1750,12 @@ export component AppWindow inherits Window {
     callback apply-mesh();
     // Trusted peers with their fingerprints, shown only inside Advanced.
     in-out property <string> trusted-peers-advanced: "";
+    // Allowed connections (Settings): structured rows with a red trash
+    // icon per computer, fed from the same peer book as Advanced.
+    in-out property <[TrustedPeer]> trusted-peers: [];
+    // Discovery sheet (Settings +): green radar sweep while scanning,
+    // then the found devices as tappable rows.
+    in-out property <bool> discovery-open: false;
     in-out property <string> layout-path: "";
     in-out property <string> peer-address: "";
     in-out property <string> pair-code: "";
@@ -1761,7 +1864,7 @@ export component AppWindow inherits Window {
                 Text {
                     text: "the link cannot work until it is running";
                     color: #fcd34d;
-                    font-size: 11px;
+                    font-size: 12px;
                     vertical-alignment: center;
                     overflow: elide;
                 }
@@ -1800,31 +1903,34 @@ export component AppWindow inherits Window {
                 // Exactly the Flickable's width: the content must never ask the
                 // viewport to be wider than the window, or the panels get
                 // sliced off at the right edge and a horizontal scrollbar
-                // appears for no reason.
+                // appears for no reason. Height comes from the layout's
+                // own preferred height so long content overflows the
+                // viewport and the ScrollView actually scrolls (a
+                // layout-managed child otherwise measures the viewport
+                // height and everything below the fold is unreachable).
                 width: parent.width;
-                VerticalLayout {
+                height: content-connect.preferred-height + 24px;
+                content-connect := VerticalLayout {
                     padding: 12px;
                     spacing: 12px;
 
-                    // ---- Nearby devices ----------------------------------
-                    // ONE canvas, NO boxes inside boxes: a single hairline
-                    // row. The dropdown only selects; the session strip's
-                    // Connect/Disconnect below is the only action button.
+                    // ---- One expanded control box ------------------------
+                    // The entire top section is a single hairline box:
+                    // device dropdown + Both ways role on the top row,
+                    // the ONE Connect/Disconnect button right below it
+                    // on the right side. It sits a little lower than the
+                    // old floating card, and nothing else frames these
+                    // controls (no inner panels, no highlights).
+                    Rectangle { height: 6px; background: transparent; }
                     if discovery-card-visible : Rectangle {
                         vertical-stretch: 0;
-                        // Explicit height: a layout-managed Rectangle in a
-                        // viewport-tall Flickable gets stretched to the
-                        // viewport and reads as a giant empty panel.
-                        // Content is 26 header + 14 status + 36 dropdown
-                        // + padding/spacing = 118.
-                        height: 118px;
                         background: Theme.bg;
-                        border-radius: 10px;
+                        border-radius: 14px;
                         border-width: 1px;
                         border-color: Theme.border;
                         VerticalLayout {
-                            padding: 10px;
-                            spacing: 8px;
+                            padding: 12px;
+                            spacing: 10px;
                             alignment: start;
                             HorizontalLayout {
                                 spacing: 6px;
@@ -1845,26 +1951,70 @@ export component AppWindow inherits Window {
                                     clicked => { hide-discovery(); }
                                 }
                             }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                if discovered-labels.length > 0 : DeviceDropdown {
+                                    labels: root.discovered-labels;
+                                    current-index <=> root.discovered-index;
+                                    height: 36px;
+                                    horizontal-stretch: 1;
+                                }
+                                if discovered-labels.length == 0 : DeviceDropdown {
+                                    labels: [];
+                                    current-index: 0;
+                                    height: 36px;
+                                    horizontal-stretch: 1;
+                                }
+                                // Role selection is local configuration, not a
+                                // daemon-dependent action: the dropdown is always
+                                // pressable. Gating it once made it look permanently
+                                // dead whenever the status poll failed.
+                                RoleDropdown {
+                                    current: root.role-text;
+                                    mode-index: root.mode-index;
+                                    applying: root.role-applying;
+                                    applied: root.role-applied;
+                                    tick: root.spinner-tick;
+                                    picked(index) => { set-role(index); }
+                                }
+                            }
                             Text {
                                 text: root.discovery-scanning ? "Scanning…" : root.discovery-text;
                                 color: root.discovery-scanning ? #6ee7b7 : Theme.faint;
-                                font-size: 11px;
+                                font-size: 12px;
                                 wrap: word-wrap;
                             }
-                            if discovered-labels.length > 0 : DeviceDropdown {
-                                labels: root.discovered-labels;
-                                current-index <=> root.discovered-index;
-                                height: 36px;
-                                horizontal-stretch: 1;
-                            }
-                            if discovered-labels.length == 0 && !discovery-scanning : Text {
-                                text: "No devices found.";
-                                color: Theme.faint;
-                                font-size: 11px;
+                            // The ONE button, two faces: Connect when idle
+                            // (dials the selected nearby computer),
+                            // Disconnect while linked (ends the whole
+                            // link). No second button anywhere.
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: 9px;
+                                if link-connecting && !session-verified : VerticalLayout {
+                                    width: 18px;
+                                    alignment: center;
+                                    SpinnerArc {
+                                        diameter: 18px;
+                                        tick: root.spinner-tick;
+                                    }
+                                }
+                                KvmButton {
+                                    text: session-active ? "Disconnect" : "Connect";
+                                    primary: !session-active;
+                                    enabled: session-active || discovered-labels.length > 0;
+                                    clicked => {
+                                        if (session-active) {
+                                            disconnect();
+                                        } else {
+                                            connect-discovered(root.discovered-index);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                    // The card's rescan control lives inside the card, so
+                    // The card's rescan control lives inside the box, so
                     // hiding it must leave a way back: this compact chip
                     // rescans and reopens the listing.
                     if !discovery-card-visible : Rectangle {
@@ -1887,53 +2037,10 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // ---- Role --------------------------------------------
-                    // Hugs its content: a stretched row leaves a wide empty
-                    // strip to the right of the dropdown. (Fixed items first,
-                    // no stretch spacer: a stretched sibling starves the
-                    // dropdown to zero width.)
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        horizontal-stretch: 1;
-                        alignment: start;
-                        spacing: 10px;
-                        Text {
-                            // This computer's name AND live LAN address: the
-                            // other machine needs the IP, so it belongs right
-                            // here, aligned with the label.
-                            // A bounded width matters: an unbounded Text
-                            // absorbs every leftover pixel of the row, which
-                            // pushed the dropdown off the right edge of the
-                            // window. Fixed at the widest the label gets.
-                            width: 260px;
-                            text: root.local-address == ""
-                                ? "This computer"
-                                : "This computer · " + root.local-address;
-                            color: Theme.faint;
-                            font-size: 13px;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                        // Role selection is local configuration, not a
-                        // daemon-dependent action: the dropdown is always
-                        // pressable. Gating it once made it look permanently
-                        // dead whenever the status poll failed.
-                        RoleDropdown {
-                            current: root.role-text;
-                            mode-index: root.mode-index;
-                            applying: root.role-applying;
-                            applied: root.role-applied;
-                            tick: root.spinner-tick;
-                            picked(index) => { set-role(index); }
-                        }
-                    }
-
                     // ---- Connect (manual out-of-band path) ----------------
                     // Auto-discovery is the normal way in, so the typed-IP
                     // row and the pairing code stay hidden unless the user
                     // opted into Manual control in Settings.
-                    Rectangle {
-                        vertical-stretch: 0; height: 1px; background: Theme.border; }
                     if root.manual-control-enabled : VerticalLayout {
                         spacing: 12px;
                         HorizontalLayout {
@@ -1962,14 +2069,28 @@ export component AppWindow inherits Window {
                             enabled: !session-active;
                         }
                     }
-                    // Live session state: one unified, middle-aligned strip.
-                    // Dot = verified, amber dot + donut = warming, grey = idle.
-                    // Disconnect sits exactly on this row — nothing detached,
-                    // nothing floating elsewhere.
+
+                    // ---- This computer + link status ----------------------
+                    // The box only selects and acts. Identity lives below:
+                    // this computer's address, a subtle line, then the
+                    // link state — green dot + the peer's IP when live,
+                    // plain grey dot when idle. No name, no extra chrome.
+                    Text {
+                        vertical-stretch: 0;
+                        text: root.local-address == ""
+                            ? "This computer"
+                            : "This computer · " + root.local-address;
+                        color: Theme.faint;
+                        font-size: 13px;
+                        overflow: elide;
+                    }
+                    Rectangle {
+                        vertical-stretch: 0; height: 1px; background: Theme.border; }
                     HorizontalLayout {
                         vertical-stretch: 0;
                         height: 36px;
                         spacing: 9px;
+                        alignment: start;
                         if link-connecting && !session-verified : VerticalLayout {
                             width: 18px;
                             alignment: center;
@@ -1979,7 +2100,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         if !link-connecting || session-verified : VerticalLayout {
-                            width: 10px;
+                            width: 18px;
                             alignment: center;
                             Rectangle {
                                 width: 10px;
@@ -1999,29 +2120,9 @@ export component AppWindow inherits Window {
                         if driving-text != "" : Text {
                             text: driving-text;
                             color: #34d399;
-                            font-size: 11px;
+                            font-size: 12px;
                             font-weight: 600;
                             vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        VerticalLayout {
-                            alignment: center;
-                            // ONE button, two faces: Connect when idle (dials
-                            // the selected nearby computer), Disconnect while
-                            // linked (ends the whole link). No second
-                            // disconnect button anywhere.
-                            KvmButton {
-                                text: session-active ? "Disconnect" : "Connect";
-                                primary: !session-active;
-                                enabled: session-active || discovered-labels.length > 0;
-                                clicked => {
-                                    if (session-active) {
-                                        disconnect();
-                                    } else {
-                                        connect-discovered(root.discovered-index);
-                                    }
-                                }
-                            }
                         }
                     }
 
@@ -2193,9 +2294,14 @@ export component AppWindow inherits Window {
                 // Exactly the Flickable's width: the content must never ask the
                 // viewport to be wider than the window, or the panels get
                 // sliced off at the right edge and a horizontal scrollbar
-                // appears for no reason.
+                // appears for no reason. Height comes from the layout's
+                // own preferred height so long content overflows the
+                // viewport and the ScrollView actually scrolls (a
+                // layout-managed child otherwise measures the viewport
+                // height and everything below the fold is unreachable).
                 width: parent.width;
-                VerticalLayout {
+                height: content-devices.preferred-height + 24px;
+                content-devices := VerticalLayout {
                     padding: 12px;
                     spacing: 12px;
 
@@ -2241,7 +2347,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: "Details";
                                     color: details-hit.has-hover ? #86efac : Theme.faint;
-                                    font-size: 11px;
+                                    font-size: 12px;
                                     font-weight: 600;
                                     vertical-alignment: center;
                                 }
@@ -2282,18 +2388,18 @@ export component AppWindow inherits Window {
                                     spacing: 3px;
                                     Text { text: "THIS COMPUTER"; color: #6ee7b7; font-size: 9px; font-weight: 800; letter-spacing: 1.3px; }
                                     Text { text: root.device-name == "" ? "Unknown" : root.device-name; color: Theme.text; font-size: 13px; font-weight: 700; wrap: word-wrap; }
-                                    Text { text: "LAN · " + (root.local-address == "" ? "…" : root.local-address); color: Theme.text-2; font-size: 11px; wrap: word-wrap; }
+                                    Text { text: "LAN · " + (root.local-address == "" ? "…" : root.local-address); color: Theme.text-2; font-size: 12px; wrap: word-wrap; }
                                     Text { text: "Fingerprint · " + root.fingerprint; color: Theme.muted; font-size: 9px; wrap: word-wrap; letter-spacing: 0.5px; }
-                                    Text { text: "Role · " + root.role-text; color: Theme.faint; font-size: 11px; }
+                                    Text { text: "Role · " + root.role-text; color: Theme.faint; font-size: 12px; }
                                 }
                                 Rectangle { width: 1px; background: Theme.border; vertical-stretch: 1; }
                                 VerticalLayout {
                                     spacing: 3px;
                                     Text { text: "LINKED COMPUTER"; color: #5eead4; font-size: 9px; font-weight: 800; letter-spacing: 1.3px; }
                                     Text { text: root.linked-peer-name == "" ? "Not paired yet" : root.linked-peer-name; color: Theme.text; font-size: 13px; font-weight: 700; wrap: word-wrap; }
-                                    Text { text: "Address · " + (root.details-peer-address == "" ? "unknown" : root.details-peer-address); color: Theme.text-2; font-size: 11px; wrap: word-wrap; }
+                                    Text { text: "Address · " + (root.details-peer-address == "" ? "unknown" : root.details-peer-address); color: Theme.text-2; font-size: 12px; wrap: word-wrap; }
                                     Text { text: "Fingerprint · " + (root.details-peer-fingerprint == "" ? "unknown" : root.details-peer-fingerprint); color: Theme.muted; font-size: 9px; wrap: word-wrap; letter-spacing: 0.5px; }
-                                    Text { text: "Link · " + (session-active ? "live" : "idle"); color: Theme.faint; font-size: 11px; }
+                                    Text { text: "Link · " + (session-active ? "live" : "idle"); color: Theme.faint; font-size: 12px; }
                                 }
                             }
                         }
@@ -2425,7 +2531,7 @@ export component AppWindow inherits Window {
                             x: 12px; y: 5px;
                             text: "Multi-node grid";
                             color: Theme.text-2;
-                            font-size: 13px;
+                            font-size: 14px;
                             font-weight: 600;
                         }
                         Text {
@@ -2448,21 +2554,21 @@ export component AppWindow inherits Window {
                             border-radius: 8px;
                             background: root.mesh-mode == "bidirectional" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("bidirectional"); } }
-                            Text { text: "Both ways"; color: root.mesh-mode == "bidirectional" ? Theme.accent-text : Theme.faint; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "Both ways"; color: root.mesh-mode == "bidirectional" ? Theme.accent-text : Theme.faint; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                         }
                         Rectangle {
                             x: parent.width / 3; width: parent.width / 3; height: 32px;
                             border-radius: 8px;
                             background: root.mesh-mode == "server_client" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("server_client"); } }
-                            Text { text: "One server"; color: root.mesh-mode == "server_client" ? Theme.accent-text : Theme.faint; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "One server"; color: root.mesh-mode == "server_client" ? Theme.accent-text : Theme.faint; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                         }
                         Rectangle {
                             x: parent.width * 2 / 3; width: parent.width / 3; height: 32px;
                             border-radius: 8px;
                             background: root.mesh-mode == "client_only" ? Theme.accent-panel : Theme.hover;
                             TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("client_only"); } }
-                            Text { text: "Clients"; color: root.mesh-mode == "client_only" ? Theme.accent-text : Theme.faint; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "Clients"; color: root.mesh-mode == "client_only" ? Theme.accent-text : Theme.faint; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
                     if root.multi-node : KvmButton {
@@ -2488,9 +2594,14 @@ export component AppWindow inherits Window {
                 // Exactly the Flickable's width: the content must never ask the
                 // viewport to be wider than the window, or the panels get
                 // sliced off at the right edge and a horizontal scrollbar
-                // appears for no reason.
+                // appears for no reason. Height comes from the layout's
+                // own preferred height so long content overflows the
+                // viewport and the ScrollView actually scrolls (a
+                // layout-managed child otherwise measures the viewport
+                // height and everything below the fold is unreachable).
                 width: parent.width;
-                VerticalLayout {
+                height: content-settings.preferred-height + 24px;
+                content-settings := VerticalLayout {
                     padding: 12px;
                     spacing: 4px;
 
@@ -2500,7 +2611,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Computer name";
                             color: Theme.text-2;
-                            font-size: 13px;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         name := LineEdit {
@@ -2523,7 +2634,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Control login and lock screens";
                             color: Theme.text-2;
-                            font-size: 13px;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2539,7 +2650,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Sync text clipboard";
                             color: Theme.text-2;
-                            font-size: 13px;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2555,7 +2666,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Reverse scroll on the other computer";
                             color: Theme.text-2;
-                            font-size: 13px;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2571,7 +2682,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Find nearby computers";
                             color: Theme.text-2;
-                            font-size: 13px;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2589,7 +2700,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Manual control";
                             color: Theme.text-2;
-                            font-size: 13px;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2602,7 +2713,7 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         text: "Typed address and pairing code for this computer; the auto-connect path never uses it.";
                         color: Theme.faint;
-                        font-size: 11px;
+                        font-size: 12px;
                         wrap: word-wrap;
                     }
                     HorizontalLayout {
@@ -2626,7 +2737,7 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         text: autostart-note;
                         color: #fbbf24;
-                        font-size: 11px;
+                        font-size: 12px;
                         wrap: word-wrap;
                     }
                     HorizontalLayout {
@@ -2636,7 +2747,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Reconnect at startup";
                             color: root.auto-connect-known && !root.auto-connect-busy ? Theme.text-2 : Theme.faint;
-                            font-size: 13px;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2646,11 +2757,18 @@ export component AppWindow inherits Window {
                             toggled => { root.apply-auto-connect(root.auto-connect-on-start); }
                         }
                     }
+                    if root.auto-connect-known : Text {
+                        vertical-stretch: 0;
+                        text: "Reconnects to last connected device";
+                        color: #fbbf24;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
                     if auto-connect-note != "" : Text {
                         vertical-stretch: 0;
                         text: auto-connect-note;
                         color: #fbbf24;
-                        font-size: 11px;
+                        font-size: 12px;
                         wrap: word-wrap;
                     }
                     HorizontalLayout {
@@ -2660,7 +2778,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: root.dark-mode ? "Dark theme (#121212)" : "Light theme (white / blue)";
                             color: Theme.text-2;
-                            font-size: 13px;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2676,7 +2794,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Clipboard limit (MB)";
                             color: Theme.text-2;
-                            font-size: 13px;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         clipboard-max := LineEdit {
@@ -2694,6 +2812,165 @@ export component AppWindow inherits Window {
 
                     Rectangle {
                         vertical-stretch: 0; height: 1px; background: Theme.border; }
+
+                    // ---- Allowed connections ------------------------------
+                    // Icon-first list: plus (opens the discovery sheet) at
+                    // the top-left, one row per computer with a red trash
+                    // icon. No word-buttons.
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 8px;
+                        alignment: start;
+                        IconButton {
+                            glyph: "+";
+                            clicked => { open-discovery(); }
+                        }
+                        Text {
+                            text: "Allowed connections";
+                            color: Theme.text;
+                            font-size: 13px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                    }
+                    for peer in root.trusted-peers : Rectangle {
+                        vertical-stretch: 0;
+                        height: 40px;
+                        border-radius: 10px;
+                        background: Theme.bg;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 6px;
+                            spacing: 8px;
+                            alignment: center;
+                            VerticalLayout {
+                                spacing: 1px;
+                                alignment: center;
+                                Text {
+                                    text: peer.name == "" ? "Unnamed computer" : peer.name;
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: peer.address == "" ? peer.fingerprint : peer.address;
+                                    color: Theme.faint;
+                                    font-size: 12px;
+                                    overflow: elide;
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Rectangle {
+                                width: 34px;
+                                height: 34px;
+                                border-radius: 8px;
+                                background: del-hit.has-hover ? #f8717118 : transparent;
+                                del-hit := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { revoke-peer(peer.fingerprint); }
+                                }
+                                accessible-role: button;
+                                accessible-label: "Remove " + peer.name;
+                                accessible-action-default => { revoke-peer(peer.fingerprint); }
+                                TrashIcon {
+                                    x: 9px;
+                                    y: 8px;
+                                }
+                            }
+                        }
+                    }
+                    if root.trusted-peers.length == 0 : Text {
+                        vertical-stretch: 0;
+                        text: "No allowed connections yet.";
+                        color: Theme.faint;
+                        font-size: 12px;
+                    }
+
+                    // Discovery sheet: green radar sweep while scanning,
+                    // then the found devices as tappable rows.
+                    if root.discovery-open : Rectangle {
+                        vertical-stretch: 0;
+                        background: Theme.bg;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 8px;
+                            alignment: start;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                alignment: center;
+                                RadarIcon {
+                                    width: 46px;
+                                    height: 46px;
+                                    sweeping: root.discovery-scanning;
+                                    tick: root.spinner-tick;
+                                }
+                                Text {
+                                    text: root.discovery-scanning
+                                        ? "Searching for devices…"
+                                        : root.discovered-labels.length == 0
+                                            ? "No devices found yet"
+                                            : root.discovered-labels.length == 1 ? "1 device found" : root.discovered-labels.length + " devices found";
+                                    color: root.discovery-scanning ? #6ee7b7 : Theme.text-2;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                RescanButton {
+                                    scanning: root.discovery-scanning;
+                                    tick: root.spinner-tick;
+                                    clicked => { discover-lan(); }
+                                }
+                                CloseButton {
+                                    clicked => { close-discovery(); }
+                                }
+                            }
+                            Text {
+                                text: "Tap a device to connect it";
+                                color: Theme.faint;
+                                font-size: 12px;
+                            }
+                            if !root.discovery-scanning && root.discovered-labels.length == 0 : Text {
+                                text: "Press the refresh icon to search again";
+                                color: Theme.faint;
+                                font-size: 12px;
+                            }
+                            for label[i] in root.discovered-labels : Rectangle {
+                                vertical-stretch: 0;
+                                height: 36px;
+                                border-radius: 8px;
+                                background: row-hit.has-hover ? Theme.hover : transparent;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                row-hit := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { connect-discovered(i); close-discovery(); }
+                                }
+                                accessible-role: button;
+                                accessible-label: label;
+                                accessible-action-default => { connect-discovered(i); close-discovery(); }
+                                Text {
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    text: label;
+                                    color: Theme.text-2;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 0; height: 1px; background: Theme.border; }
                     Disclosure {
                         vertical-stretch: 0;
                         label: "Advanced";
@@ -2706,18 +2983,18 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Fingerprint";
                             color: Theme.faint;
-                            font-size: 11px;
+                            font-size: 12px;
                         }
                         Text {
                             text: fingerprint;
                             color: #f87171;
-                            font-size: 11px;
+                            font-size: 12px;
                             wrap: word-wrap;
                         }
                         if trusted-peers-advanced != "" : Text {
                             text: "Trusted computers";
                             color: Theme.faint;
-                            font-size: 11px;
+                            font-size: 12px;
                         }
                         if trusted-peers-advanced != "" : Text {
                             text: trusted-peers-advanced;
@@ -2778,7 +3055,7 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         text: "TheKVM " + app-version;
                         color: Theme.faint;
-                        font-size: 11px;
+                        font-size: 12px;
                     }
                 
                     // Absorbs all spare vertical space so every row above
@@ -2920,7 +3197,7 @@ export component AppWindow inherits Window {
                     Text {
                         text: "Drag a screen into a cell, or select one below then click a cell. Adjacent cells cross into each other.";
                         color: Theme.faint;
-                        font-size: 11px;
+                        font-size: 12px;
                         wrap: word-wrap;
                     }
                     Rectangle {
@@ -3010,7 +3287,7 @@ export component AppWindow inherits Window {
                     Text {
                         text: root.grid-pending != "" ? "Now click a cell to place the selected computer" : "Computers (tap to select, or drag from the grid)";
                         color: Theme.faint;
-                        font-size: 11px;
+                        font-size: 12px;
                     }
                     Flickable {
                         height: 46px;
@@ -3025,7 +3302,7 @@ export component AppWindow inherits Window {
                                     border-width: 1px;
                                     border-color: root.grid-pending == node.fingerprint ? Theme.accent-strong : Theme.border;
                                     TouchArea { mouse-cursor: pointer; clicked => { root.grid-peer-tap(node.fingerprint); } }
-                                    Text { text: node.name; color: Theme.text-2; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                                    Text { text: node.name; color: Theme.text-2; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
                                 }
                             }
                             if root.grid-drag != "" : Rectangle {
@@ -3035,7 +3312,7 @@ export component AppWindow inherits Window {
                                 border-width: 1px;
                                 border-color: Theme.border;
                                 TouchArea { mouse-cursor: pointer; clicked => { root.grid-remove(root.grid-drag); } }
-                                Text { text: "Unplace"; color: Theme.text-2; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                                Text { text: "Unplace"; color: Theme.text-2; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
                             }
                         }
                     }
