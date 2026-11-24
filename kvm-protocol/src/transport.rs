@@ -25,11 +25,15 @@ fn input_transport_config() -> quinn::TransportConfig {
     transport.datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER));
     transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     // Throughput windows sized for bursty input, not bulk transfer: motion
-    // floods must never queue behind a clipboard chunk.
-    transport.send_window(8 * 1024 * 1024);
-    transport.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
-    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(32));
-    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(32));
+    // floods must never queue behind a clipboard chunk. Tight values keep
+    // every connection's preallocated buffers small; each link child
+    // holds its own endpoint and quinn preallocates against these
+    // windows, so tight windows directly shrink the idle RSS of every
+    // link process on both platforms.
+    transport.send_window(1 * 1024 * 1024);
+    transport.stream_receive_window(quinn::VarInt::from_u32(256 * 1024));
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(8));
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(8));
     transport
 }
 

@@ -239,7 +239,8 @@ fn main() -> Result<()> {
         }
     }
 
-    async_main()
+    let runtime = build_runtime();
+    runtime.block_on(async_main())
 }
 
 /// SCM-discarded stderr replacement for `--service` mode: an
@@ -372,10 +373,50 @@ fn spawn_parent_liveness_guard() {
     });
 }
 
-#[tokio::main]
+/// Hand the system allocator's freed arenas back to the OS on Linux.
+/// glibc keeps freed memory in-process to avoid evicting hot pages;
+/// a long-lived daemon that bursts (image swaps, clipboard, logs)
+/// therefore looks permanently fatter in RSS than its live set is.
+/// `malloc_trim` releases everything above the waterline back to
+/// the kernel, so the observed RSS tracks the live set. No-op
+/// elsewhere (Windows heap compaction has no cheap equivalent and
+/// the Windows working set is already private-lean).
+#[cfg(target_os = "linux")]
+fn trim_allocator() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn trim_allocator() {}
+
+fn build_runtime() -> tokio::runtime::Runtime {
+    // 2 MB stacks (tokio default is 8): the runtime never recurses
+    // deeply, but ~35 threads at 8 MB inflate every process's
+    // address space — and browsers show the mapped pages. Paired
+    // with trim_allocator() below, idle RSS tracks the live set.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(2 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build kvm-daemon tokio runtime")
+}
+
 async fn async_main() -> Result<()> {
     #[cfg(target_os = "linux")]
     spawn_parent_liveness_guard();
+    // Slow ticker: the trim only matters after heap churn settles.
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            trim_allocator();
+        }
+    });
     let cli = Cli::parse();
     match cli.command {
         Command::Fingerprint => service::print_fingerprint(),
