@@ -81,6 +81,16 @@ match (see deploy-windows-v3.log).
   complete roster lives once, in Devices (see spec CON-03 note).
 - Deployed to Windows (hash-verified, service Running, kvm-ui alive).
 
+## Fix pass 2, 2026-11-26 (commit d1c6bae)
+- Zoom-verified (z-plus/z-rows/f2-set shots): name/IP hollow gap
+  collapsed by tightening columns 200/170→150/150; the 1px separator
+  is now visible (#5b6675, 24px); trash 22px white glyph centred in a
+  36px target; plus arms enlarged to 14px so the cross reads at the
+  title's weight.
+- Monitor name text lifted above the arrow lane (no longer crossed by
+  the arrows).
+- Deployed (service Running, hashes match).
+
 ## Definition of done status
 Implemented + evidenced: DS (type, targets, colors), SET (rows, menu,
 header), DEV (roster, states, actions), CON (aligned two-row grid,
