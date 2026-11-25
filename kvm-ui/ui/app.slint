@@ -163,21 +163,21 @@ component IconButton inherits Rectangle {
     accessible-role: button;
     accessible-label: "Add a computer";
     accessible-action-default => { if (root.enabled) { root.clicked(); } }
-    // Plus cross centred optically in the 36px box: horizontal bar at
-    // y=17 (centre 18), vertical bar x=17 (centre 18).
+    // Plus cross sized to read at the same weight as a 16px bold title:
+    // 14px arms, optically centred in the 36px box (centre 18).
     if root.glyph == "+" : Rectangle {
-        x: 12px;
+        x: 11px;
         y: 17px;
-        width: 12px;
+        width: 14px;
         height: 2px;
         border-radius: 1px;
         background: root.glyph-color;
     }
     if root.glyph == "+" : Rectangle {
         x: 17px;
-        y: 12px;
+        y: 11px;
         width: 2px;
-        height: 12px;
+        height: 14px;
         border-radius: 1px;
         background: root.glyph-color;
     }
@@ -197,22 +197,22 @@ component OverflowIcon inherits Rectangle {
 // Delete: Google Fonts Material Symbols "delete" (24dp, outlined,
 // wght 400), redrawn as a native Slint Path — the exact vector from
 // delete_24dp_FILL0_wght400_GRAD0_opsz24, not an imported SVG, so it
-// rasterises crisply at 20px on the software renderer. One filled
+// rasterises crisply at 22px on the software renderer. One filled
 // path (lid bar, handle, tub outline, two ribs as cut-out subpaths);
-// only the colour is ours (red = destructive). 20px in a 36px box,
-// optically centred by bounding box.
+// only the colour is ours (white, per product feedback). 22px in a
+// 36px box, optically centred by bounding box.
 component TrashIcon inherits Rectangle {
-    width: 20px;
-    height: 20px;
+    width: 22px;
+    height: 22px;
     background: transparent;
     Path {
         x: 0px;
         y: 0px;
-        width: 20px;
-        height: 20px;
+        width: 22px;
+        height: 22px;
         viewbox-width: 24;
         viewbox-height: 24;
-        fill: #f87171;
+        fill: #f3f4f6;
         commands: "M7,21q-0.82,0-1.41-0.59T5,19V6H4V4H9V3h6V4h5V6H19V19q0,0.82-0.59,1.41T17,21H7ZM17,6H7V19H17V6ZM9,17h2V8H9v9Zm4,0h2V8H13v9ZM7,6V19V6Z";
     }
 }
@@ -646,9 +646,12 @@ component MonitorCard inherits Rectangle {
                 letter-spacing: 1.2px;
                 horizontal-alignment: center;
             }
+            // Name sits above the arrow lane (centre y=40): both labels
+            // stacked at mid-screen crossed the crossing arrows through
+            // the text.
             Text {
                 x: 10px;
-                y: 37px;
+                y: 18px;
                 width: 126px;
                 text: root.name == "" ? "…" : root.name;
                 color: white;
@@ -3196,8 +3199,10 @@ export component AppWindow inherits Window {
                             }
                             // Fixed columns (SET-02 acceptance): name and
                             // IP share one column edge across EVERY row.
+                            // Tight: a too-wide name field read as a huge
+                            // hollow gap between the name and the IP.
                             Text {
-                                width: 200px;
+                                width: 150px;
                                 text: peer.name == "" ? "Unnamed computer" : peer.name;
                                 color: Theme.text;
                                 font-size: 14px;
@@ -3206,14 +3211,16 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: left;
                                 vertical-alignment: center;
                             }
-                            // SET-04: one 1px hairline, 32px, centred.
+                            // SET-04: one 1px hairline, 24px, centred and
+                            // dark-theme-visible (a #3a3a3a line on #121212
+                            // was invisible).
                             Rectangle {
-                                width: 32px;
+                                width: 24px;
                                 height: 1px;
-                                background: Theme.border-strong;
+                                background: #5b6675;
                             }
                             Text {
-                                width: 170px;
+                                width: 150px;
                                 text: peer.address == "" ? "—" : peer.address;
                                 color: Theme.text-2;
                                 font-size: 14px;
@@ -3330,8 +3337,8 @@ export component AppWindow inherits Window {
                                     root.pending-delete-name = peer.name == "" ? "Unnamed computer" : peer.name;
                                 }
                                 TrashIcon {
-                                    x: 8px;
-                                    y: 8px;
+                                    x: 7px;
+                                    y: 7px;
                                 }
                             }
                         }
