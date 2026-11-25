@@ -70,6 +70,17 @@ Mint Linux build + tests pass (53 platform tests incl. Linux-only
 paths). Windows release built + deployed; service Running; hashes
 match (see deploy-windows-v3.log).
 
+## Fix pass 2026-11-26 (commit 93c90be)
+- Plus glyph: was top-aligned in its 36px box → geometrically centred
+  (cross centre = 18px). Trash: 18px→20px glyph, centred (8,8) in the
+  box. Verified by vision screenshots fix-set.png / fix-dev.png.
+- Left-hug alignment: removed `alignment: center` from Settings row,
+  Connect two-row grid, and Devices roster rows — dots/indexes glued
+  to the content gutter in every state; index numbers left-aligned.
+- Connect: "All computers" roster removed per user instruction; the
+  complete roster lives once, in Devices (see spec CON-03 note).
+- Deployed to Windows (hash-verified, service Running, kvm-ui alive).
+
 ## Definition of done status
 Implemented + evidenced: DS (type, targets, colors), SET (rows, menu,
 header), DEV (roster, states, actions), CON (aligned two-row grid,
