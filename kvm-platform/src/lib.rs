@@ -14,6 +14,8 @@ pub mod diagnostics;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub mod evdev_capture;
 pub mod inject;
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
+pub mod prefs;
 #[cfg(target_os = "linux")]
 pub mod mt_pinch;
 #[cfg(target_os = "linux")]

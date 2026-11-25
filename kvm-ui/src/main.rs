@@ -283,6 +283,10 @@ fn main() -> Result<()> {
     let dark = load_dark_mode();
     Theme::get(&ui).set_dark(dark);
     ui.set_dark_mode(dark);
+    // DS-07: the OS "show animations" preference gates spinners/radar.
+    let reduced = kvm_platform::prefs::reduced_motion();
+    Theme::get(&ui).set_reduced(reduced);
+    ui.set_reduced_motion(reduced);
     // Multi-node grid state (Devices). Placed machines persist locally;
     // applying pushes the whole arrangement to every pinned peer.
     let mesh_state = Arc::new(Mutex::new(load_mesh_state()));

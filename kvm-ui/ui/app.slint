@@ -48,11 +48,11 @@ component SpinnerArc inherits Rectangle {
     }
     // One revolution every ~1.9s (3° per 16ms — 2x the old pace). The
     // angle wraps at 360° so long uptimes cannot lose float precision
-    // and stutter.
+    // and stutter. DS-07: calm (reduced motion) renders a static ring.
     in-out property <angle> angle: 0deg;
     Timer {
         interval: 16ms;
-        running: true;
+        running: !Theme.reduced;
         triggered => {
             root.angle = (root.angle + 3deg >= 360deg) ? (root.angle + 3deg - 360deg) : (root.angle + 3deg);
         }
@@ -105,6 +105,10 @@ component ChevronGlyph inherits Rectangle {
 // and monitor-graphic colours are fixed and intentionally not themed.
 export global Theme {
     in-out property <bool> dark: true;
+    // DS-07: reduced motion — spinners/radar hold still (spinner arcs
+    // render at a fixed angle, radar stops sweeping). Set by Rust from
+    // the OS "show animations" preference at startup.
+    in-out property <bool> reduced: false;
     // ONE CANVAS: every surface is the same color. Structure comes
     // from hairline borders, never from filled panel boxes. `hover`
     // is the single slightly-raised tone for pressed/hovered chrome.
@@ -230,9 +234,10 @@ component RadarIcon inherits Rectangle {
     in-out property <angle> angle: 0deg;
     Timer {
         // ~0.5 second per revolution (2x the previous sweep): a brisk
-        // radar, matching a normal player's spinner pace.
+        // radar, matching a normal player's spinner pace. DS-07: stops
+        // sweeping under reduced motion.
         interval: 20ms;
-        running: root.sweeping;
+        running: root.sweeping && !Theme.reduced;
         triggered => {
             root.angle = (root.angle + 14deg >= 360deg) ? (root.angle + 14deg - 360deg) : (root.angle + 14deg);
         }
@@ -369,6 +374,10 @@ component PageScroll inherits Rectangle {
 // Width hugs its label (min-width forces a wider floor when needed).
 component KvmButton inherits Rectangle {
     in property <string> text: "";
+    // DS-10: accessible-label override when the visible text alone is
+    // ambiguous to assistive tech (e.g. "Details for X, row 2 of 5").
+    // Empty = announce the visible text.
+    in property <string> aria-label: "";
     in property <bool> primary: false;
     in property <bool> danger: false;
     in property <bool> enabled: true;
@@ -382,19 +391,36 @@ component KvmButton inherits Rectangle {
         : danger ? #dc2626
         : primary ? Theme.accent-strong
         : hit.has-hover ? Theme.hover : Theme.bg;
+    // DS-06 focus-visible: a visible outline ring while a keyboard user
+    // has this button focused (FocusScope turns on tab navigation).
     border-width: 1px;
-    border-color: !enabled ? Theme.border
+    border-color: scope.has-focus ? #60a5fa
+        : !enabled ? Theme.border
         : danger ? #dc2626
         : primary ? Theme.accent-strong : Theme.border;
     // Width hugs the label, floored at btn-width when set.
     width: max(root.btn-width, label.preferred-width + 28px);
     opacity: enabled ? 1 : 0.55;
+    scope := FocusScope {
+        focus_on_tab_navigation: true;
+        key_pressed(event) => {
+            // Enter (U+000D) and Space (U+0020); the KeyEvent 'text' is
+            // the normalized input in Slint 1.8.
+            if event.text == "\n" || event.text == " " {
+                if (root.enabled) { root.clicked(); }
+                accept
+            } else {
+                reject
+            }
+        }
+        key_released(event) => { reject }
+    }
     hit := TouchArea {
         mouse-cursor: pointer;
         clicked => { if (root.enabled) { root.clicked(); } }
     }
     accessible-role: button;
-    accessible-label: root.text;
+    accessible-label: root.aria-label == "" ? root.text : root.aria-label;
     accessible-action-default => { if (root.enabled) { root.clicked(); } }
     label := Text {
         width: parent.width;
@@ -1904,6 +1930,9 @@ export component AppWindow inherits Window {
     // Overflow-menu state (SET-06): rename editor target.
     in-out property <string> rename-peer-fp: "";
     in-out property <string> rename-peer-name: "";
+    // DS-07: OS "show animations" preference switches this on: spinners
+    // and the radar hold still. Mirrored into Theme.reduced at startup.
+    in-out property <bool> reduced-motion: false;
     // CB-13 toast: smart auto-dismissing notification (non-modal, never
     // steals focus). The 5s Timer clears it; the user can dismiss it with
     // the x. Currently used for the over-limit file clipboard (CB-05).
@@ -2003,7 +2032,6 @@ export component AppWindow inherits Window {
     callback apply-autostart(bool /* wanted */);
     callback apply-auto-connect(bool /* wanted */);
     callback import-layout(string);
-
 
     VerticalLayout {
         padding: 0px;
@@ -2674,11 +2702,15 @@ export component AppWindow inherits Window {
                             }
                             KvmButton {
                                 text: "Details";
+                                aria-label: "Details for " + root.roster-names[i] + ", row " + (i + 1) + " of " + root.roster-names.length;
                                 enabled: root.roster-fingerprints[i] != "";
                                 clicked => { root.peer-view-details(root.roster-fingerprints[i]); }
                             }
+                            // DS-10: the row announces its position in the
+                            // list ("row N of M") to assistive tech.
                             if root.roster-states[i] == "Idle" || root.roster-states[i] == "Discovered" || root.roster-states[i] == "Android" : KvmButton {
                                 text: "Connect";
+                                aria-label: "Connect to " + root.roster-names[i] + ", row " + (i + 1) + " of " + root.roster-names.length;
                                 primary: true;
                                 enabled: !session-active && root.roster-addresses[i] != "";
                                 clicked => { connect-to(root.roster-addresses[i], ""); }
