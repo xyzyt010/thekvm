@@ -370,6 +370,11 @@ pub struct Peer {
     pub fingerprint_hex: String,
     #[serde(default)]
     pub address: Option<String>,
+    /// What kind of device this is (desktop vs Android controller). Old
+    /// books predate the field and decode as Desktop. Android peers get a
+    /// yellow dot + platform label in every roster.
+    #[serde(default)]
+    pub kind: kvm_core::ClientKind,
 }
 
 impl PeerBook {
@@ -402,6 +407,24 @@ impl PeerBook {
         fingerprint_hex: String,
         address: Option<String>,
     ) -> std::io::Result<()> {
+        self.pin_with_kind(
+            name,
+            fingerprint_hex,
+            address,
+            kvm_core::ClientKind::Desktop,
+        )
+    }
+
+    /// Pin with the device kind learned from the pairing wire message
+    /// (CON-03 yellow Android rows). An existing entry keeps its kind on
+    /// re-pin, so a legacy re-pin never downgrades an Android to Desktop.
+    pub fn pin_with_kind(
+        &mut self,
+        name: impl Into<String>,
+        fingerprint_hex: String,
+        address: Option<String>,
+        kind: kvm_core::ClientKind,
+    ) -> std::io::Result<()> {
         let name = name.into().trim().to_owned();
         let fingerprint_hex = fingerprint_hex.to_ascii_lowercase();
         let address = address.map(|address| address.trim().to_owned());
@@ -422,6 +445,7 @@ impl PeerBook {
                 name,
                 fingerprint_hex,
                 address,
+                kind,
             });
             self.save()?;
         } else if let Some(peer) = self

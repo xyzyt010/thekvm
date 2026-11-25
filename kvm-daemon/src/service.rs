@@ -2511,7 +2511,10 @@ pub async fn capture(address: &str) -> Result<()> {
     )
     .await?;
     let clipboard_enabled = capabilities.clipboard_enabled;
-    let mut clipboard = start_clipboard_agent(clipboard_enabled);
+    let mut clipboard = start_clipboard_agent(
+        clipboard_enabled,
+        config.clipboard_max_bytes() as u64,
+    );
     let mut clipboard_revision = 0;
     let snapshot = capture_control.snapshot();
     send_state_sync(&mut send, snapshot.state).await?;
@@ -3684,17 +3687,28 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
     spawn_suppression_watchdog();
     stamp_task_heartbeat();
     let mut active: Option<TopologySession> = None;
-    let mut clipboard = start_clipboard_agent(config.clipboard_enabled);
+    let mut clipboard = start_clipboard_agent(
+        config.clipboard_enabled,
+        config.clipboard_max_bytes() as u64,
+    );
     let mut clipboard_enabled = config.clipboard_enabled;
     let mut clipboard_revision = 0u64;
-    let mut latest_clipboard: Option<String> = None;
+    // CB-09: revive the persisted latest copy (if any) so a reconnect
+    // delivers it as the initial paste; absent/corrupt → empty.
+    let (queued_text, queued_files) = load_clipboard_queue(&dir);
+    let mut latest_clipboard: Option<String> = queued_text;
     // Last observed local image paste (see latest_clipboard): sent as
     // the initial image when the next episode opens.
     let mut latest_image: Option<ImagePaste> = None;
+    // Last observed local file copy (CB-04): sent as the initial file
+    // paste when the next episode opens (copy-then-cross).
+    let mut latest_files: Option<Vec<(String, Vec<u8>)>> = queued_files;
     let clipboard_max_bytes = config.clipboard_max_bytes() as u64;
     // Open chunked-paste assembly for this link (see ClipboardAssembly):
     // at most one transfer buffers at a time, bounded by the cap above.
     let mut clipboard_assembly = ClipboardAssembly::default();
+    // Open file-list assembly for this link (see FilesAssembly).
+    let mut files_assembly = FilesAssembly::new();
     // Open chunked-IMAGE assembly alongside (see ImageAssembly).
     let mut image_assembly = ImageAssembly::default();
     let mut discarded_event_barrier = 0u64;
@@ -3946,6 +3960,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                     ClipboardInitial {
                                         text: latest_clipboard.clone(),
                                         image: latest_image.clone(),
+                                        files: latest_files.clone(),
                                     },
                                     &mut clipboard_revision,
                                     config.clipboard_max_bytes() as u64,
@@ -3982,6 +3997,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                                 initial_clipboard: ClipboardInitial {
                                     text: latest_clipboard.clone(),
                                     image: latest_image.clone(),
+                                    files: latest_files.clone(),
                                 },
                                 sequence: &mut sequence,
                                 clipboard_revision: &mut clipboard_revision,
@@ -4268,6 +4284,102 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                             ImageFeed::Pending => {}
                         }
                     }
+                    Some(RemoteSignal::ClipboardFilesStart {
+                        revision,
+                        total_bytes,
+                        files,
+                    }) => {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
+                            continue;
+                        };
+                        if !clipboard_frame_current(session.clipboard_enabled, revision, session.remote_clipboard_revision) {
+                            continue;
+                        }
+                        if matches!(
+                            files_assembly.feed_start(revision, total_bytes, files, clipboard_max_bytes),
+                            FilesFeed::Dropped
+                        ) {
+                            tracing::warn!(revision, total_bytes, "peer file clipboard refused (over cap or malformed header)");
+                        }
+                    }
+                    Some(RemoteSignal::ClipboardFileStart {
+                        revision,
+                        name,
+                        total_bytes,
+                        chunks,
+                    }) => {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
+                            continue;
+                        };
+                        if !clipboard_frame_current(session.clipboard_enabled, revision, session.remote_clipboard_revision) {
+                            continue;
+                        }
+                        if matches!(
+                            files_assembly.feed_file_start(revision, &name, total_bytes, chunks, clipboard_max_bytes),
+                            FilesFeed::Dropped
+                        ) {
+                            tracing::warn!(revision, %name, "peer file header refused");
+                        }
+                    }
+                    Some(RemoteSignal::ClipboardFileChunk {
+                        revision,
+                        index,
+                        data,
+                    }) => {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
+                            continue;
+                        };
+                        if !clipboard_frame_current(session.clipboard_enabled, revision, session.remote_clipboard_revision) {
+                            continue;
+                        }
+                        if matches!(
+                            files_assembly.feed_file_chunk(revision, index, &data),
+                            FilesFeed::Dropped
+                        ) {
+                            tracing::warn!(revision, index, "peer file chunk aborted (mismatch)");
+                        }
+                    }
+                    Some(RemoteSignal::ClipboardFileEnd { revision }) => {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
+                            continue;
+                        };
+                        if !clipboard_frame_current(session.clipboard_enabled, revision, session.remote_clipboard_revision) {
+                            continue;
+                        }
+                        match files_assembly.feed_file_end(revision, &dir) {
+                            FilesFeed::FileReady(path) => {
+                                tracing::info!(path = %path.display(), "peer file staged");
+                            }
+                            FilesFeed::Dropped => {
+                                tracing::warn!(revision, "peer file failed validation; dropped");
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(RemoteSignal::ClipboardFilesEnd { revision, files }) => {
+                        let Some(session) = signal_session(from_active, &mut active, &mut parked) else {
+                            continue;
+                        };
+                        if !clipboard_frame_current(session.clipboard_enabled, revision, session.remote_clipboard_revision) {
+                            continue;
+                        }
+                        match files_assembly.feed_files_end(revision, files) {
+                            FilesFeed::Ready(staged) => {
+                                session.remote_clipboard_revision = revision;
+                                tracing::info!(files = staged.len(), "peer file clipboard ready");
+                                match apply_inbound_clipboard_files(&clipboard, &mut latest_files, revision, &staged) {
+                                    Ok(()) => {}
+                                    Err(error) => {
+                                        tracing::warn!(%error, "cannot apply peer file clipboard");
+                                    }
+                                }
+                            }
+                            FilesFeed::Dropped => {
+                                tracing::warn!(revision, "peer file list failed validation; dropped");
+                            }
+                            _ => {}
+                        }
+                    }
                     Some(RemoteSignal::Closed) | None => {
                         if !from_active {
                             if let Some(session) = parked.take() {
@@ -4330,6 +4442,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     initial_clipboard: ClipboardInitial {
                         text: latest_clipboard.clone(),
                         image: latest_image.clone(),
+                        files: latest_files.clone(),
                     },
                     clipboard_revision: &mut clipboard_revision,
                     clipboard_max_bytes: config.clipboard_max_bytes() as u64,
@@ -4486,6 +4599,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     initial_clipboard: ClipboardInitial {
                         text: latest_clipboard.clone(),
                         image: latest_image.clone(),
+                        files: latest_files.clone(),
                     },
                     clipboard_revision: &mut clipboard_revision,
                     clipboard_max_bytes: config.clipboard_max_bytes() as u64,
@@ -4513,8 +4627,8 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     // Stash for the next episode open (copy-then-cross):
                     // the copy happened while nobody was driven, so no
                     // live episode carries it — the open sends it as
-                    // initial instead. Both flavors tracked; the open
-                    // sends text first, then image (final OS state wins).
+                    // initial instead. All flavors tracked; the open
+                    // sends text first, then image, then files.
                     match &change {
                         ClipboardChanged::Text(text) => {
                             latest_clipboard = Some(text.clone());
@@ -4522,7 +4636,33 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                         ClipboardChanged::Image(paste) => {
                             latest_image = Some(paste.clone());
                         }
+                        ClipboardChanged::Files(files) => {
+                            latest_files = Some(files.clone());
+                        }
+                        ClipboardChanged::FilesOverLimit {
+                            total_bytes,
+                            limit_bytes,
+                        } => {
+                            // CB-05: one auto-dismissing notification on
+                            // the copying machine; the UI relay turns this
+                            // line into a toast (CB-13).
+                            tracing::info!(
+                                total_bytes,
+                                limit_bytes,
+                                "file clipboard over limit; notification raised, nothing transferred"
+                            );
+                            eprintln!(
+                                "THEKVM_STATUS clipboard-over-limit {} {}",
+                                total_bytes, limit_bytes
+                            );
+                            continue;
+                        }
+                        ClipboardChanged::ApplyFiles(_) => {}
                     }
+                    // Persist the newest post-activation copy (CB-09):
+                    // overwrites each time, so reconnects always carry
+                    // the truly latest one and never a growing queue.
+                    persist_clipboard_queue(&dir, &latest_clipboard, &latest_files);
                     let is_active = active.is_some();
                     let Some(session) = active
                         .as_mut()
@@ -5070,6 +5210,32 @@ enum RemoteSignal {
     },
     ClipboardImageEnd {
         revision: u64,
+    },
+    /// File-list transfer frames (CB-04): staged on the receiver and
+    /// applied as one file-list clipboard at FilesEnd. Assembled in the
+    /// drive loop like the text/image streams.
+    ClipboardFilesStart {
+        revision: u64,
+        total_bytes: u64,
+        files: u32,
+    },
+    ClipboardFileStart {
+        revision: u64,
+        name: String,
+        total_bytes: u64,
+        chunks: u32,
+    },
+    ClipboardFileChunk {
+        revision: u64,
+        index: u32,
+        data: String,
+    },
+    ClipboardFileEnd {
+        revision: u64,
+    },
+    ClipboardFilesEnd {
+        revision: u64,
+        files: u32,
     },
     Closed,
     /// The peer app answered a keep-alive Ping: the episode stream is
@@ -7971,6 +8137,47 @@ async fn drain_peer_responses(
             WireMessage::ClipboardImageEnd { revision } => {
                 let _ = signal.send(RemoteSignal::ClipboardImageEnd { revision });
             }
+            WireMessage::ClipboardFilesStart {
+                revision,
+                total_bytes,
+                files,
+            } => {
+                let _ = signal.send(RemoteSignal::ClipboardFilesStart {
+                    revision,
+                    total_bytes,
+                    files,
+                });
+            }
+            WireMessage::ClipboardFileStart {
+                revision,
+                name,
+                total_bytes,
+                chunks,
+            } => {
+                let _ = signal.send(RemoteSignal::ClipboardFileStart {
+                    revision,
+                    name,
+                    total_bytes,
+                    chunks,
+                });
+            }
+            WireMessage::ClipboardFileChunk {
+                revision,
+                index,
+                data,
+            } => {
+                let _ = signal.send(RemoteSignal::ClipboardFileChunk {
+                    revision,
+                    index,
+                    data,
+                });
+            }
+            WireMessage::ClipboardFileEnd { revision } => {
+                let _ = signal.send(RemoteSignal::ClipboardFileEnd { revision });
+            }
+            WireMessage::ClipboardFilesEnd { revision, files } => {
+                let _ = signal.send(RemoteSignal::ClipboardFilesEnd { revision, files });
+            }
             WireMessage::ClipboardEnd { revision } => {
                 let _ = signal.send(RemoteSignal::ClipboardEnd { revision });
             }
@@ -8234,7 +8441,7 @@ struct ClipboardAgent {
 #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "windows")))]
 struct ClipboardAgent;
 
-fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
+fn start_clipboard_agent(enabled: bool, max_bytes: u64) -> Option<ClipboardAgent> {
     if !enabled {
         return None;
     }
@@ -8246,6 +8453,7 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let clipboard_max_bytes = max_bytes;
         let join = std::thread::Builder::new()
             .name("thekvm-clipboard-agent".into())
             .spawn(move || {
@@ -8304,6 +8512,14 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                                     tracing::debug!(%error, "cannot apply remote clipboard image");
                                 }
                             }
+                            ClipboardChanged::ApplyFiles(paths) => {
+                                if let Err(error) = clipboard.set_files(&paths) {
+                                    tracing::debug!(%error, "cannot apply remote clipboard files");
+                                }
+                            }
+                            ClipboardChanged::Files(_) | ClipboardChanged::FilesOverLimit { .. } => {
+                                // Outbound-only changes never arrive here.
+                            }
                         }
                     }
                     // Deep-OS change events: the OS wakes this loop the
@@ -8338,6 +8554,43 @@ fn start_clipboard_agent(enabled: bool) -> Option<ClipboardAgent> {
                         Ok(None) => {}
                         Err(error) => {
                             tracing::debug!(%error, "cannot poll system clipboard");
+                        }
+                    }
+                    // File lists are polled on notices (and on the timed
+                    // fallback): the X11 conversion round-trip is
+                    // per-notice, never per tick.
+                    if notice
+                        || last_image_poll.is_none_or(|when: std::time::Instant| {
+                            when.elapsed() >= Duration::from_secs(2)
+                        })
+                    {
+                        match clipboard.poll_user_files(notice) {
+                            Ok(Some(paths)) => {
+                                let total =
+                                    kvm_platform::clipboard::file_list_total_bytes(&paths);
+                                if total > clipboard_max_bytes {
+                                    // CB-05: never transfer, never replace
+                                    // the peer clipboard; the drive loop
+                                    // raises the not-too-big notification.
+                                    let _ = change_tx.send(ClipboardChanged::FilesOverLimit {
+                                        total_bytes: total,
+                                        limit_bytes: clipboard_max_bytes,
+                                    });
+                                } else {
+                                    match kvm_platform::clipboard::load_file_list(&paths) {
+                                        Ok(files) => {
+                                            let _ = change_tx.send(ClipboardChanged::Files(files));
+                                        }
+                                        Err(error) => {
+                                            tracing::debug!(%error, "cannot load copied files");
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::debug!(%error, "cannot poll system file clipboard");
+                            }
                         }
                     }
                     // Image polling is gated, not per-tick: reading pixels
@@ -8423,6 +8676,12 @@ impl ClipboardAgent {
             .send(ClipboardChanged::Image(paste))
             .map_err(|error| anyhow::anyhow!("clipboard agent stopped: {error}"))
     }
+
+    fn apply_files(&self, paths: Vec<std::path::PathBuf>) -> Result<()> {
+        self.commands
+            .send(ClipboardChanged::ApplyFiles(paths))
+            .map_err(|error| anyhow::anyhow!("clipboard agent stopped: {error}"))
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "windows")))]
@@ -8436,6 +8695,10 @@ impl ClipboardAgent {
     }
 
     fn apply_image(&self, _paste: ImagePaste) -> Result<()> {
+        Ok(())
+    }
+
+    fn apply_files(&self, _paths: Vec<std::path::PathBuf>) -> Result<()> {
         Ok(())
     }
 }
@@ -8561,6 +8824,14 @@ async fn send_clipboard_change(
     let bytes = match &change {
         ClipboardChanged::Text(text) => text.len() as u64,
         ClipboardChanged::Image(paste) => paste.png_base64.len() as u64,
+        ClipboardChanged::Files(files) => files
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum(),
+        ClipboardChanged::ApplyFiles(_) | ClipboardChanged::FilesOverLimit { .. } => {
+            // Apply-only and notify-only changes never touch the wire.
+            return Ok(None);
+        }
     };
     if bytes > max_bytes {
         tracing::debug!(bytes, "skipping oversized clipboard paste");
@@ -8576,6 +8847,12 @@ async fn send_clipboard_change(
             send_clipboard_image(send, revision, paste.clone()).await?;
             Ok(Some((revision, ClipboardChanged::Image(paste))))
         }
+        ClipboardChanged::Files(files) => {
+            send_clipboard_files(send, revision, &files).await?;
+            Ok(Some((revision, ClipboardChanged::Files(files))))
+        }
+        // Return early above; never reached.
+        ClipboardChanged::ApplyFiles(_) | ClipboardChanged::FilesOverLimit { .. } => Ok(None),
     }
 }
 
@@ -8636,6 +8913,109 @@ async fn send_clipboard_text_inner(
     Ok(())
 }
 
+/// Send one file-list paste: FilesStart, then one FileStart/Chunk/End
+/// per file (base64 chunks like the image path), then FilesEnd with the
+/// count the receiver recompares. Same 2s freeze-proof bound.
+async fn send_clipboard_files(
+    send: &mut quinn::SendStream,
+    revision: u64,
+    files: &[(String, Vec<u8>)],
+) -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        send_clipboard_files_inner(send, revision, files),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("clipboard files send stalled"))??;
+    Ok(())
+}
+
+async fn send_clipboard_files_inner(
+    send: &mut quinn::SendStream,
+    revision: u64,
+    files: &[(String, Vec<u8>)],
+) -> Result<()> {
+    use base64::Engine as _;
+    let total_bytes: u64 = files
+        .iter()
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum();
+    write_frame(
+        send,
+        &WireMessage::ClipboardFilesStart {
+            revision,
+            total_bytes,
+            files: files.len() as u32,
+        },
+    )
+    .await?;
+    for (name, bytes) in files {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let chunks = split_base64_chunks(&encoded);
+        write_frame(
+            send,
+            &WireMessage::ClipboardFileStart {
+                revision,
+                name: sanitize_file_name(name),
+                total_bytes: bytes.len() as u64,
+                chunks: chunks.len() as u32,
+            },
+        )
+        .await?;
+        for (index, data) in chunks.into_iter().enumerate() {
+            write_frame(
+                send,
+                &WireMessage::ClipboardFileChunk {
+                    revision,
+                    index: index as u32,
+                    data: data.to_owned(),
+                },
+            )
+            .await?;
+        }
+        write_frame(send, &WireMessage::ClipboardFileEnd { revision }).await?;
+    }
+    write_frame(
+        send,
+        &WireMessage::ClipboardFilesEnd {
+            revision,
+            files: files.len() as u32,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Apply a fully received peer file list: stash the bytes for the
+/// copy-then-cross initial and publish the staged paths as a file-list
+/// clipboard via the agent (CB-04). Ordering is the caller's revision
+/// check; this only runs after a count-exact FilesEnd.
+fn apply_inbound_clipboard_files(
+    clipboard: &Option<ClipboardAgent>,
+    latest_files: &mut Option<Vec<(String, Vec<u8>)>>,
+    revision: u64,
+    staged: &[std::path::PathBuf],
+) -> Result<()> {
+    let mut files = Vec::with_capacity(staged.len());
+    for path in staged {
+        let bytes = std::fs::read(path).map_err(|error| {
+            anyhow::anyhow!("read staged file {}: {error}", path.display())
+        })?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_owned();
+        files.push((name, bytes));
+    }
+    *latest_files = Some(files);
+    if let Some(agent) = clipboard {
+        agent.apply_files(staged.to_vec())?;
+    }
+    let _ = revision;
+    Ok(())
+}
+
 /// Split base64 into wire-sized chunks. Base64 is ASCII, so any split
 /// point is safe — no char-boundary walk like the text path. Pure for
 /// tests.
@@ -8684,6 +9064,18 @@ async fn send_initial_clipboard(
                 bytes = paste.png_base64.len(),
                 "skipping oversized initial clipboard image"
             );
+        }
+    }
+    if let Some(files) = initial.files.as_ref() {
+        let total: u64 = files
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum();
+        if total <= clipboard_max_bytes && !files.is_empty() {
+            *clipboard_revision = clipboard_revision.wrapping_add(1);
+            send_clipboard_files(send, *clipboard_revision, files).await?;
+        } else {
+            tracing::debug!(bytes = total, "skipping oversized initial clipboard files");
         }
     }
     Ok(())
@@ -8846,13 +9238,61 @@ struct ImagePaste {
     height: u32,
 }
 
-/// One locally-observed clipboard change, text or image. The agent
+/// Relay payload for a file paste (ClipboardKind::Files): JSON
+/// `{"files":[{"name","b64"}]}`. Parses back on the far side.
+fn relay_files_json(files: &[(String, Vec<u8>)]) -> String {
+    use base64::Engine as _;
+    let entries: Vec<String> = files
+        .iter()
+        .map(|(name, bytes)| {
+            format!(
+                "{{\"name\":{},\"b64\":{}}}",
+                serde_json::to_string(name).unwrap_or_else(|_| "\"file\"".into()),
+                serde_json::to_string(&base64::engine::general_purpose::STANDARD.encode(bytes))
+                    .unwrap_or_else(|_| "\"\"".into())
+            )
+        })
+        .collect();
+    format!("{{\"files\":[{}]}}", entries.join(","))
+}
+
+fn parse_relay_files(payload: &str) -> Option<Vec<(String, Vec<u8>)>> {
+    use base64::Engine as _;
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let list = value.get("files")?.as_array()?;
+    let mut files = Vec::with_capacity(list.len());
+    for entry in list {
+        let name = entry.get("name")?.as_str()?.to_owned();
+        let b64 = entry.get("b64")?.as_str()?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .ok()?;
+        files.push((name, bytes));
+    }
+    Some(files)
+}
+
+/// One locally-observed clipboard change, text or image or files. The agent
 /// thread owns OS touch and reports these; the drive loop forwards
 /// them on the live episode (or stashes them for the next open).
 #[derive(Debug, Clone)]
 enum ClipboardChanged {
     Text(String),
     Image(ImagePaste),
+    /// A file copy under the link cap, bytes loaded (CB-04). The agent
+    /// loads them only after the aggregate stat is under the cap.
+    Files(Vec<(String, Vec<u8>)>),
+    /// Apply-only directive for the agent thread: publish these already-
+    /// staged paths as the OS file-list clipboard (CB-04 paste). Never
+    /// sent on the wire (see `send_clipboard_change`).
+    ApplyFiles(Vec<std::path::PathBuf>),
+    /// A file copy over the configured limit: nothing transfers and the
+    /// peer clipboard is untouched; the drive loop raises the CB-05
+    /// notification on the copying machine with the limit.
+    FilesOverLimit {
+        total_bytes: u64,
+        limit_bytes: u64,
+    },
 }
 
 /// The last known clipboard state in both flavors, sent as the initial
@@ -8862,6 +9302,9 @@ enum ClipboardChanged {
 struct ClipboardInitial {
     text: Option<String>,
     image: Option<ImagePaste>,
+    /// Last observed file copy (CB-04): resent on episode open exactly
+    /// like the text/image initial, so copy-then-cross delivers it.
+    files: Option<Vec<(String, Vec<u8>)>>,
 }
 
 /// Receiver-side assembly of one chunked IMAGE paste. Mirrors
@@ -8955,6 +9398,234 @@ impl ImageAssembly {
         };
         *self = Self::default();
         ImageFeed::Ready(paste)
+    }
+}
+
+/// Receiver-side assembly of one file-list transfer. One open transfer at
+/// a time (per link): a FilesStart header, then one FileStart/Chunk/End
+/// per file, then FilesEnd. Every size is counted decoded; the aggregate
+/// is checked against the link cap at FilesStart and per-file at
+/// FileStart, so a hostile peer can never force unbounded buffering
+/// (CB-08). Completed files are staged to `dir/clipboard-files/<rev>/`
+/// and published as one file-list clipboard at FilesEnd.
+#[derive(Default)]
+struct FilesAssembly {
+    active: bool,
+    revision: u64,
+    expected_files: u32,
+    done_files: u32,
+    aggregate_bytes: u64, // decoded bytes across completed files
+    name: String,
+    per_file_total: u64, // decoded bytes for the current file
+    per_file_total_b64: u64, // base64 length the chunks must sum to
+    per_file_chunks: u32,
+    per_file_index: u32,
+    per_file_received: u64,
+    buffer: String,
+    staged: Vec<std::path::PathBuf>,
+}
+
+enum FilesFeed {
+    Dropped,
+    Pending,
+    /// One file decoded and staged: path it landed at.
+    FileReady(std::path::PathBuf),
+    /// Whole list complete and count-exact.
+    Ready(Vec<std::path::PathBuf>),
+}
+
+impl FilesAssembly {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn feed_start(&mut self, revision: u64, total_bytes: u64, files: u32, max_bytes: u64) -> FilesFeed {
+        let old = std::mem::replace(self, Self::default());
+        // Stale staging from an aborted transfer is deleted on replace.
+        cleanup_staged_dir(&old.staged);
+        if total_bytes > max_bytes || files == 0 || files > 64 {
+            return FilesFeed::Dropped;
+        }
+        self.active = true;
+        self.revision = revision;
+        self.expected_files = files;
+        FilesFeed::Pending
+    }
+
+    /// Per-file header. Resets the previous file's buffer; the aggregate
+    /// plus this file must stay inside the transfer total.
+    fn feed_file_start(
+        &mut self,
+        revision: u64,
+        name: &str,
+        total_bytes: u64,
+        chunks: u32,
+        max_bytes: u64,
+    ) -> FilesFeed {
+        if !self.active
+            || revision != self.revision
+            || total_bytes == 0
+            || chunks == 0
+            || name.trim().is_empty()
+        {
+            return FilesFeed::Dropped;
+        }
+        let aggregate = self.aggregate_bytes.saturating_add(total_bytes);
+        if aggregate > max_bytes {
+            return FilesFeed::Dropped;
+        }
+        self.name = name.to_owned();
+        self.per_file_total = total_bytes;
+        // Chunks carry base64: the wire chunk count covers the CHARACTERS
+        // (4 * ceil(bytes/3)), not the decoded bytes. The validator's
+        // min-chunk rule is shared, so per-file chunk comparisons must be
+        // made in the same unit.
+        self.per_file_total_b64 = 4 * total_bytes.div_ceil(3);
+        self.per_file_chunks = chunks;
+        self.per_file_index = 0;
+        self.per_file_received = 0;
+        self.buffer.clear();
+        FilesFeed::Pending
+    }
+
+    fn feed_file_chunk(&mut self, revision: u64, index: u32, data: &str) -> FilesFeed {
+        if !self.active
+            || revision != self.revision
+            || self.per_file_chunks == 0
+            || index != self.per_file_index
+            || self.per_file_received + data.len() as u64 > self.per_file_total_b64
+        {
+            return FilesFeed::Dropped;
+        }
+        self.buffer.push_str(data);
+        self.per_file_received += data.len() as u64;
+        self.per_file_index += 1;
+        FilesFeed::Pending
+    }
+
+    /// Decode + stage the current file. Empty names were refused at the
+    /// header; the staged root is `dir/clipboard-files/<revision>` (see
+    /// [`stage_files_dir`]) and the cap-bounded sizes above mean the
+    /// decode can never allocate past the limit.
+    fn feed_file_end(&mut self, revision: u64, dir: &std::path::Path) -> FilesFeed {
+        if !self.active
+            || revision != self.revision
+            || self.per_file_chunks == 0
+            || self.per_file_index != self.per_file_chunks
+            || self.per_file_received != self.per_file_total_b64
+        {
+            return FilesFeed::Dropped;
+        }
+        use base64::Engine as _;
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(self.buffer.as_bytes()) {
+            Ok(bytes) if bytes.len() as u64 == self.per_file_total => bytes,
+            _ => return FilesFeed::Dropped,
+        };
+        let root = stage_files_root(dir).join(format!("{revision}"));
+        if std::fs::create_dir_all(&root).is_err() {
+            return FilesFeed::Dropped;
+        }
+        let safe = sanitize_file_name(&self.name);
+        let path = root.join(format!("{:08}-{}", self.done_files, safe));
+        if std::fs::write(&path, &bytes).is_err() {
+            return FilesFeed::Dropped;
+        }
+        self.aggregate_bytes += self.per_file_total;
+        self.done_files += 1;
+        self.staged.push(path.clone());
+        self.per_file_chunks = 0;
+        FilesFeed::FileReady(path)
+    }
+
+    fn feed_files_end(&mut self, revision: u64, files: u32) -> FilesFeed {
+        if !self.active
+            || revision != self.revision
+            || files != self.expected_files
+            || self.done_files != self.expected_files
+            || self.per_file_chunks != 0
+        {
+            return FilesFeed::Dropped;
+        }
+        let staged = std::mem::take(&mut self.staged);
+        *self = Self::default();
+        FilesFeed::Ready(staged)
+    }
+}
+
+/// Staging root for received file pastes under the daemon dir.
+fn stage_files_root(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("clipboard-files")
+}
+
+/// CB-09 offline queue: the newest post-activation copy is persisted so a
+/// temporarily unreachable peer still gets it on reconnect. Only the
+/// latest of each flavor is kept (never a growing queue); stale slots
+/// are replaced, not appended.
+fn persist_clipboard_queue(
+    dir: &std::path::Path,
+    text: &Option<String>,
+    files: &Option<Vec<(String, Vec<u8>)>>,
+) {
+    let payload = relay_files_json(&files.clone().unwrap_or_default());
+    let value = serde_json::json!({
+        "text": text,
+        "files": if files.is_some() { Some(payload) } else { None },
+    });
+    if let Some(parent) = dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let bytes = serde_json::to_vec(&value).unwrap_or_default();
+    let path = dir.join("clipboard-queue.json");
+    let _ = std::fs::write(path, bytes);
+}
+
+/// Load the CB-09 offline queue at drive-loop startup. Old/absent/corrupt
+/// state falls back to empty (CB-09-safe: never resurrected garbage).
+fn load_clipboard_queue(
+    dir: &std::path::Path,
+) -> (Option<String>, Option<Vec<(String, Vec<u8>)>>) {
+    let Ok(bytes) = std::fs::read(dir.join("clipboard-queue.json")) else {
+        return (None, None);
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return (None, None);
+    };
+    let text = value
+        .get("text")
+        .and_then(|text| text.as_str())
+        .map(str::to_owned);
+    let files = value
+        .get("files")
+        .and_then(|files| files.as_str())
+        .and_then(parse_relay_files);
+    (text, files)
+}
+
+/// Delete staged files from an aborted transfer.
+fn cleanup_staged_dir(staged: &[std::path::PathBuf]) {
+    for path in staged {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Bare basename for staged bytes: no separators, no control characters,
+/// so a hostile name can never escape the staging dir.
+fn sanitize_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || c == '/' || c == '\\' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches('.').trim().to_owned();
+    if cleaned.is_empty() {
+        "file".to_owned()
+    } else {
+        cleaned
     }
 }
 
@@ -9331,6 +10002,9 @@ async fn forward_local_clipboard_offer(
             width: offer.width,
             height: offer.height,
         }),
+        kvm_protocol::control::ClipboardKind::Files => {
+            ClipboardChanged::Files(parse_relay_files(&offer.payload).unwrap_or_default())
+        }
     };
     match send_clipboard_change(send, *clipboard_revision, change, max_bytes).await? {
         Some((revision, _)) => {
@@ -10697,7 +11371,7 @@ async fn handle_connection(
                 node_name,
                 fingerprint_hex,
                 pairing_code,
-                ..
+                client_kind,
             } => {
                 handle_pairing(
                     &conn,
@@ -10711,6 +11385,7 @@ async fn handle_connection(
                         node_name,
                         claimed_fingerprint: fingerprint_hex,
                         pairing_code,
+                        client_kind,
                     },
                 )
                 .await?;
@@ -11061,8 +11736,9 @@ async fn handle_connection(
             // The relay is part of the product on every desktop, so the
             // advertisement follows the MACHINE's capability and the
             // agent stays a local apply optimization.
+            let clipboard_max_bytes = config.clipboard_max_bytes() as u64;
             let mut clipboard_agent = if config.clipboard_enabled && hello.clipboard_enabled {
-                start_clipboard_agent(true)
+                start_clipboard_agent(true, clipboard_max_bytes)
             } else {
                 None
             };
@@ -11072,7 +11748,6 @@ async fn handle_connection(
             // would be a double borrow. Re-read by the arm's own `None`
             // case (the watch simply stops there).
             let mut clipboard_agent_present = clipboard_agent.is_some();
-            let clipboard_max_bytes = config.clipboard_max_bytes() as u64;
             // Open chunked-paste assembly for this association (see
             // ClipboardAssembly): bounded by the cap above.
             let mut clipboard_assembly = ClipboardAssembly::default();
@@ -11081,8 +11756,12 @@ async fn handle_connection(
             let mut latest_clipboard: Option<String> = None;
             // Last image paste applied from the peer (mirrors text).
             let mut latest_image: Option<ImagePaste> = None;
+            // Last file paste applied from the peer (mirrors text).
+            let mut latest_files_association: Option<Vec<(String, Vec<u8>)>> = None;
             // Open chunked-IMAGE assembly alongside the text one.
             let mut image_assembly = ImageAssembly::default();
+            // Open file-list assembly for this association.
+            let mut files_assembly_association = FilesAssembly::new();
             // Provision the native receiver before advertising an accepted
             // session. Otherwise a missing /dev/uinput device or unavailable
             // Windows interactive helper can make the sender believe input is
@@ -11861,6 +12540,96 @@ async fn handle_connection(
                                         tracing::warn!(revision, "peer clipboard image transfer failed validation; dropped");
                                     }
                                     ImageFeed::Pending => {}
+                                }
+                            }
+                            WireMessage::ClipboardFilesStart {
+                                revision,
+                                total_bytes,
+                                files,
+                            } if clipboard_enabled
+                                && revision > remote_clipboard_revision =>
+                            {
+                                if matches!(
+                                    files_assembly_association.feed_start(revision, total_bytes, files, clipboard_max_bytes),
+                                    FilesFeed::Dropped
+                                ) {
+                                    tracing::warn!(revision, total_bytes, "peer file clipboard refused (over cap or malformed header)");
+                                }
+                            }
+                            WireMessage::ClipboardFileStart {
+                                revision,
+                                name,
+                                total_bytes,
+                                chunks,
+                            } if clipboard_enabled
+                                && revision > remote_clipboard_revision =>
+                            {
+                                if matches!(
+                                    files_assembly_association.feed_file_start(revision, &name, total_bytes, chunks, clipboard_max_bytes),
+                                    FilesFeed::Dropped
+                                ) {
+                                    tracing::warn!(revision, %name, "peer file header refused");
+                                }
+                            }
+                            WireMessage::ClipboardFileChunk {
+                                revision,
+                                index,
+                                data,
+                            } if clipboard_enabled
+                                && revision > remote_clipboard_revision =>
+                            {
+                                if matches!(
+                                    files_assembly_association.feed_file_chunk(revision, index, &data),
+                                    FilesFeed::Dropped
+                                ) {
+                                    tracing::warn!(revision, index, "peer file chunk aborted (mismatch)");
+                                }
+                            }
+                            WireMessage::ClipboardFileEnd { revision }
+                                if clipboard_enabled
+                                    && revision > remote_clipboard_revision =>
+                            {
+                                match files_assembly_association.feed_file_end(revision, &audit_dir) {
+                                    FilesFeed::FileReady(path) => {
+                                        tracing::info!(path = %path.display(), "peer file staged");
+                                    }
+                                    FilesFeed::Dropped => {
+                                        tracing::warn!(revision, "peer file failed validation; dropped");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            WireMessage::ClipboardFilesEnd { revision, files }
+                                if clipboard_enabled
+                                    && revision > remote_clipboard_revision =>
+                            {
+                                match files_assembly_association.feed_files_end(revision, files) {
+                                    FilesFeed::Ready(staged) => {
+                                        remote_clipboard_revision = revision;
+                                        tracing::info!(files = staged.len(), "peer file clipboard ready");
+                                        // Stage paths under audit_dir (the
+                                        // association's data dir); the agent
+                                        // applies them, the relay stashes the
+                                        // bytes for the UI when no agent can.
+                                        apply_inbound_clipboard_files(
+                                            &clipboard_agent,
+                                            &mut latest_files_association,
+                                            revision,
+                                            &staged,
+                                        )?;
+                                        let json = relay_files_json(&latest_files_association.clone().unwrap_or_default());
+                                        stash_inbound_clipboard(
+                                            revision,
+                                            kvm_protocol::control::ClipboardKind::Files,
+                                            &json,
+                                            0,
+                                            0,
+                                        );
+                                    }
+                                    FilesFeed::Dropped => {
+                                        tracing::warn!(revision, "peer file list failed validation; dropped");
+                                    }
+                                    _ => {}
                                 }
                             }
                             WireMessage::Pong { .. } => {}
@@ -13248,6 +14017,9 @@ struct PairingRequest {
     /// against the rotating station code; a match pre-approves the pairing
     /// with no local click needed.
     pairing_code: Option<String>,
+    /// Device kind learned from the wire (desktop vs Android): stored in
+    /// the peer book so every roster can mark Android yellow.
+    client_kind: kvm_core::ClientKind,
 }
 
 async fn handle_pairing(
@@ -13264,6 +14036,7 @@ async fn handle_pairing(
         node_name,
         claimed_fingerprint,
         pairing_code,
+        client_kind,
     } = request;
     if claimed_fingerprint != actual_peer_fingerprint {
         reject(send, "pairing identity does not match the certificate").await?;
@@ -13395,10 +14168,11 @@ async fn handle_pairing(
     }
     let dialable_addr =
         std::net::SocketAddr::new(conn.remote_address().ip(), DEFAULT_PORT).to_string();
-    peers.write().await.pin_with_address(
+    peers.write().await.pin_with_kind(
         node_name,
         actual_peer_fingerprint.to_owned(),
         Some(dialable_addr),
+        client_kind,
     )?;
     // A completed pairing IS a link approval for the link born right
     // after it: the human approved this exact device seconds ago, so its
@@ -14862,6 +15636,76 @@ unsafe extern "system" fn windows_service_main(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn files_assembly_stages_then_applies_once() {
+        use base64::Engine as _;
+        let mut dir = std::env::temp_dir().join(format!(
+            "thekvm-files-assembly-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut assembly = super::FilesAssembly::new();
+        // Open one list of two files, aggregate 8 bytes.
+        assert!(matches!(
+            assembly.feed_start(7, 8, 2, 16),
+            super::FilesFeed::Pending
+        ));
+        // File A: "hi" (one chunk).
+        assert!(matches!(
+            assembly.feed_file_start(7, "hi.txt", 2, 1, 16),
+            super::FilesFeed::Pending
+        ));
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"hi");
+        assert!(matches!(
+            assembly.feed_file_chunk(7, 0, &b64),
+            super::FilesFeed::Pending
+        ));
+        let path_a = match assembly.feed_file_end(7, &dir) {
+            super::FilesFeed::FileReady(path) => path,
+            _ => panic!("file A should stage"),
+        };
+        assert_eq!(std::fs::read(&path_a).unwrap(), b"hi");
+        // File B: "ok!" (one chunk).
+        assert!(matches!(
+            assembly.feed_file_start(7, "ok.txt", 3, 1, 16),
+            super::FilesFeed::Pending
+        ));
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"ok!");
+        assert!(matches!(
+            assembly.feed_file_chunk(7, 0, &b64),
+            super::FilesFeed::Pending
+        ));
+        let _ = assembly.feed_file_end(7, &dir);
+        // Count-exact end applies once with two staged paths.
+        match assembly.feed_files_end(7, 2) {
+            super::FilesFeed::Ready(staged) => assert_eq!(staged.len(), 2),
+            _ => panic!("list should complete"),
+        }
+        // A stale duplicate end is now dropped (idempotency CB-07).
+        assert!(matches!(
+            assembly.feed_files_end(7, 2),
+            super::FilesFeed::Dropped
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn files_assembly_refuses_over_cap_and_lies() {
+        let mut assembly = super::FilesAssembly::new();
+        // Aggregate over the link cap refuses at the header (CB-08).
+        assert!(matches!(
+            assembly.feed_start(9, 100, 1, 16),
+            super::FilesFeed::Dropped
+        ));
+        // Malformed header refuses.
+        assert!(matches!(
+            assembly.feed_start(9, 4, 0, 16),
+            super::FilesFeed::Dropped
+        ));
+    }
     use super::*;
 
     #[test]
@@ -16400,6 +17244,7 @@ mod tests {
             name: "mint".into(),
             fingerprint_hex: fp.clone(),
             address: Some("192.168.1.6:42110".into()),
+            kind: kvm_core::ClientKind::Desktop,
         });
         assert_eq!(
             dialable_peer_address(&book, &fp, "mint", inbound),
@@ -16412,6 +17257,7 @@ mod tests {
             name: "mint".into(),
             fingerprint_hex: "bb".repeat(32),
             address: Some("192.168.1.6:42110".into()),
+            kind: kvm_core::ClientKind::Desktop,
         });
         assert_eq!(
             dialable_peer_address(&book, &fp, "mint", inbound),
@@ -16430,6 +17276,7 @@ mod tests {
             name: "mint".into(),
             fingerprint_hex: fp.clone(),
             address: Some("192.168.1.7:42110".into()),
+            kind: kvm_core::ClientKind::Desktop,
         });
         assert_eq!(
             dialable_peer_address(&book, &fp, "mint", inbound),

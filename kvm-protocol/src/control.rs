@@ -311,10 +311,13 @@ pub enum ControlRequest {
 
 /// Which flavor a relayed clipboard paste carries. Text travels as
 /// UTF-8; images travel PNG-encoded and base64-wrapped (JSON-safe).
+/// Files travel as one JSON payload `{"files":[{"name","b64"}]}` split
+/// into chunk strings by the existing offer assembly (CB-04 via relay).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipboardKind {
     Text,
     ImagePng,
+    Files,
 }
 
 /// One chunk of a relayed peer paste for

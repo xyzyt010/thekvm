@@ -142,13 +142,15 @@ struct TrustedPeer {
 
 // Minimal modern line icons: plus (add), trash (delete), radar
 // (discovery). All drawn, no font glyphs, no word-buttons.
+// DS-04: one family, one stroke, 36x36 hit targets, glyph optically
+// centred by bounding box.
 component IconButton inherits Rectangle {
     in property <bool> enabled: true;
     in property <string> glyph: "+";
     in property <color> glyph-color: Theme.text-2;
     callback clicked();
-    width: 34px;
-    height: 34px;
+    width: 36px;
+    height: 36px;
     border-radius: 9px;
     background: hit.has-hover && enabled ? Theme.hover : transparent;
     border-width: 1px;
@@ -159,23 +161,35 @@ component IconButton inherits Rectangle {
         clicked => { if (root.enabled) { root.clicked(); } }
     }
     accessible-role: button;
+    accessible-label: "Add a computer";
     accessible-action-default => { if (root.enabled) { root.clicked(); } }
     if root.glyph == "+" : Rectangle {
-        x: 11px;
-        y: 7px;
+        x: 12px;
+        y: 8px;
         width: 12px;
         height: 2px;
         border-radius: 1px;
         background: root.glyph-color;
     }
     if root.glyph == "+" : Rectangle {
-        x: 16px;
-        y: 2px;
+        x: 17px;
+        y: 3px;
         width: 2px;
         height: 12px;
         border-radius: 1px;
         background: root.glyph-color;
     }
+}
+
+// Vertical 3-dot overflow glyph (SET-06): 18px in a 36px box, dots
+// centred on the box centre, same family/weight as the trash.
+component OverflowIcon inherits Rectangle {
+    width: 18px;
+    height: 18px;
+    background: transparent;
+    Rectangle { x: 7px; y: 2px; width: 4px; height: 4px; border-radius: 2px; background: Theme.text-2; }
+    Rectangle { x: 7px; y: 7px; width: 4px; height: 4px; border-radius: 2px; background: Theme.text-2; }
+    Rectangle { x: 7px; y: 12px; width: 4px; height: 4px; border-radius: 2px; background: Theme.text-2; }
 }
 
 // Delete: Google Fonts Material Symbols "delete" (24dp, outlined,
@@ -383,7 +397,7 @@ component KvmButton inherits Rectangle {
         width: parent.width;
         text: root.text;
         color: (root.primary || root.danger) && root.enabled ? #ffffff : Theme.text;
-        font-size: 13px;
+        font-size: 14px;
         font-weight: 600;
         vertical-alignment: center;
         horizontal-alignment: center;
@@ -421,7 +435,7 @@ component DeviceDropdown inherits Rectangle {
         text: root.labels.length > 0 && root.current-index >= 0 && root.current-index < root.labels.length
             ? root.labels[root.current-index] : "No nearby computers";
         color: root.labels.length > 0 ? Theme.text : Theme.faint;
-        font-size: 13px;
+        font-size: 14px;
         font-weight: 600;
         vertical-alignment: center;
         overflow: elide;
@@ -455,7 +469,7 @@ component DeviceDropdown inherits Rectangle {
                 if root.labels.length == 0 : Text {
                     text: "No nearby computers — press Scan";
                     color: Theme.faint;
-                    font-size: 13px;
+                    font-size: 14px;
                     vertical-alignment: center;
                 }
                 for label[i] in root.labels : Rectangle {
@@ -471,7 +485,7 @@ component DeviceDropdown inherits Rectangle {
                         width: parent.width - 20px;
                         text: label;
                         color: Theme.text-2;
-                        font-size: 13px;
+                        font-size: 14px;
                         font-weight: i == root.current-index ? 700 : 500;
                         vertical-alignment: center;
                         overflow: elide;
@@ -483,11 +497,12 @@ component DeviceDropdown inherits Rectangle {
 }
 
 // Close (hide the card): a real cross, no button chrome.
+// DS-04: 32px hit target, glyph optically centred.
 component CloseButton inherits Rectangle {
     in property <bool> enabled: true;
     callback clicked();
-    width: 26px;
-    height: 26px;
+    width: 32px;
+    height: 32px;
     border-radius: 6px;
     background: hit.has-hover && enabled ? Theme.border : transparent;
     opacity: enabled ? 1 : 0.45;
@@ -499,8 +514,8 @@ component CloseButton inherits Rectangle {
     accessible-label: "Hide nearby devices";
     accessible-action-default => { if (root.enabled) { root.clicked(); } }
     Path {
-        x: 7px;
-        y: 7px;
+        x: 10px;
+        y: 10px;
         width: 12px;
         height: 12px;
         viewbox-width: 12;
@@ -514,13 +529,14 @@ component CloseButton inherits Rectangle {
 
 // Rescan: the refresh arrow, replaced by the shared donut while a scan
 // runs, so the button itself shows the work in progress.
+// DS-04: 32px hit target, glyph optically centred.
 component RescanButton inherits Rectangle {
     in property <bool> scanning: false;
     in property <bool> enabled: true;
     in property <int> tick: 0;
     callback clicked();
-    width: 26px;
-    height: 26px;
+    width: 32px;
+    height: 32px;
     border-radius: 6px;
     background: hit.has-hover && enabled && !scanning ? Theme.border : transparent;
     opacity: enabled ? 1 : 0.45;
@@ -533,8 +549,8 @@ component RescanButton inherits Rectangle {
     accessible-action-default => { if (root.enabled && !root.scanning) { root.clicked(); } }
     if !scanning : Path {
         // Standard refresh shape: a circular arrow with a solid head.
-        x: 5px;
-        y: 5px;
+        x: 8px;
+        y: 8px;
         width: 16px;
         height: 16px;
         viewbox-width: 24;
@@ -622,7 +638,7 @@ component MonitorCard inherits Rectangle {
                 width: 126px;
                 text: root.title;
                 color: root.local ? #6ee7b7 : #78716c;
-                font-size: 8px;
+                font-size: 10px;
                 font-weight: 800;
                 letter-spacing: 1.2px;
                 horizontal-alignment: center;
@@ -1311,7 +1327,7 @@ component EdgeModeTile inherits Rectangle {
         Text {
             text: root.label;
             color: root.selected ? #e5e7eb : Theme.faint;
-            font-size: 13px;
+            font-size: 14px;
             font-weight: 700;
             horizontal-alignment: center;
         }
@@ -1459,7 +1475,7 @@ component RoleRow inherits Rectangle {
                 color: Theme.text;
                 // Same 13px size as every other label: the role name is
                 // the same size closed and expanded.
-                font-size: 13px;
+                font-size: 14px;
                 font-weight: 600;
                 vertical-alignment: center;
                 overflow: elide;
@@ -1467,7 +1483,7 @@ component RoleRow inherits Rectangle {
             Text {
                 text: root.caption;
                 color: Theme.faint;
-                font-size: 9px;
+                font-size: 12px;
                 font-weight: 400;
                 vertical-alignment: center;
                 overflow: elide;
@@ -1592,7 +1608,7 @@ component RoleDropdown inherits Rectangle {
                 color: Theme.text;
                 // Same 13px size as the closed pill: the role name never
                 // changes size between closed and open.
-                font-size: 13px;
+                font-size: 14px;
                 font-weight: 600;
                 vertical-alignment: center;
                 overflow: elide;
@@ -1693,7 +1709,7 @@ component Disclosure inherits Rectangle {
         Text {
             text: root.label;
             color: Theme.text-2;
-            font-size: 13px;
+            font-size: 14px;
             font-weight: 700;
             vertical-alignment: center;
         }
@@ -1879,6 +1895,26 @@ export component AppWindow inherits Window {
     // the popup asks first, then revokes.
     in-out property <string> pending-delete: "";
     in-out property <string> pending-delete-name: "";
+    // Overflow-menu state (SET-06): rename editor target.
+    in-out property <string> rename-peer-fp: "";
+    in-out property <string> rename-peer-name: "";
+    // CB-13 toast: smart auto-dismissing notification (non-modal, never
+    // steals focus). The 5s Timer clears it; the user can dismiss it with
+    // the x. Currently used for the over-limit file clipboard (CB-05).
+    in-out property <string> clipboard-toast: "";
+    callback peer-view-details(string /* fingerprint */);
+    callback peer-show-keys(string /* fingerprint */);
+    callback peer-copy-address(string /* fingerprint */);
+    callback peer-rename(string /* fingerprint */, string /* current name */);
+    callback peer-save-rename(string /* fingerprint */, string /* new name */);
+    // Connect roster (CON-03): the complete machine list — every row's
+    // name, address and state text, fed by the Rust side per status poll.
+    in-out property <[string]> roster-names: [];
+    in-out property <[string]> roster-addresses: [];
+    in-out property <[string]> roster-states: [];
+    in-out property <[string]> roster-fingerprints: [];
+    // Dev-10 state vocabulary: one label per state, shared by roster +
+    // Devices. Values: Live, Connecting, Idle, Discovered, Error.
     // Discovery sheet (Settings +): green radar sweep while scanning,
     // then the found devices as tappable rows.
     in-out property <bool> discovery-open: false;
@@ -2061,7 +2097,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: "Nearby devices";
                                     color: Theme.text;
-                                    font-size: 13px;
+                                    font-size: 14px;
                                     font-weight: 700;
                                     vertical-alignment: center;
                                 }
@@ -2197,39 +2233,77 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    // ---- This computer + link status ----------------------
-                    // The box only selects and acts. Identity lives below:
-                    // this computer's address, a subtle line, then the
-                    // link state — green dot + the peer's IP when live,
-                    // plain grey dot when idle. No name, no extra chrome.
+                    // ---- This computer / Connected computer (CON-02) ---
+                    // Two rows on ONE grid: the status dots share a single
+                    // 24px column at the same baseline and both labels start
+                    // on the same vertical line. Connected text never shifts
+                    // the grid. Vocabulary: Live / Connecting / Idle.
                     Text {
                         vertical-stretch: 0;
-                        text: root.local-address == ""
-                            ? "This computer"
-                            : "This computer · " + root.local-address;
-                        color: Theme.faint;
-                        font-size: 13px;
-                        overflow: elide;
+                        text: "Computers";
+                        color: Theme.text;
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
                     }
-                    Rectangle {
-                        vertical-stretch: 0; height: 1px; background: Theme.border; }
                     HorizontalLayout {
                         vertical-stretch: 0;
-                        height: 36px;
-                        spacing: 9px;
-                        alignment: start;
-                        if link-connecting && !session-verified : VerticalLayout {
-                            width: 18px;
+                        height: 40px;
+                        spacing: 8px;
+                        alignment: center;
+                        VerticalLayout {
+                            width: 24px;
                             alignment: center;
-                            SpinnerArc {
+                            Rectangle {
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                background: #22c55e;
+                            }
+                        }
+                        Text {
+                            text: "This computer";
+                            color: Theme.text;
+                            font-size: 14px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.device-name == "" ? "" : root.device-name;
+                            color: Theme.faint;
+                            font-size: 14px;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.local-address == "" ? "—" : root.local-address;
+                            color: Theme.text-2;
+                            font-size: 14px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "Live";
+                            color: #22c55e;
+                            font-size: 14px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                    }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        height: 40px;
+                        spacing: 8px;
+                        alignment: center;
+                        VerticalLayout {
+                            width: 24px;
+                            alignment: center;
+                            if link-connecting && !session-verified : SpinnerArc {
                                 diameter: 18px;
                                 tick: root.spinner-tick;
                             }
-                        }
-                        if !link-connecting || session-verified : VerticalLayout {
-                            width: 18px;
-                            alignment: center;
-                            Rectangle {
+                            if !link-connecting || session-verified : Rectangle {
                                 width: 10px;
                                 height: 10px;
                                 border-radius: 5px;
@@ -2237,20 +2311,119 @@ export component AppWindow inherits Window {
                             }
                         }
                         Text {
-                            text: session-text;
-                            color: session-active ? (session-verified ? #22c55e : #f59e0b) : Theme.faint;
-                            font-size: 13px;
-                            font-weight: 500;
+                            text: root.linked-peer-name == "" ? "Connected computer" : root.linked-peer-name;
+                            color: Theme.text;
+                            font-size: 14px;
+                            font-weight: 700;
                             vertical-alignment: center;
-                            wrap: word-wrap;
                         }
-                        if driving-text != "" : Text {
-                            text: driving-text;
-                            color: #34d399;
+                        Text {
+                            text: root.linked-peer-name == "" ? "" : "Connected computer";
+                            color: Theme.faint;
+                            font-size: 14px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text {
+                            text: root.details-peer-address == "" ? "—" : root.details-peer-address;
+                            color: Theme.text-2;
+                            font-size: 14px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: session-verified ? "Live" : (link-connecting || session-active ? "Connecting" : "Idle");
+                            color: session-verified ? #22c55e : (link-connecting || session-active ? #f59e0b : Theme.faint);
+                            font-size: 14px;
+                            font-weight: 700;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
+                    if driving-text != "" : Text {
+                        vertical-stretch: 0;
+                        text: driving-text;
+                        color: #34d399;
+                        font-size: 14px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        vertical-stretch: 0;
+                        text: session-text;
+                        color: Theme.faint;
+                        font-size: 12px;
+                        overflow: elide;
+                        wrap: word-wrap;
+                    }
+                    Rectangle {
+                        vertical-stretch: 0; height: 1px; background: Theme.border; }
+                    // ---- Complete roster (CON-03) -----------------------
+                    // EVERY known computer, one per row: trusted peers,
+                    // then discovered devices. Android rows show a yellow
+                    // dot + an "Android" platform label. The connected row
+                    // above is primary but never the only row.
+                    Text {
+                        vertical-stretch: 0;
+                        text: "All computers (" + root.roster-names.length + ")";
+                        color: Theme.faint;
+                        font-size: 14px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    for i in root.roster-names.length : HorizontalLayout {
+                        vertical-stretch: 0;
+                        height: 40px;
+                        spacing: 8px;
+                        alignment: center;
+                        VerticalLayout {
+                            width: 24px;
+                            alignment: center;
+                            Rectangle {
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                background: root.roster-states[i] == "Live" ? #22c55e
+                                    : root.roster-states[i] == "Android · Live" ? #facc15
+                                    : root.roster-states[i] == "Android" ? #facc15
+                                    : root.roster-states[i] == "Connecting" ? #f59e0b
+                                    : root.roster-states[i] == "Error" ? #f87171
+                                    : root.roster-states[i] == "Discovered" ? #5eead4
+                                    : Theme.border-strong;
+                            }
+                        }
+                        Text {
+                            text: root.roster-names[i];
+                            color: Theme.text;
                             font-size: 14px;
                             font-weight: 600;
+                            overflow: elide;
+                            horizontal-stretch: 1;
                             vertical-alignment: center;
                         }
+                        Text {
+                            text: root.roster-addresses[i];
+                            color: Theme.text-2;
+                            font-size: 14px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            width: 80px;
+                            text: root.roster-states[i];
+                            color: root.roster-states[i] == "Android · Live" ? #facc15 : Theme.faint;
+                            font-size: 14px;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
+                    if root.roster-names.length == 0 : Text {
+                        vertical-stretch: 0;
+                        text: "No computers yet. Press + in Settings to add one.";
+                        color: Theme.faint;
+                        font-size: 14px;
+                        wrap: word-wrap;
                     }
 
                     // ---- Pairing code ------------------------------------
@@ -2265,7 +2438,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Pairing code";
                             color: Theme.faint;
-                            font-size: 13px;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2289,7 +2462,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Does " + (pending-peer-name == "" ? "the other computer" : pending-peer-name) + " show this code?";
                             color: #f59e0b;
-                            font-size: 13px;
+                            font-size: 14px;
                             font-weight: 700;
                             wrap: word-wrap;
                         }
@@ -2330,7 +2503,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Incoming pairing · " + incoming-pairing;
                             color: #f59e0b;
-                            font-size: 13px;
+                            font-size: 14px;
                             font-weight: 700;
                             wrap: word-wrap;
                         }
@@ -2372,7 +2545,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Link request · " + incoming-link;
                             color: #6ee7b7;
-                            font-size: 13px;
+                            font-size: 14px;
                             font-weight: 700;
                             wrap: word-wrap;
                         }
@@ -2430,15 +2603,21 @@ export component AppWindow inherits Window {
                     padding: 12px;
                     spacing: 12px;
 
-                    // ---- Computers ---------------------------------------
+                    // ---- Computers (DEV-01: title, roster summary) ------
                     HorizontalLayout {
                         vertical-stretch: 0;
                         spacing: 10px;
                         Text {
                             text: "Computers";
                             color: Theme.text;
-                            font-size: 13px;
+                            font-size: 16px;
                             font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.roster-names.length == 0 ? "0" : root.roster-names.length + " known";
+                            color: Theme.faint;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         if discovery-scanning : SpinnerArc {
@@ -2462,6 +2641,9 @@ export component AppWindow inherits Window {
                                 mouse-cursor: pointer;
                                 clicked => { root.details-expanded = !root.details-expanded; }
                             }
+                            accessible-role: button;
+                            accessible-label: root.details-expanded ? "Hide computer details" : "Show computer details";
+                            accessible-expanded: root.details-expanded;
                             HorizontalLayout {
                                 padding-left: 8px;
                                 padding-right: 6px;
@@ -2483,6 +2665,82 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                    // ---- Per-computer rows (DEV-03/04): one primary
+                    // state per computer, from the single vocabulary
+                    // Live / Connecting / Idle / Discovered / Error.
+                    // Only actions valid for the current state appear.
+                    for i in root.roster-names.length : Rectangle {
+                        vertical-stretch: 0;
+                        height: 48px;
+                        border-radius: 10px;
+                        background: Theme.bg;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 8px;
+                            spacing: 8px;
+                            alignment: center;
+                            VerticalLayout {
+                                width: 24px;
+                                alignment: center;
+                                Rectangle {
+                                    width: 10px;
+                                    height: 10px;
+                                    border-radius: 5px;
+                                    background: root.roster-states[i] == "Live" ? #22c55e
+                                        : root.roster-states[i] == "Android · Live" ? #facc15
+                                        : root.roster-states[i] == "Android" ? #facc15
+                                        : root.roster-states[i] == "Connecting" ? #f59e0b
+                                        : root.roster-states[i] == "Error" ? #f87171
+                                        : root.roster-states[i] == "Discovered" ? #5eead4
+                                        : Theme.border-strong;
+                                }
+                            }
+                            Text {
+                                text: root.roster-names[i];
+                                color: Theme.text;
+                                font-size: 14px;
+                                font-weight: 600;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: root.roster-addresses[i];
+                                color: Theme.text-2;
+                                font-size: 14px;
+                                overflow: elide;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                width: 80px;
+                                text: root.roster-states[i];
+                                color: Theme.faint;
+                                font-size: 14px;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                            KvmButton {
+                                text: "Details";
+                                enabled: root.roster-fingerprints[i] != "";
+                                clicked => { root.peer-view-details(root.roster-fingerprints[i]); }
+                            }
+                            if root.roster-states[i] == "Idle" || root.roster-states[i] == "Discovered" || root.roster-states[i] == "Android" : KvmButton {
+                                text: "Connect";
+                                primary: true;
+                                enabled: !session-active && root.roster-addresses[i] != "";
+                                clicked => { connect-to(root.roster-addresses[i], ""); }
+                            }
+                        }
+                    }
+                    if root.roster-names.length == 0 : Text {
+                        vertical-stretch: 0;
+                        text: "No computers yet. Press Scan, or add one with + in Settings.";
+                        color: Theme.faint;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
                     // Expanded per-computer detail, collapsible inline.
                     if root.details-expanded : Rectangle {
                         vertical-stretch: 0;
@@ -2498,7 +2756,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: "Computer details";
                                     color: Theme.text;
-                                    font-size: 13px;
+                                    font-size: 16px;
                                     font-weight: 700;
                                     vertical-alignment: center;
                                 }
@@ -2511,20 +2769,22 @@ export component AppWindow inherits Window {
                                 spacing: 14px;
                                 VerticalLayout {
                                     spacing: 3px;
-                                    Text { text: "THIS COMPUTER"; color: #6ee7b7; font-size: 9px; font-weight: 800; letter-spacing: 1.3px; }
-                                    Text { text: root.device-name == "" ? "Unknown" : root.device-name; color: Theme.text; font-size: 13px; font-weight: 700; wrap: word-wrap; }
+                                    Text { text: "THIS COMPUTER"; color: #6ee7b7; font-size: 12px; font-weight: 800; letter-spacing: 1.3px; }
+                                    Text { text: root.device-name == "" ? "Unknown" : root.device-name; color: Theme.text; font-size: 14px; font-weight: 700; wrap: word-wrap; }
                                     Text { text: "LAN · " + (root.local-address == "" ? "…" : root.local-address); color: Theme.text-2; font-size: 14px; wrap: word-wrap; }
-                                    Text { text: "Fingerprint · " + root.fingerprint; color: Theme.muted; font-size: 9px; wrap: word-wrap; letter-spacing: 0.5px; }
+                                    Text { text: "Fingerprint · " + root.fingerprint; color: Theme.muted; font-size: 12px; wrap: word-wrap; letter-spacing: 0.5px; }
                                     Text { text: "Role · " + root.role-text; color: Theme.faint; font-size: 14px; }
                                 }
                                 Rectangle { width: 1px; background: Theme.border; vertical-stretch: 1; }
                                 VerticalLayout {
                                     spacing: 3px;
-                                    Text { text: "LINKED COMPUTER"; color: #5eead4; font-size: 9px; font-weight: 800; letter-spacing: 1.3px; }
-                                    Text { text: root.linked-peer-name == "" ? "Not paired yet" : root.linked-peer-name; color: Theme.text; font-size: 13px; font-weight: 700; wrap: word-wrap; }
+                                    Text { text: "LINKED COMPUTER"; color: #5eead4; font-size: 12px; font-weight: 800; letter-spacing: 1.3px; }
+                                    Text { text: root.linked-peer-name == "" ? "Not paired yet" : root.linked-peer-name; color: Theme.text; font-size: 14px; font-weight: 700; wrap: word-wrap; }
                                     Text { text: "Address · " + (root.details-peer-address == "" ? "unknown" : root.details-peer-address); color: Theme.text-2; font-size: 14px; wrap: word-wrap; }
-                                    Text { text: "Fingerprint · " + (root.details-peer-fingerprint == "" ? "unknown" : root.details-peer-fingerprint); color: Theme.muted; font-size: 9px; wrap: word-wrap; letter-spacing: 0.5px; }
-                                    Text { text: "Link · " + (session-active ? "live" : "idle"); color: Theme.faint; font-size: 14px; }
+                                    Text { text: "Fingerprint · " + (root.details-peer-fingerprint == "" ? "unknown" : root.details-peer-fingerprint); color: Theme.muted; font-size: 12px; wrap: word-wrap; letter-spacing: 0.5px; }
+                                    Text { text: "Link · " + (session-verified ? "Live" : (link-connecting || session-active ? "Connecting" : "Idle")); color: Theme.faint; font-size: 14px; }
+                                    Text { text: "Trust · Allowed"; color: Theme.faint; font-size: 14px; }
+                                    Text { text: "Capabilities · Control, Clipboard"; color: Theme.faint; font-size: 14px; }
                                 }
                             }
                         }
@@ -2547,7 +2807,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Screen arrangement";
                             color: Theme.text;
-                            font-size: 13px;
+                            font-size: 16px;
                             font-weight: 700;
                             vertical-alignment: center;
                         }
@@ -2597,7 +2857,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Crossing edges";
                             color: Theme.text;
-                            font-size: 13px;
+                            font-size: 16px;
                             font-weight: 700;
                             vertical-alignment: center;
                         }
@@ -2846,7 +3106,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Start when I log in";
                             color: root.autostart-supported && !root.autostart-busy ? Theme.text-2 : Theme.faint;
-                            font-size: 13px;
+                            font-size: 14px;
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
@@ -2936,10 +3196,9 @@ export component AppWindow inherits Window {
                     Rectangle {
                         vertical-stretch: 0; height: 1px; background: Theme.border; }
 
-                    // ---- Allowed connections ------------------------------
-                    // Icon-first list: plus (opens the discovery sheet) at
-                    // the top-left, one row per computer with a red trash
-                    // icon. No word-buttons.
+                    // SET-01: the plus and the title are ONE header row —
+                    // same centre line, same gap, aligned to the content
+                    // gutter, 36px target, section-size title.
                     HorizontalLayout {
                         vertical-stretch: 0;
                         spacing: 8px;
@@ -2951,26 +3210,158 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Allowed connections";
                             color: Theme.text;
-                            font-size: 13px;
+                            font-size: 16px;
                             font-weight: 700;
                             vertical-alignment: center;
                         }
                     }
-                    for peer in root.trusted-peers : Rectangle {
+                    // SET-02/03/04/05/06: fixed anatomy, left to right —
+                    // index; name; 32px hairline separator; IP; flexible
+                    // spacer; 3-dot overflow; trash at the far right edge.
+                    // The order never changes; delete is rightmost.
+                    for peer[i] in root.trusted-peers : Rectangle {
                         vertical-stretch: 0;
                         height: 48px;
                         border-radius: 10px;
-                        background: Theme.bg;
+                        background: row-hover.has-hover ? Theme.hover : Theme.bg;
                         border-width: 1px;
                         border-color: Theme.border;
+                        row-hover := TouchArea { mouse-cursor: pointer; }
                         HorizontalLayout {
-                            padding-left: 6px;
-                            padding-right: 12px;
-                            spacing: 10px;
+                            padding-left: 12px;
+                            padding-right: 8px;
+                            spacing: 8px;
                             alignment: center;
+                            // SET-03: one-based index, right-aligned in a
+                            // fixed column so every name starts together.
+                            Text {
+                                width: 28px;
+                                text: (i + 1) + ".";
+                                color: Theme.muted;
+                                font-size: 14px;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                            // Fixed columns (SET-02 acceptance): name and
+                            // IP share one column edge across EVERY row.
+                            Text {
+                                width: 200px;
+                                text: peer.name == "" ? "Unnamed computer" : peer.name;
+                                color: Theme.text;
+                                font-size: 14px;
+                                font-weight: 600;
+                                overflow: elide;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                            }
+                            // SET-04: one 1px hairline, 32px, centred.
                             Rectangle {
-                                width: 34px;
-                                height: 34px;
+                                width: 32px;
+                                height: 1px;
+                                background: Theme.border-strong;
+                            }
+                            Text {
+                                width: 170px;
+                                text: peer.address == "" ? "—" : peer.address;
+                                color: Theme.text-2;
+                                font-size: 14px;
+                                overflow: elide;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            // SET-06: 3-dot overflow, immediately left of
+                            // the trash, 36x36, opens a menu with the five
+                            // documented actions. Closes on outside click
+                            // or Escape (PopupWindow close-on-click-outside).
+                            Rectangle {
+                                width: 36px;
+                                height: 36px;
+                                border-radius: 8px;
+                                background: over-hit.has-hover ? Theme.hover : transparent;
+                                over-hit := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if (over-popup.is-open) { over-popup.close(); } else { over-popup.show(); }
+                                    }
+                                }
+                                accessible-role: button;
+                                accessible-label: "More actions for " + peer.name + ", row " + (i + 1) + " of " + root.trusted-peers.length;
+                                accessible-action-default => { over-popup.show(); }
+                                OverflowIcon { x: 9px; y: 9px; }
+                                over-popup := PopupWindow {
+                                    x: parent.width - 220px;
+                                    y: 40px;
+                                    width: 220px;
+                                    height: 5 * 36px + 8px;
+                                    close-policy: close-on-click-outside;
+                                    Rectangle {
+                                        width: 100%;
+                                        height: 100%;
+                                        background: Theme.surface;
+                                        border-radius: 11px;
+                                        border-width: 1px;
+                                        border-color: Theme.border;
+                                        clip: true;
+                                        VerticalLayout {
+                                            padding: 4px;
+                                            spacing: 2px;
+                                            alignment: start;
+                                            Rectangle {
+                                                height: 36px;
+                                                border-radius: 8px;
+                                                background: m1-hit.has-hover ? Theme.hover : transparent;
+                                                m1-hit := TouchArea { mouse-cursor: pointer; clicked => { over-popup.close(); root.peer-view-details(peer.fingerprint); } }
+                                                accessible-role: button;
+                                                accessible-label: "View details for " + peer.name;
+                                                Text { x: 12px; width: parent.width - 24px; text: "View details"; color: Theme.text; font-size: 14px; vertical-alignment: center; overflow: elide; }
+                                            }
+                                            Rectangle {
+                                                height: 36px;
+                                                border-radius: 8px;
+                                                background: m2-hit.has-hover ? Theme.hover : transparent;
+                                                m2-hit := TouchArea { mouse-cursor: pointer; clicked => { over-popup.close(); root.peer-show-keys(peer.fingerprint); } }
+                                                accessible-role: button;
+                                                accessible-label: "Device keys and fingerprint for " + peer.name;
+                                                Text { x: 12px; width: parent.width - 24px; text: "Device keys and fingerprint"; color: Theme.text; font-size: 14px; vertical-alignment: center; overflow: elide; }
+                                            }
+                                            Rectangle {
+                                                height: 36px;
+                                                border-radius: 8px;
+                                                background: m3-hit.has-hover ? Theme.hover : transparent;
+                                                m3-hit := TouchArea { mouse-cursor: pointer; clicked => { over-popup.close(); root.peer-copy-address(peer.fingerprint); } }
+                                                accessible-role: button;
+                                                accessible-label: "Copy address of " + peer.name;
+                                                Text { x: 12px; width: parent.width - 24px; text: "Copy address"; color: Theme.text; font-size: 14px; vertical-alignment: center; overflow: elide; }
+                                            }
+                                            Rectangle {
+                                                height: 36px;
+                                                border-radius: 8px;
+                                                background: m4-hit.has-hover ? Theme.hover : transparent;
+                                                m4-hit := TouchArea { mouse-cursor: pointer; clicked => { over-popup.close(); root.peer-rename(peer.fingerprint, peer.name); } }
+                                                accessible-role: button;
+                                                accessible-label: "Rename " + peer.name;
+                                                Text { x: 12px; width: parent.width - 24px; text: "Rename"; color: Theme.text; font-size: 14px; vertical-alignment: center; overflow: elide; }
+                                            }
+                                            Rectangle {
+                                                height: 36px;
+                                                border-radius: 8px;
+                                                background: m5-hit.has-hover ? #f8717118 : transparent;
+                                                m5-hit := TouchArea { mouse-cursor: pointer; clicked => { over-popup.close(); root.pending-delete = peer.fingerprint; root.pending-delete-name = peer.name == "" ? "Unnamed computer" : peer.name; } }
+                                                accessible-role: button;
+                                                accessible-label: "Remove " + peer.name;
+                                                Text { x: 12px; width: parent.width - 24px; text: "Remove"; color: #f87171; font-size: 14px; vertical-alignment: center; overflow: elide; }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // SET-05: trash, 18px glyph optically centred
+                            // in a 36x36 target, aligned with the overflow,
+                            // at the far right edge.
+                            Rectangle {
+                                width: 36px;
+                                height: 36px;
                                 border-radius: 8px;
                                 background: del-hit.has-hover ? #f8717118 : transparent;
                                 del-hit := TouchArea {
@@ -2981,33 +3372,66 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 accessible-role: button;
-                                accessible-label: "Remove " + peer.name;
+                                accessible-label: "Remove " + peer.name + ", row " + (i + 1) + " of " + root.trusted-peers.length;
                                 accessible-action-default => {
                                     root.pending-delete = peer.fingerprint;
                                     root.pending-delete-name = peer.name == "" ? "Unnamed computer" : peer.name;
                                 }
                                 TrashIcon {
-                                    x: 8px;
-                                    y: 8px;
+                                    x: 9px;
+                                    y: 9px;
                                 }
                             }
+                        }
+                    }
+                    // Rename editor (SET-06): opened from the overflow menu.
+                    if root.rename-peer-fp != "" : Rectangle {
+                        vertical-stretch: 0;
+                        background: Theme.bg;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+                            alignment: start;
                             Text {
-                                text: (peer.name == "" ? "Unnamed computer" : peer.name)
-                                    + (peer.address == "" ? "" : "  ·  " + peer.address);
+                                text: "Rename computer";
                                 color: Theme.text;
-                                font-size: 16px;
-                                font-weight: 600;
-                                overflow: elide;
-                                horizontal-stretch: 1;
+                                font-size: 14px;
+                                font-weight: 700;
                                 vertical-alignment: center;
+                            }
+                            rename-edit := LineEdit {
+                                height: 36px;
+                                text <=> root.rename-peer-name;
+                                placeholder-text: "Friendly name";
+                                width: 320px;
+                            }
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: 8px;
+                                KvmButton {
+                                    text: "Cancel";
+                                    btn-width: 96px;
+                                    clicked => { root.rename-peer-fp = ""; root.rename-peer-name = ""; }
+                                }
+                                KvmButton {
+                                    text: "Save";
+                                    primary: true;
+                                    btn-width: 96px;
+                                    enabled: rename-edit.text != "";
+                                    clicked => { root.peer-save-rename(root.rename-peer-fp, rename-edit.text); root.rename-peer-fp = ""; root.rename-peer-name = ""; }
+                                }
                             }
                         }
                     }
                     if root.trusted-peers.length == 0 : Text {
                         vertical-stretch: 0;
-                        text: "No allowed connections yet.";
+                        text: "No allowed connections yet. Press + to add one.";
                         color: Theme.faint;
                         font-size: 14px;
+                        wrap: word-wrap;
                     }
 
                     // Delete confirmation: nothing is removed until the
@@ -3079,7 +3503,7 @@ export component AppWindow inherits Window {
                                         ? (root.discovery-scanning ? "" : "No devices found yet")
                                         : root.discovered-labels.length == 1 ? "1 device found" : root.discovered-labels.length + " devices found";
                                     color: Theme.text-2;
-                                    font-size: 13px;
+                                    font-size: 14px;
                                     font-weight: 600;
                                     vertical-alignment: center;
                                     overflow: elide;
@@ -3123,7 +3547,7 @@ export component AppWindow inherits Window {
                                     width: parent.width - 20px;
                                     text: label;
                                     color: Theme.text-2;
-                                    font-size: 13px;
+                                    font-size: 14px;
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
@@ -3259,7 +3683,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: "Pairing request · " + incoming-pairing + (incoming-verification-code == "" ? "" : " · code " + incoming-verification-code);
                                     color: #fde68a;
-                                    font-size: 13px;
+                                    font-size: 14px;
                                     font-weight: 700;
                                     vertical-alignment: center;
                                     overflow: elide;
@@ -3297,7 +3721,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: "Link request · " + incoming-link;
                                     color: #a7f3d0;
-                                    font-size: 13px;
+                                    font-size: 14px;
                                     font-weight: 700;
                                     vertical-alignment: center;
                                     overflow: elide;
@@ -3318,6 +3742,65 @@ export component AppWindow inherits Window {
                             CheckBox {
                                 text: "Auto-connect this computer next time";
                                 checked <=> root.incoming-autoconnect;
+                            }
+                        }
+                    }
+                }
+            }
+            // CB-13 toast: its own zero-cost overlay (same pattern as the
+            // approval popups), stacked over the tabs; auto-dismisses in 5s.
+            if root.clipboard-toast != "" : Rectangle {
+                row: 0;
+                col: 0;
+                VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        alignment: end;
+                        Rectangle {
+                            width: 400px;
+                            height: 52px;
+                            border-radius: 10px;
+                            background: #3b2f07;
+                            border-width: 1px;
+                            border-color: #f59e0b;
+                            clip: true;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 8px;
+                                spacing: 8px;
+                                alignment: center;
+                                Text {
+                                    text: root.clipboard-toast;
+                                    color: #fcd34d;
+                                    font-size: 14px;
+                                    wrap: word-wrap;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle {
+                                    width: 32px;
+                                    height: 32px;
+                                    border-radius: 8px;
+                                    background: toast-hit.has-hover ? Theme.hover : transparent;
+                                    toast-hit := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.clipboard-toast = ""; }
+                                    }
+                                    accessible-role: button;
+                                    accessible-label: "Dismiss notification";
+                                    Text {
+                                        text: "x";
+                                        color: Theme.text-2;
+                                        font-size: 14px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            Timer {
+                                interval: 5s;
+                                running: true;
+                                triggered => { root.clipboard-toast = ""; }
                             }
                         }
                     }

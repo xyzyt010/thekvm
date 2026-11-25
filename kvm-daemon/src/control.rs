@@ -1271,6 +1271,7 @@ where
                 .map(|peer| peer.fingerprint_hex.clone())
                 .collect();
             let mut applied = 0usize;
+            let target_count = targets.len();
             for fingerprint in targets {
                 let result = {
                     let book = peers.read().await;
@@ -1293,8 +1294,21 @@ where
                 }
             }
             tracing::info!(applied, "mesh arrangement push complete");
-            ControlResponse::Applied {
-                restart_required: false,
+            if target_count != 0 && applied == 0 {
+                // MN-10: never claim success before every node
+                // acknowledges. Nodes that are off-line or gated simply
+                // re-apply this grid when their user opens it, but the
+                // pusher must say so honestly instead of reporting done.
+                ControlResponse::Error {
+                    message: format!(
+                        "Grid saved locally, but 0 of {} computers acknowledged. They will apply it when they next open the grid.",
+                        target_count
+                    ),
+                }
+            } else {
+                ControlResponse::Applied {
+                    restart_required: false,
+                }
             }
         }
         ControlRequest::PinPeer {

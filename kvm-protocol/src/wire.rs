@@ -376,6 +376,40 @@ pub enum WireMessage {
     ClipboardImageEnd {
         revision: u64,
     },
+    /// Start of a file-list clipboard transfer (CB-04): announced before
+    /// one FileStart/Chunk/End per file. `total_bytes` is the aggregate
+    /// decoded size so the receiver refuses over-cap BEFORE allocating.
+    /// `files` is the file count; FilesEnd recompares it (fail-closed).
+    ClipboardFilesStart {
+        revision: u64,
+        total_bytes: u64,
+        files: u32,
+    },
+    /// One file inside a file-list transfer. `name` is a bare basename
+    /// (never a path); sizes are counted AFTER base64 decode.
+    ClipboardFileStart {
+        revision: u64,
+        name: String,
+        total_bytes: u64,
+        chunks: u32,
+    },
+    /// One base64 slice of the current file (ASCII; any split is safe).
+    ClipboardFileChunk {
+        revision: u64,
+        index: u32,
+        data: String,
+    },
+    /// End of one file inside the transfer.
+    ClipboardFileEnd {
+        revision: u64,
+    },
+    /// End of the whole file-list transfer: the receiver stages the files
+    /// it accumulated and applies them as a file-list clipboard only when
+    /// every announced file arrived.
+    ClipboardFilesEnd {
+        revision: u64,
+        files: u32,
+    },
     ReleaseAll,
     /// Administrative link teardown: the sender's user pressed Disconnect
     /// for `link_id`. The receiver bans the epoch (like a local Disconnect
@@ -589,12 +623,52 @@ pub fn validate_message(message: &WireMessage) -> std::io::Result<()> {
         validate_image_dims(*width, *height)?;
     }
     if let WireMessage::ClipboardChunk { data, .. }
-    | WireMessage::ClipboardImageChunk { data, .. } = message
+    | WireMessage::ClipboardImageChunk { data, .. }
+    | WireMessage::ClipboardFileChunk { data, .. } = message
     {
         if data.len() > MAX_CLIPBOARD_TEXT_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "clipboard chunk exceeds maximum size",
+            ));
+        }
+    }
+    if let WireMessage::ClipboardFilesStart {
+        total_bytes, files, ..
+    } = message
+    {
+        if *total_bytes > MAX_CLIPBOARD_UPDATE_BYTES || *files == 0 || *files > 64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "clipboard files header is empty or exceeds maximum size",
+            ));
+        }
+    }
+    if let WireMessage::ClipboardFileStart {
+        name,
+        total_bytes,
+        chunks,
+        ..
+    } = message
+    {
+        if name.trim().is_empty()
+            || name.len() > 255
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains('\0')
+            || *total_bytes > MAX_CLIPBOARD_UPDATE_BYTES
+            || *chunks == 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "clipboard file header is invalid",
+            ));
+        }
+        let min_chunks = total_bytes.div_ceil(MAX_CLIPBOARD_TEXT_BYTES as u64);
+        if u64::from(*chunks) < min_chunks {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "clipboard file header undercounts its chunks",
             ));
         }
     }
@@ -919,6 +993,60 @@ mod tests {
             actual,
             WireMessage::ClipboardText { revision: 42, text } if text == "TheKVM — साझा clipboard"
         ));
+    }
+
+    #[test]
+    fn clipboard_files_transfer_rejects_lies() {
+        // Path traversal in a file name must never validate (CB-08).
+        assert!(validate_message(&WireMessage::ClipboardFileStart {
+            revision: 1,
+            name: "../evil.txt".into(),
+            total_bytes: 10,
+            chunks: 1,
+        })
+        .is_err());
+        // Over-cap header lies about chunk coverage (mirrors text rule).
+        assert!(validate_message(&WireMessage::ClipboardFileStart {
+            revision: 1,
+            name: "note.txt".into(),
+            total_bytes: MAX_CLIPBOARD_UPDATE_BYTES + 1,
+            chunks: 1,
+        })
+        .is_err());
+        // Aggregate header over the absolute ceiling.
+        assert!(validate_message(&WireMessage::ClipboardFilesStart {
+            revision: 1,
+            total_bytes: MAX_CLIPBOARD_UPDATE_BYTES + 1,
+            files: 1,
+        })
+        .is_err());
+        // Valid minimal transfer validates (empty file is refused: every
+        // file carries at least one byte; zero-byte files never transfer).
+        assert!(validate_message(&WireMessage::ClipboardFilesStart {
+            revision: 1,
+            total_bytes: 4,
+            files: 1,
+        })
+        .is_ok());
+        assert!(validate_message(&WireMessage::ClipboardFileStart {
+            revision: 1,
+            name: "note.txt".into(),
+            total_bytes: 4,
+            chunks: 1,
+        })
+        .is_ok());
+        assert!(validate_message(&WireMessage::ClipboardFileChunk {
+            revision: 1,
+            index: 0,
+            data: "YWJj".into(),
+        })
+        .is_ok());
+        assert!(validate_message(&WireMessage::ClipboardFileEnd { revision: 1 }).is_ok());
+        assert!(validate_message(&WireMessage::ClipboardFilesEnd {
+            revision: 1,
+            files: 1,
+        })
+        .is_ok());
     }
 
     #[test]

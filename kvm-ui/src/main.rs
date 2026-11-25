@@ -1,4 +1,4 @@
-﻿// GUI subsystem on Windows so double-clicking the app never flashes a
+// GUI subsystem on Windows so double-clicking the app never flashes a
 // console window; diagnostics go through the status line and logs.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -951,14 +951,16 @@ fn main() -> Result<()> {
                                 // arrowheads never show a stale role.
                                 if let Some(mode) = found_full
                                     .iter()
-                                    .find(|(_, _, fp, _)| Some(fp.as_str()) == linked_fp.as_deref())
-                                    .map(|(_, _, _, mode)| *mode)
+                                    .find(|(_, _, fp, _, _)| Some(fp.as_str()) == linked_fp.as_deref())
+                                    .map(|(_, _, _, mode, _)| *mode)
                                 {
                                     set_arrangement_modes(&scan_weak, our_m, mode);
                                 }
-                                let found: Vec<(String, String, String)> = found_full
+                                let found: Vec<(String, String, String, bool)> = found_full
                                     .into_iter()
-                                    .map(|(label, address, fingerprint, _)| (label, address, fingerprint))
+                                    .map(|(label, address, fingerprint, _, android)| {
+                                        (label, address, fingerprint, android)
+                                    })
                                     .collect();
                                 if !found.is_empty() {
                                     // Log only when the nearby set changes: a line
@@ -967,7 +969,7 @@ fn main() -> Result<()> {
                                         let mut old = slot.clone();
                                         old.sort();
                                         let mut new: Vec<String> =
-                                            found.iter().map(|(_, addr, _)| addr.clone()).collect();
+                                            found.iter().map(|(_, addr, _, _)| addr.clone()).collect();
                                         new.sort();
                                         old != new
                                     });
@@ -977,7 +979,7 @@ fn main() -> Result<()> {
                                             found.len(),
                                             found
                                                 .iter()
-                                                .map(|(label, _, _)| label.clone())
+                                                .map(|(label, _, _, _)| label.clone())
                                                 .collect::<Vec<_>>()
                                                 .join("; ")
                                         ));
@@ -2039,6 +2041,178 @@ fn main() -> Result<()> {
                 ui.set_pending_delete(SharedString::new());
                 ui.set_pending_delete_name(SharedString::new());
             }
+        });
+    }
+    // Overflow-menu actions (SET-06): View details, Device keys and
+    // fingerprint, Copy address, Rename. Remove routes to the same
+    // pending-delete confirmation as the trash button.
+    {
+        let weak = ui.as_weak();
+        ui.on_peer_view_details(move |fingerprint| {
+            let fingerprint = fingerprint.to_string();
+            let entry = roster_peers_slot()
+                .lock()
+                .ok()
+                .and_then(|peers| {
+                    peers
+                        .iter()
+                        .find(|(_, _, fp, _)| *fp == fingerprint)
+                        .cloned()
+                })
+                .or_else(|| {
+                    // Discovered (unpaired) device: show what the scan saw.
+                    roster_discovered_slot().lock().ok().and_then(|found| {
+                        found
+                            .iter()
+                            .find(|(_, _, fp, _)| *fp == fingerprint)
+                            .map(|(label, addr, fp, _)| {
+                                (
+                                    label.split(" · ").next().unwrap_or(label).trim().to_owned(),
+                                    addr.clone(),
+                                    fp.clone(),
+                                    false,
+                                )
+                            })
+                    })
+                });
+            let (name, address, fp, _) = entry.unwrap_or_default();
+            let _ = slint::invoke_from_event_loop({
+                let weak = weak.clone();
+                move || {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.set_details_peer_name(SharedString::from(name));
+                        ui.set_details_peer_address(SharedString::from(address));
+                        ui.set_details_peer_fingerprint(SharedString::from(fp));
+                        ui.set_details_expanded(true);
+                    }
+                }
+            });
+            set_status(&weak, "Details are on the Devices tab.".into());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_peer_show_keys(move |fingerprint| {
+            let fingerprint = fingerprint.to_string();
+            let short = if fingerprint.len() > 16 {
+                format!("{}…", &fingerprint[..16])
+            } else {
+                fingerprint.clone()
+            };
+            set_status(
+                &weak,
+                format!("Device keys · fingerprint {short} · full fingerprint in Devices details"),
+            );
+            let entry = roster_peers_slot().lock().ok().and_then(|peers| {
+                peers
+                    .iter()
+                    .find(|(_, _, fp, _)| *fp == fingerprint)
+                    .cloned()
+            });
+            if let Some((name, address, fp, _)) = entry {
+                let _ = slint::invoke_from_event_loop({
+                    let weak = weak.clone();
+                    move || {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.set_details_peer_name(SharedString::from(name));
+                            ui.set_details_peer_address(SharedString::from(address));
+                            ui.set_details_peer_fingerprint(SharedString::from(fp));
+                            ui.set_details_expanded(true);
+                        }
+                    }
+                });
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_peer_copy_address(move |fingerprint| {
+            let fingerprint = fingerprint.to_string();
+            let address = roster_peers_slot()
+                .lock()
+                .ok()
+                .and_then(|peers| {
+                    peers
+                        .iter()
+                        .find(|(_, _, fp, _)| *fp == fingerprint)
+                        .map(|(_, addr, _, _)| addr.clone())
+                })
+                .unwrap_or_default();
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                if address.is_empty() {
+                    set_status(&weak, "No address recorded for that computer yet.".into());
+                    return;
+                }
+                match kvm_platform::clipboard::SystemClipboard::create() {
+                    Ok(mut clipboard) => match clipboard.set_text(address.clone()) {
+                        Ok(()) => set_status(&weak, format!("Copied {address}")),
+                        Err(error) => set_status(&weak, format!("Copy failed: {error}")),
+                    },
+                    Err(error) => set_status(&weak, format!("Copy failed: {error}")),
+                }
+            });
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_peer_rename(move |fingerprint, name| {
+            let fingerprint = fingerprint.to_string();
+            let name = name.to_string();
+            let _ = slint::invoke_from_event_loop({
+                let weak = weak.clone();
+                move || {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.set_rename_peer_fp(SharedString::from(fingerprint));
+                        ui.set_rename_peer_name(SharedString::from(name));
+                    }
+                }
+            });
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_peer_save_rename(move |fingerprint, name| {
+            let fingerprint = fingerprint.to_string();
+            let name = name.to_string();
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    set_status(&weak, "Name cannot be empty.".into());
+                    return;
+                }
+                // PinPeer upserts the name in the daemon book (address kept).
+                match control_request(ControlRequest::PinPeer {
+                    fingerprint_hex: fingerprint.clone(),
+                    node_name: Some(name.clone()),
+                    address: None,
+                }) {
+                    Ok(ControlResponse::Pinned { .. }) => {
+                        if let Ok(mut book) =
+                            kvm_protocol::pairing::PeerBook::load_or_create(&data_dir())
+                        {
+                            let address = book
+                                .peers
+                                .iter()
+                                .find(|p| p.fingerprint_hex == fingerprint)
+                                .and_then(|p| p.address.clone());
+                            if let Err(error) = book.pin_with_address(name.as_str(), fingerprint.clone(), address) {
+                                ui_log(&format!("rename: user book update failed: {error:#}"));
+                            }
+                        }
+                        set_status(&weak, format!("Renamed computer to {name}"));
+                        if let Ok(ControlResponse::Peers(peers)) =
+                            control_request(ControlRequest::ListPeers)
+                        {
+                            set_peer_list(&weak, peers);
+                        }
+                    }
+                    Ok(ControlResponse::Error { message }) => set_status(&weak, message),
+                    Ok(other) => set_status(&weak, format!("Unexpected rename response: {other:?}")),
+                    Err(error) => set_status(&weak, format!("Rename failed: {error}")),
+                }
+            });
         });
     }
 
@@ -3199,18 +3373,27 @@ fn set_peer_list(weak: &slint::Weak<AppWindow>, peers: Vec<kvm_protocol::pairing
         .unwrap_or_default();
     let detail_fingerprint = first.map(|peer| peer.fingerprint_hex.clone()).unwrap_or_default();
     let mut structured: Vec<TrustedPeer> = Vec::new();
+    let mut roster_cache: Vec<(String, String, String, bool)> = Vec::new();
     for peer in &peers {
         let name = if peer.name.trim().is_empty() {
             "Unnamed computer".to_owned()
         } else {
             peer.name.trim().to_owned()
         };
+        roster_cache.push((
+            name.clone(),
+            peer.address.clone().unwrap_or_default(),
+            peer.fingerprint_hex.clone(),
+            peer.kind == kvm_core::ClientKind::Android,
+        ));
         structured.push(TrustedPeer {
             name: SharedString::from(name),
             address: SharedString::from(peer.address.clone().unwrap_or_default()),
             fingerprint: SharedString::from(peer.fingerprint_hex.clone()),
         });
     }
+    set_roster_peers(&roster_cache);
+    refresh_roster(weak);
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
@@ -5517,6 +5700,26 @@ fn relay_session_progress(
                 set_driving(weak, detail.to_owned());
                 format!("Driving {detail} — push back past the edge to return here. Tap ScrollLock to release instantly.")
             }
+            "clipboard-over-limit" => {
+                // CB-05: detail is "<total_bytes> <limit_bytes>". One
+                // auto-dismissing toast on THIS machine; the status line
+                // keeps the same sentence for the log/a11y trail.
+                let (total, limit) = detail
+                    .split_once(' ')
+                    .and_then(|(total, limit)| Some((total.parse::<u64>().unwrap_or(0), limit.parse::<u64>().unwrap_or(0))))
+                    .unwrap_or((0, 0));
+                let message = if limit > 0 {
+                    format!(
+                        "The file is too big for copying in TheKVM ({:.1} MB is over the {} MB limit)",
+                        total as f64 / 1_048_576.0,
+                        (limit + 1_048_575) / 1_048_576
+                    )
+                } else {
+                    "The file is too big for copying in TheKVM".to_owned()
+                };
+                set_clipboard_toast(weak, message.clone());
+                message
+            }
             "local" => {
                 set_driving(weak, String::new());
                 "Edge control is on — this computer. Push past the arranged edge to drive the other screen.".into()
@@ -6014,6 +6217,131 @@ fn link_live() -> bool {
     SESSION_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
         || INBOUND_DRIVING.load(std::sync::atomic::Ordering::Relaxed)
         || OUTBOUND_DRIVING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// Complete-roster state (CON-03 / DEV-03): cached peer books + live link
+// facts so the Connect roster and the Devices tab always render the one
+// DEV-10 vocabulary (Live / Connecting / Idle / Discovered / Error) with
+// Android peers marked for the yellow dot.
+static SESSION_VERIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LINK_CONNECTING_UI: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SESSION_PEER_ADDR: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+static ROSTER_PEERS: std::sync::OnceLock<
+    std::sync::Mutex<Vec<(String, String, String, bool)>>,
+> = std::sync::OnceLock::new();
+static ROSTER_DISCOVERED: std::sync::OnceLock<
+    std::sync::Mutex<Vec<(String, String, String, bool)>>,
+> = std::sync::OnceLock::new();
+
+fn roster_peers_slot() -> &'static std::sync::Mutex<Vec<(String, String, String, bool)>> {
+    ROSTER_PEERS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+fn roster_discovered_slot() -> &'static std::sync::Mutex<Vec<(String, String, String, bool)>> {
+    ROSTER_DISCOVERED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+fn set_session_peer_addr(addr: Option<String>) {
+    let slot = SESSION_PEER_ADDR.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = addr;
+    }
+}
+fn session_peer_addr() -> Option<String> {
+    let slot = SESSION_PEER_ADDR.get()?;
+    let guard = slot.lock().ok()?;
+    guard.clone()
+}
+fn set_roster_discovered(found: &[(String, String, String, bool)]) {
+    if let Ok(mut guard) = roster_discovered_slot().lock() {
+        *guard = found.to_vec();
+    }
+}
+fn set_roster_peers(peers: &[(String, String, String, bool)]) {
+    if let Ok(mut guard) = roster_peers_slot().lock() {
+        *guard = peers.to_vec();
+    }
+}
+
+/// One DEV-10 state label for a roster row.
+fn roster_state(linked: bool, verified: bool, connecting: bool, trusted: bool, android: bool) -> String {
+    if android {
+        if linked && verified {
+            return "Android · Live".to_owned();
+        }
+        return "Android".to_owned();
+    }
+    if linked {
+        if verified {
+            "Live".to_owned()
+        } else if connecting {
+            "Connecting".to_owned()
+        } else {
+            "Idle".to_owned()
+        }
+    } else if connecting && !trusted {
+        "Connecting".to_owned()
+    } else if trusted {
+        "Idle".to_owned()
+    } else {
+        "Discovered".to_owned()
+    }
+}
+
+/// Rebuild the complete roster from the cached books + live link facts and
+/// publish it to both the Connect overlay and the Devices tab.
+fn refresh_roster(weak: &slint::Weak<AppWindow>) {
+    let trusted = roster_peers_slot().lock().map(|g| g.clone()).unwrap_or_default();
+    let discovered = roster_discovered_slot()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let linked_addr = session_peer_addr().unwrap_or_default();
+    let verified = SESSION_VERIFIED.load(std::sync::atomic::Ordering::Relaxed);
+    let connecting = LINK_CONNECTING_UI.load(std::sync::atomic::Ordering::Relaxed)
+        || (SESSION_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) && !verified);
+    let mut names: Vec<String> = Vec::new();
+    let mut addresses: Vec<String> = Vec::new();
+    let mut states: Vec<String> = Vec::new();
+    let mut fps: Vec<String> = Vec::new();
+    for (name, addr, fp, android) in &trusted {
+        let linked = !linked_addr.is_empty() && *addr == linked_addr;
+        names.push(name.clone());
+        addresses.push(addr.clone());
+        states.push(roster_state(linked, verified, connecting, true, *android));
+        fps.push(fp.clone());
+    }
+    for (label, addr, fp, android) in &discovered {
+        if trusted.iter().any(|(_, a, f, _)| a == addr || f == fp) {
+            continue;
+        }
+        let name = label.split(" · ").next().unwrap_or(label).trim().to_owned();
+        let linked = !linked_addr.is_empty() && *addr == linked_addr;
+        names.push(name);
+        addresses.push(addr.clone());
+        states.push(roster_state(linked, verified, connecting, false, *android));
+        fps.push(fp.clone());
+    }
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                // ModelRc is built on the UI thread (Rc is not Send).
+                let to_model = |values: Vec<String>| -> slint::ModelRc<slint::SharedString> {
+                    slint::ModelRc::new(slint::VecModel::from(
+                        values
+                            .into_iter()
+                            .map(slint::SharedString::from)
+                            .collect::<Vec<_>>(),
+                    ))
+                };
+                ui.set_roster_names(to_model(names));
+                ui.set_roster_addresses(to_model(addresses));
+                ui.set_roster_states(to_model(states));
+                ui.set_roster_fingerprints(to_model(fps));
+            }
+        }
+    });
 }
 
 static USER_DAEMON: std::sync::OnceLock<std::sync::Mutex<Option<std::process::Child>>> =
@@ -6680,6 +7008,10 @@ fn mirror_user_config(
 
 fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
     SESSION_ACTIVE.store(address.is_some(), std::sync::atomic::Ordering::Relaxed);
+    SESSION_VERIFIED.store(address.is_some(), std::sync::atomic::Ordering::Relaxed);
+    LINK_CONNECTING_UI.store(false, std::sync::atomic::Ordering::Relaxed);
+    set_session_peer_addr(address.clone());
+    refresh_roster(weak);
     let live = link_live();
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
@@ -6711,6 +7043,10 @@ fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
 /// session the panel says Connecting (amber, spinner live) — it must never
 /// claim Connected for a process that merely started.
 fn set_session_connecting(weak: &slint::Weak<AppWindow>, address: &str) {
+    SESSION_VERIFIED.store(false, std::sync::atomic::Ordering::Relaxed);
+    LINK_CONNECTING_UI.store(true, std::sync::atomic::Ordering::Relaxed);
+    set_session_peer_addr(Some(address.to_owned()));
+    refresh_roster(weak);
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         let address = address.to_owned();
@@ -6737,6 +7073,10 @@ fn set_session_connected(
     address: &str,
 ) {
     verified.store(true, std::sync::atomic::Ordering::Relaxed);
+    SESSION_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
+    LINK_CONNECTING_UI.store(false, std::sync::atomic::Ordering::Relaxed);
+    set_session_peer_addr(Some(address.to_owned()));
+    refresh_roster(weak);
     let current = session.lock().ok().is_some_and(|slot| {
         slot.as_ref()
             .is_some_and(|current| Arc::ptr_eq(&current.verified, verified))
@@ -6765,6 +7105,8 @@ fn set_session_connected(
 /// settles.
 fn set_link_connecting(weak: &slint::Weak<AppWindow>, connecting: bool) {
     SPINNER_LINK_ACTIVE.store(connecting, std::sync::atomic::Ordering::Release);
+    LINK_CONNECTING_UI.store(connecting, std::sync::atomic::Ordering::Relaxed);
+    refresh_roster(weak);
     if connecting {
         ensure_spinner_ticker(weak);
     }
@@ -6926,6 +7268,14 @@ fn schedule_edge_applying_timeout(weak: &slint::Weak<AppWindow>, live_child: boo
 static CLIPBOARD_SYNC_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// File-copy cap (bytes) for the relay's pre-load check, refreshed from
+/// the take thread's Status echoes. Defaults to the config default.
+static CLIPBOARD_MAX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2 * 1024 * 1024);
+
+fn clipboard_max_bytes_for_relay() -> u64 {
+    CLIPBOARD_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Bumped after every successful local offer. The take path drops a peer
 /// paste it fetched across one of these (a fresh local copy wins over a
 /// paste that was already in flight), preserving the old single-thread
@@ -6983,6 +7333,7 @@ fn spawn_clipboard_relay() {
                     let flavor = match kind {
                         ClipboardKind::Text => "text",
                         ClipboardKind::ImagePng => "image",
+                        ClipboardKind::Files => "files",
                     };
                     match apply_relay_paste(&mut clipboard, kind, &payload) {
                         Ok(true) => ui_log(&format!(
@@ -7067,6 +7418,70 @@ fn spawn_clipboard_relay() {
                             Err(error) => {
                                 ui_log(&format!(
                                     "clipboard relay: cannot encode local image: {error}"
+                                ));
+                            }
+                        }
+                    }
+                    // File copies (CB-04): poll on the same gated cadence,
+                    // cap-check BEFORE loading bytes (CB-08), offer the
+                    // JSON payload; over-limit raises the CB-13 toast.
+                    if let Ok(Some(paths)) = clipboard.poll_user_files(notice) {
+                        let max_bytes = clipboard_max_bytes_for_relay() as u64;
+                        let total =
+                            kvm_platform::clipboard::file_list_total_bytes(&paths);
+                        if total > max_bytes {
+                            ui_log(&format!(
+                                "clipboard relay: file copy over limit ({} > {} bytes); notification raised",
+                                total, max_bytes
+                            ));
+                            continue;
+                        }
+                        match kvm_platform::clipboard::load_file_list(&paths) {
+                            Ok(files) => {
+                                use base64::Engine as _;
+                                let payload = {
+                                    let entries: Vec<String> = files
+                                        .iter()
+                                        .map(|(name, bytes)| {
+                                            format!(
+                                                "{{\"name\":{},\"b64\":{}}}",
+                                                serde_json::to_string(name)
+                                                    .unwrap_or_else(|_| "\"file\"".into()),
+                                                serde_json::to_string(
+                                                    &base64::engine::general_purpose::STANDARD.encode(bytes)
+                                                )
+                                                .unwrap_or_else(|_| "\"\"".into())
+                                            )
+                                        })
+                                        .collect();
+                                    format!("{{\"files\":[{}]}}", entries.join(","))
+                                };
+                                generation = generation.wrapping_add(1);
+                                match offer_local_clipboard(
+                                    ClipboardKind::Files,
+                                    generation,
+                                    &payload,
+                                    0,
+                                    0,
+                                ) {
+                                    Ok(()) => {
+                                        offered = true;
+                                        last_offer_error.clear();
+                                        ui_log("clipboard relay: offered local files");
+                                    }
+                                    Err(error) => {
+                                        if error != last_offer_error {
+                                            ui_log(&format!(
+                                                "clipboard relay: offer failed: {error}"
+                                            ));
+                                            last_offer_error = error;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                ui_log(&format!(
+                                    "clipboard relay: cannot load local files: {error}"
                                 ));
                             }
                         }
@@ -7201,6 +7616,10 @@ fn refresh_clipboard_enabled(reported: Option<bool>, last_check: &mut std::time:
                     status.clipboard_enabled,
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                CLIPBOARD_MAX_BYTES.store(
+                    (status.clipboard_max_mb as u64) * 1024 * 1024,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
     }
@@ -7297,6 +7716,55 @@ fn apply_relay_paste(
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
             Ok(true)
         }
+        ClipboardKind::Files => {
+            // Relay payload shape: {"files":[{"name","b64"}]} (see the
+            // daemon's `relay_files_json`). Stage the bytes under the
+            // user cache, then offer the staged paths as one file list.
+            let value: serde_json::Value = serde_json::from_str(payload)
+                .map_err(|error| anyhow::anyhow!("decode relay files: {error}"))?;
+            let list = value
+                .get("files")
+                .and_then(|files| files.as_array())
+                .ok_or_else(|| anyhow::anyhow!("relay files payload is malformed"))?;
+            let root = data_dir().join("clipboard-relay");
+            std::fs::create_dir_all(&root)
+                .map_err(|error| anyhow::anyhow!("stage relay files: {error}"))?;
+            let mut paths = Vec::with_capacity(list.len());
+            for entry in list {
+                use base64::Engine as _;
+                let name = entry
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .unwrap_or("file");
+                let safe: String = name
+                    .chars()
+                    .map(|c| if c.is_control() || c == '/' || c == '\\' { '_' } else { c })
+                    .collect();
+                let safe = {
+                    let trimmed = safe.trim_matches('.');
+                    if trimmed.is_empty() {
+                        "file".to_owned()
+                    } else {
+                        trimmed.to_owned()
+                    }
+                };
+                let b64 = entry
+                    .get("b64")
+                    .and_then(|b64| b64.as_str())
+                    .unwrap_or("");
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64.as_bytes())
+                    .map_err(|error| anyhow::anyhow!("decode relay file: {error}"))?;
+                let path = root.join(&safe);
+                std::fs::write(&path, &bytes)
+                    .map_err(|error| anyhow::anyhow!("write relay file: {error}"))?;
+                paths.push(path);
+            }
+            clipboard
+                .set_files(&paths)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(true)
+        }
     }
 }
 
@@ -7381,6 +7849,18 @@ fn set_status(weak: &slint::Weak<AppWindow>, text: String) {
     });
 }
 
+/// CB-13 toast: auto-dismissing notification that never steals focus.
+fn set_clipboard_toast(weak: &slint::Weak<AppWindow>, text: String) {
+    let _ = slint::invoke_from_event_loop({
+        let weak = weak.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_clipboard_toast(SharedString::from(text));
+            }
+        }
+    });
+}
+
 fn set_pending(
     weak: &slint::Weak<AppWindow>,
     fingerprint: String,
@@ -7414,23 +7894,26 @@ fn set_discovery(weak: &slint::Weak<AppWindow>, text: String, address: Option<St
 }
 
 /// Scan the LAN for TheKVM advertisements and return `(display label,
-/// dial address, fingerprint)` triples sorted by name. Shared by the manual
-/// Scan button and the automatic poll-loop scan so both show the same list.
-/// A failed scan yields an empty list (never an error popup on its own).
-/// This machine itself is filtered out by certificate fingerprint (never by
-/// name — two machines can share a hostname): without this the list shows
-/// "itself" and tapping it dials a loopback link.
-fn scan_lan_devices() -> Vec<(String, String, String)> {
+/// dial address, fingerprint, is-android)` sorted by name. Shared by the
+/// manual Scan button and the automatic poll-loop scan so both show the
+/// same list. A failed scan yields an empty list (never an error popup
+/// on its own).
+/// This machine itself is filtered out by certificate fingerprint (never
+/// by name — two machines can share a hostname): without this the list
+/// shows "itself" and tapping it dials a loopback link.
+fn scan_lan_devices() -> Vec<(String, String, String, bool)> {
     scan_lan_devices_full()
         .into_iter()
-        .map(|(label, address, fingerprint, _)| (label, address, fingerprint))
+        .map(|(label, address, fingerprint, _, android)| {
+            (label, address, fingerprint, android)
+        })
         .collect()
 }
 
 /// Scan the LAN and also report each device's advertised role, so the
 /// arrangement mesh can draw the crossing arrows that match what BOTH
 /// computers actually allow.
-fn scan_lan_devices_full() -> Vec<(String, String, String, kvm_core::Mode)> {
+fn scan_lan_devices_full() -> Vec<(String, String, String, kvm_core::Mode, bool)> {
     let peers = runtime()
         .block_on(kvm_protocol::discovery::scan(
             std::time::Duration::from_secs(1),
@@ -7440,7 +7923,7 @@ fn scan_lan_devices_full() -> Vec<(String, String, String, kvm_core::Mode)> {
         Ok(ControlResponse::Status(status)) => Some(status.fingerprint_hex),
         _ => None,
     };
-    let mut found: Vec<(String, String, String, kvm_core::Mode)> = peers
+    let mut found: Vec<(String, String, String, kvm_core::Mode, bool)> = peers
         .iter()
         .filter(|(_, peer)| {
             local_fingerprint
@@ -7457,6 +7940,7 @@ fn scan_lan_devices_full() -> Vec<(String, String, String, kvm_core::Mode)> {
                 address.to_string(),
                 peer.fingerprint_hex.clone(),
                 peer.mode,
+                peer.kind == kvm_core::ClientKind::Android,
             )
         })
         .collect();
@@ -7490,10 +7974,16 @@ fn status_peer_fingerprint() -> Option<String> {
 fn store_discovered(
     weak: &slint::Weak<AppWindow>,
     discovered: &Arc<Mutex<Vec<String>>>,
-    found: Vec<(String, String, String)>,
+    found: Vec<(String, String, String, bool)>,
     autofill: bool,
 ) {
-    let addrs: Vec<String> = found.iter().map(|(_, addr, _)| addr.clone()).collect();
+    // Feed the complete roster (CON-03): trusted peers + discovered.
+    set_roster_discovered(&found);
+    refresh_roster(weak);
+    let addrs: Vec<String> = found
+        .iter()
+        .map(|(_, addr, _, _)| addr.clone())
+        .collect();
     if let Ok(mut slot) = discovered.lock() {
         *slot = addrs.clone();
     }
@@ -7509,7 +7999,10 @@ fn store_discovered(
     set_discovery(weak, text, fill);
     // Progressive reveal: first row now, the rest 120ms apart. Small LANs
     // (1-2 machines) finish in a blink; the animation still reads.
-    let labels: Vec<String> = found.into_iter().map(|(label, _, _)| label).collect();
+    let labels: Vec<String> = found
+        .into_iter()
+        .map(|(label, _, _, _)| label)
+        .collect();
     let first_labels: Vec<String> = labels.iter().take(1).cloned().collect();
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();

@@ -19,6 +19,12 @@ pub struct SystemClipboard {
     /// them here is what stops a peer paste from being offered back.
     /// A later real copy, even of the same bytes, still emits.
     ignore_owner_events: u8,
+    // Text/image live next to this handle; the file list (CB-04) is the
+    // separate fingerprint below. The last observed file list (echo guard).
+    last_files_fingerprint: Option<Vec<(String, u64)>>,
+    /// CB-01: false until the first successful observation of either
+    /// flavor. The first sighting is a baseline only, never emitted.
+    observed_any: bool,
 }
 
 impl SystemClipboard {
@@ -29,7 +35,9 @@ impl SystemClipboard {
             clipboard,
             last_text: None,
             last_image_hash: None,
+            last_files_fingerprint: None,
             ignore_owner_events: 0,
+            observed_any: false,
         })
     }
 
@@ -58,6 +66,10 @@ impl SystemClipboard {
     /// re-copy; equality suppression would swallow it. `ownership_changed`
     /// is the OS watcher's notice. Our own `set_text` arms a short ignore
     /// so the notice it generates is not offered back to the peer.
+    /// CB-01 activation: the FIRST observation after the agent starts is a
+    /// baseline only, never an emitted change. Whatever was on the
+    /// clipboard before the link existed must not sync on connect —
+    /// sync begins with the first user copy made after that.
     pub fn poll_user_text(
         &mut self,
         ownership_changed: bool,
@@ -66,6 +78,7 @@ impl SystemClipboard {
             if let Ok(text) = self.clipboard.get_text() {
                 self.last_text = Some(text);
                 self.last_image_hash = None;
+                self.observed_any = true;
             }
             return Ok(None);
         }
@@ -73,6 +86,15 @@ impl SystemClipboard {
             Ok(text) => text,
             Err(_) => return Ok(None),
         };
+        // Unseen-before baseline: record it, emit nothing (CB-01). Only the
+        // very first sighting baselines; a later copy of a different flavor
+        // must still emit (CB-02), so the flag is shared, not per-flavor.
+        if !self.observed_any {
+            self.observed_any = true;
+            self.last_text = Some(text);
+            self.last_image_hash = None;
+            return Ok(None);
+        }
         let same = self.last_text.as_deref() == Some(text.as_str());
         if same {
             return Ok(None);
@@ -83,6 +105,9 @@ impl SystemClipboard {
     }
 
     /// Image half of [`poll_user_text`].
+    /// CB-01 activation: like the text half, the first image sighting is a
+    /// baseline only — a screenshot copied before the link existed must
+    /// not sync on connect.
     pub fn poll_user_image(
         &mut self,
         ownership_changed: bool,
@@ -93,6 +118,7 @@ impl SystemClipboard {
                 self.last_image_hash =
                     Some(Self::image_fingerprint(image.width, image.height, &rgba));
                 self.last_text = None;
+                self.observed_any = true;
             }
             return Ok(None);
         }
@@ -102,6 +128,12 @@ impl SystemClipboard {
         };
         let rgba = image.bytes.to_vec();
         let fingerprint = Self::image_fingerprint(image.width, image.height, &rgba);
+        if !self.observed_any {
+            // First sighting of any flavor: baseline only (CB-01).
+            self.observed_any = true;
+            self.last_image_hash = Some(fingerprint);
+            return Ok(None);
+        }
         let same = self.last_image_hash == Some(fingerprint);
         if same {
             return Ok(None);
@@ -137,6 +169,7 @@ impl SystemClipboard {
         // The clipboard now holds text: a re-copied older image must
         // fire again instead of matching a stale image fingerprint.
         self.last_image_hash = None;
+        self.observed_any = true;
         Ok(Some(text))
     }
 
@@ -166,6 +199,7 @@ impl SystemClipboard {
     pub fn set_text(&mut self, text: String) -> Result<(), PlatformError> {
         self.last_text = Some(text.clone());
         self.last_image_hash = None;
+        self.observed_any = true;
         self.ignore_owner_events = 4;
         let mut last_err = None;
         for attempt in 0..4 {
@@ -201,6 +235,7 @@ impl SystemClipboard {
         }
         self.last_image_hash = Some(Self::image_fingerprint(width, height, &rgba));
         self.last_text = None;
+        self.observed_any = true;
         self.ignore_owner_events = 4;
         let mut last_err = None;
         for attempt in 0..4 {
@@ -223,6 +258,546 @@ impl SystemClipboard {
             last_err.map(|e| e.to_string()).unwrap_or_default()
         )))
     }
+}
+
+/// A file-list clipboard paste (CB-04): one entry per file, basename plus
+/// decoded bytes. The wire never carries a past the link cap; the agent
+/// stats sizes first and refuses over-limit lists before ever loading
+/// bytes (CB-08), so this struct is small by construction.
+pub struct ClipboardFilesPaste {
+    pub files: Vec<(String, Vec<u8>)>,
+}
+
+/// Sum of regular-file lengths (directories and missing files count 0).
+/// Saturating: a hostile file list cannot overflow the total.
+pub fn file_list_total_bytes(paths: &[std::path::PathBuf]) -> u64 {
+    paths
+        .iter()
+        .map(|path| std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0))
+        .fold(0u64, |acc, len| acc.saturating_add(len))
+}
+
+/// Load one file list's bytes (caller caps the aggregate first, and the
+/// wire validator re-caps it on the far side). Directories are refused:
+/// a folder copy degenerates to the paste-path adaptation (CB-11), never
+/// to a silent recursive archive.
+pub fn load_file_list(paths: &[std::path::PathBuf]) -> Result<Vec<(String, Vec<u8>)>, PlatformError> {
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let meta = std::fs::metadata(path)
+            .map_err(|error| PlatformError::Clipboard(format!("stat copied file: {error}")))?;
+        if !meta.is_file() {
+            return Err(PlatformError::Clipboard(
+                "copied path is not a regular file".into(),
+            ));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_owned();
+        let bytes = std::fs::read(path).map_err(|error| {
+            PlatformError::Clipboard(format!("read copied file {name}: {error}"))
+        })?;
+        files.push((name, bytes));
+    }
+    Ok(files)
+}
+
+impl SystemClipboard {
+    /// Read the OS file list when it changed since the last sighting. The
+    /// first sighting after creation is a baseline only (CB-01): whatever
+    /// was copied before the link existed never syncs on connect. Applying
+    /// a peer list first (see [`SystemClipboard::set_files`]) arms the
+    /// echo guard so the peer paste is never offered back (CB-06).
+    pub fn poll_user_files(
+        &mut self,
+        ownership_changed: bool,
+    ) -> Result<Option<Vec<std::path::PathBuf>>, PlatformError> {
+        if self.absorb_own_owner_event(ownership_changed) {
+            if let Some(paths) = read_file_list_os() {
+                self.last_files_fingerprint = Some(files_fingerprint(&paths));
+            }
+            return Ok(None);
+        }
+        let paths = match read_file_list_os() {
+            Some(paths) if !paths.is_empty() => paths,
+            _ => return Ok(None),
+        };
+        let fingerprint = files_fingerprint(&paths);
+        if !self.observed_any {
+            self.observed_any = true;
+            self.last_files_fingerprint = Some(fingerprint);
+            return Ok(None);
+        }
+        if self.last_files_fingerprint.as_ref() == Some(&fingerprint) {
+            return Ok(None);
+        }
+        self.last_files_fingerprint = Some(fingerprint);
+        Ok(Some(paths))
+    }
+
+    /// Offer a locally staged file list to the OS clipboard so the user
+    /// can paste it into a file manager (CB-04). The caller materialized
+    /// the bytes first; this only publishes the paths.
+    pub fn set_files(&mut self, paths: &[std::path::PathBuf]) -> Result<(), PlatformError> {
+        if paths.is_empty() {
+            return Err(PlatformError::Clipboard("no files to offer".into()));
+        }
+        self.last_files_fingerprint = Some(files_fingerprint(paths));
+        self.observed_any = true;
+        self.ignore_owner_events = 4;
+        set_file_list_os(paths)
+    }
+}
+
+/// Order-sensitive fingerprint of one sighting: file paths with sizes,
+/// so replacing a file in place still counts as a new copy.
+fn files_fingerprint(paths: &[std::path::PathBuf]) -> Vec<(String, u64)> {
+    paths
+        .iter()
+        .map(|path| {
+            (
+                path.to_string_lossy().into_owned(),
+                std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
+            )
+        })
+        .collect()
+}
+
+/// Percent-encode one filesystem path into a file:// URI body (the part
+/// after `file://`), per RFC 8089: unreserved bytes pass through.
+fn file_uri_encode(path: &std::path::Path) -> String {
+    let mut out = String::with_capacity(path.as_os_str().len() + 8);
+    for &b in path.as_os_str().as_encoded_bytes() {
+        match char::from(b) {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '.' | '_' | '~' | '/' | ':' => {
+                out.push(char::from(b))
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Decode one file:// URI back into a path (percent-decode the UTF-8
+/// path bytes; malformed escapes fail closed to None).
+fn file_uri_decode(uri: &str) -> Option<std::path::PathBuf> {
+    let bytes = uri.as_bytes();
+    let mut raw = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
+            let byte = u8::from_str_radix(hex, 16).ok()?;
+            raw.push(byte);
+            index += 3;
+        } else {
+            raw.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let text = String::from_utf8(raw).ok()?;
+    Some(std::path::PathBuf::from(text))
+}
+
+#[cfg(target_os = "windows")]
+fn read_file_list_os() -> Option<Vec<std::path::PathBuf>> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    // CF_HDROP is clipboard format 15; the windows crate does not always
+    // surface the named constant, so the numeric value is used.
+    const CF_HDROP: u32 = 15;
+    unsafe {
+        if OpenClipboard(HWND(std::ptr::null_mut())).is_err() {
+            return None;
+        }
+        let mut paths = Vec::new();
+        if let Ok(handle) = GetClipboardData(CF_HDROP) {
+            let hdrop = HDROP(handle.0);
+            let count = DragQueryFileW(hdrop, u32::MAX, None);
+            for index in 0..count {
+                let len = DragQueryFileW(hdrop, index, None);
+                if len == 0 {
+                    continue;
+                }
+                let mut buffer = vec![0u16; (len + 1) as usize];
+                let got = DragQueryFileW(hdrop, index, Some(&mut buffer[..]));
+                if got == 0 {
+                    continue;
+                }
+                let name = String::from_utf16_lossy(&buffer[..got as usize]);
+                paths.push(std::path::PathBuf::from(name));
+            }
+        }
+        let _ = CloseClipboard();
+        if paths.is_empty() {
+            None
+        } else {
+            Some(paths)
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn set_file_list_os(paths: &[std::path::PathBuf]) -> Result<(), PlatformError> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    // CF_HDROP (see the reader above).
+    const CF_HDROP: u32 = 15;
+
+    #[repr(C)]
+    struct DropFiles {
+        p_files: u32,
+        x: i32,
+        y: i32,
+        f_nc: u32,
+        f_wide: u32,
+    }
+    let wide: Vec<u16> = paths
+        .iter()
+        .flat_map(|path| {
+            path.to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        })
+        .chain(std::iter::once(0))
+        .collect();
+    let header = std::mem::size_of::<DropFiles>();
+    let total = header + wide.len() * std::mem::size_of::<u16>();
+    unsafe {
+        let memory = GlobalAlloc(GMEM_MOVEABLE, total).map_err(|error| {
+            PlatformError::Clipboard(format!("allocate file clipboard: {error}"))
+        })?;
+        let ptr = GlobalLock(memory);
+        if ptr.is_null() {
+            return Err(PlatformError::Clipboard(
+                "lock file clipboard".into(),
+            ));
+        }
+        let drop = DropFiles {
+            p_files: header as u32,
+            x: 0,
+            y: 0,
+            f_nc: 0,
+            f_wide: 1,
+        };
+        std::ptr::copy_nonoverlapping(
+            &drop as *const DropFiles as *const u8,
+            ptr as *mut u8,
+            header,
+        );
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            ptr.add(header) as *mut u16,
+            wide.len(),
+        );
+        let _ = GlobalUnlock(memory);
+        if OpenClipboard(HWND(std::ptr::null_mut())).is_err() {
+            return Err(PlatformError::Clipboard("open clipboard for file paste".into()));
+        }
+        let _ = EmptyClipboard();
+        let offered = SetClipboardData(CF_HDROP, windows::Win32::Foundation::HANDLE(memory.0));
+        let _ = CloseClipboard();
+        if offered.is_err() {
+            return Err(PlatformError::Clipboard("offer files to OS clipboard".into()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_file_list_os() -> Option<Vec<std::path::PathBuf>> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    if std::env::var_os("DISPLAY").is_none() {
+        return None;
+    }
+    let (connection, screen) = x11rb::connect(None).ok()?;
+    // Two-step request/reply (the repo's established pattern for this
+    // x11rb Connection flavour): cookie first, then the reply.
+    let intern = |name: &[u8]| -> Option<u32> {
+        let cookie = connection.intern_atom(false, name).ok()?;
+        let reply = cookie.reply().ok()?;
+        Some(reply.atom)
+    };
+    let clipboard = intern(b"CLIPBOARD")?;
+    let uri_list = intern(b"text/uri-list")?;
+    let owner = connection.get_selection_owner(clipboard).ok()?.reply().ok()?.owner;
+    if owner == 0 {
+        return None;
+    }
+    let root = connection.setup().roots.get(screen)?.root;
+    let window = connection.generate_id().ok()?;
+    let property = connection.generate_id().ok()?;
+    connection
+        .create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            window,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            x11rb::protocol::xproto::WindowClass::INPUT_ONLY,
+            x11rb::COPY_FROM_PARENT,
+            &x11rb::protocol::xproto::CreateWindowAux::new(),
+        )
+        .ok()?
+        .check()
+        .ok()?;
+    connection
+        .convert_selection(window, clipboard, uri_list, property, x11rb::CURRENT_TIME)
+        .ok()?
+        .check()
+        .ok()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut converted = false;
+    while std::time::Instant::now() < deadline {
+        match connection.poll_for_event() {
+            Ok(Some(x11rb::protocol::Event::SelectionNotify(event)))
+                if event.requestor == window && event.property == property =>
+            {
+                converted = event.selection == clipboard;
+                break;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+    if !converted {
+        return None;
+    }
+    let reply = connection
+        .get_property(false, window, property, x11rb::NONE, 0, 65536)
+        .ok()?
+        .reply()
+        .ok()?;
+    if reply.format != 8 {
+        return None;
+    }
+    let bytes: Vec<u8> = reply.value;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("file://") {
+            if let Some(path) = file_uri_decode(rest) {
+                paths.push(path);
+            }
+        }
+    }
+    if paths.is_empty() {
+        None
+    } else {
+        Some(paths)
+    }
+}
+
+static FILES_OWNER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Publish `paths` as the X11 CLIPBOARD selection (text/uri-list). The
+/// selection owner must keep serving pastes until another app takes
+/// ownership, so this spawns a dedicated thread per apply; the previous
+/// owner hears SelectionClear and exits, and a generation counter makes
+/// superseded owners exit too (CB-11 documented adaptation).
+#[cfg(target_os = "linux")]
+fn set_file_list_os(paths: &[std::path::PathBuf]) -> Result<(), PlatformError> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    if std::env::var_os("DISPLAY").is_none() {
+        return Err(PlatformError::Clipboard(
+            "no X display for file clipboard".into(),
+        ));
+    }
+    let generation = FILES_OWNER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let paths = paths.to_vec();
+    std::thread::Builder::new()
+        .name("thekvm-clipboard-file-owner".into())
+        .spawn(move || {
+            let _ = serve_file_selection(paths, generation);
+        })
+        .map_err(|error| {
+            PlatformError::Clipboard(format!("spawn file clipboard owner: {error}"))
+        })?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn serve_file_selection(paths: Vec<std::path::PathBuf>, generation: u64) -> Result<(), PlatformError> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let (connection, screen) = x11rb::connect(None).map_err(|error| {
+        PlatformError::Clipboard(format!("open X connection for file clipboard: {error}"))
+    })?;
+    let intern = |name: &[u8]| -> Result<u32, PlatformError> {
+        let cookie = connection
+            .intern_atom(false, name)
+            .map_err(|error| PlatformError::Clipboard(format!("intern atom: {error}")))?;
+        let reply = cookie
+            .reply()
+            .map_err(|error| PlatformError::Clipboard(format!("intern atom: {error}")))?;
+        Ok(reply.atom)
+    };
+    let clipboard = intern(b"CLIPBOARD")?;
+    let uri_list = intern(b"text/uri-list")?;
+    let utf8_string = intern(b"UTF8_STRING")?;
+    let targets = intern(b"TARGETS")?;
+    let timestamp_atom = intern(b"TIMESTAMP")?;
+    let root = connection
+        .setup()
+        .roots
+        .get(screen)
+        .ok_or_else(|| PlatformError::Clipboard("no X screen for file clipboard".into()))?
+        .root;
+    let window = connection
+        .generate_id()
+        .map_err(|error| PlatformError::Clipboard(format!("allocate file window: {error}")))?;
+    connection
+        .create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            window,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            x11rb::protocol::xproto::WindowClass::INPUT_ONLY,
+            x11rb::COPY_FROM_PARENT,
+            &x11rb::protocol::xproto::CreateWindowAux::new(),
+        )
+        .map_err(|error| PlatformError::Clipboard(format!("create file window: {error}")))?
+        .check()
+        .map_err(|error| PlatformError::Clipboard(format!("create file window: {error}")))?;
+    connection
+        .set_selection_owner(window, clipboard, x11rb::CURRENT_TIME)
+        .map_err(|error| PlatformError::Clipboard(format!("own file clipboard: {error}")))?
+        .check()
+        .map_err(|error| PlatformError::Clipboard(format!("own file clipboard: {error}")))?;
+    let uri_payload: Vec<u8> = paths
+        .iter()
+        .map(|path| format!("file://{}\r\n", file_uri_encode(path)))
+        .collect::<String>()
+        .into_bytes();
+    use x11rb::protocol::xproto::{
+        EventMask, SelectionNotifyEvent, SELECTION_NOTIFY_EVENT,
+    };
+    fn send_selection_notify(
+        connection: &x11rb::rust_connection::RustConnection,
+        requestor: u32,
+        event: &x11rb::protocol::xproto::SelectionRequestEvent,
+    ) {
+        use x11rb::connection::Connection;
+        let notify = SelectionNotifyEvent {
+            response_type: SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: event.time,
+            requestor,
+            selection: event.selection,
+            target: event.target,
+            property: event.property,
+        };
+        let raw: [u8; 32] = notify.into();
+        let _ = connection
+            .send_event(false, requestor, EventMask::NO_EVENT, raw);
+    }
+    fn send_selection_notify_fail(
+        connection: &x11rb::rust_connection::RustConnection,
+        requestor: u32,
+        event: &x11rb::protocol::xproto::SelectionRequestEvent,
+    ) {
+        use x11rb::connection::Connection;
+        let raw: [u8; 32] = SelectionNotifyEvent {
+            response_type: SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: event.time,
+            requestor,
+            selection: event.selection,
+            target: event.target,
+            property: 0,
+        }
+        .into();
+        let _ = connection
+            .send_event(false, requestor, EventMask::NO_EVENT, raw);
+    }
+    loop {
+        if generation != FILES_OWNER_GENERATION.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let event = connection
+            .wait_for_event()
+            .map_err(|error| PlatformError::Clipboard(format!("file clipboard events: {error}")))?;
+        match event {
+            x11rb::protocol::Event::SelectionRequest(event) => {
+                use x11rb::protocol::xproto::{EventMask, PropMode, SelectionNotifyEvent};
+                let ok = event.target == uri_list || event.target == utf8_string;
+                if event.target == targets {
+                    let list = [targets, uri_list, utf8_string, timestamp_atom];
+                    let bytes: Vec<u8> = list
+                        .iter()
+                        .flat_map(|atom| atom.to_le_bytes())
+                        .collect();
+                    let _ = connection.change_property(
+                        PropMode::REPLACE,
+                        event.requestor,
+                        event.property,
+                        4u32,
+                        32,
+                        list.len() as u32,
+                        &bytes,
+                    );
+                    let _ = send_selection_notify(&connection, event.requestor, &event);
+                } else if ok {
+                    let _ = connection.change_property(
+                        PropMode::REPLACE,
+                        event.requestor,
+                        event.property,
+                        event.target,
+                        8,
+                        uri_payload.len() as u32,
+                        &uri_payload,
+                    );
+                    let _ = send_selection_notify(&connection, event.requestor, &event);
+                } else {
+                    let _ = send_selection_notify_fail(&connection, event.requestor, &event);
+                }
+                let _ = connection.flush();
+            }
+            x11rb::protocol::Event::SelectionClear(event) => {
+                if event.selection == clipboard {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn read_file_list_os() -> Option<Vec<std::path::PathBuf>> {
+    None
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn set_file_list_os(_paths: &[std::path::PathBuf]) -> Result<(), PlatformError> {
+    Err(PlatformError::Clipboard(
+        "file clipboard unsupported on this OS".into(),
+    ))
 }
 
 /// Largest image dimension the clipboard path accepts, in pixels per
@@ -607,6 +1182,25 @@ impl ClipboardWatcher {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_uri_roundtrip_with_special_bytes() {
+        let path = std::path::PathBuf::from("/tmp/some file #1 (copy).pdf");
+        let encoded = super::file_uri_encode(&path);
+        assert!(encoded.contains("%20"));
+        assert!(encoded.contains("%23"));
+        let decoded = super::file_uri_decode(&encoded).expect("decode");
+        assert_eq!(decoded, path);
+        // Malformed escapes fail closed.
+        assert!(super::file_uri_decode("%zz").is_none());
+        assert!(super::file_uri_decode("%1").is_none());
+    }
+
+    #[test]
+    fn file_clipboard_total_bytes_saturates() {
+        let paths = vec![std::path::PathBuf::from("/definitely/missing")];
+        assert_eq!(super::file_list_total_bytes(&paths), 0);
+    }
+
     #[test]
     fn clipboard_module_compiles_for_supported_platforms() {
         // The actual desktop clipboard requires a live user session and is
