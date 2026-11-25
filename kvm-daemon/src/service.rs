@@ -15706,6 +15706,20 @@ mod tests {
             super::FilesFeed::Dropped
         ));
     }
+
+    #[test]
+    fn clipboard_frame_ordering_is_per_sender_sequence() {
+        // CB-07: the receiver applies only strictly newer events from
+        // the per-sender sequence; replays (dedup, never applied
+        // twice), stale/gap reordered arrivals, and disabled streams
+        // are all dropped.
+        assert!(super::clipboard_frame_current(true, 5, 4));
+        assert!(!super::clipboard_frame_current(true, 4, 4)); // exact replay
+        assert!(!super::clipboard_frame_current(true, 3, 4)); // stale arrival
+        assert!(!super::clipboard_frame_current(false, 99, 0)); // disabled
+        assert!(!super::clipboard_frame_current(true, 0, 0)); // pre-activation
+    }
+
     use super::*;
 
     #[test]

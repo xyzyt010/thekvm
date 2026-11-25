@@ -91,9 +91,44 @@ match (see deploy-windows-v3.log).
   the arrows).
 - Deployed (service Running, hashes match).
 
+## Fix pass 3, 2026-11-26 (SET-10 focus trap + DS-10 + Loop 4 re-pass)
+- DS-06: every KvmButton gained a FocusScope (tab navigation +
+  blue #60a5fa focus ring, visible in v5-confirm shot on Cancel);
+  settings overflow/trash are tab stops; Enter/Space activates
+  (KeyEvent text: Enter U+000A, Space, Tab U+0009, Escape U+001B,
+  Backtab U+0019 via \u{...} escapes — Slint has no \t/\r).
+- DS-07: Theme.reduced gates the spinner/radar timers; Rust seeds it
+  from the OS MinAnimate flag (kvm-platform/src/prefs.rs).
+- DS-10: Devices Details/Connect announce "row N of M" via aria-label;
+  Settings overflow/trash likewise.
+- SET-10: delete confirmation moved INSIDE its row. Cancel is the
+  default (timer focuses it on open); Tab/Shift-Tab trap cycles
+  Cancel<->Delete (capture_key on the panel FocusScope, using
+  KvmButton.forward-focus + has-focus); Escape cancels; closing
+  returns focus to that row's trash. Overflow menu items are now
+  keyboard-navigable RowMenuAction rows (Enter/Space act, Escape
+  closes). Verified: v5-confirm.png (Cancel focused, panel in row 1).
+- CB-07: added clipboard_frame_ordering_is_per_sender_sequence test
+  (newer applies; replay dedup; stale dropped; disabled dropped).
+  Simultaneous multi-sender ties still resolve by per-stream arrival
+  order (per-sender sequence + per-session identity is the
+  tie-break); wire unchanged for mixed-version compatibility.
+- Loop 4 (Mint, Xvfb): re-ran at 720x560 (1024x768 display) in dark
+  and light themes plus a daemon-online run — Connect two-row grid,
+  Devices rows, Settings rows (tight columns, white trash, visible
+  separator), empty state, offline banner. Synthetic clicks need
+  DOUBLE clicks under bare Xvfb (first click is focus).
+- Tests: core 75, daemon 95 (+1 new), platform 48, protocol 54,
+  ui 14 = 286 green. kvm-android fails to test-compile on Windows
+  (pre-existing; package untouched this pass).
+- Deployed (service Running, hashes match).
+
 ## Definition of done status
-Implemented + evidenced: DS (type, targets, colors), SET (rows, menu,
-header), DEV (roster, states, actions), CON (aligned two-row grid,
-complete roster), CB (activation, revision order, files, limit toast,
-offline queue), MN (push honesty). Pending user loop: live 3-node
-crossing + clipboard 9-step acceptance on real machines.
+Implemented + evidenced: DS (type, targets, colors, focus ring,
+reduced motion), SET (rows, menu, header, focus trap), DEV (roster,
+states, actions), CON (aligned two-row grid, complete roster), CB
+(activation, revision order, files, limit toast, offline queue), MN
+(push honesty). Pending user loop: live 3-node crossing + clipboard
+9-step acceptance on real machines; DS-06 disabled-reason tooltips;
+Android controller UI parity (desktop renders Android peers with
+yellow dot + label; the Android app itself has no Slint UI).
