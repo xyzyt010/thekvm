@@ -1,4 +1,4 @@
-import { CheckBox, LineEdit, Palette, ScrollView, TabWidget } from "std-widgets.slint";
+import { CheckBox, LineEdit, Palette, TabWidget } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------
 // One loading language: a full faint ring with a single bright comet arc
@@ -46,14 +46,15 @@ component SpinnerArc inherits Rectangle {
             + (round((12 + 9.5 * cos(root.angle + 90deg)) * 100) / 100) + " "
             + (round((12 + 9.5 * sin(root.angle + 90deg)) * 100) / 100);
     }
-    // One revolution every ~3.8s (1.5° per 16ms). The angle wraps at 360°
-    // so long uptimes cannot lose float precision and stutter.
+    // One revolution every ~1.9s (3° per 16ms — 2x the old pace). The
+    // angle wraps at 360° so long uptimes cannot lose float precision
+    // and stutter.
     in-out property <angle> angle: 0deg;
     Timer {
         interval: 16ms;
         running: true;
         triggered => {
-            root.angle = (root.angle + 1.5deg >= 360deg) ? (root.angle + 1.5deg - 360deg) : (root.angle + 1.5deg);
+            root.angle = (root.angle + 3deg >= 360deg) ? (root.angle + 3deg - 360deg) : (root.angle + 3deg);
         }
     }
 }
@@ -177,10 +178,12 @@ component IconButton inherits Rectangle {
     }
 }
 
-// Delete: Material Symbols "delete" (outlined style), drawn by
-// hand for Slint: a lidded bin with three vertical ribs — the
-// ribs are background-colored cutouts over the filled tub, like
-// the webui original. Same silhouette, no extra details.
+// Delete: Google Fonts Material Symbols "delete" (24dp, outlined,
+// wght 400), redrawn as a native Slint Path — the exact vector from
+// delete_24dp_FILL0_wght400_GRAD0_opsz24, not an imported SVG, so it
+// rasterises crisply at 18px on the software renderer. One filled
+// path (lid bar, handle, tub outline, two ribs as cut-out subpaths);
+// only the colour is ours (red = destructive).
 component TrashIcon inherits Rectangle {
     width: 18px;
     height: 18px;
@@ -193,12 +196,8 @@ component TrashIcon inherits Rectangle {
         viewbox-width: 24;
         viewbox-height: 24;
         fill: #f87171;
-        commands: "M 6 19 c0 1.1 0.9 2 2 2 h 8 c1.1 0 2 -0.9 2 -2 V 7 H 6 Z M 19 4 h -1 V 2 h -4 v 2 H 10 V 2 H 6 v 2 H 5 c-1.1 0 -2 0.9 -2 2 v 1 h 18 V 6 c0 -1.1 -0.9 -2 -2 -2 Z";
+        commands: "M7,21q-0.82,0-1.41-0.59T5,19V6H4V4H9V3h6V4h5V6H19V19q0,0.82-0.59,1.41T17,21H7ZM17,6H7V19H17V6ZM9,17h2V8H9v9Zm4,0h2V8H13v9ZM7,6V19V6Z";
     }
-    // Three rib cutouts through the tub.
-    Rectangle { x: 6px; y: 8.25px; width: 1.5px; height: 4.5px; background: Theme.bg; }
-    Rectangle { x: 8.25px; y: 8.25px; width: 1.5px; height: 4.5px; background: Theme.bg; }
-    Rectangle { x: 10.5px; y: 8.25px; width: 1.5px; height: 4.5px; background: Theme.bg; }
 }
 
 // Discovery radar: concentric green rings with one bright comet arc
@@ -213,12 +212,12 @@ component RadarIcon inherits Rectangle {
     background: transparent;
     in-out property <angle> angle: 0deg;
     Timer {
-        // ~1 second per revolution: the pace of a normal player,
-        // not a slow planet.
+        // ~0.5 second per revolution (2x the previous sweep): a brisk
+        // radar, matching a normal player's spinner pace.
         interval: 20ms;
         running: root.sweeping;
         triggered => {
-            root.angle = (root.angle + 7deg >= 360deg) ? (root.angle + 7deg - 360deg) : (root.angle + 7deg);
+            root.angle = (root.angle + 14deg >= 360deg) ? (root.angle + 14deg - 360deg) : (root.angle + 14deg);
         }
     }
     // Three rings, center dot, and the comet arm.
@@ -276,6 +275,74 @@ component ToggleSwitch inherits Rectangle {
         height: 22px;
         border-radius: 11px;
         background: #ffffff;
+    }
+}
+
+// Tab page scroller, hand-rolled instead of std ScrollView: the std
+// one's Flickable is non-interactive with a 2px scrollbar sliver, and
+// its viewport size is left for the child to imply — in the TabWidget
+// that chain measured short, so Devices/Settings simply never
+// scrolled. Here the Flickable's viewport-height is bound explicitly
+// to the content child's own height, the wheel is native Flickable
+// input, and the scrollbar is a real 8px track with a draggable thumb
+// that is always visible whenever content overflows. Content drag-pan
+// stays OFF (interactive: false) so monitor-card drags in Devices are
+// never stolen; wheel + thumb are the scroll inputs.
+component PageScroll inherits Rectangle {
+    horizontal-stretch: 1;
+    vertical-stretch: 1;
+    preferred-width: 100%;
+    preferred-height: 100%;
+    min-width: 50px;
+    min-height: 50px;
+    property <length> max-scroll: max(0px, flick.viewport-height - flick.height);
+    flick := Flickable {
+        width: parent.width;
+        height: parent.height;
+        interactive: false;
+        viewport-width: self.width;
+        viewport-height: content-box.height;
+        content-box := Rectangle {
+            width: flick.width;
+            height: page.preferred-height;
+            page := VerticalLayout {
+                width: parent.width;
+                @children
+            }
+        }
+    }
+    if root.max-scroll > 0px : track := Rectangle {
+        x: parent.width - 10px;
+        y: 2px;
+        width: 8px;
+        height: parent.height - 4px;
+        border-radius: 4px;
+        background: Theme.dark ? #ffffff14 : #00000014;
+        thumb := Rectangle {
+            x: 1px;
+            width: 6px;
+            height: max(28px, track.height * flick.height / max(1px, flick.viewport-height));
+            y: (track.height - self.height) * (-flick.viewport-y / root.max-scroll);
+            border-radius: 3px;
+            background: drag.has-hover || drag.pressed ? Theme.faint : Theme.border-strong;
+            drag := TouchArea {
+                property <length> press-abs-y: 0px;
+                property <length> press-view-y: 0px;
+                mouse-cursor: pointer;
+                pointer-event(event) => {
+                    if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                        self.press-abs-y = self.absolute-position.y + self.mouse-y;
+                        self.press-view-y = flick.viewport-y;
+                    }
+                }
+                moved => {
+                    if (self.pressed && track.height > thumb.height) {
+                        let dy = (self.absolute-position.y + self.mouse-y) - self.press-abs-y;
+                        flick.viewport-y = max(-root.max-scroll, min(0px, self.press-view-y - dy * root.max-scroll / (track.height - thumb.height)));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -538,10 +605,12 @@ component MonitorCard inherits Rectangle {
                 : @linear-gradient(180deg, #141414 0%, #0a0a0a 100%);
             border-radius: 4px;
             // Exit bars (this computer) and entry bars (linked computer).
-            if root.exit-left : Rectangle { x: 0; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #86efac : #22c55e; }
-            if root.exit-right : Rectangle { x: 143px; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #86efac : #22c55e; }
-            if root.enter-left : Rectangle { x: 0; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #99f6e4 : #5eead4; }
-            if root.enter-right : Rectangle { x: 143px; y: 12px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #99f6e4 : #5eead4; }
+            // Bar centre is the screen centre (y 14 + 52/2 = 40 in screen
+            // space): the crossing arrows land exactly on it.
+            if root.exit-left : Rectangle { x: 0; y: 14px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #86efac : #22c55e; }
+            if root.exit-right : Rectangle { x: 143px; y: 14px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #86efac : #22c55e; }
+            if root.enter-left : Rectangle { x: 0; y: 14px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #99f6e4 : #5eead4; }
+            if root.enter-right : Rectangle { x: 143px; y: 14px; width: 3px; height: 52px; border-radius: 2px; background: root.crossing-pulse ? #99f6e4 : #5eead4; }
             // Tiny direction chevrons beside the lit edges.
             if root.exit-left : Path { x: 7px; y: 35px; width: 10px; height: 10px; viewbox-width: 10; viewbox-height: 10; stroke: #22c55e; stroke-width: 1.8px; stroke-line-cap: round; stroke-line-join: round; fill: transparent; commands: "M 8 2 L 3 5 L 8 8"; }
             if root.exit-right : Path { x: 129px; y: 35px; width: 10px; height: 10px; viewbox-width: 10; viewbox-height: 10; stroke: #22c55e; stroke-width: 1.8px; stroke-line-cap: round; stroke-line-join: round; fill: transparent; commands: "M 2 2 L 7 5 L 2 8"; }
@@ -732,10 +801,23 @@ component ArrangementMesh inherits Rectangle {
     property <bool> head-at-our: root.peer-may-drive && root.we-may-be-driven;
 
     // ---- Where the two cards actually are right now ----------------
-    // A drag nudges the grabbed monitor, so the arrows follow the card they
-    // start or end on rather than its resting slot.
-    property <length> our-cur-x: root.local-x + ((root.dragging-local && root.dragging) ? root.drag-dx : 0px);
-    property <length> peer-cur-x: root.peer-x + ((root.dragging || root.flip-pending) ? root.drag-dx : 0px);
+    // The grabbed monitor follows the pointer exactly (no lag, no haze:
+    // it is lifted out of its slot). The OTHER monitor previews the
+    // swap: once the grabbed card's centre crosses the middle, the
+    // other card slides into the vacated slot, so the drop target is
+    // already occupied-correct before the pointer is released. On
+    // release the placement callback confirms and both cards settle
+    // (magnetise) into their slots with the x animation.
+    property <bool> peer-will-swap: root.dragging && !root.dragging-local && (root.will-land-right != root.peer-on-right);
+    property <bool> local-will-swap: root.dragging && root.dragging-local && ((root.local-x + root.drag-dx + root.card-w / 2 > root.inner-w / 2) == root.peer-on-right);
+    property <length> local-render-x: (root.dragging && root.dragging-local)
+        ? root.local-x + root.drag-dx
+        : (root.peer-will-swap ? root.peer-x : root.local-x);
+    property <length> peer-render-x: ((root.dragging && !root.dragging-local) || root.flip-pending)
+        ? root.peer-x + root.drag-dx
+        : (root.local-will-swap ? root.local-x : root.peer-x);
+    property <length> our-cur-x: root.local-render-x;
+    property <length> peer-cur-x: root.peer-render-x;
     property <length> our-l: root.our-cur-x;
     property <length> our-r: root.our-cur-x + root.card-w;
     property <length> peer-l: root.peer-cur-x;
@@ -782,11 +864,24 @@ component ArrangementMesh inherits Rectangle {
         }
     }
 
+    // Vacated-slot ghost while a card is lifted: the slot the grabbed
+    // monitor came from stays drawn as an empty outline, so the pair
+    // never looks like one monitor vanished into haze.
+    if root.dragging : Rectangle {
+        x: root.dragging-local ? root.local-x : root.peer-x;
+        y: root.card-y;
+        width: root.card-w;
+        height: root.card-h;
+        border-radius: 10px;
+        border-width: 1.5px;
+        border-color: Theme.border-strong;
+        background: transparent;
+    }
     // The two monitors, placed from the mesh's rendered width and animated:
-    // a drag nudges the grabbed monitor, a confirmed swap slides it into the
-    // other slot.
+    // the grabbed card tracks the pointer with zero animation lag; the
+    // other card (and a confirmed drop) slides with the animation.
     local := MonitorCard {
-        x: root.local-x + ((root.dragging-local && root.dragging) ? root.drag-dx : 0px);
+        x: root.local-render-x;
         y: root.card-y;
         width: root.card-w;
         height: root.card-h;
@@ -795,12 +890,14 @@ component ArrangementMesh inherits Rectangle {
         local: true;
         exit-left: root.enabled && root.exit-left;
         exit-right: root.enabled && root.exit-right;
+        hovered: local-drag-area.has-hover;
+        dragging: root.dragging && root.dragging-local;
         powered: root.link-live;
         crossing-pulse: root.crossing-pulse;
-        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
+        animate x { duration: (root.dragging && root.dragging-local) ? 0ms : 200ms; easing: ease-in-out; }
     }
     peer := MonitorCard {
-        x: root.peer-x + (root.dragging || root.flip-pending ? root.drag-dx : 0px);
+        x: root.peer-render-x;
         y: root.card-y;
         width: root.card-w;
         height: root.card-h;
@@ -810,11 +907,11 @@ component ArrangementMesh inherits Rectangle {
         enter-left: root.enabled && root.enter-left;
         enter-right: root.enabled && root.enter-right;
         hovered: drag-area.has-hover;
-        dragging: root.dragging;
+        dragging: root.dragging && !root.dragging-local;
         dimmed: !root.enabled;
         powered: root.link-live;
         crossing-pulse: root.crossing-pulse;
-        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
+        animate x { duration: (root.dragging && !root.dragging-local) ? 0ms : 200ms; easing: ease-in-out; }
     }
     // ---- The crossing arrows ---------------------------------------
     // Both arrows are dead straight and parallel to each other. The short
@@ -832,11 +929,14 @@ component ArrangementMesh inherits Rectangle {
     property <float> near-x2: root.peer-facing-x / 1px;
     property <float> far-x1: root.our-far-x / 1px;
     property <float> far-x2: root.entry-x / 1px;
-    // Single draws ONE arrow, and it runs dead straight through the
-    // vertical middle of the screens; the double disciplines keep their
-    // staggered two-arrow pair.
-    property <int> y-near: root.edge-mode == 0 ? root.card-y / 1px + 49 : root.card-y / 1px + 38;
-    property <int> y-far: root.card-y / 1px + 60;
+    // Arrows are perfectly centred on the screens: the screen area's
+    // vertical middle is card-y + 9 (bezel) + 40 (half the 80px
+    // screen) = card-y + 49, which is also the lit bars' centre. The
+    // double disciplines straddle it symmetrically (±11); Single runs
+    // dead through it.
+    property <int> center-y: root.card-y / 1px + 49;
+    property <int> y-near: root.edge-mode == 0 ? root.center-y : root.center-y - 11;
+    property <int> y-far: root.center-y + 11;
     property <bool> near-right: root.near-x1 < root.near-x2;
     property <bool> far-right: root.far-x1 < root.far-x2;
 
@@ -899,7 +999,7 @@ component ArrangementMesh inherits Rectangle {
     // The linked monitor is draggable: it follows the pointer and lands on
     // the side it is released on.
     drag-area := TouchArea {
-        x: root.peer-x + (root.dragging || root.flip-pending ? root.drag-dx : 0px);
+        x: root.peer-render-x;
         y: root.card-y;
         width: root.card-w;
         height: root.card-h;
@@ -909,11 +1009,12 @@ component ArrangementMesh inherits Rectangle {
             if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
                 root.flip-pending = false;
                 root.dragging = true;
+                root.dragging-local = false;
                 root.drag-start-abs = self.absolute-position.x + self.mouse-x;
                 root.drag-dx = 0px;
-            } else if (event.kind == PointerEventKind.move && root.dragging) {
+            } else if (event.kind == PointerEventKind.move && root.dragging && !root.dragging-local) {
                 root.drag-dx = max(-root.drag-limit, min(root.drag-limit, (self.absolute-position.x + self.mouse-x) - root.drag-start-abs));
-            } else if ((event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) && root.dragging) {
+            } else if ((event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) && root.dragging && !root.dragging-local) {
                 root.dragging = false;
                 let want-right = root.will-land-right;
                 if (want-right != root.peer-on-right) {
@@ -932,13 +1033,13 @@ component ArrangementMesh inherits Rectangle {
         double-clicked => {
             if (root.peer-on-right) { root.to-left(); } else { root.to_right(); }
         }
-        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
+        animate x { duration: (root.dragging && !root.dragging-local) ? 0ms : 200ms; easing: ease-in-out; }
     }
     // The local monitor is draggable too: pushing THIS PC across the middle
     // is the same swap as pulling the linked PC the other way, so the
     // gesture feels symmetric on both halves of the pair.
     local-drag-area := TouchArea {
-        x: root.local-x;
+        x: root.local-render-x;
         y: root.card-y;
         width: root.card-w;
         height: root.card-h;
@@ -975,7 +1076,7 @@ component ArrangementMesh inherits Rectangle {
         double-clicked => {
             if (root.peer-on-right) { root.to-left(); } else { root.to-right(); }
         }
-        animate x { duration: root.dragging ? 0ms : 200ms; easing: ease-in-out; }
+        animate x { duration: (root.dragging && root.dragging-local) ? 0ms : 200ms; easing: ease-in-out; }
     }    // Magnetic landing slot while dragging.
     if root.dragging : Rectangle {
         x: root.will-land-right ? root.inner-w - root.margin - root.card-w : root.margin;
@@ -1921,9 +2022,7 @@ export component AppWindow inherits Window {
                 // plain VerticalLayout silently CLIPS everything past the
                 // bottom — which once hid the whole address/code/connect
                 // row with no way to reach it. Never clip again.
-                ScrollView {
-                    vertical-scrollbar-policy: ScrollBarPolicy.always-on;
-                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                PageScroll {
                 Rectangle {
                 // Exactly the Flickable's width: the content must never ask the
                 // viewport to be wider than the window, or the panels get
@@ -2003,9 +2102,12 @@ export component AppWindow inherits Window {
                                     picked(index) => { set-role(index); }
                                 }
                             }
+                            // No "Scanning…" caption: the spinning rescan
+                            // icon already says it. Only the result count
+                            // shows, once the scan settles.
                             Text {
-                                text: root.discovery-scanning ? "Scanning…" : root.discovery-text;
-                                color: root.discovery-scanning ? Theme.text-2 : Theme.faint;
+                                text: root.discovery-scanning ? "" : root.discovery-text;
+                                color: Theme.faint;
                                 font-size: 14px;
                                 wrap: word-wrap;
                             }
@@ -2312,9 +2414,7 @@ export component AppWindow inherits Window {
 
             Tab {
                 title: "Devices";
-                ScrollView {
-                    vertical-scrollbar-policy: ScrollBarPolicy.always-on;
-                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                PageScroll {
                 Rectangle {
                 // Exactly the Flickable's width: the content must never ask the
                 // viewport to be wider than the window, or the panels get
@@ -2612,9 +2712,7 @@ export component AppWindow inherits Window {
 
             Tab {
                 title: "Settings";
-                ScrollView {
-                    vertical-scrollbar-policy: ScrollBarPolicy.always-on;
-                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                PageScroll {
                 Rectangle {
                 // Exactly the Flickable's width: the content must never ask the
                 // viewport to be wider than the window, or the panels get
@@ -2977,11 +3075,9 @@ export component AppWindow inherits Window {
                                     tick: root.spinner-tick;
                                 }
                                 Text {
-                                    text: root.discovery-scanning
-                                        ? "Searching for devices…"
-                                        : root.discovered-labels.length == 0
-                                            ? "No devices found yet"
-                                            : root.discovered-labels.length == 1 ? "1 device found" : root.discovered-labels.length + " devices found";
+                                    text: root.discovered-labels.length == 0
+                                        ? (root.discovery-scanning ? "" : "No devices found yet")
+                                        : root.discovered-labels.length == 1 ? "1 device found" : root.discovered-labels.length + " devices found";
                                     color: Theme.text-2;
                                     font-size: 13px;
                                     font-weight: 600;

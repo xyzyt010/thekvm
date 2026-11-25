@@ -110,11 +110,69 @@ pub struct InjectionReceipts {
     pub absolute_detail: String,
 }
 
-static POOLED_INPUT_PROXIES: std::sync::OnceLock<std::sync::Mutex<Vec<ServiceInputProxy>>> =
+/// Idle offload window for pooled input helpers. Pooled helpers are
+/// the fast-onload mechanism: a session that starts within the window
+/// reuses warm helper processes and pays zero spawn latency. Past the
+/// window the helpers are offloaded (streams shut down, helper
+/// processes exit on EOF) so an idle machine does not carry ~4 extra
+/// daemon processes forever — the next session simply spawns fresh.
+const HELPER_IDLE_OFFLOAD: std::time::Duration = std::time::Duration::from_secs(120);
+
+struct PooledInputProxy {
+    pooled_at: std::time::Instant,
+    proxy: ServiceInputProxy,
+}
+
+static POOLED_INPUT_PROXIES: std::sync::OnceLock<std::sync::Mutex<Vec<PooledInputProxy>>> =
     std::sync::OnceLock::new();
 
-fn pooled_input_proxies() -> &'static std::sync::Mutex<Vec<ServiceInputProxy>> {
+fn pooled_input_proxies() -> &'static std::sync::Mutex<Vec<PooledInputProxy>> {
     POOLED_INPUT_PROXIES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Shut down every pooled proxy older than HELPER_IDLE_OFFLOAD. Their
+/// helper processes exit immediately on EOF (see Drop below), which
+/// is the offload: resident set drops back to service + UI only.
+fn evict_expired_pooled() -> usize {
+    let now = std::time::Instant::now();
+    let mut expired: Vec<PooledInputProxy> = Vec::new();
+    if let Ok(mut guard) = pooled_input_proxies().lock() {
+        let mut index = 0;
+        while index < guard.len() {
+            if now.duration_since(guard[index].pooled_at) >= HELPER_IDLE_OFFLOAD {
+                expired.push(guard.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+    }
+    let count = expired.len();
+    for mut entry in expired {
+        for stream in &entry.proxy.streams {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        entry.proxy.streams.clear();
+    }
+    if count > 0 {
+        tracing::info!(
+            offloaded = count,
+            idle_secs = HELPER_IDLE_OFFLOAD.as_secs(),
+            "idle offload: released pooled input helpers (fast onload re-spawns on demand)"
+        );
+    }
+    count
+}
+
+/// Background reaper: evicts expired pooled helpers even when no new
+/// session ever arrives to trigger the lazy eviction in create().
+fn ensure_offload_reaper() {
+    static REAPER: std::sync::Once = std::sync::Once::new();
+    REAPER.call_once(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            evict_expired_pooled();
+        });
+    });
 }
 
 /// Pre-warm the interactive input helpers at Windows service startup so the
@@ -136,8 +194,10 @@ pub struct ServiceInputProxy {
 
 impl ServiceInputProxy {
     pub fn create(lock_screen_enabled: bool) -> Result<Self> {
+        // Lazy offload sweep: expired pooled helpers never get reused.
+        evict_expired_pooled();
         if let Ok(mut guard) = pooled_input_proxies().lock() {
-            while let Some(mut cached) = guard.pop() {
+            while let Some(mut cached) = guard.pop().map(|entry| entry.proxy) {
                 let has_winlogon = cached
                     .desktops
                     .iter()
@@ -508,11 +568,16 @@ impl Drop for ServiceInputProxy {
         {
             if let Ok(mut guard) = pooled_input_proxies().lock() {
                 if guard.len() < 2 {
-                    guard.push(ServiceInputProxy {
-                        streams: std::mem::take(&mut self.streams),
-                        desktops: std::mem::take(&mut self.desktops),
-                        session_id: self.session_id,
+                    guard.push(PooledInputProxy {
+                        pooled_at: std::time::Instant::now(),
+                        proxy: ServiceInputProxy {
+                            streams: std::mem::take(&mut self.streams),
+                            desktops: std::mem::take(&mut self.desktops),
+                            session_id: self.session_id,
+                        },
                     });
+                    drop(guard);
+                    ensure_offload_reaper();
                     return;
                 }
             }

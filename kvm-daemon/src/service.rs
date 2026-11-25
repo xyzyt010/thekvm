@@ -10758,6 +10758,48 @@ async fn handle_connection(
                 reject(&mut send, "peer is not paired").await?;
                 bail!("untrusted peer fingerprint {peer_fingerprint}");
             }
+            // Heal the allowed-connections address from this verified
+            // inbound connection: the peer's TLS fingerprint is pinned
+            // (checked above), so its source IP is truth — record it at
+            // the listen port (the wire source port is ephemeral) in
+            // the LIVE book, so the UI's Allowed connections row shows
+            // the current IP within one poll cycle, not after a restart.
+            {
+                let healed = std::net::SocketAddr::new(conn.remote_address().ip(), DEFAULT_PORT)
+                    .to_string();
+                let mut book = peers.write().await;
+                let stale = book
+                    .peers
+                    .iter()
+                    .find(|peer| peer.fingerprint_hex.eq_ignore_ascii_case(&peer_fingerprint))
+                    .map(|peer| peer.address.as_deref() != Some(healed.as_str()))
+                    .unwrap_or(false);
+                if stale {
+                    if let Some(peer) = book
+                        .peers
+                        .iter()
+                        .find(|peer| {
+                            peer.fingerprint_hex.eq_ignore_ascii_case(&peer_fingerprint)
+                        })
+                        .cloned()
+                    {
+                        if book
+                            .pin_with_address(
+                                peer.name.clone(),
+                                peer_fingerprint.clone(),
+                                Some(healed.clone()),
+                            )
+                            .is_ok()
+                        {
+                            tracing::info!(
+                                peer = %peer_fingerprint,
+                                address = %healed,
+                                "allowed-connection address healed from verified inbound connection"
+                            );
+                        }
+                    }
+                }
+            }
             // A local Disconnect latches "no reconnect" for this app run.
             // Without this gate the peer keeps auto-dialing us, so we end up
             // in the one-way state: they enter our desktop while our own
