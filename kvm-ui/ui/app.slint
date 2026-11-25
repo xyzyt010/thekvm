@@ -163,9 +163,11 @@ component IconButton inherits Rectangle {
     accessible-role: button;
     accessible-label: "Add a computer";
     accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    // Plus cross centred optically in the 36px box: horizontal bar at
+    // y=17 (centre 18), vertical bar x=17 (centre 18).
     if root.glyph == "+" : Rectangle {
         x: 12px;
-        y: 8px;
+        y: 17px;
         width: 12px;
         height: 2px;
         border-radius: 1px;
@@ -173,7 +175,7 @@ component IconButton inherits Rectangle {
     }
     if root.glyph == "+" : Rectangle {
         x: 17px;
-        y: 3px;
+        y: 12px;
         width: 2px;
         height: 12px;
         border-radius: 1px;
@@ -195,18 +197,19 @@ component OverflowIcon inherits Rectangle {
 // Delete: Google Fonts Material Symbols "delete" (24dp, outlined,
 // wght 400), redrawn as a native Slint Path — the exact vector from
 // delete_24dp_FILL0_wght400_GRAD0_opsz24, not an imported SVG, so it
-// rasterises crisply at 18px on the software renderer. One filled
+// rasterises crisply at 20px on the software renderer. One filled
 // path (lid bar, handle, tub outline, two ribs as cut-out subpaths);
-// only the colour is ours (red = destructive).
+// only the colour is ours (red = destructive). 20px in a 36px box,
+// optically centred by bounding box.
 component TrashIcon inherits Rectangle {
-    width: 18px;
-    height: 18px;
+    width: 20px;
+    height: 20px;
     background: transparent;
     Path {
         x: 0px;
         y: 0px;
-        width: 18px;
-        height: 18px;
+        width: 20px;
+        height: 20px;
         viewbox-width: 24;
         viewbox-height: 24;
         fill: #f87171;
@@ -2250,7 +2253,12 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         height: 40px;
                         spacing: 8px;
-                        alignment: center;
+                        // Left-hugging row: the dot column stays glued to
+                        // the content gutter on both rows, so the status
+                        // dots share one column and the labels start at
+                        // the same line in every state (Live/Connecting/
+                        // Idle) — centering let the dot column drift.
+                        alignment: start;
                         VerticalLayout {
                             width: 24px;
                             alignment: center;
@@ -2295,7 +2303,10 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         height: 40px;
                         spacing: 8px;
-                        alignment: center;
+                        // Left-hugging row, same grid as the local row
+                        // above: dots share one column, labels start at
+                        // the same line in every state.
+                        alignment: start;
                         VerticalLayout {
                             width: 24px;
                             alignment: center;
@@ -2357,74 +2368,9 @@ export component AppWindow inherits Window {
                         overflow: elide;
                         wrap: word-wrap;
                     }
-                    Rectangle {
-                        vertical-stretch: 0; height: 1px; background: Theme.border; }
-                    // ---- Complete roster (CON-03) -----------------------
-                    // EVERY known computer, one per row: trusted peers,
-                    // then discovered devices. Android rows show a yellow
-                    // dot + an "Android" platform label. The connected row
-                    // above is primary but never the only row.
-                    Text {
-                        vertical-stretch: 0;
-                        text: "All computers (" + root.roster-names.length + ")";
-                        color: Theme.faint;
-                        font-size: 14px;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                    }
-                    for i in root.roster-names.length : HorizontalLayout {
-                        vertical-stretch: 0;
-                        height: 40px;
-                        spacing: 8px;
-                        alignment: center;
-                        VerticalLayout {
-                            width: 24px;
-                            alignment: center;
-                            Rectangle {
-                                width: 10px;
-                                height: 10px;
-                                border-radius: 5px;
-                                background: root.roster-states[i] == "Live" ? #22c55e
-                                    : root.roster-states[i] == "Android · Live" ? #facc15
-                                    : root.roster-states[i] == "Android" ? #facc15
-                                    : root.roster-states[i] == "Connecting" ? #f59e0b
-                                    : root.roster-states[i] == "Error" ? #f87171
-                                    : root.roster-states[i] == "Discovered" ? #5eead4
-                                    : Theme.border-strong;
-                            }
-                        }
-                        Text {
-                            text: root.roster-names[i];
-                            color: Theme.text;
-                            font-size: 14px;
-                            font-weight: 600;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: root.roster-addresses[i];
-                            color: Theme.text-2;
-                            font-size: 14px;
-                            overflow: elide;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            width: 80px;
-                            text: root.roster-states[i];
-                            color: root.roster-states[i] == "Android · Live" ? #facc15 : Theme.faint;
-                            font-size: 14px;
-                            horizontal-alignment: right;
-                            vertical-alignment: center;
-                        }
-                    }
-                    if root.roster-names.length == 0 : Text {
-                        vertical-stretch: 0;
-                        text: "No computers yet. Press + in Settings to add one.";
-                        color: Theme.faint;
-                        font-size: 14px;
-                        wrap: word-wrap;
-                    }
+                    // (No roster here: the complete per-computer roster
+                    // lives once, in Devices. Connect stays the two-row
+                    // this/connected status grid only.)
 
                     // ---- Pairing code ------------------------------------
                     // Only meaningful for the manual path: auto-connect never
@@ -2680,7 +2626,9 @@ export component AppWindow inherits Window {
                             padding-left: 12px;
                             padding-right: 8px;
                             spacing: 8px;
-                            alignment: center;
+                            // Left-hugging row: dot/name/address/state
+                            // start at the content gutter in every state.
+                            alignment: start;
                             VerticalLayout {
                                 width: 24px;
                                 alignment: center;
@@ -3231,15 +3179,19 @@ export component AppWindow inherits Window {
                             padding-left: 12px;
                             padding-right: 8px;
                             spacing: 8px;
-                            alignment: center;
-                            // SET-03: one-based index, right-aligned in a
-                            // fixed column so every name starts together.
+                            // Content hugs the left gutter (index starts
+                            // at the box edge); the spacer pushes the two
+                            // trailing actions to the right edge.
+                            alignment: start;
+                            // SET-03: one-based index, left-aligned so it
+                            // starts at the box edge; numbers renumber
+                            // automatically after a delete.
                             Text {
                                 width: 28px;
                                 text: (i + 1) + ".";
                                 color: Theme.muted;
                                 font-size: 14px;
-                                horizontal-alignment: right;
+                                horizontal-alignment: left;
                                 vertical-alignment: center;
                             }
                             // Fixed columns (SET-02 acceptance): name and
@@ -3378,8 +3330,8 @@ export component AppWindow inherits Window {
                                     root.pending-delete-name = peer.name == "" ? "Unnamed computer" : peer.name;
                                 }
                                 TrashIcon {
-                                    x: 9px;
-                                    y: 9px;
+                                    x: 8px;
+                                    y: 8px;
                                 }
                             }
                         }
