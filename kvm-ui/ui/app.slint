@@ -1,4 +1,4 @@
-﻿import { CheckBox, LineEdit, Palette, TabWidget } from "std-widgets.slint";
+import { CheckBox, LineEdit, Palette, TabWidget } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------
 // One loading language: a full faint ring with a single bright comet arc
@@ -2429,13 +2429,6 @@ export component AppWindow inherits Window {
                             font-weight: 700;
                             vertical-alignment: center;
                         }
-                        Text {
-                            text: root.linked-peer-name == "" ? "" : "Connected computer";
-                            color: Theme.faint;
-                            font-size: 14px;
-                            overflow: elide;
-                            vertical-alignment: center;
-                        }
                         Rectangle { horizontal-stretch: 1; }
                         Text {
                             text: root.details-peer-address == "" ? "—" : root.details-peer-address;
@@ -3042,7 +3035,7 @@ export component AppWindow inherits Window {
                 height: content-settings.preferred-height + 24px;
                 content-settings := VerticalLayout {
                     padding: 12px;
-                    spacing: 4px;
+                    spacing: 8px;
 
                     HorizontalLayout {
                         vertical-stretch: 0;
@@ -3271,10 +3264,11 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                     }
-                    // SET-02/03/04/05/06: fixed anatomy, left to right —
-                    // index; name; 32px hairline separator; IP; flexible
-                    // spacer; 3-dot overflow; trash at the far right edge.
-                    // The order never changes; delete is rightmost.
+                    // SET-02/03/04/06: fixed anatomy, left to right —
+                    // index; name; 1px VERTICAL separator; IP; flexible
+                    // spacer; 3-dot overflow at the far right edge.
+                    // The order never changes; the 3-dot is rightmost and
+                    // "Remove" lives inside its menu (no trash button).
                     for peer[i] in root.trusted-peers : Rectangle {
                         vertical-stretch: 0;
                         border-radius: 10px;
@@ -3284,7 +3278,7 @@ export component AppWindow inherits Window {
                         // SET-10: the delete confirmation lives inside
                         // its own row (below the 48px anatomy) so focus
                         // can trap in the confirm and return to this
-                        // row's trash.
+                        // row's 3-dot button.
                         VerticalLayout {
                             padding: 0px;
                             spacing: 0px;
@@ -3297,17 +3291,18 @@ export component AppWindow inherits Window {
                             padding-right: 8px;
                             spacing: 8px;
                             // Content hugs the left gutter (index starts
-                            // at the box edge); the spacer pushes the two
-                            // trailing actions to the right edge.
+                            // at the box edge); the spacer pushes the 3-dot
+                            // to the right edge.
                             alignment: start;
                             // SET-03: one-based index, left-aligned so it
                             // starts at the box edge; numbers renumber
                             // automatically after a delete.
                             Text {
-                                width: 28px;
+                                width: 30px;
                                 text: (i + 1) + ".";
                                 color: Theme.muted;
-                                font-size: 14px;
+                                font-size: 16px;
+                                font-weight: 700;
                                 horizontal-alignment: left;
                                 vertical-alignment: center;
                             }
@@ -3325,12 +3320,12 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: left;
                                 vertical-alignment: center;
                             }
-                            // SET-04: one 1px hairline, 24px, centred and
-                            // dark-theme-visible (a #3a3a3a line on #121212
-                            // was invisible).
+                            // SET-04: one 1px VERTICAL hairline, 24px,
+                            // centred and dark-theme-visible (a #3a3a3a
+                            // line on #121212 was invisible).
                             Rectangle {
-                                width: 24px;
-                                height: 1px;
+                                width: 1px;
+                                height: 24px;
                                 background: #5b6675;
                             }
                             Text {
@@ -3343,10 +3338,11 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                             }
                             Rectangle { horizontal-stretch: 1; }
-                            // SET-06: 3-dot overflow, immediately left of
-                            // the trash, 36x36, opens a menu with the five
-                            // documented actions. Closes on outside click
-                            // or Escape (PopupWindow close-on-click-outside).
+                            // SET-06: 3-dot overflow, at the far right
+                            // edge, opens a menu with the five documented
+                            // actions (Remove is the last). Closes on
+                            // outside click or Escape (PopupWindow
+                            // close-on-click-outside).
                             Rectangle {
                                 width: 36px;
                                 height: 36px;
@@ -3432,55 +3428,16 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            // SET-05: trash, 18px glyph optically centred
-                            // in a 36x36 target, aligned with the overflow,
-                            // at the far right edge.
-                            Rectangle {
-                                width: 36px;
-                                height: 36px;
-                                border-radius: 8px;
-                                background: del-hit.has-hover ? #f8717118 : transparent;
-                                // SET-10: trash is a tab stop in visual
-                                // order and Enter/Space opens the same
-                                // delete confirmation as a click.
-                                trash-scope := FocusScope {
-                                    focus_on_tab_navigation: true;
-                                    key_pressed(event) => {
-                                        if (event.text == "\n" || event.text == " ") {
-                                            root.pending-delete = peer.fingerprint;
-                                            root.pending-delete-name = peer.name == "" ? "Unnamed computer" : peer.name;
-                                            accept
-                                        } else {
-                                            reject
-                                        }
-                                    }
-                                    key_released(event) => { reject }
-                                }
-                                del-hit := TouchArea {
-                                    mouse-cursor: pointer;
-                                    clicked => {
-                                        root.pending-delete = peer.fingerprint;
-                                        root.pending-delete-name = peer.name == "" ? "Unnamed computer" : peer.name;
-                                    }
-                                }
-                                accessible-role: button;
-                                accessible-label: "Remove " + peer.name + ", row " + (i + 1) + " of " + root.trusted-peers.length;
-                                accessible-action-default => {
-                                    root.pending-delete = peer.fingerprint;
-                                    root.pending-delete-name = peer.name == "" ? "Unnamed computer" : peer.name;
-                                }
-                                TrashIcon {
-                                    x: 7px;
-                                    y: 7px;
-                                }
-                            }
+                            // SET-05: deletion lives inside the 3-dot menu
+                            // as "Remove" — no separate trash button. The
+                            // 3-dot is the last element on the right edge.
                                 }
                             }
                             // SET-10: delete confirmation. Cancel is
                             // the default (focused on open); Tab /
                             // Shift-Tab cycle between Cancel and Delete
                             // only (focus trap); Escape cancels; closing
-                            // returns focus to this row's trash.
+                            // returns focus to this row's 3-dot button.
                             if root.pending-delete == peer.fingerprint : trap := FocusScope {
                                 focus_on_tab_navigation: false;
                                 capture_key_pressed(event) => {
@@ -3489,7 +3446,7 @@ export component AppWindow inherits Window {
                                         accept
                                     } else if (event.text == "\u{1b}") {
                                         cancel-delete();
-                                        trash-scope.focus();
+                                        over-scope.focus();
                                         accept
                                     } else {
                                         reject
@@ -3536,7 +3493,7 @@ export component AppWindow inherits Window {
                                                 aria-label: "Cancel removing " + peer.name;
                                                 clicked => {
                                                     cancel-delete();
-                                                    trash-scope.focus();
+                                                    over-scope.focus();
                                                 }
                                             }
                                             delete-b := KvmButton {
@@ -3546,7 +3503,7 @@ export component AppWindow inherits Window {
                                                 aria-label: "Delete " + peer.name;
                                                 clicked => {
                                                     confirm-delete();
-                                                    trash-scope.focus();
+                                                    over-scope.focus();
                                                 }
                                             }
                                         }

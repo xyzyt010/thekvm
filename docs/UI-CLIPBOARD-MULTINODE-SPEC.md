@@ -56,25 +56,25 @@ The list must read as a precise table-like list, not a stack of loose text.
 
 **SET-01 — Header alignment.** The plus control and the "Allowed connections" title form one header row: same vertical center, same baseline, one consistent gap, aligned to the content gutter. The plus is a 36x36 target with an optically centered glyph. The title uses the section type size. There is no unexplained top padding and no floating placement.
 
-**SET-02 — Row anatomy, fixed order.** Left to right: index number; computer name; a short horizontal separator; IP address; flexible spacer; 3-dot overflow button; trash button at the far right edge. The order never changes. The 3-dot sits immediately left of the trash. Delete is rightmost.
+**SET-02 — Row anatomy, fixed order.** Left to right: index number; computer name; a short vertical separator; IP address; flexible spacer; 3-dot overflow button at the far right edge. The order never changes. There is no separate trash button: **Remove lives inside the 3-dot menu** as its last item. The 3-dot is the last element on the right edge, set apart from the left-aligned text columns.
 
-**SET-03 — Index.** One-based ("1.", "2.", ...), right-aligned in a fixed-width column so every name starts on the same left edge. Renumber after deletion. Muted color, body size. The index is not part of the name and is not selectable as content.
+**SET-03 — Index.** One-based ("1.", "2.", ...), left-aligned in a fixed-width column so every name starts on the same left edge. Renumber after deletion. Muted color, **one type level above body (16 px bold)**, so the index reads as the row's anchor. The index is not part of the name and is not selectable as content.
 
-**SET-04 — Separator.** A single 1 px hairline, 24-40 px long, vertically centered between name and IP, identical in every row. It is a separator, not an underline or a full-width divider. On a narrow pane, hide it before truncating the name.
+**SET-04 — Separator.** A single 1 px **vertical** hairline, 24 px tall, vertically centered between name and IP, identical in every row. It is a separator, not an underline or a full-width divider. On a narrow pane, hide it before truncating the name.
 
-**SET-05 — Trash.** An 18-20 px glyph, optically centered in a 36x36 target, aligned with the overflow button. It opens a confirmation that names the computer. Confirm removes; cancel restores focus. The icon must never look oversized, clipped, or off-center.
+**SET-05 — Remove.** There is no trash icon button. Row-local deletion is the "Remove" item in the 3-dot menu; it opens a confirmation that names the computer. Confirm removes; cancel restores focus.
 
-**SET-06 — Overflow (3 dots).** An 18-20 px glyph in a 36x36 target, immediately left of the trash. It opens a menu anchored to the button containing View details, Device keys and fingerprint, Copy address, Rename, and Remove. It is keyboard navigable, closes on Escape or outside click, and never overflows the window.
+**SET-06 — Overflow (3 dots).** An 18-20 px glyph in a 36x36 target at the far right edge of the row. It opens a menu anchored to the button containing View details, Device keys and fingerprint, Copy address, Rename, and Remove. It is keyboard navigable, closes on Escape or outside click, and never overflows the window.
 
 **SET-07 — Details.** "View details" shows name, address, fingerprint and device keys, trust state, last seen, role and capabilities, and removal. Read-only by default; destructive actions are separated from informational content.
 
 **SET-08 — Empty, loading, error.** Empty: one-line explanation plus the add action. Loading: skeleton rows or a spinner, never a blank area. Error: message plus retry. Only one add control exists.
 
-**SET-09 — List behavior.** Row height is 44-52 px and identical across rows. Hover highlights the row without turning destructive actions red prematurely. Scrolling is vertical only. The header stays visible or scrolls predictably; the list never pushes the header off-screen.
+**SET-09 — List behavior.** Row height is 44-52 px and identical across rows. Adjacent blocks keep one 8px grid step of separation. Hover highlights the row without turning destructive actions red prematurely. Scrolling is vertical only. The header stays visible or scrolls predictably; the list never pushes the header off-screen.
 
-**SET-10 — Focus and confirmation.** Tabbing moves through the row, overflow, and trash in visual order. Enter or Space activates. The delete confirmation traps focus, defaults to Cancel, and returns focus to the row's trash on close. Screen readers announce "row N of M".
+**SET-10 — Focus and confirmation.** Tabbing moves through the row, overflow, and menu in visual order. Enter or Space activates. The delete confirmation traps focus, defaults to Cancel, and returns focus to the row's 3-dot button on close. Screen readers announce "row N of M".
 
-**Acceptance:** at every supported viewport, index, name, separator, IP, overflow, and trash align on shared columns in every row. The header plus and title align. Both icons are centered and equally sized. Deletion renumbers. Long values elide with tooltips. Keyboard and screen-reader passes succeed.
+**Acceptance:** at every supported viewport, index, name, vertical separator, IP, and the rightmost 3-dot align on shared columns in every row. The header plus and title align. Deletion renumbers. Long values elide with tooltips. Keyboard and screen-reader passes succeed.
 
 ## 3. Devices
 
@@ -112,7 +112,7 @@ The mapping is good; the execution is not yet cohesive.
 
 **CON-03 — Complete roster.** The overlay lists every known computer, one per row: local first, then connected peers, then other trusted or multi-node peers, then discovered devices. Android devices are separate rows with yellow status dots and a platform label. The list scrolls when long. The connected row is primary but never the only row.
 
-**CON-04 — Row anatomy.** Fixed columns: status dot, name, address or transport, state label, optional action. Same height and gaps for local, peer, Android, and multi-node rows. No duplicated "this PC" wording.
+**CON-04 — Row anatomy.** Fixed columns: status dot, name, address or transport, state label, optional action. Same height and gaps for local, peer, Android, and multi-node rows. No duplicated "this PC" wording and no grey filler text duplicating the name next to the address.
 
 **CON-05 — State feedback.** Connecting shows progress on the affected row only. Failure shows retry. Disconnected shows idle. Android shows yellow. Multi-node peers show their own link state. No ambiguous global spinner.
 

@@ -7544,6 +7544,8 @@ const CLIPBOARD_VERSION_SENDER_SHIFT: u32 = 8;
 const CLIPBOARD_VERSION_SENDER_MASK: u64 = 0x0fff;
 const CLIPBOARD_VERSION_SEQ_MASK: u64 = 0x00ff;
 const CLIPBOARD_VERSION_MS_MASK: u64 = (1_u64 << 44) - 1;
+static LAST_CLIPBOARD_VERSION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn clipboard_version_candidate(now_ms: u64, sender_tag: u64, sequence: u64) -> u64 {
     ((now_ms & CLIPBOARD_VERSION_MS_MASK) << CLIPBOARD_VERSION_MS_SHIFT)
@@ -7587,9 +7589,13 @@ fn next_clipboard_version(previous: u64) -> u64 {
     }
 }
 
-/// Drop a clipboard frame whose revision is not newer than what this
-/// stream already applied. Disabled streams stay quiet; a stale revision
-/// is logged so a stuck counter is visible in the journal.
+/// Check a clipboard frame against both this stream's floor and the
+/// process-wide high-water mark. This helper deliberately does not
+/// advance the watermark: chunked transfers must be allowed to feed a
+/// `Start`, intermediate chunks and the matching `End` under one
+/// revision, while actual application (below) advances it exactly
+/// once. Disabled streams stay quiet; a stale revision is logged so a
+/// stuck counter is visible in the journal.
 fn clipboard_frame_current(enabled: bool, revision: u64, remote: u64) -> bool {
     if !enabled {
         return false;
@@ -7598,18 +7604,28 @@ fn clipboard_frame_current(enabled: bool, revision: u64, remote: u64) -> bool {
     // compared across senders, so the receiver watermark is the
     // process-wide high-water mark; `remote` remains the per-stream
     // floor and is kept for stream-local diagnostics.
-    static LAST_CLIPBOARD_VERSION: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    let observed = LAST_CLIPBOARD_VERSION.load(std::sync::atomic::Ordering::Acquire);
+    let watermark = remote.max(observed);
+    if revision <= watermark {
+        tracing::info!(
+            revision,
+            remote,
+            observed,
+            "dropping peer clipboard frame; revision is not newer"
+        );
+        return false;
+    }
+    true
+}
+
+/// Atomically advance the process-wide clipboard high-water mark.
+/// Callers invoke this immediately before applying a completed paste:
+/// returning false means a newer event from another sender won the
+/// race and this completion must not clobber it.
+fn clipboard_revision_advance(revision: u64) -> bool {
     loop {
         let observed = LAST_CLIPBOARD_VERSION.load(std::sync::atomic::Ordering::Acquire);
-        let watermark = remote.max(observed);
-        if revision <= watermark {
-            tracing::info!(
-                revision,
-                remote,
-                observed,
-                "dropping peer clipboard frame; revision is not newer"
-            );
+        if revision <= observed {
             return false;
         }
         if LAST_CLIPBOARD_VERSION
@@ -7624,6 +7640,13 @@ fn clipboard_frame_current(enabled: bool, revision: u64, remote: u64) -> bool {
             return true;
         }
     }
+}
+
+/// Test-only reset for the process-wide watermark: keeps unit tests
+/// independent of execution order and parallel scheduling.
+#[cfg(test)]
+fn reset_clipboard_watermark_for_tests() {
+    LAST_CLIPBOARD_VERSION.store(0, std::sync::atomic::Ordering::Release);
 }
 
 /// How long a Pong still counts as proof that a parked stream is alive.
@@ -8825,6 +8848,9 @@ fn apply_inbound_clipboard(
     revision: u64,
     text: String,
 ) -> Result<()> {
+    if !clipboard_revision_advance(revision) {
+        return Ok(());
+    }
     *session_remote_revision = revision;
     if let Some(agent) = clipboard.as_ref() {
         if let Err(error) = agent.apply_text(text.clone()) {
@@ -8852,6 +8878,9 @@ fn apply_inbound_clipboard_image(
     revision: u64,
     paste: ImagePaste,
 ) -> Result<()> {
+    if !clipboard_revision_advance(revision) {
+        return Ok(());
+    }
     *session_remote_revision = revision;
     if let Some(agent) = clipboard.as_ref() {
         if let Err(error) = agent.apply_image(paste.clone()) {
@@ -9082,6 +9111,9 @@ fn apply_inbound_clipboard_files(
     revision: u64,
     staged: &[std::path::PathBuf],
 ) -> Result<()> {
+    if !clipboard_revision_advance(revision) {
+        return Ok(());
+    }
     let mut files = Vec::with_capacity(staged.len());
     for path in staged {
         let bytes = std::fs::read(path).map_err(|error| {
@@ -10691,7 +10723,7 @@ async fn run_capture_stream(
             },
             remote = remote_message_rx.recv() => match remote {
                 Some(WireMessage::ClipboardText { revision, text })
-                    if clipboard_enabled && revision > remote_clipboard_revision =>
+                    if clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                 {
                     if text.len() as u64 > clipboard_max_bytes {
                         tracing::warn!(bytes = text.len(), "peer sent oversized clipboard text; dropped");
@@ -10709,7 +10741,7 @@ async fn run_capture_stream(
                     revision,
                     total_bytes,
                     chunks,
-                }) if clipboard_enabled && revision > remote_clipboard_revision => {
+                }) if clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) => {
                     if matches!(
                         clipboard_assembly.feed_start(
                             revision,
@@ -10726,7 +10758,7 @@ async fn run_capture_stream(
                     revision,
                     index,
                     data,
-                }) if clipboard_enabled && revision > remote_clipboard_revision => {
+                }) if clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) => {
                     if matches!(
                         clipboard_assembly.feed_chunk(revision, index, &data),
                         ClipboardFeed::Dropped
@@ -10735,7 +10767,7 @@ async fn run_capture_stream(
                     }
                 }
                 Some(WireMessage::ClipboardEnd { revision })
-                    if clipboard_enabled && revision > remote_clipboard_revision =>
+                    if clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                 {
                     match clipboard_assembly.feed_end(revision) {
                         ClipboardFeed::Ready(text) => {
@@ -10759,7 +10791,7 @@ async fn run_capture_stream(
                     png_base64,
                     width,
                     height,
-                }) if clipboard_enabled && revision > remote_clipboard_revision => {
+                }) if clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) => {
                     if png_base64.len() as u64 > clipboard_max_bytes {
                         tracing::warn!(bytes = png_base64.len(), "peer sent oversized clipboard image; dropped");
                     } else {
@@ -10783,7 +10815,7 @@ async fn run_capture_stream(
                     chunks,
                     width,
                     height,
-                }) if clipboard_enabled && revision > remote_clipboard_revision => {
+                }) if clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) => {
                     if matches!(
                         image_assembly.feed_start(
                             revision,
@@ -10802,7 +10834,7 @@ async fn run_capture_stream(
                     revision,
                     index,
                     data,
-                }) if clipboard_enabled && revision > remote_clipboard_revision => {
+                }) if clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) => {
                     if matches!(
                         image_assembly.feed_chunk(revision, index, &data),
                         ImageFeed::Dropped
@@ -10811,7 +10843,7 @@ async fn run_capture_stream(
                     }
                 }
                 Some(WireMessage::ClipboardImageEnd { revision })
-                    if clipboard_enabled && revision > remote_clipboard_revision =>
+                    if clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                 {
                     match image_assembly.feed_end(revision) {
                         ImageFeed::Ready(paste) => {
@@ -12477,7 +12509,7 @@ async fn handle_connection(
                             }
                             WireMessage::ClipboardText { revision, text }
                                 if clipboard_enabled
-                                    && revision > remote_clipboard_revision =>
+                                    && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 if text.len() as u64 > clipboard_max_bytes {
                                     tracing::warn!(bytes = text.len(), "peer sent oversized clipboard text; dropped");
@@ -12496,7 +12528,7 @@ async fn handle_connection(
                                 total_bytes,
                                 chunks,
                             } if clipboard_enabled
-                                && revision > remote_clipboard_revision =>
+                                && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 if matches!(
                                     clipboard_assembly.feed_start(
@@ -12515,7 +12547,7 @@ async fn handle_connection(
                                 index,
                                 data,
                             } if clipboard_enabled
-                                && revision > remote_clipboard_revision =>
+                                && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 if matches!(
                                     clipboard_assembly.feed_chunk(revision, index, &data),
@@ -12526,7 +12558,7 @@ async fn handle_connection(
                             }
                             WireMessage::ClipboardEnd { revision }
                                 if clipboard_enabled
-                                    && revision > remote_clipboard_revision =>
+                                    && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 match clipboard_assembly.feed_end(revision) {
                                     ClipboardFeed::Ready(text) => {
@@ -12551,7 +12583,7 @@ async fn handle_connection(
                                 width,
                                 height,
                             } if clipboard_enabled
-                                && revision > remote_clipboard_revision =>
+                                && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 if png_base64.len() as u64 > clipboard_max_bytes {
                                     tracing::warn!(bytes = png_base64.len(), "peer sent oversized clipboard image; dropped");
@@ -12577,7 +12609,7 @@ async fn handle_connection(
                                 width,
                                 height,
                             } if clipboard_enabled
-                                && revision > remote_clipboard_revision =>
+                                && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 if matches!(
                                     image_assembly.feed_start(
@@ -12598,7 +12630,7 @@ async fn handle_connection(
                                 index,
                                 data,
                             } if clipboard_enabled
-                                && revision > remote_clipboard_revision =>
+                                && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 if matches!(
                                     image_assembly.feed_chunk(revision, index, &data),
@@ -12609,7 +12641,7 @@ async fn handle_connection(
                             }
                             WireMessage::ClipboardImageEnd { revision }
                                 if clipboard_enabled
-                                    && revision > remote_clipboard_revision =>
+                                    && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 match image_assembly.feed_end(revision) {
                                     ImageFeed::Ready(paste) => {
@@ -12633,7 +12665,7 @@ async fn handle_connection(
                                 total_bytes,
                                 files,
                             } if clipboard_enabled
-                                && revision > remote_clipboard_revision =>
+                                && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 if matches!(
                                     files_assembly_association.feed_start(revision, total_bytes, files, clipboard_max_bytes),
@@ -12648,7 +12680,7 @@ async fn handle_connection(
                                 total_bytes,
                                 chunks,
                             } if clipboard_enabled
-                                && revision > remote_clipboard_revision =>
+                                && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 if matches!(
                                     files_assembly_association.feed_file_start(revision, &name, total_bytes, chunks, clipboard_max_bytes),
@@ -12662,7 +12694,7 @@ async fn handle_connection(
                                 index,
                                 data,
                             } if clipboard_enabled
-                                && revision > remote_clipboard_revision =>
+                                && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 if matches!(
                                     files_assembly_association.feed_file_chunk(revision, index, &data),
@@ -12673,7 +12705,7 @@ async fn handle_connection(
                             }
                             WireMessage::ClipboardFileEnd { revision }
                                 if clipboard_enabled
-                                    && revision > remote_clipboard_revision =>
+                                    && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 match files_assembly_association.feed_file_end(revision, &audit_dir) {
                                     FilesFeed::FileReady(path) => {
@@ -12687,7 +12719,7 @@ async fn handle_connection(
                             }
                             WireMessage::ClipboardFilesEnd { revision, files }
                                 if clipboard_enabled
-                                    && revision > remote_clipboard_revision =>
+                                    && clipboard_frame_current(clipboard_enabled, revision, remote_clipboard_revision) =>
                             {
                                 match files_assembly_association.feed_files_end(revision, files) {
                                     FilesFeed::Ready(staged) => {
@@ -15795,6 +15827,7 @@ mod tests {
 
     #[test]
     fn clipboard_frame_ordering_is_per_sender_sequence() {
+        super::reset_clipboard_watermark_for_tests();
         // CB-07: the receiver applies only strictly newer events from
         // the per-sender sequence; replays (dedup, never applied
         // twice), stale/gap reordered arrivals, and disabled streams
@@ -15804,6 +15837,19 @@ mod tests {
         assert!(!super::clipboard_frame_current(true, 3, 4)); // stale arrival
         assert!(!super::clipboard_frame_current(false, 99, 0)); // disabled
         assert!(!super::clipboard_frame_current(true, 0, 0)); // pre-activation
+    }
+
+    #[test]
+    fn clipboard_watermark_is_global_across_senders() {
+        super::reset_clipboard_watermark_for_tests();
+        // CB-07: once a paste from one sender advances the process-wide
+        // watermark, an older paste arriving on another stream drops.
+        assert!(super::clipboard_revision_advance(1_000_000));
+        assert!(!super::clipboard_frame_current(true, 999_999, 0));
+        assert!(super::clipboard_frame_current(true, 1_000_001, 0));
+        assert!(super::clipboard_revision_advance(1_000_001));
+        assert!(!super::clipboard_frame_current(true, 1_000_001, 0));
+        super::reset_clipboard_watermark_for_tests();
     }
 
     #[test]

@@ -168,6 +168,38 @@ match (see deploy-windows-v3.log).
   live 3-node and clipboard 9-step results by requirement ID before
   claiming the spec exit gate is met.
 
+## Fix pass 5, 2026-11-26 (user-requested: Connect filler, Settings rows)
+- Connect tab: removed the grey filler text left in the connected
+  row next to the peer name/address ("Connected computer" duplicate);
+  the row is now just name + address + state label.
+- Settings allowed-connection rows (user-requested, supersedes the
+  prior trash-button anatomy in the spec):
+  - the 24px **horizontal** dash is replaced by a 1px **vertical**
+    hairline (24px tall) between name and IP;
+  - index number is **one type level above body** (16px bold) so it
+    reads as the row anchor; everything still starts at the left
+    gutter with shared columns;
+  - Settings content spacing stepped 4px → 8px (one grid step) for
+    slightly larger separation between blocks;
+  - **trash button removed**; Remove lives inside the 3-dot menu
+    (last item), and the 3-dot is the last element at the row's far
+    right edge. SET-10 focus return retargets to the 3-dot button.
+- Vision re-verified on Mint (daemon online, /tmp/kvm-vision-data):
+  Settings rows show big index, vertical line, tight name/IP, 3-dot
+  at right, no trash; Connect shows the clean two-row grid.
+  `fix-settings.png` / `fix-connect.png` in the temp workspace.
+- Also fixed this pass: CB-07 watermark is now *check-only* for
+  frame guards with advance exactly once at apply time (chunked
+  Start/Chunk can no longer trip the high-water mark before End),
+  applied in all three receive loops; `clipboard_watermark_is_global_
+  across_senders` test added. Clipboard acceptance reached via the
+  exact UI→daemon offer path on live Windows↔Mint: MINT-OFFER-001
+  (Mint→Win) and WIN-OFFER-001 legs verified at the control plane;
+  Windows Set-Clipboard reached the Mint desktop clipboard. The
+  remaining steps (file paste into a file manager, over-limit toast,
+  revoke, restart) stay with the user's physical pass.
+- Deployed (service Running, hashes match).
+
 ## Definition of done status
 Implemented + evidenced: DS (type, targets, colors, focus ring,
 pressed/disabled tooltips, reduced motion), SET (rows, menu, header,
