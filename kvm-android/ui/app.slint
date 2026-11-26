@@ -321,7 +321,7 @@ export component App inherits Window {
             if root.connected-name != "" : Rectangle {
                 height: 22px * root.scale;
                 Text {
-                    text: "CONNECTED NOW";
+                    text: "Live";
                     color: Theme.accent;
                     font-size: 10px * root.scale;
                     font-weight: 700;
@@ -354,10 +354,10 @@ export component App inherits Window {
                         overflow: elide;
                     }
                     Rectangle {
-                        x: parent.width - 138px * root.scale;
+                        x: parent.width - 168px * root.scale;
                         y: 7px * root.scale;
-                        width: 62px * root.scale;
-                        height: 30px * root.scale;
+                        width: 84px * root.scale;
+                        height: 32px * root.scale;
                         border-radius: 8px * root.scale;
                         background: Theme.accent-panel;
                         TouchArea { clicked => { root.switch-device(device.fingerprint); } }
@@ -370,15 +370,15 @@ export component App inherits Window {
                         }
                     }
                     Rectangle {
-                        x: parent.width - 70px * root.scale;
+                        x: parent.width - 80px * root.scale;
                         y: 7px * root.scale;
-                        width: 60px * root.scale;
-                        height: 30px * root.scale;
+                        width: 72px * root.scale;
+                        height: 32px * root.scale;
                         border-radius: 8px * root.scale;
                         background: Theme.danger-bg;
                         TouchArea { clicked => { root.stop-device(device.fingerprint); } }
                         Text {
-                            text: "Stop";
+                            text: "Disconnect";
                             color: Theme.danger-text;
                             font-size: 11px * root.scale;
                             horizontal-alignment: center;
@@ -749,8 +749,8 @@ export component App inherits Window {
                 }
                 PillButton {
                     scale: root.scale;
-                    label: "Stop";
-                    width: 64px * root.scale;
+                    label: "Disconnect";
+                    width: 92px * root.scale;
                     height: 34px * root.scale;
                     clicked => { root.stop-device(""); }
                 }

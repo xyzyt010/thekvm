@@ -7522,6 +7522,71 @@ fn signal_session<'a>(
     }
 }
 
+/// CB-07 ordering version. The wire still carries one `u64`, but the
+/// value is now a hybrid logical clock rather than a bare per-process
+/// counter:
+///
+/// ```text
+/// [44-bit Unix milliseconds][12-bit sender tag][8-bit per-sender sequence]
+/// ```
+///
+/// The timestamp makes versions comparable across machines; the
+/// sender tag (first 12 bits of the local identity fingerprint) is
+/// the deterministic tie-break for copies in the same millisecond;
+/// the sequence orders multiple copies on one sender. Older peers
+/// that still number events 1, 2, 3... remain intelligible: any
+/// HLC version is numerically greater, while the u64 framing, cap
+/// checks and deduplication (` revision <= watermark`) are
+/// identical. Gap recovery is handled by the latest-copy replay on
+/// every fresh, resumed or parked episode.
+const CLIPBOARD_VERSION_MS_SHIFT: u32 = 20;
+const CLIPBOARD_VERSION_SENDER_SHIFT: u32 = 8;
+const CLIPBOARD_VERSION_SENDER_MASK: u64 = 0x0fff;
+const CLIPBOARD_VERSION_SEQ_MASK: u64 = 0x00ff;
+const CLIPBOARD_VERSION_MS_MASK: u64 = (1_u64 << 44) - 1;
+
+fn clipboard_version_candidate(now_ms: u64, sender_tag: u64, sequence: u64) -> u64 {
+    ((now_ms & CLIPBOARD_VERSION_MS_MASK) << CLIPBOARD_VERSION_MS_SHIFT)
+        | ((sender_tag & CLIPBOARD_VERSION_SENDER_MASK) << CLIPBOARD_VERSION_SENDER_SHIFT)
+        | (sequence & CLIPBOARD_VERSION_SEQ_MASK)
+}
+
+fn clipboard_sender_tag() -> u64 {
+    static TAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TAG.get_or_init(|| {
+        let fingerprint = Identity::load_or_create(&data_dir())
+            .map(|identity| identity.fingerprint)
+            .unwrap_or_default();
+        if fingerprint == [0_u8; 32] {
+            // Test/headless fallback: stable for this process and still
+            // a usable tie-break because it is distinct per process.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            ((nanos ^ (std::process::id() as u128)) & 0x0fff) as u64
+        } else {
+            (((fingerprint[0] as u64) << 4) | ((fingerprint[1] as u64) >> 4))
+                & CLIPBOARD_VERSION_SENDER_MASK
+        }
+    })
+}
+
+fn next_clipboard_version(previous: u64) -> u64 {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let candidate = clipboard_version_candidate(now_ms, clipboard_sender_tag(), sequence);
+    if candidate <= previous {
+        previous.saturating_add(1)
+    } else {
+        candidate
+    }
+}
+
 /// Drop a clipboard frame whose revision is not newer than what this
 /// stream already applied. Disabled streams stay quiet; a stale revision
 /// is logged so a stuck counter is visible in the journal.
@@ -7529,15 +7594,36 @@ fn clipboard_frame_current(enabled: bool, revision: u64, remote: u64) -> bool {
     if !enabled {
         return false;
     }
-    if revision <= remote {
-        tracing::info!(
-            revision,
-            remote,
-            "dropping peer clipboard frame; revision is not newer"
-        );
-        return false;
+    // One daemon may drive several peer links. CB-07 needs versions
+    // compared across senders, so the receiver watermark is the
+    // process-wide high-water mark; `remote` remains the per-stream
+    // floor and is kept for stream-local diagnostics.
+    static LAST_CLIPBOARD_VERSION: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let observed = LAST_CLIPBOARD_VERSION.load(std::sync::atomic::Ordering::Acquire);
+        let watermark = remote.max(observed);
+        if revision <= watermark {
+            tracing::info!(
+                revision,
+                remote,
+                observed,
+                "dropping peer clipboard frame; revision is not newer"
+            );
+            return false;
+        }
+        if LAST_CLIPBOARD_VERSION
+            .compare_exchange_weak(
+                observed,
+                revision,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return true;
+        }
     }
-    true
 }
 
 /// How long a Pong still counts as proof that a parked stream is alive.
@@ -8837,7 +8923,7 @@ async fn send_clipboard_change(
         tracing::debug!(bytes, "skipping oversized clipboard paste");
         return Ok(None);
     }
-    let revision = revision.wrapping_add(1);
+    let revision = next_clipboard_version(revision);
     match change {
         ClipboardChanged::Text(text) => {
             send_clipboard_text(send, revision, text.clone()).await?;
@@ -9046,7 +9132,7 @@ async fn send_initial_clipboard(
 ) -> Result<()> {
     if let Some(text) = initial.text.as_ref() {
         if (text.len() as u64) <= clipboard_max_bytes {
-            *clipboard_revision = clipboard_revision.wrapping_add(1);
+            *clipboard_revision = next_clipboard_version(*clipboard_revision);
             send_clipboard_text(send, *clipboard_revision, text.clone()).await?;
         } else {
             tracing::debug!(
@@ -9057,7 +9143,7 @@ async fn send_initial_clipboard(
     }
     if let Some(paste) = initial.image.as_ref() {
         if (paste.png_base64.len() as u64) <= clipboard_max_bytes {
-            *clipboard_revision = clipboard_revision.wrapping_add(1);
+            *clipboard_revision = next_clipboard_version(*clipboard_revision);
             send_clipboard_image(send, *clipboard_revision, paste.clone()).await?;
         } else {
             tracing::debug!(
@@ -9072,7 +9158,7 @@ async fn send_initial_clipboard(
             .map(|(_, bytes)| bytes.len() as u64)
             .sum();
         if total <= clipboard_max_bytes && !files.is_empty() {
-            *clipboard_revision = clipboard_revision.wrapping_add(1);
+            *clipboard_revision = next_clipboard_version(*clipboard_revision);
             send_clipboard_files(send, *clipboard_revision, files).await?;
         } else {
             tracing::debug!(bytes = total, "skipping oversized initial clipboard files");
@@ -15718,6 +15804,21 @@ mod tests {
         assert!(!super::clipboard_frame_current(true, 3, 4)); // stale arrival
         assert!(!super::clipboard_frame_current(false, 99, 0)); // disabled
         assert!(!super::clipboard_frame_current(true, 0, 0)); // pre-activation
+    }
+
+    #[test]
+    fn clipboard_versions_are_globally_comparable() {
+        // CB-07: the timestamp dominates, the sender tag breaks
+        // same-millisecond ties, and the sequence orders events from
+        // one sender. Legacy small counters remain below every HLC.
+        let now_ms = 1_769_000_000_000_u64;
+        let first = super::clipboard_version_candidate(now_ms, 0x123, 1);
+        let same_ms_other_sender = super::clipboard_version_candidate(now_ms, 0x124, 0);
+        let later = super::clipboard_version_candidate(now_ms + 1, 0x001, 0);
+        assert!(first > 1_000_000);
+        assert!(same_ms_other_sender > first);
+        assert!(later > same_ms_other_sender);
+        assert!(super::clipboard_version_candidate(now_ms, 0x124, 0) > 255);
     }
 
     use super::*;

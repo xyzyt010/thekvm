@@ -378,6 +378,8 @@ component KvmButton inherits Rectangle {
     // ambiguous to assistive tech (e.g. "Details for X, row 2 of 5").
     // Empty = announce the visible text.
     in property <string> aria-label: "";
+    // DS-06: shown on hover; used to explain a disabled control.
+    in property <string> tooltip: "";
     in property <bool> primary: false;
     in property <bool> danger: false;
     in property <bool> enabled: true;
@@ -388,6 +390,7 @@ component KvmButton inherits Rectangle {
     height: 36px;
     border-radius: 8px;
     background: !enabled ? Theme.bg
+        : hit.pressed ? Theme.border-strong
         : danger ? #dc2626
         : primary ? Theme.accent-strong
         : hit.has-hover ? Theme.hover : Theme.bg;
@@ -424,6 +427,23 @@ component KvmButton inherits Rectangle {
     hit := TouchArea {
         mouse-cursor: pointer;
         clicked => { if (root.enabled) { root.clicked(); } }
+    }
+    if root.tooltip != "" : Tooltip {
+        Rectangle {
+            background: Theme.surface;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalLayout {
+                padding: 6px;
+                Text {
+                    text: root.tooltip;
+                    color: Theme.text;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
     }
     accessible-role: button;
     accessible-label: root.aria-label == "" ? root.text : root.aria-label;
@@ -2304,6 +2324,7 @@ export component AppWindow inherits Window {
                                 text: "Connect";
                                 primary: true;
                                 enabled: addr.text != "" && !session-active;
+                                tooltip: session-active ? "Disconnect the current session first" : (addr.text == "" ? "Enter the other computer's address" : "");
                                 clicked => { connect-to(addr.text, code-field.text); }
                             }
                             Rectangle { horizontal-stretch: 1; }
@@ -2753,6 +2774,7 @@ export component AppWindow inherits Window {
                                 text: "Details";
                                 aria-label: "Details for " + root.roster-names[i] + ", row " + (i + 1) + " of " + root.roster-names.length;
                                 enabled: root.roster-fingerprints[i] != "";
+                                tooltip: root.roster-fingerprints[i] == "" ? "Details become available after this computer is paired" : "";
                                 clicked => { root.peer-view-details(root.roster-fingerprints[i]); }
                             }
                             // DS-10: the row announces its position in the
@@ -2762,6 +2784,7 @@ export component AppWindow inherits Window {
                                 aria-label: "Connect to " + root.roster-names[i] + ", row " + (i + 1) + " of " + root.roster-names.length;
                                 primary: true;
                                 enabled: !session-active && root.roster-addresses[i] != "";
+                                tooltip: session-active ? "Disconnect the current session first" : (root.roster-addresses[i] == "" ? "No address is known for this computer yet" : "");
                                 clicked => { connect-to(root.roster-addresses[i], ""); }
                             }
                         }
@@ -2993,6 +3016,7 @@ export component AppWindow inherits Window {
                         text: "Configure grid";
                         primary: true;
                         enabled: !root.mesh-applying;
+                        tooltip: root.mesh-applying ? "The current arrangement is still being applied" : "";
                         clicked => { root.open-mesh-grid(); }
                     }
 
@@ -3568,6 +3592,7 @@ export component AppWindow inherits Window {
                                     primary: true;
                                     btn-width: 96px;
                                     enabled: rename-edit.text != "";
+                                    tooltip: rename-edit.text == "" ? "Enter a computer name first" : "";
                                     clicked => { root.peer-save-rename(root.rename-peer-fp, rename-edit.text); root.rename-peer-fp = ""; root.rename-peer-name = ""; }
                                 }
                             }
@@ -4073,6 +4098,7 @@ export component AppWindow inherits Window {
                         text: root.mesh-applying ? "Applying…" : "Apply to all computers";
                         primary: !root.mesh-applying;
                         enabled: !root.mesh-applying;
+                        tooltip: root.mesh-applying ? "The current arrangement is still being applied" : "";
                         clicked => { root.apply-mesh(); }
                     }
                 }

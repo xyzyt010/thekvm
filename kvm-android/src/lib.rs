@@ -262,7 +262,7 @@ impl Controller {
         *self.active.lock().unwrap() = Some(fingerprint.to_owned());
         self.set_connected_name(format!("{} · {}", name, short_fp(fingerprint)));
         self.set_phase("control");
-        self.set_status(format!("Controlling {} · {} connected", name, self.connected_count()));
+        self.set_status(format!("Live · Controlling {} · {} connected", name, self.connected_count()));
     }
 
     /// Slint TouchArea events -> trackpad input for the ACTIVE desktop.
@@ -501,7 +501,7 @@ impl Controller {
             }
         }
         if self.connected_count() >= MAX_DEVICES {
-            self.set_status(format!("Already connected to the maximum of {MAX_DEVICES} computers"));
+            self.set_status(format!("Error · Already connected to the maximum of {MAX_DEVICES} computers"));
             return;
         }
         let watcher = self.clone();
@@ -552,7 +552,7 @@ impl Controller {
 
                 // Confirm our side, then wait for the human to click Allow
                 // on the desktop. The desktop sends Accepted only after that.
-                self.set_status(format!("Allow access on {peer_name} to continue…"));
+                self.set_status(format!("Connecting · Allow access on {peer_name} to continue…"));
                 write_frame(
                     &mut pair_send,
                     &WireMessage::PairConfirm {
@@ -660,10 +660,10 @@ impl Controller {
                 }
                 self.set_connected_name(format!("{} · {}", name, short_fp(&fingerprint)));
                 self.set_phase("control");
-                self.set_status(format!("Controlling {name} · {} connected", self.connected_count()));
+                self.set_status(format!("Live · Controlling {name} · {} connected", self.connected_count()));
                 self.refresh_remembered();
             }
-            Err(error) => self.set_status(format!("{error:#}")),
+            Err(error) => self.set_status(format!("Error · {error:#}")),
         }
     }
 
@@ -702,7 +702,7 @@ impl Controller {
         } else {
             self.set_connected_name(String::new());
             self.set_phase("devices");
-            self.set_status("Disconnected · auto-connect resumes after restart or Connect".into());
+            self.set_status("Idle · auto-connect resumes after restart or Connect".into());
         }
     }
 
@@ -739,7 +739,7 @@ impl Controller {
         } else {
             self.set_connected_name(String::new());
             self.set_phase("devices");
-            self.set_status("Connection dropped — reconnecting…".into());
+            self.set_status("Connecting · connection dropped — reconnecting…".into());
         }
     }
 
@@ -760,7 +760,7 @@ impl Controller {
             self.refresh_remembered();
         }
         self.set_status(format!(
-            "Pairing deleted · {} will not auto-connect",
+            "Idle · pairing deleted · {} will not auto-connect",
             short_fp(&fingerprint)
         ));
     }
@@ -906,7 +906,7 @@ impl Controller {
             !(entry.fingerprint == fingerprint) && !(entry.col == col && entry.row == row)
         });
         if store.mesh_grid.len() >= 15 {
-            self.set_status("The grid holds at most 15 computers".into());
+            self.set_status("Error · The grid holds at most 15 computers".into());
             return;
         }
         store.mesh_grid.push(GridEntry {
@@ -1225,7 +1225,7 @@ fn android_main(app: AndroidApp) {
     ui.set_paste_mode(store.paste_mode);
     ui.set_horizontal_mode(store.horizontal_mode);
     ui.set_phase(SharedString::from("devices"));
-    ui.set_status("Scanning for computers…".into());
+    ui.set_status("Discovered · scanning for computers…".into());
     controller.refresh_remembered();
 
     ui.run().expect("run UI");

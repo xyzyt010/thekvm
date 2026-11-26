@@ -123,12 +123,58 @@ match (see deploy-windows-v3.log).
   (pre-existing; package untouched this pass).
 - Deployed (service Running, hashes match).
 
+## Fix pass 4, 2026-11-26 (CB-07 global ordering, DS-06 tooltips, Android labels, Loop 4 matrix)
+- CB-07 is now structurally closed: clipboard revisions are a hybrid
+  logical clock in the same u64 wire field —
+  `[44-bit Unix ms][12-bit sender tag][8-bit sequence]`. The sender tag
+  is the first 12 bits of the local identity fingerprint; the timestamp
+  orders events across machines, the tag is the same-millisecond
+  tie-break, and the sequence orders same-sender events. Receivers
+  retain a process-wide high-water mark (in addition to each stream's
+  floor), so a stale event from any sender remains dropped after a
+  newer event from another sender; duplicates still never apply twice.
+  Latest-copy replay on fresh/resumed/parked episodes remains the gap
+  recovery path. New test:
+  `clipboard_versions_are_globally_comparable`.
+- DS-06: `KvmButton` now defines a pressed state and an optional
+  custom-content `Tooltip` for disabled reasons. Disabled explanations
+  are wired on Connect (enter an address / disconnect first), Device
+  Details (available after pairing), roster Connect (disconnect first /
+  no address known), rename Save (enter a name), and mesh Configure /
+  Apply (arrangement still applying). These supplement the adjacent
+  captions already shown by disabled rows and empty states.
+- Android (DS-09 parity pass): controller statuses now use the shared
+  vocabulary — `Live`, `Connecting`, `Idle`, `Discovered`, and `Error`.
+  The connected header says `Live`; `Stop` is renamed `Disconnect`
+  with a 32px minimum target. Android still does not implement
+  desktop clipboard sync (`clipboard_enabled: false` in its Hello
+  advertisement), so full state/capability parity remains unproven on
+  a physical device.
+- Loop 4 matrix: fresh Mint Xvfb screenshots were captured for
+  720x560, 1024x768, 1440x900, and 1920x1080 displays, each in dark
+  and light themes — 24 captures across Connect, Devices, and
+  Settings. The app window remained the 720x560 minimum on smaller
+  displays. A separate resized-window check at 1920x1080 confirmed
+  the layout stretches without row overflow; maximized Devices tab
+  switching remained usable.
+- Tests: core 75, daemon 96, platform 48, protocol 54, UI 14 =
+  287 green. `kvm-android` still has a pre-existing Windows-target
+  compile issue (`slint::android` is not available off Android), so
+  the Android channel was verified by code/doc inspection rather
+  than a host build.
+- The daemon/UI release pair was deployed after the pass: Windows
+  service Running and hashes match for both binaries (`5A380A...` and
+  `A0D567...`). It remains necessary for the user to record the
+  live 3-node and clipboard 9-step results by requirement ID before
+  claiming the spec exit gate is met.
+
 ## Definition of done status
 Implemented + evidenced: DS (type, targets, colors, focus ring,
-reduced motion), SET (rows, menu, header, focus trap), DEV (roster,
-states, actions), CON (aligned two-row grid, complete roster), CB
-(activation, revision order, files, limit toast, offline queue), MN
-(push honesty). Pending user loop: live 3-node crossing + clipboard
-9-step acceptance on real machines; DS-06 disabled-reason tooltips;
-Android controller UI parity (desktop renders Android peers with
-yellow dot + label; the Android app itself has no Slint UI).
+pressed/disabled tooltips, reduced motion), SET (rows, menu, header,
+focus trap), DEV (roster, states, actions), CON (aligned two-row grid,
+complete roster), CB (activation, globally comparable HLC revision,
+files, limit toast, offline queue), MN (push honesty). Pending user
+loop: live 3-node crossing + clipboard 9-step acceptance on real
+machines, plus physical Android controller verification (desktop-side
+labels and vocabulary are aligned; Android clipboard capability is
+still disabled in its Hello advertisement).
