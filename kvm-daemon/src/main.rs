@@ -121,6 +121,13 @@ enum Command {
         /// Explicitly disable lock-screen-capable injection.
         #[arg(long, conflicts_with = "allow_lock_screen_control")]
         disable_lock_screen_control: bool,
+        /// Allow the service to dial and accept control at boot while
+        /// nobody is logged in (kiosk / pre-login control).
+        #[arg(long, conflicts_with = "disable_prelogin_auto_connect")]
+        allow_prelogin_auto_connect: bool,
+        /// Disable pre-login (boot/greeter) control.
+        #[arg(long, conflicts_with = "allow_prelogin_auto_connect")]
+        disable_prelogin_auto_connect: bool,
         /// UDP port for the daemon.
         #[arg(long)]
         listen_port: Option<u16>,
@@ -453,6 +460,8 @@ async fn async_main() -> Result<()> {
             transport,
             allow_lock_screen_control,
             disable_lock_screen_control,
+            allow_prelogin_auto_connect,
+            disable_prelogin_auto_connect,
             listen_port,
             layout,
             auto_connect,
@@ -477,6 +486,13 @@ async fn async_main() -> Result<()> {
                 allow_lock_screen_control: if allow_lock_screen_control {
                     Some(true)
                 } else if disable_lock_screen_control {
+                    Some(false)
+                } else {
+                    None
+                },
+                allow_prelogin_auto_connect: if allow_prelogin_auto_connect {
+                    Some(true)
+                } else if disable_prelogin_auto_connect {
                     Some(false)
                 } else {
                     None

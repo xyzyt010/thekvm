@@ -188,13 +188,16 @@ when the app (UI) itself launches.**
 - **A manual Connect after a Disconnect:** always works — pressing
   Connect is explicit intent. It clears the session ban for that peer.
 - **Fresh boot at the greeter/lock screen:** the background service
-  listens for QUIC but **never dials out** while nobody has logged in.
-  The lock screen is always yours; pre-login control of the greeter by
-  the paired peer does not happen, even before the app has a chance to
-  launch. (A station that deliberately wants pre-login control — a
-  kiosk, wall display, or service controller — can opt in with the
-  `allow_prelogin_auto_connect` flag in `config.json`, which defaults
-  to false.)
+  listens for QUIC but **never dials out**, and refuses inbound control,
+  while nobody has logged in. The lock screen is always yours; pre-login
+  control of the greeter by the paired peer does not happen, even before
+  the app has a chance to launch. (A station that deliberately wants
+  pre-login control — a kiosk, wall display, or service controller —
+  opts in with the Settings toggle "Control login, lock and startup
+  screens", or with the `allow_prelogin_auto_connect` flag in
+  `config.json`, which defaults to false. With both flags set, a pinned
+  peer is admitted at the greeter in both directions, so control works
+  before the local password is typed.)
 - **After login:** the app launches at login autostart (or when you open
   it); auto-connect arms at that point.
 
@@ -328,12 +331,21 @@ Three separate behaviors are worth not conflating:
 
 - **Unattended pre-login remote control (greeter, nobody logged in):**
   OFF by default. The background service listens for QUIC at boot but
-  never dials out in this state. A machine at its greeter — or a Windows
-  lock screen reached by a fresh boot — is always fully usable locally.
-  Opt-in for deliberate stations: `allow_prelogin_auto_connect` in
-  `config.json` (default `false`). Even when set, pre-login control is a
-  network-facing capability and should be paired with device-level
-  protection; nobody should enable it on a laptop that travels.
+  never dials out in this state, and a pinned peer's inbound Hello is
+  refused while nobody is logged in. A machine at its greeter — or a
+  Windows lock screen reached by a fresh boot — is always fully usable
+  locally, with no link until the local login password opens the app.
+  Opt-in for deliberate stations: the Settings toggle
+  ("Control login, lock and startup screens", ON) sets BOTH
+  `allow_prelogin_auto_connect` and `allow_lock_screen_control`;
+  `kvm-daemon configure --allow-prelogin-auto-connect` /
+  `--disable-prelogin-auto-connect` set the pre-login flag directly.
+  With both flags set, a pinned peer is admitted at the greeter (both
+  directions, same policy as the outbound pre-login dial) so control
+  works before the local password is typed; every admission is
+  audit-logged. Even when set, pre-login control is a network-facing
+  capability and should be paired with device-level protection; nobody
+  should enable it on a laptop that travels.
 - **Pre-logon input helper (Windows):** the LocalSystem service may
   still spawn helpers so the peer can serve input at the lock screen —
   but no session exists (and therefore no input flows) until the link
@@ -377,7 +389,7 @@ bounded length; unknown keys are refused, not silently dropped.
 | `layout` | object | `{}` | The `x`,`y`,`width`,`height` per screen, `self_screen` |
 | `auto_connect_address` | string? | `null` | Peer the app dials automatically at launch |
 | `auto_connect_enabled` | bool | `true` | Enable/disable auto-connect at app launch |
-| `allow_prelogin_auto_connect` | bool | `false` | Allow the service to dial at machine boot while nobody is logged in (kiosk mode) |
+| `allow_prelogin_auto_connect` | bool | `false` | Allow the service to dial/accept at boot while nobody is logged in (kiosk mode); set together with the lock flag by the Settings toggle |
 | `idle_home_secs` | u32 | 10 | Seconds of no outbound traffic before control auto-homes |
 | `allow_lock_screen_control` | bool | `true` | Permits peer to control from lock screen (logged-in sessions only) |
 | `clipboard_enabled` | bool | `true` | Sync clipboard both ways |

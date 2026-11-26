@@ -1635,6 +1635,19 @@ pub(crate) fn interactive_session_active() -> bool {
     false
 }
 
+/// Whether a trusted peer may open a control channel while nobody is
+/// logged in (the boot greeter). This is the deliberate kiosk opt-in:
+/// BOTH flags must be set (pre-login control AND lock-screen control),
+/// the peer must be pinned (paired), and the machine must be unattended
+/// (no desktop user and no interactive login session). Every other gate
+/// still applies downstream (paused, mode, ban). Pure for tests.
+fn prelogin_inbound_allowed(config: &Config, pinned: bool, unattended: bool) -> bool {
+    config.allow_prelogin_auto_connect
+        && config.allow_lock_screen_control
+        && pinned
+        && unattended
+}
+
 /// True when the dial failed because the peer deliberately ended this link
 /// epoch (Disconnect there). Callers exit instead of retrying: a banned
 /// link must stay dead. Matches only our own ban wording (lowercase), never
@@ -2055,6 +2068,9 @@ pub(crate) struct ConfigureOptions<'a> {
     pub(crate) mode: Option<&'a str>,
     pub(crate) transport: Option<kvm_core::TransportProtocol>,
     pub(crate) allow_lock_screen_control: Option<bool>,
+    /// Pre-login (boot/greeter) control; omission preserves. See
+    /// `Config::allow_prelogin_auto_connect`.
+    pub(crate) allow_prelogin_auto_connect: Option<bool>,
     pub(crate) listen_port: Option<u16>,
     pub(crate) layout_path: Option<&'a std::path::Path>,
     pub(crate) auto_connect_address: Option<&'a str>,
@@ -2072,6 +2088,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
         mode,
         transport,
         allow_lock_screen_control,
+        allow_prelogin_auto_connect,
         listen_port,
         layout_path,
         auto_connect_address,
@@ -2119,6 +2136,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
             device_name: device_name.map(str::to_owned),
             mode: requested_mode,
             allow_lock_screen_control,
+            allow_prelogin_auto_connect,
             listen_port,
             layout: requested_layout.clone(),
             auto_connect_address: auto_connect_address.map(|address| address.trim().to_owned()),
@@ -2167,6 +2185,9 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     }
     if let Some(allow_lock_screen_control) = allow_lock_screen_control {
         config.allow_lock_screen_control = allow_lock_screen_control;
+    }
+    if let Some(allow_prelogin_auto_connect) = allow_prelogin_auto_connect {
+        config.allow_prelogin_auto_connect = allow_prelogin_auto_connect;
     }
     if let Some(port) = listen_port {
         if port == 0 {
@@ -11524,7 +11545,20 @@ async fn handle_connection(
                 // is admitted — any pairing state, the greeter/lock screen,
                 // or a freshly paired trusted peer. The machine is wholly
                 // local until TheKVM is opened. Same rule on every OS.
+                // One deliberate exception: a station that opted into
+                // pre-login control (BOTH flags) is already driven at the
+                // boot greeter by ITS OWN outbound pre-login dial; a pinned
+                // peer's inbound Hello there is admitted too, so the peer
+                // need not wait for a local login password. Untrusted
+                // peers and attended machines (logged-in user or open app)
+                // still refuse with the same message.
                 if !ui_present() {
+                    let prelogin_ok = prelogin_inbound_allowed(
+                        &local_config,
+                        peers.read().await.is_pinned(&peer_fingerprint),
+                        !interactive_session_active(),
+                    );
+                    if !prelogin_ok {
                     reject(
                         &mut send,
                         "the TheKVM app is not running on this computer; open it there and connect again",
@@ -11538,6 +11572,18 @@ async fn handle_connection(
                         ),
                     );
                     bail!("incoming link refused: the local TheKVM app is not running");
+                    }
+                    tracing::info!(
+                        peer = %peer_fingerprint,
+                        "pre-login inbound admitted for deliberate opt-in station at greeter"
+                    );
+                    audit_event(
+                        audit_dir,
+                        &format!(
+                            "session-admitted peer={peer_fingerprint} remote={} reason=prelogin_opt_in",
+                            conn.remote_address(),
+                        ),
+                    );
                 }
                 let stream_result: Result<()> = async {
             let config_shared = config.clone();
@@ -11656,7 +11702,16 @@ async fn handle_connection(
                 }
                 Some(epoch) => {
                     let links = crate::control::link_approvals();
+                    // A pinned peer on a deliberate pre-login station is
+                    // already trusted: at the greeter there is nobody to
+                    // approve a queued link, so it must never queue.
+                    let prelogin_trusted = prelogin_inbound_allowed(
+                        &config,
+                        peers.read().await.is_pinned(&peer_fingerprint),
+                        !interactive_session_active(),
+                    );
                     let known = config.auto_connect_enabled
+                        || prelogin_trusted
                         || links.is_approved(&peer_fingerprint, epoch).await
                         || links.recently_paired(&peer_fingerprint).await;
                     let locally_initiated =
@@ -15934,6 +15989,33 @@ mod tests {
             // off Windows.
             assert!(validate_input_capability(&locked_off, true).is_err());
         }
+    }
+
+    #[test]
+    fn prelogin_inbound_requires_both_flags_pinned_and_unattended() {
+        let off = kvm_core::Config {
+            allow_prelogin_auto_connect: false,
+            allow_lock_screen_control: true,
+            ..kvm_core::Config::default()
+        };
+        let on = kvm_core::Config {
+            allow_prelogin_auto_connect: true,
+            allow_lock_screen_control: true,
+            ..kvm_core::Config::default()
+        };
+        let lock_off = kvm_core::Config {
+            allow_prelogin_auto_connect: true,
+            allow_lock_screen_control: false,
+            ..kvm_core::Config::default()
+        };
+        // Opted-in station at the greeter: a pinned peer is admitted, so
+        // the peer need not wait for the local login password.
+        assert!(prelogin_inbound_allowed(&on, true, true));
+        // Any one condition missing refuses.
+        assert!(!prelogin_inbound_allowed(&off, true, true));
+        assert!(!prelogin_inbound_allowed(&lock_off, true, true));
+        assert!(!prelogin_inbound_allowed(&on, false, true));
+        assert!(!prelogin_inbound_allowed(&on, true, false));
     }
 
     #[tokio::test]

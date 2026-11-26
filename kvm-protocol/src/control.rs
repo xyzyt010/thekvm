@@ -209,6 +209,13 @@ pub enum ControlRequest {
         /// switches for this field.
         #[serde(default)]
         allow_lock_screen_control: Option<bool>,
+        /// Replace pre-login (boot/greeter) control policy when supplied;
+        /// omission preserves the current policy. When true together with
+        /// `allow_lock_screen_control`, a pinned peer may open a control
+        /// channel while nobody is logged in. Opt-in kiosk stations set
+        /// this; the default stays off.
+        #[serde(default)]
+        allow_prelogin_auto_connect: Option<bool>,
         listen_port: Option<u16>,
         /// Replace the validated screen topology when supplied.
         #[serde(default)]
@@ -672,6 +679,7 @@ mod tests {
             device_name: Some("office-controller".into()),
             mode: Some(Mode::ServerClient),
             allow_lock_screen_control: Some(true),
+            allow_prelogin_auto_connect: Some(true),
             listen_port: Some(42110),
             layout: None,
             auto_connect_address: Some("127.0.0.1:42110".into()),
@@ -694,6 +702,7 @@ mod tests {
             device_name,
             mode,
             allow_lock_screen_control,
+            allow_prelogin_auto_connect,
             listen_port,
             layout,
             auto_connect_address,
@@ -714,6 +723,7 @@ mod tests {
         assert_eq!(device_name.as_deref(), Some("office-controller"));
         assert_eq!(mode, Some(Mode::ServerClient));
         assert_eq!(allow_lock_screen_control, Some(true));
+        assert_eq!(allow_prelogin_auto_connect, Some(true));
         assert_eq!(listen_port, Some(42110));
         assert!(layout.is_none());
         assert_eq!(

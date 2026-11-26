@@ -2339,9 +2339,12 @@ export component AppWindow inherits Window {
 
                     // ---- This computer / Connected computer (CON-02) ---
                     // Two rows on ONE grid: the status dots share a single
-                    // 24px column at the same baseline and both labels start
-                    // on the same vertical line. Connected text never shifts
-                    // the grid. Vocabulary: Live / Connecting / Idle.
+                    // 24px column flush LEFT at the content gutter (dot
+                    // left = box left = "Computers" left) and both labels
+                    // start on the same vertical line. Live is shown by
+                    // the green dot alone — there is no green "Live"
+                    // text label in this grid. Connecting/Idle text shows
+                    // only until the link is verified.
                     Text {
                         vertical-stretch: 0;
                         text: "Computers";
@@ -2349,21 +2352,24 @@ export component AppWindow inherits Window {
                         font-size: 16px;
                         font-weight: 700;
                         vertical-alignment: center;
+                        horizontal-alignment: left;
                     }
                     HorizontalLayout {
                         vertical-stretch: 0;
                         height: 40px;
                         spacing: 8px;
-                        // Left-hugging row: the dot column stays glued to
-                        // the content gutter on both rows, so the status
-                        // dots share one column and the labels start at
-                        // the same line in every state (Live/Connecting/
-                        // Idle) — centering let the dot column drift.
+                        // Flush-left dot: the dot's left edge IS the
+                        // content gutter, so box / "Computers" / dot
+                        // share one starting line. The 24px cell keeps
+                        // both labels on one shared line. y centers the
+                        // dots ((40-10)/2 = 15).
                         alignment: start;
-                        VerticalLayout {
+                        Rectangle {
                             width: 24px;
-                            alignment: center;
+                            height: 40px;
                             Rectangle {
+                                x: 0px;
+                                y: 15px;
                                 width: 10px;
                                 height: 10px;
                                 border-radius: 5px;
@@ -2392,30 +2398,28 @@ export component AppWindow inherits Window {
                             overflow: elide;
                             vertical-alignment: center;
                         }
-                        Text {
-                            text: "Live";
-                            color: #22c55e;
-                            font-size: 14px;
-                            font-weight: 700;
-                            vertical-alignment: center;
-                        }
+                        // No "Live" text here: the green dot IS the state.
                     }
                     HorizontalLayout {
                         vertical-stretch: 0;
                         height: 40px;
                         spacing: 8px;
-                        // Left-hugging row, same grid as the local row
-                        // above: dots share one column, labels start at
-                        // the same line in every state.
+                        // Flush-left dot cell, same grid as the local
+                        // row: dot left = gutter, labels share one line.
+                        // Spinner (18px) y = (40-18)/2 = 11, dot y = 15.
                         alignment: start;
-                        VerticalLayout {
+                        Rectangle {
                             width: 24px;
-                            alignment: center;
+                            height: 40px;
                             if link-connecting && !session-verified : SpinnerArc {
+                                x: 0px;
+                                y: 11px;
                                 diameter: 18px;
                                 tick: root.spinner-tick;
                             }
                             if !link-connecting || session-verified : Rectangle {
+                                x: 0px;
+                                y: 15px;
                                 width: 10px;
                                 height: 10px;
                                 border-radius: 5px;
@@ -2437,9 +2441,11 @@ export component AppWindow inherits Window {
                             overflow: elide;
                             vertical-alignment: center;
                         }
-                        Text {
-                            text: session-verified ? "Live" : (link-connecting || session-active ? "Connecting" : "Idle");
-                            color: session-verified ? #22c55e : (link-connecting || session-active ? #f59e0b : Theme.faint);
+                        // No green "Live" label: Live is the green dot
+                        // alone. Connecting/Idle shows only until verified.
+                        if !session-verified : Text {
+                            text: link-connecting || session-active ? "Connecting" : "Idle";
+                            color: link-connecting || session-active ? #f59e0b : Theme.faint;
                             font-size: 14px;
                             font-weight: 700;
                             horizontal-alignment: right;
@@ -2720,13 +2726,16 @@ export component AppWindow inherits Window {
                             padding-left: 12px;
                             padding-right: 8px;
                             spacing: 8px;
-                            // Left-hugging row: dot/name/address/state
-                            // start at the content gutter in every state.
+                            // Flush-left dot cell: dot left = row's
+                            // inner padding start (no 7px centering
+                            // inset). (48-10)/2 = 19 centers it.
                             alignment: start;
-                            VerticalLayout {
+                            Rectangle {
                                 width: 24px;
-                                alignment: center;
+                                height: 48px;
                                 Rectangle {
+                                    x: 0px;
+                                    y: 19px;
                                     width: 10px;
                                     height: 10px;
                                     border-radius: 5px;
@@ -3064,7 +3073,7 @@ export component AppWindow inherits Window {
                         spacing: 10px;
                         height: 36px;
                         Text {
-                            text: "Control login and lock screens";
+                            text: "Control login, lock and startup screens";
                             color: Theme.text-2;
                             font-size: 16px;
                             vertical-alignment: center;

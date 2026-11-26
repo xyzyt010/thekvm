@@ -200,6 +200,72 @@ match (see deploy-windows-v3.log).
   revoke, restart) stay with the user's physical pass.
 - Deployed (service Running, hashes match).
 
+## Fix pass 6, 2026-11-27 (user-requested: Connect Live/alignment, Mint startup/greeter)
+- Connect tab: removed BOTH green "Live" texts from the two-row grid
+  (This computer + Connected computer). Live is now the green dot
+  alone; Connecting/Idle text shows only until verified. Status dots
+  are flush LEFT (box left = "Computers" left = dot left) instead of
+  centered in their 24px cell (7px inset removed); Devices roster
+  dots got the same flush-left fix.
+- Mint startup (user: at the login/startup screen it needed the local
+  password before it would connect): the incoming-Hello admission gate
+  refused ANY control channel while the app was absent, so a pinned
+  peer could not drive the boot greeter until login (password) started
+  the UI. Now, on a deliberately opted-in station — BOTH
+  `allow_prelogin_auto_connect` AND `allow_lock_screen_control` set,
+  peer pinned, machine unattended (nobody logged in) — the inbound is
+  admitted in both directions (mirrors the outbound pre-login dial
+  policy). Untrusted peers and attended machines still refuse with the
+  same message; every pre-login admission is audit-logged.
+  `prelogin_inbound_allowed` pure helper +
+  `prelogin_inbound_requires_both_flags_pinned_and_unattended` test;
+  `known` treats an opted-in pinned peer as trusted so it never waits
+  in an approval queue nobody can approve at the greeter.
+- Flag plumbing: new `SetConfig.allow_prelogin_auto_connect` protocol
+  field (serde-default, compatible), daemon `ConfigureOptions` +
+  `configure --allow-prelogin-auto-connect` /
+  `--disable-prelogin-auto-connect`, and the Settings toggle
+  "Control login, lock and startup screens" now drives BOTH flags
+  (label updated). `docs/APP-BEHAVIOR.md` §5/§9/§11 updated.
+- Tests: core 75, daemon 98 (+1), platform 48, protocol 54, UI 14 =
+  289 green.
+- PENDING this pass: Mint Xvfb vision loops for the Connect alignment
+  (dark/light/narrow) and Windows+Mint redeploy after screenshot
+  sign-off.
+- Vision loops DONE (2026-11-27): Mint build (target/release/kvm-ui
+  Nov 27 03:34) + Xvfb harness (daemon isolated on 43110,
+  /tmp/kvm-vision-data, fake peers restored; visionfix2.sh with
+  PID-scoped kills only, desktop UI untouched). Three loops:
+  fix2-connect.png (dark 1024x768), fix2-connect-light.png,
+  fix2-connect-narrow.png (720x560) — all show: no green "Live" text,
+  dots flush-left (box left = "Computers" left = dot left, spinner
+  too), shared label line, no overflow at minimum size.
+  fix2-devices.png shows flush-left roster dots, "Devices" header,
+  Screen arrangement with monitor names uncrossed.
+- Windows redeploy: first attempt failed — the TheKVM service had
+  StartType=Disabled (unknown origin, not the deploy script) and the
+  UI immediately respawned user-session daemons that held UDP 42110
+  so the service could not bind. Recovered by re-enabling the
+  service (Automatic), stopping UI+daemons, starting the service
+  (now owns 42110), relaunching the UI. Fresh service instance
+  verified healthy: inbound link from Mint live + peer clipboard
+  relay applied (60 bytes). Retry of deploy-windows-v3.ps1 then
+  succeeded clean: service Running, hashes match
+  (1E6628F0…), kvm-ui alive. Mint desktop UI relaunched from the
+  new build; link re-established.
+- Vision re-verified after rebuilding on Mint (isolated daemon on
+  port 43110, /tmp/kvm-vision-data, fake peers restored): three
+  loops — dark 1024x768, light 1024x768, narrow 720x560 — all show
+  no green "Live" text, dots flush-left (box left = "Computers"
+  left = dot left, spinner too), shared label line, no overflow at
+  minimum size; Devices rows flush-left with monitor names uncrossed.
+  Captures: fix2-connect.png / fix2-devices.png /
+  fix2-connect-light.png / fix2-connect-narrow.png (temp workspace).
+  Desktop UI left running throughout (PID-scoped kills only).
+  (Harness note: LAN discovery still heard the production daemon on
+  42110, so the Connect tab auto-dialed it into a timeout; alignment
+  unaffected.)
+
 ## Definition of done status
 Implemented + evidenced: DS (type, targets, colors, focus ring,
 pressed/disabled tooltips, reduced motion), SET (rows, menu, header,

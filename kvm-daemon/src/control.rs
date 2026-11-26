@@ -1362,6 +1362,7 @@ where
             device_name,
             mode,
             allow_lock_screen_control,
+            allow_prelogin_auto_connect,
             listen_port,
             layout,
             auto_connect_address,
@@ -1406,6 +1407,9 @@ where
                     }
                     if let Some(allow_lock_screen_control) = allow_lock_screen_control {
                         updated.allow_lock_screen_control = allow_lock_screen_control;
+                    }
+                    if let Some(allow_prelogin_auto_connect) = allow_prelogin_auto_connect {
+                        updated.allow_prelogin_auto_connect = allow_prelogin_auto_connect;
                     }
                     if let Some(auto_enabled) = auto_connect_enabled {
                         updated.auto_connect_enabled = auto_enabled;

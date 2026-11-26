@@ -98,7 +98,7 @@ This tab is the weakest: misalignment, overflow, redundant text, and non-functio
 
 **DEV-09 — Multi-node entry.** The grid editor is reachable from Devices, explained in one line, and shares the same roster and state as the tab. Opening or closing it preserves placement and selection.
 
-**DEV-10 — Status vocabulary.** Use one label per state everywhere: Live, Connecting, Idle, Discovered, Error. Do not alternate between synonyms such as connected, linked, online, and active for the same condition. The roster and the Connect overlay share this vocabulary.
+**DEV-10 — Status vocabulary.** Use one label per state everywhere: Live, Connecting, Idle, Discovered, Error. Do not alternate between synonyms such as connected, linked, online, and active for the same condition. The roster and the Connect overlay share this vocabulary. Exception: the Connect two-row grid (CON-02) shows Live by dot color only, with no "Live" text.
 
 **Acceptance:** a component-by-component vision pass and a white-box state-mapping review find no overflow, misalignment, dead control, or misleading label. Every action produces the correct visible result. Backend failures are visible and recoverable.
 
@@ -108,7 +108,7 @@ The mapping is good; the execution is not yet cohesive.
 
 **CON-01 — Type size.** Keep the mapping, but raise essential text to the body scale of at least 14 px. Section title 16, body 14, metadata 12. No essential label below 13.
 
-**CON-02 — Status alignment.** "This computer" and "Connected computer", or the peer name, are two rows that start on the same vertical line. Their status dots share one fixed column and one baseline. The dot, label, and value form one aligned grid across both rows. Green connected text must not shift baseline or indent.
+**CON-02 — Status alignment.** "This computer" and "Connected computer", or the peer name, are two rows that start on the same vertical line. Their status dots share one fixed column flush left at the content gutter and one baseline (box left = "Computers" left = dot left). The dot, label, and value form one aligned grid across both rows. Live is shown by the green dot alone: the Connect grid never renders a green "Live" text label (user decision, 2026-11-27); Connecting/Idle text shows only until the link is verified. All other gates of this spec (DEV-10 vocabulary in the roster) still apply.
 
 **CON-03 — Complete roster.** The overlay lists every known computer, one per row: local first, then connected peers, then other trusted or multi-node peers, then discovered devices. Android devices are separate rows with yellow status dots and a platform label. The list scrolls when long. The connected row is primary but never the only row.
 

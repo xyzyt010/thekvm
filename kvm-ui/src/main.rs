@@ -1034,6 +1034,7 @@ fn main() -> Result<()> {
             device_name: Some(current.device_name.clone()),
             mode: Some(current.mode),
             allow_lock_screen_control: Some(current.allow_lock_screen_control),
+            allow_prelogin_auto_connect: None,
             listen_port: None,
             layout: None,
             auto_connect_address: address,
@@ -1268,6 +1269,7 @@ fn main() -> Result<()> {
                 device_name: Some(current.device_name.clone()),
                 mode: Some(requested),
                 allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                allow_prelogin_auto_connect: None,
                 listen_port: None,
                 layout: None,
                 auto_connect_address: current.auto_connect_address.clone(),
@@ -1400,6 +1402,7 @@ fn main() -> Result<()> {
                 device_name: Some(current.device_name.clone()),
                 mode: Some(current.mode),
                 allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                allow_prelogin_auto_connect: None,
                 listen_port: None,
                 layout: None,
                 auto_connect_address: current.auto_connect_address.clone(),
@@ -1491,6 +1494,7 @@ fn main() -> Result<()> {
                 device_name: Some(current.device_name.clone()),
                 mode: Some(current.mode),
                 allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                allow_prelogin_auto_connect: None,
                 listen_port: None,
                 layout: None,
                 auto_connect_address: current.auto_connect_address.clone(),
@@ -2305,6 +2309,7 @@ fn main() -> Result<()> {
                 device_name: Some(current.device_name.clone()),
                 mode: Some(current.mode),
                 allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                allow_prelogin_auto_connect: None,
                 listen_port: None,
                 layout: None,
                 auto_connect_address: current.auto_connect_address.clone(),
@@ -2382,6 +2387,7 @@ fn main() -> Result<()> {
                 device_name: Some(current.device_name.clone()),
                 mode: Some(current.mode),
                 allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                allow_prelogin_auto_connect: None,
                 listen_port: None,
                 layout: None,
                 auto_connect_address: current.auto_connect_address.clone(),
@@ -2634,8 +2640,12 @@ fn main() -> Result<()> {
                 command.arg("--device-name").arg(&device_name);
                 if allow_lock_screen {
                     command.arg("--allow-lock-screen-control");
+                    // The same toggle is the pre-login (boot greeter)
+                    // opt-in: ON also allows control before login.
+                    command.arg("--allow-prelogin-auto-connect");
                 } else {
                     command.arg("--disable-lock-screen-control");
+                    command.arg("--disable-prelogin-auto-connect");
                 }
                 if !auto_address.trim().is_empty() {
                     command.arg("--auto-connect").arg(&auto_address);
@@ -2653,6 +2663,11 @@ fn main() -> Result<()> {
                     device_name: Some(device_name.clone()),
                     mode: Some(requested_mode),
                     allow_lock_screen_control: Some(allow_lock_screen),
+                    // "Control login and lock screens" is the deliberate
+                    // opt-in for BOTH the locked desktop and the boot
+                    // greeter, so the toggle drives the pre-login flag
+                    // with it. Every other save preserves pre-login.
+                    allow_prelogin_auto_connect: Some(allow_lock_screen),
                     listen_port: None,
                     layout: None,
                     auto_connect_address: (!auto_address.trim().is_empty())
@@ -2745,6 +2760,7 @@ fn main() -> Result<()> {
                             device_name: Some(current.device_name.clone()),
                             mode: Some(current.mode),
                             allow_lock_screen_control: Some(current.allow_lock_screen_control),
+                            allow_prelogin_auto_connect: None,
                             listen_port: None,
                             layout: Some(layout),
                             auto_connect_address: None,
@@ -3467,6 +3483,7 @@ fn remember_peer_for_auto_connect(weak: &slint::Weak<AppWindow>, address: String
             device_name: Some(current.device_name.clone()),
             mode: Some(current.mode),
             allow_lock_screen_control: Some(current.allow_lock_screen_control),
+            allow_prelogin_auto_connect: None,
             listen_port: None,
             layout: None,
             auto_connect_address: Some(address.clone()),
@@ -4332,6 +4349,7 @@ fn remember_auto_connect_peer(data_dir: &std::path::Path, address: &str) {
                 device_name: None,
                 mode: None,
                 allow_lock_screen_control: None,
+                allow_prelogin_auto_connect: None,
                 listen_port: None,
                 layout: None,
                 auto_connect_address: Some(trimmed.to_owned()),
@@ -4477,6 +4495,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         device_name: Some(current.device_name.clone()),
         mode: Some(current.mode),
         allow_lock_screen_control: Some(current.allow_lock_screen_control),
+        allow_prelogin_auto_connect: None,
         listen_port: None,
         layout: Some(layout.clone()),
         auto_connect_address: current.auto_connect_address.clone(),
