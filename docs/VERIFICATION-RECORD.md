@@ -229,9 +229,6 @@ match (see deploy-windows-v3.log).
   (label updated). `docs/APP-BEHAVIOR.md` §5/§9/§11 updated.
 - Tests: core 75, daemon 98 (+1), platform 48, protocol 54, UI 14 =
   289 green.
-- PENDING this pass: Mint Xvfb vision loops for the Connect alignment
-  (dark/light/narrow) and Windows+Mint redeploy after screenshot
-  sign-off.
 - Vision loops DONE (2026-11-27): Mint build (target/release/kvm-ui
   Nov 27 03:34) + Xvfb harness (daemon isolated on 43110,
   /tmp/kvm-vision-data, fake peers restored; visionfix2.sh with
@@ -242,6 +239,9 @@ match (see deploy-windows-v3.log).
   too), shared label line, no overflow at minimum size.
   fix2-devices.png shows flush-left roster dots, "Devices" header,
   Screen arrangement with monitor names uncrossed.
+  (Harness note: LAN discovery still heard the production daemon on
+  42110, so the Connect tab auto-dialed it into a timeout; alignment
+  unaffected.)
 - Windows redeploy: first attempt failed — the TheKVM service had
   StartType=Disabled (unknown origin, not the deploy script) and the
   UI immediately respawned user-session daemons that held UDP 42110
@@ -253,18 +253,34 @@ match (see deploy-windows-v3.log).
   succeeded clean: service Running, hashes match
   (1E6628F0…), kvm-ui alive. Mint desktop UI relaunched from the
   new build; link re-established.
-- Vision re-verified after rebuilding on Mint (isolated daemon on
-  port 43110, /tmp/kvm-vision-data, fake peers restored): three
-  loops — dark 1024x768, light 1024x768, narrow 720x560 — all show
-  no green "Live" text, dots flush-left (box left = "Computers"
-  left = dot left, spinner too), shared label line, no overflow at
-  minimum size; Devices rows flush-left with monitor names uncrossed.
-  Captures: fix2-connect.png / fix2-devices.png /
-  fix2-connect-light.png / fix2-connect-narrow.png (temp workspace).
-  Desktop UI left running throughout (PID-scoped kills only).
-  (Harness note: LAN discovery still heard the production daemon on
-  42110, so the Connect tab auto-dialed it into a timeout; alignment
-  unaffected.)
+
+## Fix pass 7, 2026-11-28 (user: GUI undisputed, single APK, Android touch, Fn+Shift)
+- GUI live-verified on the user's own Windows window (screenshots:
+  Devices + Settings with "Control login, lock and startup screens",
+  Allowed connections with big indices, vertical separators, far-right
+  3-dot, no trash button). The earlier claim that the launched app
+  lacked the fixes was stale: the window was buried behind the browser
+  and the deploy had already installed the new UI (hash-matched).
+- APK: exactly ONE `.apk` in the workspace now —
+  `dist/TheKVM-Android.apk`, rebuilt fresh with `cargo apk` from
+  current source. Stale cargo-apk intermediates deleted. (Any future
+  `cargo apk` recreates target/ intermediates; dist/ is canonical.)
+- Android touch fix (works-once-then-stops + on-screen diag numbers):
+  the input pump swallowed stream write failures forever, leaving a
+  dead session "active" — touches counted, frames never sent. Now a
+  failed write evicts the session and auto-reconnects
+  (`on_session_lost` path, fingerprint+session captured at send time).
+  `kvm-android` compiles for `aarch64-linux-android`.
+- Fn+Shift+number instant switching: design locked, implementation
+  deferred to a dedicated pass. Semantics: Shift+F1..F9 (laptop Fn
+  sends F-key codes, so Shift+F-key reads as the requested combo);
+  1 = This computer (instant home), 2.. = peers in Devices-list
+  order; consumed at the daemon capture layer like Scroll Lock, works
+  for both 2-node and multi-node, Settings toggle to turn it off.
+  Why deferred: it must hook the topology session-open
+  (`open_topology_session`) inside the most guarded drive path, and
+  the behavior needs physical crossing verification only this user
+  can do with two nodes.
 
 ## Definition of done status
 Implemented + evidenced: DS (type, targets, colors, focus ring,

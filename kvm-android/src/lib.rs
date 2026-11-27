@@ -218,13 +218,19 @@ impl Controller {
         Store::load(&self.data_dir)
     }
 
-    fn active_session(&self) -> Option<Arc<Session>> {
+    fn active_entry(&self) -> Option<(String, Arc<Session>)> {
         let fingerprint = self.active.lock().unwrap().clone()?;
-        self.sessions
+        let session = self
+            .sessions
             .lock()
             .unwrap()
             .get(&fingerprint)
-            .map(|device| device.session.clone())
+            .map(|device| device.session.clone())?;
+        Some((fingerprint, session))
+    }
+
+    fn active_session(&self) -> Option<Arc<Session>> {
+        self.active_entry().map(|(_, session)| session)
     }
 
     fn is_connected(&self, fingerprint: &str) -> bool {
@@ -1070,11 +1076,17 @@ fn android_main(app: AndroidApp) {
     let pump = controller.clone();
     controller.runtime.spawn(async move {
         while let Some(event) = event_rx.recv().await {
-            let (send, sequence) = {
-                let Some(session) = pump.active_session() else { continue };
-                (session.send.clone(), session.sequence.fetch_add(1, Ordering::Relaxed))
+            let (fingerprint, session, sequence) = {
+                let Some((fingerprint, session)) = pump.active_entry() else {
+                    continue;
+                };
+                (
+                    fingerprint,
+                    session.clone(),
+                    session.sequence.fetch_add(1, Ordering::Relaxed),
+                )
             };
-            let mut stream = send.lock().await;
+            let mut stream = session.send.lock().await;
             let ok = write_frame(
                 &mut *stream,
                 &WireMessage::Input(InputPacket { sequence, event }),
@@ -1084,6 +1096,13 @@ fn android_main(app: AndroidApp) {
             drop(stream);
             if ok {
                 pump.frame_count.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // The input stream died (peer closed, network blip,
+                // lease expiry): without this, the session stayed
+                // "active" forever — touches counted on screen, frames
+                // never sent, the peer's cursor never moved again.
+                // Evict and reconnect instead.
+                pump.on_session_lost(&fingerprint, &session);
             }
         }
     });
