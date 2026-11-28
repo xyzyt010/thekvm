@@ -142,6 +142,18 @@ struct TrustedPeer {
     name: string,
     address: string,
     fingerprint: string,
+    // Android controllers are not computers: the Connect page lists
+    // them separately (and only while connected).
+    is-android: bool,
+}
+
+// One CONNECTED desktop computer for the Connect list: only live,
+// verified links appear here (saved/connecting ones never do). The
+// number is the Ctrl+Shift+<number> index (This computer = 1).
+struct ConnectedPeer {
+    name: string,
+    address: string,
+    number: int,
 }
 
 // Minimal modern line icons: plus (add), trash (delete), radar
@@ -2027,6 +2039,12 @@ export component AppWindow inherits Window {
     in-out property <[string]> roster-addresses: [];
     in-out property <[string]> roster-states: [];
     in-out property <[string]> roster-fingerprints: [];
+    // Connected Android controllers right now (roster state
+    // "Android · Live"). The Connect page shows them as their own
+    // small section, never as computers.
+    in-out property <int> android-live-count: 0;
+    in-out property <[ConnectedPeer]> connected-peers: [];
+    in-out property <[string]> connected-androids: [];
     // Dev-10 state vocabulary: one label per state, shared by roster +
     // Devices. Values: Live, Connecting, Idle, Discovered, Error.
     // Discovery sheet (Settings +): green radar sweep while scanning,
@@ -2169,12 +2187,13 @@ export component AppWindow inherits Window {
             if root.view == "main" : VerticalLayout {
                 row: 0;
                 col: 0;
-                // Explicitly window-sized: the PageScroll preferred
-                // 100% chain otherwise inflates this wrapper past the
-                // window on scaled displays and pushes the header's
-                // right side (Settings entry) off-screen.
-                width: parent.width;
-                height: parent.height;
+                // Pinned to the WINDOW width (never parent.width: the
+                // GridLayout sizes itself from its children, so a
+                // parent binding recurses and panics at startup). The
+                // PageScroll preferred 100% chain otherwise inflates
+                // this wrapper past the window on scaled displays and
+                // pushes the header's right side (Settings) off-screen.
+                width: root.width - 24px;
                 spacing: 0px;
                 HorizontalLayout {
                     vertical-stretch: 0;
@@ -2209,15 +2228,16 @@ export component AppWindow inherits Window {
                             padding-right: 10px;
                             spacing: 7px;
                             alignment: center;
-                            Rectangle {
-                                width: 16px;
-                                height: 16px;
-                                Rectangle { x: 0px; y: 2px; width: 16px; height: 2px; border-radius: 1px; background: Theme.faint; }
-                                Rectangle { x: 0px; y: 7px; width: 16px; height: 2px; border-radius: 1px; background: Theme.faint; }
-                                Rectangle { x: 0px; y: 12px; width: 16px; height: 2px; border-radius: 1px; background: Theme.faint; }
-                                Rectangle { x: 3px; y: 0px; width: 6px; height: 6px; border-radius: 3px; background: Theme.text-2; }
-                                Rectangle { x: 8px; y: 5px; width: 6px; height: 6px; border-radius: 3px; background: Theme.text-2; }
-                                Rectangle { x: 2px; y: 10px; width: 6px; height: 6px; border-radius: 3px; background: Theme.text-2; }
+                            // One gear, drawn (no font glyph): the
+                            // universal settings mark, centred on the
+                            // button's line next to the label.
+                            Path {
+                                width: 18px;
+                                height: 18px;
+                                viewbox-width: 24;
+                                viewbox-height: 24;
+                                fill: Theme.text-2;
+                                commands: "M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.03-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z";
                             }
                             Text {
                                 text: "Settings";
@@ -2477,13 +2497,12 @@ export component AppWindow inherits Window {
                         }
                         // No "Live" text here: the green dot IS the state.
                     }
-                    // One row per known computer (same numbering as
-                    // Ctrl+Shift+<number> and Devices order): dot, index,
-                    // name, and the computer's address in grey beside the
-                    // name. The live computer's dot is green, a connecting
-                    // one amber, others grey. No "Connected to" wording —
-                    // the address simply sits beside the name.
-                    for peer[i] in root.trusted-peers : HorizontalLayout {
+                    // Only CONNECTED desktop computers are listed
+                    // here, numbered exactly as Ctrl+Shift+<number>
+                    // sees them (trusted order, This computer = 1).
+                    // Saved/remembered computers live in Settings;
+                    // connecting or idle ones never appear here.
+                    for peer in root.connected-peers : HorizontalLayout {
                         vertical-stretch: 0;
                         height: 40px;
                         spacing: 8px;
@@ -2491,26 +2510,18 @@ export component AppWindow inherits Window {
                         Rectangle {
                             width: 24px;
                             height: 40px;
-                            if link-connecting && !session-verified && peer.address == root.details-peer-address : SpinnerArc {
-                                x: 0px;
-                                y: 11px;
-                                diameter: 18px;
-                                tick: root.spinner-tick;
-                            }
-                            if !(link-connecting && !session-verified && peer.address == root.details-peer-address) : Rectangle {
+                            Rectangle {
                                 x: 0px;
                                 y: 15px;
                                 width: 10px;
                                 height: 10px;
                                 border-radius: 5px;
-                                background: session-verified && peer.address == root.details-peer-address ? #22c55e
-                                    : session-active && peer.address == root.details-peer-address ? #f59e0b
-                                    : Theme.border-strong;
+                                background: #22c55e;
                             }
                         }
                         Text {
                             width: 22px;
-                            text: (i + 2) + ".";
+                            text: peer.number + ".";
                             color: Theme.muted;
                             font-size: 16px;
                             font-weight: 700;
@@ -2533,16 +2544,10 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                             vertical-alignment: center;
                         }
-                        if !session-verified && peer.address == root.details-peer-address : Text {
-                            text: link-connecting || session-active ? "Connecting" : "Idle";
-                            color: link-connecting || session-active ? #f59e0b : Theme.faint;
-                            font-size: 14px;
-                            font-weight: 700;
-                            horizontal-alignment: right;
-                            vertical-alignment: center;
-                        }
                     }
-                    if root.trusted-peers.length == 0 : HorizontalLayout {
+                    // A connected computer that is not in the book yet
+                    // (fresh discovery connect) still gets its row.
+                    if session-verified && root.trusted-peers.length == 0 : HorizontalLayout {
                         vertical-stretch: 0;
                         height: 40px;
                         spacing: 8px;
@@ -2550,19 +2555,13 @@ export component AppWindow inherits Window {
                         Rectangle {
                             width: 24px;
                             height: 40px;
-                            if link-connecting && !session-verified : SpinnerArc {
-                                x: 0px;
-                                y: 11px;
-                                diameter: 18px;
-                                tick: root.spinner-tick;
-                            }
-                            if !link-connecting || session-verified : Rectangle {
+                            Rectangle {
                                 x: 0px;
                                 y: 15px;
                                 width: 10px;
                                 height: 10px;
                                 border-radius: 5px;
-                                background: session-verified ? #22c55e : (session-active ? #f59e0b : Theme.border-strong);
+                                background: #22c55e;
                             }
                         }
                         Text {
@@ -2589,15 +2588,55 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                             vertical-alignment: center;
                         }
-                        if !session-verified : Text {
-                            text: link-connecting || session-active ? "Connecting" : "Idle";
-                            color: link-connecting || session-active ? #f59e0b : Theme.faint;
-                            font-size: 14px;
-                            font-weight: 700;
-                            horizontal-alignment: right;
+                    }
+                    // Android controllers: a separate, smaller section
+                    // of their own — never computers, and only while
+                    // actually connected.
+                    if root.android-live-count > 0 : Text {
+                        vertical-stretch: 0;
+                        text: "Android controllers";
+                        color: Theme.text;
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-alignment: left;
+                    }
+                    for name in root.connected-androids : HorizontalLayout {
+                        vertical-stretch: 0;
+                        height: 32px;
+                        spacing: 8px;
+                        alignment: start;
+                        Rectangle {
+                            width: 24px;
+                            height: 32px;
+                            Rectangle {
+                                x: 0px;
+                                y: 11px;
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                background: #facc15;
+                            }
+                        }
+                        Rectangle { width: 22px; }
+                        Text {
+                            text: name;
+                            color: Theme.text;
+                            font-size: 13px;
+                            font-weight: 600;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "Android controller";
+                            color: Theme.faint;
+                            font-size: 12px;
+                            overflow: elide;
+                            horizontal-stretch: 1;
                             vertical-alignment: center;
                         }
                     }
+
                     if driving-text != "" : Text {
                         vertical-stretch: 0;
                         text: driving-text;
@@ -2780,8 +2819,7 @@ export component AppWindow inherits Window {
             if root.view == "settings" : VerticalLayout {
                 row: 0;
                 col: 0;
-                width: parent.width;
-                height: parent.height;
+                width: root.width - 24px;
                 spacing: 0px;
                 HorizontalLayout {
                     vertical-stretch: 0;

@@ -3484,6 +3484,7 @@ fn set_peer_list(weak: &slint::Weak<AppWindow>, peers: Vec<kvm_protocol::pairing
             name: SharedString::from(name),
             address: SharedString::from(peer.address.clone().unwrap_or_default()),
             fingerprint: SharedString::from(peer.fingerprint_hex.clone()),
+            is_android: peer.kind == kvm_core::ClientKind::Android,
         });
     }
     set_roster_peers(&roster_cache);
@@ -6422,10 +6423,35 @@ fn refresh_roster(weak: &slint::Weak<AppWindow>) {
         states.push(roster_state(linked, verified, connecting, false, *android));
         fps.push(fp.clone());
     }
+    let android_live = states.iter().filter(|s| *s == "Android · Live").count() as i32;
+    // Connect lists ONLY connected devices: live desktop peers (with
+    // their Ctrl+Shift number = trusted position + 1) and live Android
+    // controllers, computed here where trust + link state meet.
+    let connected_peers: Vec<ConnectedPeer> = trusted
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, addr, _, android))| {
+            !*android && verified && !linked_addr.is_empty() && *addr == linked_addr
+        })
+        .map(|(index, (name, addr, _, _))| ConnectedPeer {
+            name: SharedString::from(name.clone()),
+            address: SharedString::from(addr.clone()),
+            number: (index + 2) as i32,
+        })
+        .collect();
+    let connected_androids: Vec<SharedString> = names
+        .iter()
+        .zip(states.iter())
+        .filter(|(_, state)| *state == "Android · Live")
+        .map(|(name, _)| SharedString::from(name.clone()))
+        .collect();
     let _ = slint::invoke_from_event_loop({
         let weak = weak.clone();
         move || {
             if let Some(ui) = weak.upgrade() {
+                ui.set_android_live_count(android_live);
+                ui.set_connected_peers(ModelRc::new(VecModel::from(connected_peers)));
+                ui.set_connected_androids(ModelRc::new(VecModel::from(connected_androids)));
                 // ModelRc is built on the UI thread (Rc is not Send).
                 let to_model = |values: Vec<String>| -> slint::ModelRc<slint::SharedString> {
                     slint::ModelRc::new(slint::VecModel::from(
