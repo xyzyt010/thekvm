@@ -2156,6 +2156,7 @@ pub async fn configure(options: ConfigureOptions<'_>) -> Result<()> {
                 None
             },
             manual_control_enabled: None,
+            hotkey_switch_enabled: None,
         },
     )
     .await
@@ -4482,6 +4483,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     want_udp_motion: true, // UDP cemented: every dial offers motion fast path
                     send_strikes: &mut send_strikes,
                     send_stall_since: &mut send_stall_since,
+                    hotkey_switch_enabled: config.hotkey_switch_enabled,
                     reverse_scroll: config.reverse_scroll,
                 })
                 .await?;
@@ -4639,6 +4641,7 @@ async fn connect_topology(link: Option<TopologyLink>, identity: Identity) -> Res
                     want_udp_motion: true, // UDP cemented: every dial offers motion fast path
                     send_strikes: &mut send_strikes,
                     send_stall_since: &mut send_stall_since,
+                    hotkey_switch_enabled: config.hotkey_switch_enabled,
                     reverse_scroll: config.reverse_scroll,
                 })
                 .await?;
@@ -6208,6 +6211,9 @@ struct TopologyEventContext<'a> {
     /// (the mid-display sudden-exit shape) — only sustained silence
     /// with nothing getting through for seconds means dead network.
     send_stall_since: &'a mut Option<std::time::Instant>,
+    /// Instant computer switching with Shift+F1..F9 (see
+    /// Config::hotkey_switch_enabled), live copy of the setting.
+    hotkey_switch_enabled: bool,
     /// Sender's reverse-scroll setting (see Config::reverse_scroll):
     /// loop-local copy taken at drive start. Wheel deltas are negated
     /// before pinch expansion and the downgrade debt.
@@ -6456,8 +6462,191 @@ async fn handle_topology_event(
         want_udp_motion,
         send_strikes,
         send_stall_since,
+        hotkey_switch_enabled,
         reverse_scroll,
     } = context;
+
+    // Fn+Shift+number instant switching (user request): laptops turn
+    // Fn+1..9 into F1..F9, so Shift+F1..F9 is the requested chord. The
+    // daemon owns the keys (works while it is driving another computer,
+    // where the OS never sees them). Number 1 returns here; 2..N drives
+    // the Nth *placed* trusted computer in Devices order. Explicit
+    // switching is the alternative to edge-dragging the cursor, so it
+    // opens the same drive episode the router would have opened.
+    if hotkey_switch_enabled && !router.is_locked() {
+        if let Some(number) =
+            hotkey_switch_number(&captured.event, &capture_control.snapshot().state)
+        {
+            let local = router.local_screen();
+            let target = if number == 1 {
+                local
+            } else {
+                let mut seen = 1usize;
+                let mut found = None;
+                for peer in &peers.peers {
+                    let placed = router
+                        .layout()
+                        .screens
+                        .iter()
+                        .find(|screen| {
+                            screen.peer_fingerprint.as_deref()
+                                == Some(peer.fingerprint_hex.as_str())
+                        })
+                        .map(|screen| screen.id);
+                    if let Some(id) = placed {
+                        seen += 1;
+                        if seen == number {
+                            found = Some(id);
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some(id) => id,
+                    None => {
+                        tracing::warn!(
+                            number,
+                            "hotkey switch: no placed computer has that number"
+                        );
+                        return Ok(());
+                    }
+                }
+            };
+            if target == local {
+                // 1 = This computer: park the drive and come home now.
+                if let Some(session) = active.take() {
+                    let from = session.target;
+                    release_suppression(capture_control, Some(&mut *suppression_requested));
+                    tokio::spawn(session.finish());
+                    *discarded_event_barrier = (*discarded_event_barrier)
+                        .max(capture_control.snapshot().last_event_id);
+                    let _ = router.restore_local(from);
+                    resync_home_to_truth(router);
+                    let (x, y) = router.cursor_position();
+                    let _ = capture_control.warp_cursor(x, y);
+                    *last_transfer = Some(std::time::Instant::now());
+                    eprintln!("THEKVM_STATUS local");
+                    tracing::info!("hotkey switch: control returned to this computer");
+                } else if let Some(stale) = parked.take() {
+                    tokio::spawn(stale.finish());
+                }
+                return Ok(());
+            }
+            if active.as_ref().is_some_and(|session| session.target == target) {
+                return Ok(());
+            }
+            // A direct switch replaces the current drive. Finish it (one
+            // parked slot is not enough to hold several old peers); the
+            // next crossing re-dials in the normal way.
+            if let Some(session) = active.take() {
+                let from = session.target;
+                release_suppression(capture_control, Some(&mut *suppression_requested));
+                tokio::spawn(session.finish());
+                *discarded_event_barrier = (*discarded_event_barrier)
+                    .max(capture_control.snapshot().last_event_id);
+                let _ = router.restore_local(from);
+                resync_home_to_truth(router);
+            }
+            if let Some(stale) = parked.take() {
+                tokio::spawn(stale.finish());
+            }
+            if let Some(from) = router.active_remote() {
+                let _ = router.restore_local(from);
+            }
+            let (cx, cy) = router
+                .screen(target)
+                .map(|screen| (screen.width / 2, screen.height / 2))
+                .unwrap_or((0, 0));
+            if !router
+                .handoff_to(target, cx, cy)
+                .map_err(anyhow::Error::msg)?
+            {
+                eprintln!("THEKVM_STATUS local");
+                return Ok(());
+            }
+            let snapshot = capture_control.snapshot();
+            let opened = tokio::time::timeout(
+                COLD_OPEN_TIMEOUT,
+                open_topology_session(TopologyOpen {
+                    router,
+                    identity,
+                    peers,
+                    node_name,
+                    target,
+                    target_x: cx,
+                    target_y: cy,
+                    state: snapshot.state,
+                    event_barrier: captured.event_id,
+                    first_event: None,
+                    request_lock_screen,
+                    mode,
+                    local_geometry,
+                    clipboard_enabled,
+                    initial_clipboard: initial_clipboard.clone(),
+                    clipboard_revision,
+                    clipboard_max_bytes,
+                    sequence,
+                    dir,
+                    link_id: link.and_then(|link| link.link_id),
+                    want_udp_motion,
+                }),
+            )
+            .await;
+            match opened {
+                Ok(Ok(session)) => {
+                    capture_control.set_exclusive(true)?;
+                    *suppression_requested = true;
+                    *last_peer_progress = None;
+                    *unacked_pings = 0;
+                    *last_transfer = Some(std::time::Instant::now());
+                    *last_outbound_input = Some(std::time::Instant::now());
+                    *send_strikes = 0;
+                    *send_stall_since = None;
+                    adopt_peer_geometry(
+                        router,
+                        link.map(|link| link.fingerprint.as_str()),
+                        session.peer_geometry,
+                    );
+                    *active = Some(session);
+                    *divert_baseline = kvm_platform::capture::inbound_while_driving_count();
+                    *inbound_baselines_fresh = false;
+                    let name = router
+                        .screen(target)
+                        .map(|screen| screen.name.clone())
+                        .unwrap_or_else(|| format!("screen {}", target.0));
+                    tracing::info!(?target, number, "hotkey switch activated");
+                    eprintln!("THEKVM_STATUS driving {name}");
+                }
+                Ok(Err(error)) => {
+                    if is_link_ended_rejection(&error) {
+                        eprintln!(
+                            "THEKVM_STATUS {}",
+                            ban_ended_status(link.and_then(|link| link.link_id))
+                        );
+                        return Err(error);
+                    }
+                    *last_failed_episode = Some(std::time::Instant::now());
+                    release_suppression(capture_control, Some(&mut *suppression_requested));
+                    let _ = router.restore_local(target);
+                    resync_home_to_truth(router);
+                    let (x, y) = router.cursor_position();
+                    let _ = capture_control.warp_cursor(x, y);
+                    tracing::warn!(%error, ?target, number, "hotkey switch failed; control remains local");
+                }
+                Err(_) => {
+                    *last_failed_episode = Some(std::time::Instant::now());
+                    release_suppression(capture_control, Some(&mut *suppression_requested));
+                    let _ = router.restore_local(target);
+                    resync_home_to_truth(router);
+                    let (x, y) = router.cursor_position();
+                    let _ = capture_control.warp_cursor(x, y);
+                    tracing::warn!(?target, number, "hotkey switch timed out; control remains local");
+                }
+            }
+            return Ok(());
+        }
+    }
+
     // OS-pointer truth resync (Deskflow jump-zone half of the phantom fix):
     // Raw deltas keep flowing after the OS pointer has stopped at the edge,
     // so the integrated virtual cursor runs AHEAD of the visible one and a
@@ -14400,6 +14589,36 @@ fn is_scroll_lock_press(event: &kvm_core::InputEvent) -> bool {
     )
 }
 
+/// USB HID usages for F1..F9. Laptops send these when the user holds Fn
+/// and presses 1..9, so Shift+F-key is exactly the requested
+/// Fn+Shift+computer-number chord (the Fn layer itself never reaches the
+/// OS as a key).
+const HOTKEY_F1_USAGE: u16 = 0x3a;
+const HOTKEY_F9_USAGE: u16 = 0x42;
+const HID_LEFT_SHIFT_USAGE: u16 = 0xe1;
+const HID_RIGHT_SHIFT_USAGE: u16 = 0xe5;
+
+/// Return the requested one-based computer number when this event is a
+/// fresh Shift+F1..F9 press. Releases and auto-repeats are not switches.
+fn hotkey_switch_number(
+    event: &kvm_core::InputEvent,
+    state: &kvm_core::InputState,
+) -> Option<usize> {
+    let kvm_core::InputEvent::Key(key) = event else {
+        return None;
+    };
+    if !key.pressed || key.repeat {
+        return None;
+    }
+    if !(HOTKEY_F1_USAGE..=HOTKEY_F9_USAGE).contains(&key.usage) {
+        return None;
+    }
+    let shift_held = state.pressed_keys.iter().any(|usage| {
+        *usage == HID_LEFT_SHIFT_USAGE || *usage == HID_RIGHT_SHIFT_USAGE
+    });
+    shift_held.then_some(usize::from(key.usage - HOTKEY_F1_USAGE) + 1)
+}
+
 struct ConnectPolicy<'a> {
     node_name: &'a str,
     request_lock_screen: bool,
@@ -17146,6 +17365,51 @@ mod tests {
             dx: 1,
             dy: 0
         }));
+    }
+
+    #[test]
+    fn hotkey_switch_reads_shift_f1_to_f9_only() {
+        use kvm_core::{InputEvent, InputState, KeyEvent};
+        let shift = InputState {
+            pressed_keys: vec![HID_LEFT_SHIFT_USAGE],
+            pressed_buttons: Vec::new(),
+        };
+        let plain = InputState::default();
+        let key = |usage, pressed, repeat| {
+            InputEvent::Key(KeyEvent {
+                usage,
+                pressed,
+                repeat,
+            })
+        };
+        assert_eq!(
+            hotkey_switch_number(&key(HOTKEY_F1_USAGE, true, false), &shift),
+            Some(1)
+        );
+        assert_eq!(
+            hotkey_switch_number(&key(HOTKEY_F1_USAGE + 1, true, false), &shift),
+            Some(2)
+        );
+        assert_eq!(
+            hotkey_switch_number(&key(HOTKEY_F9_USAGE, true, false), &shift),
+            Some(9)
+        );
+        // No Shift, a release, an auto-repeat, F10 and ordinary keys are
+        // never switches.
+        assert_eq!(hotkey_switch_number(&key(HOTKEY_F1_USAGE, true, false), &plain), None);
+        assert_eq!(
+            hotkey_switch_number(&key(HOTKEY_F1_USAGE, false, false), &shift),
+            None
+        );
+        assert_eq!(
+            hotkey_switch_number(&key(HOTKEY_F1_USAGE, true, true), &shift),
+            None
+        );
+        assert_eq!(
+            hotkey_switch_number(&key(HOTKEY_F9_USAGE + 1, true, false), &shift),
+            None
+        );
+        assert_eq!(hotkey_switch_number(&InputEvent::MouseMove { dx: 9, dy: 0 }, &shift), None);
     }
 
     #[test]

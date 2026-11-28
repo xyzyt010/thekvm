@@ -267,6 +267,11 @@ pub enum ControlRequest {
         /// preserves the current value.
         #[serde(default)]
         manual_control_enabled: Option<bool>,
+        /// Instant computer switching with Shift+F1..F9 (see
+        /// `Config::hotkey_switch_enabled`); omission preserves the
+        /// current value.
+        #[serde(default)]
+        hotkey_switch_enabled: Option<bool>,
     },
     /// Take one chunk of the latest peer paste stashed for this
     /// logged-in session (see [`ClipboardUpdate`]): the headless
@@ -360,6 +365,10 @@ fn default_clipboard_max_mb() -> u32 {
 }
 
 /// Discovery lists default on for status frames from older daemons.
+fn default_hotkey_switch_enabled() -> bool {
+    true
+}
+
 fn default_auto_discover() -> bool {
     true
 }
@@ -410,6 +419,11 @@ pub struct DaemonStatus {
     /// false for older daemons that predate the field.
     #[serde(default)]
     pub manual_control_enabled: bool,
+    /// Instant Fn+Shift+number computer switching is enabled. Defaults to
+    /// true for older daemons that predate the field (the shortcut is a
+    /// convenience, not a policy).
+    #[serde(default = "default_hotkey_switch_enabled")]
+    pub hotkey_switch_enabled: bool,
     pub peer_count: usize,
     pub active_session_count: usize,
     pub uptime_seconds: u64,
@@ -693,6 +707,7 @@ mod tests {
             double_edge_style: None,
             auto_connect_enabled: Some(true),
             manual_control_enabled: Some(false),
+            hotkey_switch_enabled: Some(true),
         };
         let expected_address = "127.0.0.1:42110".to_owned();
         let sender = tokio::spawn(async move {
@@ -716,6 +731,7 @@ mod tests {
             double_edge_style,
             auto_connect_enabled,
             manual_control_enabled,
+            hotkey_switch_enabled,
         }) = read_request(&mut right).await.unwrap()
         else {
             panic!("expected SetConfig request");
@@ -740,6 +756,7 @@ mod tests {
         assert_eq!(double_edge_style, None);
         assert_eq!(auto_connect_enabled, Some(true));
         assert_eq!(manual_control_enabled, Some(false));
+        assert_eq!(hotkey_switch_enabled, Some(true));
         sender.await.unwrap();
     }
 

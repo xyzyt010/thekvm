@@ -879,6 +879,7 @@ where
                 auto_discover: current.auto_discover,
                 double_edge_style: current.double_edge_style,
                 manual_control_enabled: current.manual_control_enabled,
+                hotkey_switch_enabled: current.hotkey_switch_enabled,
                 peer_count,
                 active_session_count: active_sessions.load(std::sync::atomic::Ordering::Relaxed),
                 sessions: crate::service::list_inbound_links(),
@@ -1376,6 +1377,7 @@ where
             double_edge_style,
             auto_connect_enabled,
             manual_control_enabled,
+            hotkey_switch_enabled,
         } => {
             if listen_port == Some(0) {
                 ControlResponse::Error {
@@ -1413,6 +1415,9 @@ where
                     }
                     if let Some(auto_enabled) = auto_connect_enabled {
                         updated.auto_connect_enabled = auto_enabled;
+                    }
+                    if let Some(hotkey_enabled) = hotkey_switch_enabled {
+                        updated.hotkey_switch_enabled = hotkey_enabled;
                     }
                     if clear_auto_connect {
                         updated.auto_connect_address = None;

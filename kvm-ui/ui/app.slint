@@ -1921,6 +1921,10 @@ export component AppWindow inherits Window {
     in-out property <string> incoming-link: "";
     in-out property <string> incoming-link-fingerprint: "";
     in-out property <bool> lock-screen-control: false;
+    // Instant computer switching: Shift+F1 returns here, Shift+F2.. drives
+    // the 2nd.. trusted computer. The daemon consumes the chord; this switch
+    // is the persisted off-ramp.
+    in-out property <bool> hotkey-switch-enabled: true;
     in-out property <bool> clipboard-enabled: true;
     in-out property <string> clipboard-max-mb: "2";
     in-out property <bool> reverse-scroll: false;
@@ -2095,6 +2099,7 @@ export component AppWindow inherits Window {
     callback place-peer-right();
     callback open-log-folder();
     callback apply-config(bool, int, string, string, bool, string);
+    callback apply-hotkey-switch(bool /* wanted */);
     // Login auto-start and auto-reconnect toggles (Problem 3). Both carry the
     // requested state; the UI code re-reads the OS / the daemon afterwards so
     // the switches always show what the machine will really do.
@@ -2358,11 +2363,12 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         height: 40px;
                         spacing: 8px;
-                        // Flush-left dot: the dot's left edge IS the
-                        // content gutter, so box / "Computers" / dot
-                        // share one starting line. The 24px cell keeps
-                        // both labels on one shared line. y centers the
-                        // dots ((40-10)/2 = 15).
+                        // CON-02 + user request: dot flush left at the
+                        // gutter, then the one-based computer index in a
+                        // fixed column, then the label. Both rows share
+                        // every column start, so "Computers", the dots,
+                        // the indices and the names align as one grid.
+                        // No duplicated grey name/value filler (CON-04).
                         alignment: start;
                         Rectangle {
                             width: 24px;
@@ -2377,20 +2383,22 @@ export component AppWindow inherits Window {
                             }
                         }
                         Text {
+                            width: 22px;
+                            text: "1.";
+                            color: Theme.muted;
+                            font-size: 16px;
+                            font-weight: 700;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                        }
+                        Text {
                             text: "This computer";
                             color: Theme.text;
                             font-size: 14px;
                             font-weight: 700;
                             vertical-alignment: center;
                         }
-                        Text {
-                            text: root.device-name == "" ? "" : root.device-name;
-                            color: Theme.faint;
-                            font-size: 14px;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                            vertical-alignment: center;
-                        }
+                        Rectangle { horizontal-stretch: 1; }
                         Text {
                             text: root.local-address == "" ? "—" : root.local-address;
                             color: Theme.text-2;
@@ -2404,9 +2412,11 @@ export component AppWindow inherits Window {
                         vertical-stretch: 0;
                         height: 40px;
                         spacing: 8px;
-                        // Flush-left dot cell, same grid as the local
-                        // row: dot left = gutter, labels share one line.
-                        // Spinner (18px) y = (40-18)/2 = 11, dot y = 15.
+                        // Same shared grid as the local row: dot, index,
+                        // label all start on the same columns. The peer's
+                        // address is NOT repeated here (CON-04: no grey
+                        // "connected to <ip>" filler) — Devices owns the
+                        // complete per-computer facts.
                         alignment: start;
                         Rectangle {
                             width: 24px;
@@ -2427,6 +2437,15 @@ export component AppWindow inherits Window {
                             }
                         }
                         Text {
+                            width: 22px;
+                            text: "2.";
+                            color: Theme.muted;
+                            font-size: 16px;
+                            font-weight: 700;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                        }
+                        Text {
                             text: root.linked-peer-name == "" ? "Connected computer" : root.linked-peer-name;
                             color: Theme.text;
                             font-size: 14px;
@@ -2434,13 +2453,6 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
-                        Text {
-                            text: root.details-peer-address == "" ? "—" : root.details-peer-address;
-                            color: Theme.text-2;
-                            font-size: 14px;
-                            overflow: elide;
-                            vertical-alignment: center;
-                        }
                         // No green "Live" label: Live is the green dot
                         // alone. Connecting/Idle shows only until verified.
                         if !session-verified : Text {
@@ -3044,7 +3056,9 @@ export component AppWindow inherits Window {
                 height: content-settings.preferred-height + 24px;
                 content-settings := VerticalLayout {
                     padding: 12px;
-                    spacing: 8px;
+                    // One 10px step between blocks: the allowed-connection
+                    // cards read as separate objects instead of one stack.
+                    spacing: 10px;
 
                     HorizontalLayout {
                         vertical-stretch: 0;
@@ -3082,6 +3096,22 @@ export component AppWindow inherits Window {
                         ToggleSwitch {
                             checked <=> root.lock-screen-control;
                             toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb); }
+                        }
+                    }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: "Switch computers with Fn+Shift+number";
+                            color: Theme.text-2;
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ToggleSwitch {
+                            checked <=> root.hotkey-switch-enabled;
+                            toggled => { root.apply-hotkey-switch(root.hotkey-switch-enabled); }
                         }
                     }
                     HorizontalLayout {
@@ -3297,7 +3327,9 @@ export component AppWindow inherits Window {
                                 row-hover := TouchArea { mouse-cursor: pointer; }
                                 HorizontalLayout {
                             padding-left: 12px;
-                            padding-right: 8px;
+                            // The 3-dot is the row's last element and sits
+                            // on the right edge itself, not inset by a gap.
+                            padding-right: 4px;
                             spacing: 8px;
                             // Content hugs the left gutter (index starts
                             // at the box edge); the spacer pushes the 3-dot
@@ -3307,8 +3339,12 @@ export component AppWindow inherits Window {
                             // starts at the box edge; numbers renumber
                             // automatically after a delete.
                             Text {
-                                width: 30px;
+                                width: 32px;
                                 text: (i + 1) + ".";
+                                // SET-03: one type level above the 14px
+                                // name/IP, bold, left-aligned in its own
+                                // fixed column so every name starts on the
+                                // same edge. Muted, never name-coloured.
                                 color: Theme.muted;
                                 font-size: 16px;
                                 font-weight: 700;

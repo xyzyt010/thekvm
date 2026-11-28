@@ -234,6 +234,9 @@ export component App inherits Window {
     in property <string> status: "Scanning…";
     in property <string> connected-name: "";
     in property <string> touch-debug: "";
+    // True while the active session is down and auto-reconnecting: the
+    // trackpad stays on screen (never yanked to Devices) and shows it.
+    in property <bool> reconnecting: false;
     in property <[KnownItem]> remembered: [];
     in property <bool> paste-mode: false;
     in-out property <bool> horizontal-mode: false;
@@ -726,7 +729,7 @@ export component App inherits Window {
                 spacing: 6px * root.scale;
                 Text {
                     text: "● " + root.connected-name;
-                    color: Theme.accent;
+                    color: root.reconnecting ? #f59e0b : Theme.accent;
                     font-size: 13px * root.scale;
                     font-weight: 600;
                     vertical-alignment: center;
@@ -757,6 +760,20 @@ export component App inherits Window {
             }
         }
 
+        if root.reconnecting : Rectangle {
+            height: 30px * root.scale;
+            background: #3b2f07;
+            Text {
+                text: root.status;
+                color: #fbbf24;
+                font-size: 12px * root.scale;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
         // Trackpad: native touch events are translated to relative mouse
         // motion and clicks by Rust. Nothing is drawn here on purpose.
         Rectangle {
@@ -771,13 +788,6 @@ export component App inherits Window {
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 wrap: word-wrap;
-            }
-            Text {
-                text: root.touch-debug;
-                color: Theme.faint;
-                font-size: 11px * root.scale;
-                horizontal-alignment: center;
-                vertical-alignment: bottom;
             }
             // One finger: move / click / drag. Coordinates are local to the
             // trackpad, so bars above and below can never move the cursor.

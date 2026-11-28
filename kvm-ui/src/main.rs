@@ -1,4 +1,4 @@
-// GUI subsystem on Windows so double-clicking the app never flashes a
+﻿// GUI subsystem on Windows so double-clicking the app never flashes a
 // console window; diagnostics go through the status line and logs.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -328,6 +328,7 @@ fn main() -> Result<()> {
 
     if let Ok(config) = kvm_core::Config::load(&startup_dir.join("config.json")) {
         ui.set_lock_screen_control(config.allow_lock_screen_control);
+        ui.set_hotkey_switch_enabled(config.hotkey_switch_enabled);
         ui.set_clipboard_enabled(config.clipboard_enabled);
         ui.set_reverse_scroll(config.reverse_scroll);
         ui.set_auto_discover(config.auto_discover);
@@ -1048,6 +1049,7 @@ fn main() -> Result<()> {
             double_edge_style: None,
             auto_connect_enabled: Some(enabled),
             manual_control_enabled: None,
+            hotkey_switch_enabled: None,
         }
     }
 
@@ -1283,6 +1285,7 @@ fn main() -> Result<()> {
                 double_edge_style: None,
                 auto_connect_enabled: None,
                 manual_control_enabled: None,
+                hotkey_switch_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     set_role_applying(&weak, false);
@@ -1416,6 +1419,7 @@ fn main() -> Result<()> {
                 double_edge_style: Some(requested_style),
                 auto_connect_enabled: None,
                 manual_control_enabled: None,
+                hotkey_switch_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -1508,6 +1512,7 @@ fn main() -> Result<()> {
                 double_edge_style: None,
                 auto_connect_enabled: None,
                 manual_control_enabled: None,
+                hotkey_switch_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -2323,6 +2328,7 @@ fn main() -> Result<()> {
                 double_edge_style: None,
                 auto_connect_enabled: None,
                 manual_control_enabled: None,
+                hotkey_switch_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -2401,6 +2407,7 @@ fn main() -> Result<()> {
                 double_edge_style: None,
                 auto_connect_enabled: None,
                 manual_control_enabled: Some(wanted),
+                hotkey_switch_enabled: None,
             }) {
                 Ok(ControlResponse::Applied { .. }) => {
                     mirror_user_config(
@@ -2438,6 +2445,70 @@ fn main() -> Result<()> {
                 Ok(ControlResponse::Error { message }) => set_status(&weak, message),
                 Ok(other) => set_status(&weak, format!("Unexpected daemon response: {other:?}")),
                 Err(error) => set_status(&weak, format!("Cannot set manual control: {error}")),
+            }
+        });
+    });
+
+    // Fn+Shift+number instant switching (Settings toggle). The daemon owns
+    // the chord; this only persists the off-ramp. A minimal SetConfig keeps
+    // every other policy exactly as it was.
+    let weak = ui.as_weak();
+    ui.on_apply_hotkey_switch(move |enabled| {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            match control_request(ControlRequest::SetConfig {
+                device_name: None,
+                mode: None,
+                allow_lock_screen_control: None,
+                allow_prelogin_auto_connect: None,
+                listen_port: None,
+                layout: None,
+                auto_connect_address: None,
+                clear_auto_connect: false,
+                clipboard_enabled: None,
+                clipboard_max_mb: None,
+                edge_mode: None,
+                transport: None,
+                reverse_scroll: None,
+                auto_discover: None,
+                double_edge_style: None,
+                auto_connect_enabled: None,
+                manual_control_enabled: None,
+                hotkey_switch_enabled: Some(enabled),
+            }) {
+                Ok(ControlResponse::Applied { .. }) => set_status(
+                    &weak,
+                    if enabled {
+                        "Fn+Shift+number switching on: Shift+F1 returns here, Shift+F2+ drives that computer."
+                            .into()
+                    } else {
+                        "Fn+Shift+number switching off; edge crossings still work.".into()
+                    },
+                ),
+                Ok(ControlResponse::Error { message }) => {
+                    // Put the switch back on the daemon's real value.
+                    let _ = slint::invoke_from_event_loop({
+                        let weak = weak.clone();
+                        move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_hotkey_switch_enabled(!enabled);
+                            }
+                        }
+                    });
+                    set_status(&weak, message);
+                }
+                Ok(other) => set_status(&weak, format!("Unexpected daemon response: {other:?}")),
+                Err(error) => {
+                    let _ = slint::invoke_from_event_loop({
+                        let weak = weak.clone();
+                        move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_hotkey_switch_enabled(!enabled);
+                            }
+                        }
+                    });
+                    set_status(&weak, format!("Cannot set hotkey switching: {error}"));
+                }
             }
         });
     });
@@ -2683,6 +2754,7 @@ fn main() -> Result<()> {
                     double_edge_style: None,
                     auto_connect_enabled: None,
                     manual_control_enabled: None,
+                    hotkey_switch_enabled: None,
                 }) {
                     Ok(ControlResponse::Applied { restart_required }) => {
                         // Same truth rule as the role buttons: the green
@@ -2774,6 +2846,7 @@ fn main() -> Result<()> {
                             double_edge_style: None,
                             auto_connect_enabled: None,
                             manual_control_enabled: None,
+                            hotkey_switch_enabled: None,
                         })? {
                             ControlResponse::Applied { .. } => Ok(()),
                             ControlResponse::Error { message } => anyhow::bail!(message),
@@ -3071,6 +3144,7 @@ fn set_daemon_status(weak: &slint::Weak<AppWindow>, status: DaemonStatus) {
                     status.peer_count, status.active_session_count
                 )));
                 ui.set_lock_screen_control(status.allow_lock_screen_control);
+                ui.set_hotkey_switch_enabled(status.hotkey_switch_enabled);
                 ui.set_clipboard_enabled(status.clipboard_enabled);
                 ui.set_reverse_scroll(status.reverse_scroll);
                 ui.set_auto_discover(status.auto_discover);
@@ -3497,6 +3571,7 @@ fn remember_peer_for_auto_connect(weak: &slint::Weak<AppWindow>, address: String
             double_edge_style: None,
             auto_connect_enabled: Some(true),
             manual_control_enabled: None,
+            hotkey_switch_enabled: None,
         }) {
             Ok(ControlResponse::Applied { .. }) => {
                 mirror_user_config(
@@ -4363,6 +4438,7 @@ fn remember_auto_connect_peer(data_dir: &std::path::Path, address: &str) {
                 double_edge_style: None,
                 auto_connect_enabled: None,
                 manual_control_enabled: None,
+                hotkey_switch_enabled: None,
             });
         }
     }
@@ -4509,6 +4585,7 @@ fn write_arrangement(layout: kvm_core::Layout) -> Result<kvm_core::Layout> {
         double_edge_style: None,
         auto_connect_enabled: None,
         manual_control_enabled: None,
+        hotkey_switch_enabled: None,
     }) {
         Ok(ControlResponse::Applied { .. }) => {}
         Ok(ControlResponse::Error { message }) => anyhow::bail!("{message}"),
@@ -5711,7 +5788,7 @@ fn relay_session_progress(
                 // arranged (ghost pins misroute every handoff).
                 adopt_link_fingerprint(&data_dir, effective_addr);
                 format!(
-                    "Connected to {effective_addr} — shared cursor is live both ways: push past the arranged edge to drive the other screen, push back past the edge to return. Both computers stay usable. Disconnect ends the link."
+                    "Shared cursor is live both ways: push past the arranged edge to drive the other screen, push back past the edge to return. Both computers stay usable. Disconnect ends the link."
                 )
             }
             "edge-ready" => {
@@ -7044,10 +7121,13 @@ fn set_session(weak: &slint::Weak<AppWindow>, address: Option<String>) {
                 // first-connect spinner has done its job either way.
                 ui.set_link_connecting(false);
                 match address {
-                    Some(address) => {
+                    Some(_address) => {
                         ui.set_session_active(true);
                         ui.set_session_verified(true);
-                        ui.set_session_text(SharedString::from(format!("Connected to {address}")));
+                        // No "Connected to <ip>" line: the Connect grid
+                        // shows state by dot alone (CON-02/CON-04), and
+                        // the address lives in Devices where it belongs.
+                        ui.set_session_text(SharedString::from(""));
                         ui.set_link_live(true);
                     }
                     None => {
@@ -7078,7 +7158,7 @@ fn set_session_connecting(weak: &slint::Weak<AppWindow>, address: &str) {
                 SESSION_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
                 ui.set_session_active(true);
                 ui.set_session_verified(false);
-                ui.set_session_text(SharedString::from(format!("Connecting to {address}…")));
+                ui.set_session_text(SharedString::from("Connecting…"));
                 ui.set_link_connecting(true);
                 ui.set_link_live(true);
             }
@@ -7115,7 +7195,9 @@ fn set_session_connected(
                 SESSION_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
                 ui.set_session_active(true);
                 ui.set_session_verified(true);
-                ui.set_session_text(SharedString::from(format!("Connected to {address}")));
+                // No "Connected to <ip>" text (CON-02/CON-04): state is
+                // the dot; the address belongs in Devices.
+                ui.set_session_text(SharedString::from(""));
                 ui.set_link_connecting(false);
                 ui.set_link_live(true);
             }

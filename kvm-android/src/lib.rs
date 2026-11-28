@@ -20,7 +20,6 @@ use slint::{ComponentHandle, Global, Model, ModelRc, SharedString, VecModel, Wea
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::Mutex as AsyncMutex;
 use std::time::{Duration, Instant};
 
 const NODE_NAME: &str = "Android controller";
@@ -87,8 +86,16 @@ impl Store {
 
 struct Session {
     connection: quinn::Connection,
-    send: Arc<AsyncMutex<quinn::SendStream>>,
-    sequence: AtomicU64,
+    /// Every frame for this session (input AND Ping replies) goes through
+    /// this one channel to the single writer task that owns the stream.
+    /// The old design shared an async mutex between the input pump and
+    /// the Ping watcher: one stalled Pong write held the lock forever,
+    /// the pump's lock wait had no timeout, and touch frames silently
+    /// stopped after the first movement.
+    frames: tokio::sync::mpsc::UnboundedSender<WireMessage>,
+    /// Set false by the writer/reader the moment the session dies, so
+    /// senders fail fast instead of queueing into a dead channel.
+    alive: AtomicBool,
 }
 
 impl Session {
@@ -96,8 +103,16 @@ impl Session {
     /// the peer's inbound link alive, which lets it dial back into us after
     /// a manual Disconnect — the one-way "they can enter, we cannot" state.
     fn close(&self) {
+        self.alive.store(false, Ordering::Relaxed);
         self.connection
             .close(quinn::VarInt::from_u32(0), b"manual disconnect");
+    }
+
+    /// Queue one input frame. False means the session is dead and the
+    /// caller should evict + reconnect instead of dropping the event
+    /// into a black hole.
+    fn queue(&self, message: WireMessage) -> bool {
+        self.alive.load(Ordering::Relaxed) && self.frames.send(message).is_ok()
     }
 
     /// Push the whole multi-node arrangement to this desktop on its own
@@ -161,6 +176,22 @@ struct Controller {
     multi_finger: Arc<AtomicBool>,
     /// Fingerprints whose session died and should reconnect on the next poll.
     retry_now: Mutex<Vec<String>>,
+    /// Connect attempts currently in flight (fingerprint, or address for
+    /// first contact). Without this, auto-connect respawned a second —
+    /// then third — attempt while the first was still waiting for the
+    /// desktop Allow click; the sessions replaced each other, the
+    /// desktop closed the loser, and the UI flipped between the
+    /// trackpad and the device list every few seconds.
+    connecting: Mutex<std::collections::HashSet<String>>,
+    /// One process-wide input sequence. It must never reset when a
+    /// session reconnects: the desktop deduplicates by sequence, so a
+    /// restarted counter reads as stale/replayed frames and the new
+    /// session's touches are dropped until it catches up.
+    next_sequence: AtomicU64,
+    /// Current UI phase as last set, so background events (a lost
+    /// background session, a discovery refresh) never yank the user
+    /// out of the trackpad or settings screen they are looking at.
+    phase: Mutex<String>,
     /// Latched by any manual Disconnect/Stop. Cleared only by a fresh app
     /// process (or an explicit Connect by the user). While set, NO automatic
     /// reconnect — outgoing or incoming — is attempted.
@@ -191,8 +222,13 @@ impl Controller {
     }
 
     fn set_phase(&self, phase: &str) {
+        *self.phase.lock().unwrap() = phase.to_owned();
         let value = SharedString::from(phase);
         self.notify_ui(move |ui| ui.set_phase(value));
+    }
+
+    fn current_phase(&self) -> String {
+        self.phase.lock().unwrap().clone()
     }
 
     fn set_status(&self, status: String) {
@@ -203,6 +239,10 @@ impl Controller {
     fn set_connected_name(&self, name: String) {
         let value = SharedString::from(name);
         self.notify_ui(move |ui| ui.set_connected_name(value));
+    }
+
+    fn set_reconnecting(&self, reconnecting: bool) {
+        self.notify_ui(move |ui| ui.set_reconnecting(reconnecting));
     }
 
     fn publish_diag(&self) {
@@ -266,6 +306,7 @@ impl Controller {
         };
         let Some(name) = device else { return };
         *self.active.lock().unwrap() = Some(fingerprint.to_owned());
+        self.set_reconnecting(false);
         self.set_connected_name(format!("{} · {}", name, short_fp(fingerprint)));
         self.set_phase("control");
         self.set_status(format!("Live · Controlling {} · {} connected", name, self.connected_count()));
@@ -510,6 +551,35 @@ impl Controller {
             self.set_status(format!("Error · Already connected to the maximum of {MAX_DEVICES} computers"));
             return;
         }
+        // One attempt per computer at a time. A pairing wait can last
+        // minutes (a human must click Allow); auto-connect must not
+        // spawn parallel attempts that replace each other's sessions.
+        let connect_key = fingerprint_hint
+            .clone()
+            .unwrap_or_else(|| address.clone());
+        {
+            let mut connecting = self.connecting.lock().unwrap();
+            if !connecting.insert(connect_key.clone()) {
+                return;
+            }
+        }
+        struct ConnectGuard {
+            controller: Arc<Controller>,
+            key: String,
+        }
+        impl Drop for ConnectGuard {
+            fn drop(&mut self) {
+                self.controller
+                    .connecting
+                    .lock()
+                    .unwrap()
+                    .remove(&self.key);
+            }
+        }
+        let _connect_guard = ConnectGuard {
+            controller: self.clone(),
+            key: connect_key,
+        };
         let watcher = self.clone();
         let result: Result<(Arc<Session>, String, String)> = self.runtime.block_on(async {
             let identity = Identity::load_or_create(&self.data_dir)?;
@@ -604,25 +674,53 @@ impl Controller {
             }
             write_frame(&mut send, &WireMessage::StateSync(InputState::default())).await?;
 
-            let send = Arc::new(AsyncMutex::new(send));
-            let ping_send = send.clone();
+            // One writer task owns the send stream. Input frames, Ping
+            // replies and typed text all queue through `frames`, so no
+            // lock can ever be held across a stalled network write.
+            let (frame_tx, mut frame_rx) =
+                tokio::sync::mpsc::unbounded_channel::<WireMessage>();
             let session = Arc::new(Session {
                 connection,
-                send,
-                sequence: AtomicU64::new(1),
+                frames: frame_tx,
+                alive: AtomicBool::new(true),
             });
+            {
+                let writer_session = session.clone();
+                let writer_controller = watcher.clone();
+                let writer_fp = fingerprint.clone();
+                let mut send = send;
+                tokio::spawn(async move {
+                    while let Some(message) = frame_rx.recv().await {
+                        let written = tokio::time::timeout(
+                            Duration::from_millis(2000),
+                            write_frame(&mut send, &message),
+                        )
+                        .await;
+                        match written {
+                            Ok(Ok(())) => {
+                                writer_controller.frame_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                            _ => break,
+                        }
+                    }
+                    writer_session.alive.store(false, Ordering::Relaxed);
+                    writer_controller.on_session_lost(&writer_fp, &writer_session);
+                });
+            }
             let watch = session.clone();
             let watch_fp = fingerprint.clone();
             let watch_controller = watcher.clone();
             tokio::spawn(async move {
                 while let Ok(Some(message)) = read_frame(&mut recv).await {
                     if let WireMessage::Ping { nonce } = message {
-                        let mut stream = ping_send.lock().await;
-                        let _ = write_frame(&mut *stream, &WireMessage::Pong { nonce }).await;
+                        // Queue the Pong through the writer; never write
+                        // to the stream from here.
+                        let _ = watch.queue(WireMessage::Pong { nonce });
                     }
                 }
                 // Stream closed: the desktop ended the session. Drop the
                 // stale entry so discovery reconnects instead of wedging.
+                watch.alive.store(false, Ordering::Relaxed);
                 watch_controller.on_session_lost(&watch_fp, &watch);
             });
             Ok((session, fingerprint, peer_name))
@@ -643,7 +741,11 @@ impl Controller {
                     // is allowed again from here on.
                     self.auto_disconnected.store(false, Ordering::Relaxed);
                 }
-                self.sessions.lock().unwrap().insert(
+                // Replacing a live session (should not happen with the
+                // in-flight guard, but belt and braces): close the old
+                // connection so the desktop never holds two links from
+                // this phone and arbitrates between them.
+                let replaced = self.sessions.lock().unwrap().insert(
                     fingerprint.clone(),
                     ConnectedDevice {
                         name: name.clone(),
@@ -651,6 +753,9 @@ impl Controller {
                         session,
                     },
                 );
+                if let Some(old) = replaced {
+                    old.session.close();
+                }
                 *self.active.lock().unwrap() = Some(fingerprint.clone());
                 let mut store = self.store();
                 // A deleted pairing can be used manually but is NEVER
@@ -664,6 +769,7 @@ impl Controller {
                     store.devices.truncate(MAX_DEVICES);
                     store.save(&self.data_dir);
                 }
+                self.set_reconnecting(false);
                 self.set_connected_name(format!("{} · {}", name, short_fp(&fingerprint)));
                 self.set_phase("control");
                 self.set_status(format!("Live · Controlling {name} · {} connected", self.connected_count()));
@@ -689,6 +795,14 @@ impl Controller {
                 vec![fingerprint]
             }
         };
+        // Stopping a background computer must not switch the active one
+        // or move the user between screens; only an active stop does.
+        let stops_active = self
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|active| targets.contains(active));
         for target in &targets {
             let removed = self.sessions.lock().unwrap().remove(target);
             if let Some(device) = removed {
@@ -697,25 +811,30 @@ impl Controller {
                 device.session.close();
             }
         }
+        self.refresh_remembered();
+        if !stops_active {
+            return;
+        }
         let fallback = {
             let sessions = self.sessions.lock().unwrap();
             sessions.keys().next().cloned()
         };
         *self.active.lock().unwrap() = fallback.clone();
-        self.refresh_remembered();
         if let Some(next) = fallback {
             self.activate(&next);
         } else {
+            self.set_reconnecting(false);
             self.set_connected_name(String::new());
             self.set_phase("devices");
             self.set_status("Idle · auto-connect resumes after restart or Connect".into());
         }
     }
 
-    /// Called from the stream watcher when the desktop closes the session.
+    /// Called when a session's writer or reader dies.
     /// Only removes the entry if it is still the same session object, so a
     /// reconnect that already happened is never torn down by a stale watcher.
     fn on_session_lost(&self, fingerprint: &str, session: &Arc<Session>) {
+        session.alive.store(false, Ordering::Relaxed);
         let removed = {
             let mut sessions = self.sessions.lock().unwrap();
             let same = sessions
@@ -737,15 +856,24 @@ impl Controller {
         {
             self.retry_now.lock().unwrap().push(fingerprint.to_owned());
         }
+        self.refresh_remembered();
+        // A background computer dying must never touch what the user is
+        // looking at or which computer is active.
+        let was_active = self.active.lock().unwrap().as_deref() == Some(fingerprint);
+        if !was_active {
+            return;
+        }
         let fallback = self.sessions.lock().unwrap().keys().next().cloned();
         *self.active.lock().unwrap() = fallback.clone();
-        self.refresh_remembered();
         if let Some(next) = fallback {
             self.activate(&next);
         } else {
-            self.set_connected_name(String::new());
-            self.set_phase("devices");
-            self.set_status("Connecting · connection dropped — reconnecting…".into());
+            // Stay on the trackpad and say what is happening; discovery
+            // retries within a poll and the reconnect restores Live.
+            // Throwing the user back to Devices on every transient drop
+            // was the visible "glitching between sections" bug.
+            self.set_reconnecting(true);
+            self.set_status("Reconnecting · connection dropped — retrying…".into());
         }
     }
 
@@ -991,11 +1119,9 @@ impl Controller {
     fn send_text(&self, text: String) {
         let paste = *self.paste_mode.lock().unwrap();
         let Some(session) = self.active_session() else { return };
-        let send = session.send.clone();
-        self.runtime.spawn(async move {
-            let mut stream = send.lock().await;
-            let _ = write_frame(&mut *stream, &WireMessage::TextInput { text, paste }).await;
-        });
+        // Through the session's single writer like every other frame:
+        // no second lock holder can ever stall typing or touch.
+        session.queue(WireMessage::TextInput { text, paste });
     }
 }
 
@@ -1057,6 +1183,9 @@ fn android_main(app: AndroidApp) {
         horizontal_mode: Mutex::new(store.horizontal_mode),
         multi_finger: Arc::new(AtomicBool::new(false)),
         retry_now: Mutex::new(Vec::new()),
+        connecting: Mutex::new(std::collections::HashSet::new()),
+        next_sequence: AtomicU64::new(1),
+        phase: Mutex::new("devices".to_string()),
         auto_disconnected: AtomicBool::new(false),
         pending_device: Mutex::new(String::new()),
         dragging: Mutex::new(String::new()),
@@ -1069,39 +1198,19 @@ fn android_main(app: AndroidApp) {
     });
     controller.ui.set(ui.as_weak()).ok();
 
-    // Sequence-numbered input frames go to the ACTIVE desktop only.
-    // Writes are strictly serial here: spawning one task per event reordered
-    // frames, made the receiver drop them as stale, and piled up thousands of
-    // tasks behind one mutex — the source of the growing delay and dropouts.
+    // Input frames go to the ACTIVE desktop only, queued onto that
+    // session's single writer task (which owns the stream and counts
+    // frames actually written). The pump itself never touches the
+    // network, so it can never stall behind a dead connection: a
+    // failed queue means the session is dead — evict and reconnect.
     let pump = controller.clone();
     controller.runtime.spawn(async move {
         while let Some(event) = event_rx.recv().await {
-            let (fingerprint, session, sequence) = {
-                let Some((fingerprint, session)) = pump.active_entry() else {
-                    continue;
-                };
-                (
-                    fingerprint,
-                    session.clone(),
-                    session.sequence.fetch_add(1, Ordering::Relaxed),
-                )
+            let Some((fingerprint, session)) = pump.active_entry() else {
+                continue;
             };
-            let mut stream = session.send.lock().await;
-            let ok = write_frame(
-                &mut *stream,
-                &WireMessage::Input(InputPacket { sequence, event }),
-            )
-            .await
-            .is_ok();
-            drop(stream);
-            if ok {
-                pump.frame_count.fetch_add(1, Ordering::Relaxed);
-            } else {
-                // The input stream died (peer closed, network blip,
-                // lease expiry): without this, the session stayed
-                // "active" forever — touches counted on screen, frames
-                // never sent, the peer's cursor never moved again.
-                // Evict and reconnect instead.
+            let sequence = pump.next_sequence.fetch_add(1, Ordering::Relaxed);
+            if !session.queue(WireMessage::Input(InputPacket { sequence, event })) {
                 pump.on_session_lost(&fingerprint, &session);
             }
         }
@@ -1322,15 +1431,20 @@ fn discovery_loop(controller: Arc<Controller>) {
             .iter()
             .map(|row| controller.is_connected(&row.2))
             .collect();
-        let status = if count == 0 {
-            "No computers found — make sure TheKVM is running on a Windows or Linux computer".into()
-        } else {
-            format!(
-                "{count} computer(s) found · {} connected · remembered devices connect automatically",
-                controller.connected_count()
-            )
-        };
-        controller.set_status(status);
+        // While the user is on the trackpad, the Live/Reconnecting
+        // status owns the line; discovery must not repaint it every
+        // couple of seconds (the visible status flicker).
+        if controller.current_phase() != "control" {
+            let status = if count == 0 {
+                "No computers found — make sure TheKVM is running on a Windows or Linux computer".into()
+            } else {
+                format!(
+                    "{count} computer(s) found · {} connected · remembered devices connect automatically",
+                    controller.connected_count()
+                )
+            };
+            controller.set_status(status);
+        }
         controller.notify_ui(move |ui| {
             let items: Vec<DeviceItem> = rows
                 .iter()
