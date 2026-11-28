@@ -125,15 +125,15 @@ untouched.
 
 ## 4. Cross-cutting UI behavior
 
-The entire GUI is a single `AppWindow` with three tabs plus a tray.
+The entire GUI is a single `AppWindow` with two views plus a tray.
 
-### Tabs
+### Views
 
-| Tab | Contents |
+| View | Contents |
 |---|---|
-| **Connect** | Nearby devices (the discovery list appears when auto-discovery is on), role dropdown ("Both ways", "Control other only", "Be controlled only"), link state, Disconnect; when auto-discovery is **off** the manual address box, pairing code, and Connect button appear as the out-of-band path |
-| **Devices** | "Screen arrangement" monitor mesh with arrows showing crossing edges; a **Details** button that expands an inline two-column card (this computer / linked computer: name, LAN address, fingerprint, role, link state); "Crossing edges" tiles (Single, Mirror) — the Single tile carries a minimal **flip-sides** glyph that swaps which side each computer sits on while keeping Single mode; the active tile wears a green highlight box; each tile carries its own donut when a live change is pending but not yet applied |
-| **Settings** | Lock-screen policy toggle, clipboard on/off, clipboard size limit, auto-discover toggle, diagnostics option, about/version info |
+| **Main** | Header ("TheKVM" + the Settings entry, sliders icon and label). Nearby devices (the discovery list appears when auto-discovery is on), role dropdown ("Both ways", "Control other only", "Be controlled only"), link state, Disconnect; the numbered Computers grid (1. This computer, then every known computer with its grey address beside the name); when auto-discovery is **off** the manual address box, pairing code, and Connect button appear as the out-of-band path |
+| **Settings > Devices** | Reached from the main view's Settings entry; a straight back arrow returns to Main. Contains the Computers section (allowed connections: index, name, vertical separator, address, far-right 3-dot menu with Remove inside), the per-computer details card, "Screen arrangement" monitor mesh with arrows showing crossing edges, "Crossing edges" tiles (Single, Mirror) and multi-node setup |
+| **Settings > General** | The other Settings section (segmented Devices/General switch under the Settings header): lock-screen/pre-login policy toggle, Ctrl+Shift+number switching toggle, clipboard on/off and size limit, auto-discover toggle, allowed connections (same block as Devices > Computers), diagnostics, about/version info |
 
 ### Persistent elements
 

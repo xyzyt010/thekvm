@@ -2174,7 +2174,8 @@ export component AppWindow inherits Window {
                     vertical-stretch: 0;
                     height: 44px;
                     spacing: 8px;
-                    alignment: start;
+                    // No alignment here: the spacer must stretch so the
+                    // Settings entry sits at the right edge.
                     Text {
                         text: "TheKVM";
                         color: Theme.text;

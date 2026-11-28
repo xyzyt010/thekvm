@@ -122,6 +122,8 @@ The mapping is good; the execution is not yet cohesive.
 
 **CON-08 — Instant switching by number.** Pressing Ctrl+Shift+<number> (digit row or numpad) switches control without any cursor travel: 1 returns to this computer; 2..N drives the Nth trusted computer in Devices order that has a placed screen. It works identically in a two-node link and in multi-node topology, in both directions (every computer that may drive can do it from its own keyboard; a ClientOnly machine opens nothing, exactly like an edge crossing). It is consumed by the daemon (never typed into the peer), and can be turned off in Settings ("Switch computers with Ctrl+Shift+number"). An unplaced or out-of-range number is a logged no-op, never a wrong drive. The Connect grid numbers its rows (1. This computer, 2. Connected computer) with the same one-based indexing.
 
+**CON-09 — Two-view navigation.** The app has exactly two top-level views. The main view carries one visible Settings entry (sliders icon + "Settings" label, 36px target). Settings is a single view with a straight left-arrow back control that returns to the main view, and two sections chosen by one segmented control: Devices (computers, details, arrangement, multi-node) and General (policies, clipboard, and the same allowed-connections block). There is no tab bar. Section switches never lose scroll-independent state, and the back arrow is always in the same place.
+
 **Acceptance:** vision passes confirm same-line starts, a shared dot column, body-size text, and a complete roster including Android and multi-node peers. Black-box passes connect and disconnect each row type. No row overflows at any supported size.
 
 ## 5. Multi-node: a real, usable protocol
