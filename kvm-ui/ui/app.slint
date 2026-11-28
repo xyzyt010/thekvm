@@ -2187,13 +2187,12 @@ export component AppWindow inherits Window {
             if root.view == "main" : VerticalLayout {
                 row: 0;
                 col: 0;
-                // Pinned to the WINDOW width (never parent.width: the
-                // GridLayout sizes itself from its children, so a
-                // parent binding recurses and panics at startup). The
-                // PageScroll preferred 100% chain otherwise inflates
-                // this wrapper past the window on scaled displays and
-                // pushes the header's right side (Settings) off-screen.
-                width: root.width - 24px;
+                // Stretch, like the TabWidget this replaced: without it
+                // the GridLayout sizes this wrapper to the content's
+                // preferred width, which overflows the window (and
+                // pushes the header's Settings entry off-screen).
+                horizontal-stretch: 1;
+                vertical-stretch: 1;
                 spacing: 0px;
                 HorizontalLayout {
                     vertical-stretch: 0;
@@ -2819,7 +2818,8 @@ export component AppWindow inherits Window {
             if root.view == "settings" : VerticalLayout {
                 row: 0;
                 col: 0;
-                width: root.width - 24px;
+                horizontal-stretch: 1;
+                vertical-stretch: 1;
                 spacing: 0px;
                 HorizontalLayout {
                     vertical-stretch: 0;
