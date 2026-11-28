@@ -2169,6 +2169,12 @@ export component AppWindow inherits Window {
             if root.view == "main" : VerticalLayout {
                 row: 0;
                 col: 0;
+                // Explicitly window-sized: the PageScroll preferred
+                // 100% chain otherwise inflates this wrapper past the
+                // window on scaled displays and pushes the header's
+                // right side (Settings entry) off-screen.
+                width: parent.width;
+                height: parent.height;
                 spacing: 0px;
                 HorizontalLayout {
                     vertical-stretch: 0;
@@ -2774,6 +2780,8 @@ export component AppWindow inherits Window {
             if root.view == "settings" : VerticalLayout {
                 row: 0;
                 col: 0;
+                width: parent.width;
+                height: parent.height;
                 spacing: 0px;
                 HorizontalLayout {
                     vertical-stretch: 0;
