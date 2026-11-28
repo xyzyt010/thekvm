@@ -1,4 +1,4 @@
-use crate::layout::DoubleEdgeStyle;
+﻿use crate::layout::DoubleEdgeStyle;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
@@ -102,8 +102,8 @@ pub struct Config {
     /// Off by default; the Settings switch opts in.
     #[serde(default)]
     pub manual_control_enabled: bool,
-    /// Instant computer switching with Shift+F1..F9 (laptop Fn sends the
-    /// F-key codes, so Shift+F-key is the requested Fn+Shift+number).
+    /// Instant computer switching with Ctrl+Shift+1..9 (digit row or
+    /// numpad), consumed by the daemon in its capture path.
     /// Number 1 always returns control to this computer; 2..N drive the
     /// Nth trusted computer in Devices order. Works in a two-node link
     /// and in multi-node topology because the daemon resolves the number
@@ -176,7 +176,7 @@ impl Default for Config {
 }
 
 /// Instant switching is a convenience, not a safety policy: default on so
-/// the requested Fn+Shift+number gesture works out of the box, with a
+/// the requested Ctrl+Shift+number gesture works out of the box, with a
 /// Settings switch to turn it off for users who bind those keys elsewhere.
 fn default_hotkey_switch_enabled() -> bool {
     true
@@ -615,3 +615,4 @@ mod tests {
         assert_eq!(back.transport, TransportProtocol::Quic);
     }
 }
+

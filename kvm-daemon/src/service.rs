@@ -1,4 +1,4 @@
-//! Daemon main loop, pairing flow, and test client.
+﻿//! Daemon main loop, pairing flow, and test client.
 
 use anyhow::{bail, Context, Result};
 use kvm_core::{
@@ -6211,7 +6211,7 @@ struct TopologyEventContext<'a> {
     /// (the mid-display sudden-exit shape) — only sustained silence
     /// with nothing getting through for seconds means dead network.
     send_stall_since: &'a mut Option<std::time::Instant>,
-    /// Instant computer switching with Shift+F1..F9 (see
+    /// Instant computer switching with Ctrl+Shift+1..9 (see
     /// Config::hotkey_switch_enabled), live copy of the setting.
     hotkey_switch_enabled: bool,
     /// Sender's reverse-scroll setting (see Config::reverse_scroll):
@@ -6466,11 +6466,14 @@ async fn handle_topology_event(
         reverse_scroll,
     } = context;
 
-    // Fn+Shift+number instant switching (user request): laptops turn
-    // Fn+1..9 into F1..F9, so Shift+F1..F9 is the requested chord. The
-    // daemon owns the keys (works while it is driving another computer,
-    // where the OS never sees them). Number 1 returns here; 2..N drives
-    // the Nth *placed* trusted computer in Devices order. Explicit
+    // Ctrl+Shift+number instant switching (user request): the chord is
+    // consumed here, in the daemon's capture path, so it works while
+    // this machine is driving another computer (the peer OS never sees
+    // it) and while it is local. Number 1 returns here; 2..N drives the
+    // Nth *placed* trusted computer in Devices order. It is a
+    // controller-side action: a machine that may not drive (ClientOnly)
+    // opens nothing, exactly like an edge crossing; in bidirectional
+    // mode every computer can do it from its own keyboard. Explicit
     // switching is the alternative to edge-dragging the cursor, so it
     // opens the same drive episode the router would have opened.
     if hotkey_switch_enabled && !router.is_locked() {
@@ -14589,17 +14592,23 @@ fn is_scroll_lock_press(event: &kvm_core::InputEvent) -> bool {
     )
 }
 
-/// USB HID usages for F1..F9. Laptops send these when the user holds Fn
-/// and presses 1..9, so Shift+F-key is exactly the requested
-/// Fn+Shift+computer-number chord (the Fn layer itself never reaches the
-/// OS as a key).
-const HOTKEY_F1_USAGE: u16 = 0x3a;
-const HOTKEY_F9_USAGE: u16 = 0x42;
+/// USB HID usages for the Ctrl+Shift+number switch chord. The Fn layer
+/// never reaches the OS reliably (Ctrl+Shift+number was the first request
+/// and does not work on the user's keyboards), so the chord is the
+/// literal one the user asked for: Ctrl+Shift+1..9. Digit row usages are
+/// 0x1e..0x26 (1..9); the numpad digits 0x59..0x61 count too.
+const HOTKEY_DIGIT1_USAGE: u16 = 0x1e;
+const HOTKEY_DIGIT9_USAGE: u16 = 0x26;
+const HOTKEY_NUMPAD1_USAGE: u16 = 0x59;
+const HOTKEY_NUMPAD9_USAGE: u16 = 0x61;
+const HID_LEFT_CTRL_USAGE: u16 = 0xe0;
+const HID_RIGHT_CTRL_USAGE: u16 = 0xe4;
 const HID_LEFT_SHIFT_USAGE: u16 = 0xe1;
 const HID_RIGHT_SHIFT_USAGE: u16 = 0xe5;
 
 /// Return the requested one-based computer number when this event is a
-/// fresh Shift+F1..F9 press. Releases and auto-repeats are not switches.
+/// fresh Ctrl+Shift+1..9 press. Releases and auto-repeats are not
+/// switches, and neither modifier alone ever switches.
 fn hotkey_switch_number(
     event: &kvm_core::InputEvent,
     state: &kvm_core::InputState,
@@ -14610,13 +14619,22 @@ fn hotkey_switch_number(
     if !key.pressed || key.repeat {
         return None;
     }
-    if !(HOTKEY_F1_USAGE..=HOTKEY_F9_USAGE).contains(&key.usage) {
+    let number = if (HOTKEY_DIGIT1_USAGE..=HOTKEY_DIGIT9_USAGE).contains(&key.usage) {
+        usize::from(key.usage - HOTKEY_DIGIT1_USAGE) + 1
+    } else if (HOTKEY_NUMPAD1_USAGE..=HOTKEY_NUMPAD9_USAGE).contains(&key.usage) {
+        usize::from(key.usage - HOTKEY_NUMPAD1_USAGE) + 1
+    } else {
         return None;
-    }
-    let shift_held = state.pressed_keys.iter().any(|usage| {
-        *usage == HID_LEFT_SHIFT_USAGE || *usage == HID_RIGHT_SHIFT_USAGE
-    });
-    shift_held.then_some(usize::from(key.usage - HOTKEY_F1_USAGE) + 1)
+    };
+    let held = |usages: [u16; 2]| {
+        state
+            .pressed_keys
+            .iter()
+            .any(|usage| usages.contains(usage))
+    };
+    let ctrl_held = held([HID_LEFT_CTRL_USAGE, HID_RIGHT_CTRL_USAGE]);
+    let shift_held = held([HID_LEFT_SHIFT_USAGE, HID_RIGHT_SHIFT_USAGE]);
+    (ctrl_held && shift_held).then_some(number)
 }
 
 struct ConnectPolicy<'a> {
@@ -17368,10 +17386,18 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_switch_reads_shift_f1_to_f9_only() {
+    fn hotkey_switch_reads_ctrl_shift_digits_only() {
         use kvm_core::{InputEvent, InputState, KeyEvent};
-        let shift = InputState {
+        let both = InputState {
+            pressed_keys: vec![HID_LEFT_CTRL_USAGE, HID_LEFT_SHIFT_USAGE],
+            pressed_buttons: Vec::new(),
+        };
+        let shift_only = InputState {
             pressed_keys: vec![HID_LEFT_SHIFT_USAGE],
+            pressed_buttons: Vec::new(),
+        };
+        let ctrl_only = InputState {
+            pressed_keys: vec![HID_RIGHT_CTRL_USAGE],
             pressed_buttons: Vec::new(),
         };
         let plain = InputState::default();
@@ -17383,33 +17409,44 @@ mod tests {
             })
         };
         assert_eq!(
-            hotkey_switch_number(&key(HOTKEY_F1_USAGE, true, false), &shift),
+            hotkey_switch_number(&key(HOTKEY_DIGIT1_USAGE, true, false), &both),
             Some(1)
         );
         assert_eq!(
-            hotkey_switch_number(&key(HOTKEY_F1_USAGE + 1, true, false), &shift),
+            hotkey_switch_number(&key(HOTKEY_DIGIT1_USAGE + 1, true, false), &both),
             Some(2)
         );
         assert_eq!(
-            hotkey_switch_number(&key(HOTKEY_F9_USAGE, true, false), &shift),
+            hotkey_switch_number(&key(HOTKEY_DIGIT9_USAGE, true, false), &both),
             Some(9)
         );
-        // No Shift, a release, an auto-repeat, F10 and ordinary keys are
-        // never switches.
-        assert_eq!(hotkey_switch_number(&key(HOTKEY_F1_USAGE, true, false), &plain), None);
+        // Numpad digits count too.
         assert_eq!(
-            hotkey_switch_number(&key(HOTKEY_F1_USAGE, false, false), &shift),
+            hotkey_switch_number(&key(HOTKEY_NUMPAD1_USAGE + 2, true, false), &both),
+            Some(3)
+        );
+        // Either modifier alone, a release, an auto-repeat, "0", F-keys
+        // and ordinary keys are never switches.
+        assert_eq!(hotkey_switch_number(&key(HOTKEY_DIGIT1_USAGE, true, false), &shift_only), None);
+        assert_eq!(hotkey_switch_number(&key(HOTKEY_DIGIT1_USAGE, true, false), &ctrl_only), None);
+        assert_eq!(hotkey_switch_number(&key(HOTKEY_DIGIT1_USAGE, true, false), &plain), None);
+        assert_eq!(
+            hotkey_switch_number(&key(HOTKEY_DIGIT1_USAGE, false, false), &both),
             None
         );
         assert_eq!(
-            hotkey_switch_number(&key(HOTKEY_F1_USAGE, true, true), &shift),
+            hotkey_switch_number(&key(HOTKEY_DIGIT1_USAGE, true, true), &both),
             None
         );
         assert_eq!(
-            hotkey_switch_number(&key(HOTKEY_F9_USAGE + 1, true, false), &shift),
+            hotkey_switch_number(&key(HOTKEY_DIGIT1_USAGE - 1, true, false), &both),
             None
         );
-        assert_eq!(hotkey_switch_number(&InputEvent::MouseMove { dx: 9, dy: 0 }, &shift), None);
+        assert_eq!(
+            hotkey_switch_number(&key(0x3a, true, false), &both),
+            None
+        );
+        assert_eq!(hotkey_switch_number(&InputEvent::MouseMove { dx: 9, dy: 0 }, &both), None);
     }
 
     #[test]
@@ -18012,3 +18049,4 @@ mod tests {
         assert!(validate_input_capability(&Config::default(), false).is_ok());
     }
 }
+

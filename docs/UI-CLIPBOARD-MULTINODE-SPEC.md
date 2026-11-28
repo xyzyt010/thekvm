@@ -1,4 +1,4 @@
-# TheKVM Specification — UI Cohesion, Device Roster, Multi-Node, Clipboard
+﻿# TheKVM Specification — UI Cohesion, Device Roster, Multi-Node, Clipboard
 
 **Status:** normative. **Scope:** desktop UI/UX, Settings, Devices, Connect overlay, multi-node topology, clipboard for text and files. **Agnostic rule:** this document defines observable behavior, states, invariants, and acceptance criteria. It does not prescribe frameworks, languages, file names, or internal APIs. Platform constraints are named only where behavior must adapt. Every numbered requirement is a task; IDs are stable and are used by the verification protocol.
 
@@ -120,7 +120,7 @@ The mapping is good; the execution is not yet cohesive.
 
 **CON-07 — Empty state and truncation.** With no peers, the overlay still shows the local row and a one-line prompt to add a computer. Names and addresses elide with tooltips. The roster never collapses to a single row merely because only one peer is connected.
 
-**CON-08 — Instant switching by number.** Pressing Fn+Shift+<number> (delivered to the OS as Shift+F1..F9) switches control without any cursor travel: 1 returns to this computer; 2..N drives the Nth trusted computer in Devices order that has a placed screen. It works identically in a two-node link and in multi-node topology, is consumed by the daemon (never typed into the peer), and can be turned off in Settings ("Switch computers with Fn+Shift+number"). An unplaced or out-of-range number is a logged no-op, never a wrong drive. The Connect grid numbers its rows (1. This computer, 2. Connected computer) with the same one-based indexing.
+**CON-08 — Instant switching by number.** Pressing Ctrl+Shift+<number> (digit row or numpad) switches control without any cursor travel: 1 returns to this computer; 2..N drives the Nth trusted computer in Devices order that has a placed screen. It works identically in a two-node link and in multi-node topology, in both directions (every computer that may drive can do it from its own keyboard; a ClientOnly machine opens nothing, exactly like an edge crossing). It is consumed by the daemon (never typed into the peer), and can be turned off in Settings ("Switch computers with Ctrl+Shift+number"). An unplaced or out-of-range number is a logged no-op, never a wrong drive. The Connect grid numbers its rows (1. This computer, 2. Connected computer) with the same one-based indexing.
 
 **Acceptance:** vision passes confirm same-line starts, a shared dot column, body-size text, and a complete roster including Android and multi-node peers. Black-box passes connect and disconnect each row type. No row overflows at any supported size.
 
@@ -231,3 +231,4 @@ Verification is evidence-based and iterative. Each loop ends with a defect list 
 3. Count pass: the document stays under 4,000 words.
 4. Consistency pass: status colors, ordering, and activation rules agree.
 5. Agnosticism pass: requirements are observable without prescribing implementation.
+

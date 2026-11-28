@@ -1,4 +1,4 @@
-//! Local daemon-control protocol shared by the daemon and the desktop UI.
+﻿//! Local daemon-control protocol shared by the daemon and the desktop UI.
 
 use crate::pairing::Peer;
 use kvm_core::{Config, DoubleEdgeStyle, EdgeMode, Layout, Mode, TransportProtocol};
@@ -267,7 +267,7 @@ pub enum ControlRequest {
         /// preserves the current value.
         #[serde(default)]
         manual_control_enabled: Option<bool>,
-        /// Instant computer switching with Shift+F1..F9 (see
+        /// Instant computer switching with Ctrl+Shift+1..9 (see
         /// `Config::hotkey_switch_enabled`); omission preserves the
         /// current value.
         #[serde(default)]
@@ -419,7 +419,7 @@ pub struct DaemonStatus {
     /// false for older daemons that predate the field.
     #[serde(default)]
     pub manual_control_enabled: bool,
-    /// Instant Fn+Shift+number computer switching is enabled. Defaults to
+    /// Instant Ctrl+Shift+number computer switching is enabled. Defaults to
     /// true for older daemons that predate the field (the shortcut is a
     /// convenience, not a policy).
     #[serde(default = "default_hotkey_switch_enabled")]
@@ -910,3 +910,4 @@ mod tests {
         assert_eq!(status.recent_inbound[0].last_seen_secs_ago, 3);
     }
 }
+

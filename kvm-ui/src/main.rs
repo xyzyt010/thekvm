@@ -2100,7 +2100,7 @@ fn main() -> Result<()> {
                     }
                 }
             });
-            set_status(&weak, "Details are on the Devices tab.".into());
+            set_status(&weak, "Details are in Settings > Devices.".into());
         });
     }
     {
@@ -2449,7 +2449,7 @@ fn main() -> Result<()> {
         });
     });
 
-    // Fn+Shift+number instant switching (Settings toggle). The daemon owns
+    // Ctrl+Shift+number instant switching (Settings toggle). The daemon owns
     // the chord; this only persists the off-ramp. A minimal SetConfig keeps
     // every other policy exactly as it was.
     let weak = ui.as_weak();
@@ -2479,10 +2479,10 @@ fn main() -> Result<()> {
                 Ok(ControlResponse::Applied { .. }) => set_status(
                     &weak,
                     if enabled {
-                        "Fn+Shift+number switching on: Shift+F1 returns here, Shift+F2+ drives that computer."
+                        "Ctrl+Shift+number switching on: Ctrl+Shift+1 returns here, Ctrl+Shift+2+ drives that computer."
                             .into()
                     } else {
-                        "Fn+Shift+number switching off; edge crossings still work.".into()
+                        "Ctrl+Shift+number switching off; edge crossings still work.".into()
                     },
                 ),
                 Ok(ControlResponse::Error { message }) => {
@@ -8487,3 +8487,4 @@ mod tests {
         assert!(mode_mismatch_guidance("link ended by this computer", "x").is_none());
     }
 }
+

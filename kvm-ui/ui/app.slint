@@ -1,4 +1,4 @@
-import { CheckBox, LineEdit, Palette, TabWidget } from "std-widgets.slint";
+import { CheckBox, LineEdit, Palette } from "std-widgets.slint";
 
 // ---------------------------------------------------------------------
 // One loading language: a full faint ring with a single bright comet arc
@@ -1815,7 +1815,13 @@ component Disclosure inherits Rectangle {
             vertical-alignment: center;
         }
         Rectangle { horizontal-stretch: 1; }
-        ChevronGlyph { open: root.open; glyph-color: Theme.faint; }
+        // Chevron in a fixed 24x36 slot, optically centred on the
+        // label's line (14px glyph at y=11 of the 36px row).
+        Rectangle {
+            width: 24px;
+            height: 36px;
+            ChevronGlyph { x: 5px; y: 11px; open: root.open; glyph-color: Theme.faint; }
+        }
     }
 }
 
@@ -1921,7 +1927,7 @@ export component AppWindow inherits Window {
     in-out property <string> incoming-link: "";
     in-out property <string> incoming-link-fingerprint: "";
     in-out property <bool> lock-screen-control: false;
-    // Instant computer switching: Shift+F1 returns here, Shift+F2.. drives
+    // Instant computer switching: Ctrl+Shift+1 returns here, Ctrl+Shift+2.. drives
     // the 2nd.. trusted computer. The daemon consumes the chord; this switch
     // is the persisted off-ramp.
     in-out property <bool> hotkey-switch-enabled: true;
@@ -2041,6 +2047,11 @@ export component AppWindow inherits Window {
     // Expanded per-computer detail card on the Devices tab; peers only
     // fill in their address/fingerprint once the daemon reports them.
     in-out property <bool> details-expanded: false;
+    // Two-view navigation: "main" (Connect) and "settings", which
+    // itself holds the Devices and General sections. One Settings
+    // entry on the main view; one straight back arrow returns.
+    in-out property <string> view: "main";
+    in-out property <string> settings-section: "devices";
     in-out property <string> details-peer-name: "";
     in-out property <string> details-peer-address: "";
     in-out property <string> details-peer-fingerprint: "";
@@ -2155,18 +2166,69 @@ export component AppWindow inherits Window {
             padding: 12px;
             spacing: 0px;
 
-        TabWidget {
-            row: 0;
-            col: 0;
-            horizontal-stretch: 1;
-            vertical-stretch: 1;
-            Tab {
-                title: "Connect";
+            if root.view == "main" : VerticalLayout {
+                row: 0;
+                col: 0;
+                spacing: 0px;
+                HorizontalLayout {
+                    vertical-stretch: 0;
+                    height: 44px;
+                    spacing: 8px;
+                    alignment: start;
+                    Text {
+                        text: "TheKVM";
+                        color: Theme.text;
+                        font-size: 20px;
+                        font-weight: 800;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Rectangle {
+                        width: 118px;
+                        height: 36px;
+                        border-radius: 9px;
+                        background: settings-hit.has-hover ? Theme.hover : transparent;
+                        border-width: 1px;
+                        border-color: settings-hit.has-hover ? Theme.border : transparent;
+                        settings-hit := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.view = "settings"; }
+                        }
+                        accessible-role: button;
+                        accessible-label: "Open settings";
+                        accessible-action-default => { root.view = "settings"; }
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 7px;
+                            alignment: center;
+                            Rectangle {
+                                width: 16px;
+                                height: 16px;
+                                Rectangle { x: 0px; y: 2px; width: 16px; height: 2px; border-radius: 1px; background: Theme.faint; }
+                                Rectangle { x: 0px; y: 7px; width: 16px; height: 2px; border-radius: 1px; background: Theme.faint; }
+                                Rectangle { x: 0px; y: 12px; width: 16px; height: 2px; border-radius: 1px; background: Theme.faint; }
+                                Rectangle { x: 3px; y: 0px; width: 6px; height: 6px; border-radius: 3px; background: Theme.text-2; }
+                                Rectangle { x: 8px; y: 5px; width: 6px; height: 6px; border-radius: 3px; background: Theme.text-2; }
+                                Rectangle { x: 2px; y: 10px; width: 6px; height: 6px; border-radius: 3px; background: Theme.text-2; }
+                            }
+                            Text {
+                                text: "Settings";
+                                color: Theme.text;
+                                font-size: 14px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
                 // Scrollable: tab content is taller than the window, and a
                 // plain VerticalLayout silently CLIPS everything past the
                 // bottom — which once hid the whole address/code/connect
                 // row with no way to reach it. Never clip again.
                 PageScroll {
+                    vertical-stretch: 1;
                 Rectangle {
                 // Exactly the Flickable's width: the content must never ask the
                 // viewport to be wider than the window, or the panels get
@@ -2408,15 +2470,75 @@ export component AppWindow inherits Window {
                         }
                         // No "Live" text here: the green dot IS the state.
                     }
-                    HorizontalLayout {
+                    // One row per known computer (same numbering as
+                    // Ctrl+Shift+<number> and Devices order): dot, index,
+                    // name, and the computer's address in grey beside the
+                    // name. The live computer's dot is green, a connecting
+                    // one amber, others grey. No "Connected to" wording —
+                    // the address simply sits beside the name.
+                    for peer[i] in root.trusted-peers : HorizontalLayout {
                         vertical-stretch: 0;
                         height: 40px;
                         spacing: 8px;
-                        // Same shared grid as the local row: dot, index,
-                        // label all start on the same columns. The peer's
-                        // address is NOT repeated here (CON-04: no grey
-                        // "connected to <ip>" filler) — Devices owns the
-                        // complete per-computer facts.
+                        alignment: start;
+                        Rectangle {
+                            width: 24px;
+                            height: 40px;
+                            if link-connecting && !session-verified && peer.address == root.details-peer-address : SpinnerArc {
+                                x: 0px;
+                                y: 11px;
+                                diameter: 18px;
+                                tick: root.spinner-tick;
+                            }
+                            if !(link-connecting && !session-verified && peer.address == root.details-peer-address) : Rectangle {
+                                x: 0px;
+                                y: 15px;
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                background: session-verified && peer.address == root.details-peer-address ? #22c55e
+                                    : session-active && peer.address == root.details-peer-address ? #f59e0b
+                                    : Theme.border-strong;
+                            }
+                        }
+                        Text {
+                            width: 22px;
+                            text: (i + 2) + ".";
+                            color: Theme.muted;
+                            font-size: 16px;
+                            font-weight: 700;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: peer.name == "" ? "Unnamed computer" : peer.name;
+                            color: Theme.text;
+                            font-size: 14px;
+                            font-weight: 700;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: peer.address;
+                            color: Theme.faint;
+                            font-size: 14px;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
+                        if !session-verified && peer.address == root.details-peer-address : Text {
+                            text: link-connecting || session-active ? "Connecting" : "Idle";
+                            color: link-connecting || session-active ? #f59e0b : Theme.faint;
+                            font-size: 14px;
+                            font-weight: 700;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
+                    if root.trusted-peers.length == 0 : HorizontalLayout {
+                        vertical-stretch: 0;
+                        height: 40px;
+                        spacing: 8px;
                         alignment: start;
                         Rectangle {
                             width: 24px;
@@ -2452,9 +2574,14 @@ export component AppWindow inherits Window {
                             font-weight: 700;
                             vertical-alignment: center;
                         }
-                        Rectangle { horizontal-stretch: 1; }
-                        // No green "Live" label: Live is the green dot
-                        // alone. Connecting/Idle shows only until verified.
+                        Text {
+                            text: root.details-peer-address;
+                            color: Theme.faint;
+                            font-size: 14px;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
                         if !session-verified : Text {
                             text: link-connecting || session-active ? "Connecting" : "Idle";
                             color: link-connecting || session-active ? #f59e0b : Theme.faint;
@@ -2643,9 +2770,106 @@ export component AppWindow inherits Window {
                 }
             }
 
-            Tab {
-                title: "Devices";
-                PageScroll {
+            if root.view == "settings" : VerticalLayout {
+                row: 0;
+                col: 0;
+                spacing: 0px;
+                HorizontalLayout {
+                    vertical-stretch: 0;
+                    height: 44px;
+                    spacing: 8px;
+                    alignment: start;
+                    Rectangle {
+                        width: 36px;
+                        height: 36px;
+                        border-radius: 9px;
+                        background: back-hit.has-hover ? Theme.hover : transparent;
+                        back-hit := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.view = "main"; }
+                        }
+                        accessible-role: button;
+                        accessible-label: "Back";
+                        accessible-action-default => { root.view = "main"; }
+                        Path {
+                            x: 11px;
+                            y: 10px;
+                            width: 14px;
+                            height: 16px;
+                            viewbox-width: 24;
+                            viewbox-height: 24;
+                            stroke: Theme.text-2;
+                            stroke-width: 2.4px;
+                            stroke-line-cap: round;
+                            stroke-line-join: round;
+                            fill: transparent;
+                            commands: "M 15 4 L 7 12 L 15 20";
+                        }
+                    }
+                    Text {
+                        text: "Settings";
+                        color: Theme.text;
+                        font-size: 20px;
+                        font-weight: 800;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                HorizontalLayout {
+                    vertical-stretch: 0;
+                    alignment: start;
+                    padding-bottom: 10px;
+                    Rectangle {
+                        width: 264px;
+                        height: 36px;
+                        border-radius: 10px;
+                        background: Theme.surface-2;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        HorizontalLayout {
+                            padding: 3px;
+                            spacing: 3px;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: root.settings-section == "devices" ? Theme.hover : transparent;
+                                seg-dev := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.settings-section = "devices"; }
+                                }
+                                Text {
+                                    text: "Devices";
+                                    color: root.settings-section == "devices" ? Theme.text : Theme.faint;
+                                    font-size: 14px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 8px;
+                                background: root.settings-section == "general" ? Theme.hover : transparent;
+                                seg-gen := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.settings-section = "general"; }
+                                }
+                                Text {
+                                    text: "General";
+                                    color: root.settings-section == "general" ? Theme.text : Theme.faint;
+                                    font-size: 14px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                if root.settings-section == "devices" : PageScroll {
+                    vertical-stretch: 1;
                 Rectangle {
                 // Exactly the Flickable's width: the content must never ask the
                 // viewport to be wider than the window, or the panels get
@@ -2661,10 +2885,15 @@ export component AppWindow inherits Window {
                     padding: 12px;
                     spacing: 12px;
 
-                    // ---- Computers (DEV-01: title, roster summary) ------
+                    // Computers header: one 36px line — title, count, a
+                    // FIXED spinner slot (reserved whether or not a scan
+                    // is running, so nothing floats or shifts), then the
+                    // actions. Everything shares the title's centre line.
                     HorizontalLayout {
                         vertical-stretch: 0;
-                        spacing: 10px;
+                        height: 36px;
+                        spacing: 8px;
+                        alignment: start;
                         Text {
                             text: "Computers";
                             color: Theme.text;
@@ -2673,634 +2902,30 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                         Text {
-                            text: root.roster-names.length == 0 ? "0" : root.roster-names.length + " known";
+                            text: root.trusted-peers.length == 0 ? "" : root.trusted-peers.length + " allowed";
                             color: Theme.faint;
                             font-size: 14px;
                             vertical-alignment: center;
                         }
-                        if discovery-scanning : SpinnerArc {
-                            diameter: 16px;
-                            tick: root.spinner-tick;
+                        Rectangle {
+                            width: 18px;
+                            height: 36px;
+                            if root.discovery-scanning : SpinnerArc {
+                                x: 0px;
+                                y: 9px;
+                                diameter: 18px;
+                                tick: root.spinner-tick;
+                            }
                         }
+                        Rectangle { horizontal-stretch: 1; }
                         KvmButton {
                             text: "Scan";
-                            enabled: !discovery-scanning;
+                            enabled: !root.discovery-scanning;
                             clicked => { discover-lan(); }
                         }
-                        Rectangle { horizontal-stretch: 1; }
-                        Rectangle {
-                            width: 78px;
-                            height: 30px;
-                            border-radius: 7px;
-                            background: details-hit.has-hover ? Theme.accent-panel : transparent;
-                            border-width: 1px;
-                            border-color: details-hit.has-hover ? Theme.accent-border : Theme.border;
-                            details-hit := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { root.details-expanded = !root.details-expanded; }
-                            }
-                            accessible-role: button;
-                            accessible-label: root.details-expanded ? "Hide computer details" : "Show computer details";
-                            accessible-expanded: root.details-expanded;
-                            HorizontalLayout {
-                                padding-left: 8px;
-                                padding-right: 6px;
-                                padding-top: 4px;
-                                padding-bottom: 4px;
-                                alignment: center;
-                                spacing: 4px;
-                                Text {
-                                    text: "Details";
-                                    color: details-hit.has-hover ? #86efac : Theme.faint;
-                                    font-size: 14px;
-                                    font-weight: 600;
-                                    vertical-alignment: center;
-                                }
-                                ChevronGlyph {
-                                    open: root.details-expanded;
-                                    glyph-color: details-hit.has-hover ? #86efac : Theme.faint;
-                                }
-                            }
-                        }
-                    }
-                    // ---- Per-computer rows (DEV-03/04): one primary
-                    // state per computer, from the single vocabulary
-                    // Live / Connecting / Idle / Discovered / Error.
-                    // Only actions valid for the current state appear.
-                    for i in root.roster-names.length : Rectangle {
-                        vertical-stretch: 0;
-                        height: 48px;
-                        border-radius: 10px;
-                        background: Theme.bg;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        HorizontalLayout {
-                            padding-left: 12px;
-                            padding-right: 8px;
-                            spacing: 8px;
-                            // Flush-left dot cell: dot left = row's
-                            // inner padding start (no 7px centering
-                            // inset). (48-10)/2 = 19 centers it.
-                            alignment: start;
-                            Rectangle {
-                                width: 24px;
-                                height: 48px;
-                                Rectangle {
-                                    x: 0px;
-                                    y: 19px;
-                                    width: 10px;
-                                    height: 10px;
-                                    border-radius: 5px;
-                                    background: root.roster-states[i] == "Live" ? #22c55e
-                                        : root.roster-states[i] == "Android · Live" ? #facc15
-                                        : root.roster-states[i] == "Android" ? #facc15
-                                        : root.roster-states[i] == "Connecting" ? #f59e0b
-                                        : root.roster-states[i] == "Error" ? #f87171
-                                        : root.roster-states[i] == "Discovered" ? #5eead4
-                                        : Theme.border-strong;
-                                }
-                            }
-                            Text {
-                                text: root.roster-names[i];
-                                color: Theme.text;
-                                font-size: 14px;
-                                font-weight: 600;
-                                overflow: elide;
-                                horizontal-stretch: 1;
-                                vertical-alignment: center;
-                            }
-                            Text {
-                                text: root.roster-addresses[i];
-                                color: Theme.text-2;
-                                font-size: 14px;
-                                overflow: elide;
-                                vertical-alignment: center;
-                            }
-                            Text {
-                                width: 80px;
-                                text: root.roster-states[i];
-                                color: Theme.faint;
-                                font-size: 14px;
-                                horizontal-alignment: right;
-                                vertical-alignment: center;
-                            }
-                            KvmButton {
-                                text: "Details";
-                                aria-label: "Details for " + root.roster-names[i] + ", row " + (i + 1) + " of " + root.roster-names.length;
-                                enabled: root.roster-fingerprints[i] != "";
-                                tooltip: root.roster-fingerprints[i] == "" ? "Details become available after this computer is paired" : "";
-                                clicked => { root.peer-view-details(root.roster-fingerprints[i]); }
-                            }
-                            // DS-10: the row announces its position in the
-                            // list ("row N of M") to assistive tech.
-                            if root.roster-states[i] == "Idle" || root.roster-states[i] == "Discovered" || root.roster-states[i] == "Android" : KvmButton {
-                                text: "Connect";
-                                aria-label: "Connect to " + root.roster-names[i] + ", row " + (i + 1) + " of " + root.roster-names.length;
-                                primary: true;
-                                enabled: !session-active && root.roster-addresses[i] != "";
-                                tooltip: session-active ? "Disconnect the current session first" : (root.roster-addresses[i] == "" ? "No address is known for this computer yet" : "");
-                                clicked => { connect-to(root.roster-addresses[i], ""); }
-                            }
-                        }
-                    }
-                    if root.roster-names.length == 0 : Text {
-                        vertical-stretch: 0;
-                        text: "No computers yet. Press Scan, or add one with + in Settings.";
-                        color: Theme.faint;
-                        font-size: 14px;
-                        wrap: word-wrap;
-                    }
-                    // Expanded per-computer detail, collapsible inline.
-                    if root.details-expanded : Rectangle {
-                        vertical-stretch: 0;
-                        background: Theme.surface;
-                        border-radius: 10px;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        VerticalLayout {
-                            padding: 10px;
-                            spacing: 4px;
-                            HorizontalLayout {
-                                spacing: 8px;
-                                Text {
-                                    text: "Computer details";
-                                    color: Theme.text;
-                                    font-size: 16px;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                }
-                                Rectangle { horizontal-stretch: 1; }
-                                CloseButton {
-                                    clicked => { root.details-expanded = false; }
-                                }
-                            }
-                            HorizontalLayout {
-                                spacing: 14px;
-                                VerticalLayout {
-                                    spacing: 3px;
-                                    Text { text: "THIS COMPUTER"; color: #6ee7b7; font-size: 12px; font-weight: 800; letter-spacing: 1.3px; }
-                                    Text { text: root.device-name == "" ? "Unknown" : root.device-name; color: Theme.text; font-size: 14px; font-weight: 700; wrap: word-wrap; }
-                                    Text { text: "LAN · " + (root.local-address == "" ? "…" : root.local-address); color: Theme.text-2; font-size: 14px; wrap: word-wrap; }
-                                    Text { text: "Fingerprint · " + root.fingerprint; color: Theme.muted; font-size: 12px; wrap: word-wrap; letter-spacing: 0.5px; }
-                                    Text { text: "Role · " + root.role-text; color: Theme.faint; font-size: 14px; }
-                                }
-                                Rectangle { width: 1px; background: Theme.border; vertical-stretch: 1; }
-                                VerticalLayout {
-                                    spacing: 3px;
-                                    Text { text: "LINKED COMPUTER"; color: #5eead4; font-size: 12px; font-weight: 800; letter-spacing: 1.3px; }
-                                    Text { text: root.linked-peer-name == "" ? "Not paired yet" : root.linked-peer-name; color: Theme.text; font-size: 14px; font-weight: 700; wrap: word-wrap; }
-                                    Text { text: "Address · " + (root.details-peer-address == "" ? "unknown" : root.details-peer-address); color: Theme.text-2; font-size: 14px; wrap: word-wrap; }
-                                    Text { text: "Fingerprint · " + (root.details-peer-fingerprint == "" ? "unknown" : root.details-peer-fingerprint); color: Theme.muted; font-size: 12px; wrap: word-wrap; letter-spacing: 0.5px; }
-                                    Text { text: "Link · " + (session-verified ? "Live" : (link-connecting || session-active ? "Connecting" : "Idle")); color: Theme.faint; font-size: 14px; }
-                                    Text { text: "Trust · Allowed"; color: Theme.faint; font-size: 14px; }
-                                    Text { text: "Capabilities · Control, Clipboard"; color: Theme.faint; font-size: 14px; }
-                                }
-                            }
-                        }
-                    }
-                    // Nearby devices + the single Connect/Disconnect button
-                    // live on the Connect tab. This tab stays arrangement
-                    // only, so there is exactly one action button in
-                    // the whole window.
-                    // (Past/present computer names deliberately not listed
-                    // here: the Devices tab shows what is arranged.
-                    // Remembered names/addresses come later.)
-
-                    Rectangle {
-                        vertical-stretch: 0; height: 1px; background: Theme.border; }
-
-                    // ---- Arrangement -------------------------------------
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        Text {
-                            text: "Screen arrangement";
-                            color: Theme.text;
-                            font-size: 16px;
-                            font-weight: 700;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: root.edge-mode-index == 0 ? "Single" : "Mirror";
-                            color: #22c55e;
-                            font-size: 14px;
-                            font-weight: 700;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-                    ArrangementMesh {
-                        vertical-stretch: 0;
-                        local-name: root.device-name;
-                        peer-name: root.linked-peer-name;
-                        peer-on-right: root.peer-on-right;
-                        enabled: root.link-live;
-                        link-live: root.link-live;
-                        crossing-pulse: root.crossing-pulse;
-                        edge-mode: root.edge-mode-index;
-                        our-mode: root.mode-index;
-                        peer-mode: root.peer-mode;
-                        to-left => { place-peer-left(); }
-                        to-right => { place-peer-right(); }
-                    }
-                    // Live cue for who has the cursor right now. Honest about
-                    // which computer currently makes this screen respond.
-                    if root.outbound-driving : Text {
-                        vertical-stretch: 0;
-                        text: "You are driving " + root.linked-peer-name;
-                        color: #22c55e; font-size: 14px; font-weight: 700;
-                    }
-                    if !root.outbound-driving && root.inbound-driving : Text {
-                        vertical-stretch: 0;
-                        text: root.linked-peer-name + " is driving this computer";
-                        color: #5eead4; font-size: 14px; font-weight: 700;
-                    }
-
-                    Rectangle {
-                        vertical-stretch: 0; height: 1px; background: Theme.border; }
-
-                    // ---- Crossing edges ----------------------------------
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        Text {
-                            text: "Crossing edges";
-                            color: Theme.text;
-                            font-size: 16px;
-                            font-weight: 700;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: root.edge-mode-index == 0 ? "Single" : "Mirror";
-                            color: #22c55e;
-                            font-size: 14px;
-                            font-weight: 700;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-                    EdgeModePicker {
-                        vertical-stretch: 0;
-                        selected: root.edge-mode-index;
-                        applying: root.edge-applying;
-                        pending-index: root.pending-edge-index;
-                        // Crossing discipline is global config: selectable
-                        // before the first pair too, not only while linked.
-                        enabled: true;
-                        tick: root.spinner-tick;
-                        our-mode: root.mode-index;
-                        peer-mode: root.peer-mode;
-                        arranged-peer-on-right: root.peer-on-right;
-                        picked(index) => {
-                            root.pending-edge-index = index;
-                            set-edge-mode(index);
-                        }
-                        flip => {
-                            if (root.peer-on-right) {
-                                place-peer-left();
-                            } else {
-                                place-peer-right();
-                            }
-                        }
-                    }
-                    if driving-text != "" : Text {
-                        vertical-stretch: 0;
-                        text: driving-text;
-                        color: #22c55e;
-                        font-size: 14px;
-                        font-weight: 700;
-                    }
-
-                    // ---- Multi-node grid (opt-in; 2-device stays default) ----
-                    Rectangle {
-                        vertical-stretch: 0; height: 1px; background: Theme.border; }
-                    Rectangle {
-                        vertical-stretch: 0;
-                        height: 48px;
-                        border-radius: 10px;
-                        background: Theme.surface;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        Text {
-                            x: 12px; y: 5px;
-                            text: "Multi-node grid";
-                            color: Theme.text-2;
-                            font-size: 16px;
-                            font-weight: 600;
-                        }
-                        Text {
-                            x: 12px; y: 25px;
-                            text: root.multi-node ? "Up to 15 computers on a 5 x 3 grid" : "Two-device mode";
-                            color: Theme.faint;
-                            font-size: 10px;
-                        }
-                        ToggleSwitch {
-                            x: parent.width - 58px; y: 11px;
-                            checked <=> root.multi-node;
-                            toggled => { root.toggle-multi-node(); }
-                        }
-                    }
-                    if root.multi-node : Rectangle {
-                        vertical-stretch: 0;
-                        height: 36px;
-                        Rectangle {
-                            width: (parent.width - 16px) / 3; height: 32px;
-                            border-radius: 8px;
-                            background: root.mesh-mode == "bidirectional" ? Theme.accent-panel : Theme.hover;
-                            TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("bidirectional"); } }
-                            Text { text: "Both ways"; color: root.mesh-mode == "bidirectional" ? Theme.accent-text : Theme.faint; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
-                        }
-                        Rectangle {
-                            x: (parent.width - 16px) / 3 + 8px; width: (parent.width - 16px) / 3; height: 32px;
-                            border-radius: 8px;
-                            background: root.mesh-mode == "server_client" ? Theme.accent-panel : Theme.hover;
-                            TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("server_client"); } }
-                            Text { text: "One server"; color: root.mesh-mode == "server_client" ? Theme.accent-text : Theme.faint; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
-                        }
-                        Rectangle {
-                            x: (parent.width - 16px) / 3 * 2 + 16px; width: (parent.width - 16px) / 3; height: 32px;
-                            border-radius: 8px;
-                            background: root.mesh-mode == "client_only" ? Theme.accent-panel : Theme.hover;
-                            TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("client_only"); } }
-                            Text { text: "Clients"; color: root.mesh-mode == "client_only" ? Theme.accent-text : Theme.faint; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
-                        }
-                    }
-                    if root.multi-node : KvmButton {
-                        vertical-stretch: 0;
-                        text: "Configure grid";
-                        primary: true;
-                        enabled: !root.mesh-applying;
-                        tooltip: root.mesh-applying ? "The current arrangement is still being applied" : "";
-                        clicked => { root.open-mesh-grid(); }
-                    }
-
-                    Rectangle { height: 28px; background: transparent; }
-                }
-                }
-                }
-            }
-
-            Tab {
-                title: "Settings";
-                PageScroll {
-                Rectangle {
-                // Exactly the Flickable's width: the content must never ask the
-                // viewport to be wider than the window, or the panels get
-                // sliced off at the right edge and a horizontal scrollbar
-                // appears for no reason. Height comes from the layout's
-                // own preferred height so long content overflows the
-                // viewport and the ScrollView actually scrolls (a
-                // layout-managed child otherwise measures the viewport
-                // height and everything below the fold is unreachable).
-                width: parent.width;
-                height: content-settings.preferred-height + 24px;
-                content-settings := VerticalLayout {
-                    padding: 12px;
-                    // One 10px step between blocks: the allowed-connection
-                    // cards read as separate objects instead of one stack.
-                    spacing: 10px;
-
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        Text {
-                            text: "Computer name";
-                            color: Theme.text-2;
-                            font-size: 16px;
-                            vertical-alignment: center;
-                        }
-                        name := LineEdit {
-                            height: 36px;
-                            text <=> root.device-name;
-                            placeholder-text: "friendly name";
-                            width: 230px;
-                        }
-                        KvmButton {
-                            text: "Save";
-                            enabled: name.text != "";
-                            clicked => { apply-config(lock-screen-control, mode-index, name.text, auto-connect-address, clipboard-enabled, root.clipboard-max-mb); }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        height: 36px;
-                        Text {
-                            text: "Control login, lock and startup screens";
-                            color: Theme.text-2;
-                            font-size: 16px;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        ToggleSwitch {
-                            checked <=> root.lock-screen-control;
-                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb); }
-                        }
-                    }
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        height: 36px;
-                        Text {
-                            text: "Switch computers with Fn+Shift+number";
-                            color: Theme.text-2;
-                            font-size: 16px;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        ToggleSwitch {
-                            checked <=> root.hotkey-switch-enabled;
-                            toggled => { root.apply-hotkey-switch(root.hotkey-switch-enabled); }
-                        }
-                    }
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        height: 36px;
-                        Text {
-                            text: "Sync text clipboard";
-                            color: Theme.text-2;
-                            font-size: 16px;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        ToggleSwitch {
-                            checked <=> root.clipboard-enabled;
-                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb); }
-                        }
-                    }
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        height: 36px;
-                        Text {
-                            text: "Reverse scroll on the other computer";
-                            color: Theme.text-2;
-                            font-size: 16px;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        ToggleSwitch {
-                            checked <=> root.reverse-scroll;
-                            toggled => { root.set-reverse-scroll(root.reverse-scroll); }
-                        }
-                    }
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        height: 36px;
-                        Text {
-                            text: "Find nearby computers";
-                            color: Theme.text-2;
-                            font-size: 16px;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        ToggleSwitch {
-                            checked <=> root.auto-discover;
-                            toggled => { root.apply-auto-discover(root.auto-discover); }
-                        }
-                    }
-                    // Manual control gates the typed-IP + typed-code path. When
-                    // off, auto-discovery is the only way machines come in.
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        height: 36px;
-                        Text {
-                            text: "Manual control";
-                            color: Theme.text-2;
-                            font-size: 16px;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        ToggleSwitch {
-                            checked <=> root.manual-control-enabled;
-                            toggled => { root.apply-manual-control(root.manual-control-enabled); }
-                        }
-                    }
-                    Text {
-                        vertical-stretch: 0;
-                        text: "Typed address and pairing code for this computer; the auto-connect path never uses it.";
-                        color: Theme.faint;
-                        font-size: 14px;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        height: 36px;
-                        Text {
-                            text: "Start when I log in";
-                            color: root.autostart-supported && !root.autostart-busy ? Theme.text-2 : Theme.faint;
-                            font-size: 14px;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        ToggleSwitch {
-                            checked <=> root.autostart-enabled;
-            enabled: root.autostart-supported && !root.autostart-busy;
-                            toggled => { root.apply-autostart(root.autostart-enabled); }
-                        }
-                    }
-                    if autostart-note != "" : Text {
-                        vertical-stretch: 0;
-                        text: autostart-note;
-                        color: #fbbf24;
-                        font-size: 14px;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        height: 36px;
-                        Text {
-                            text: "Reconnect at startup";
-                            color: root.auto-connect-known && !root.auto-connect-busy ? Theme.text-2 : Theme.faint;
-                            font-size: 16px;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        ToggleSwitch {
-                            checked <=> root.auto-connect-on-start;
-                            enabled: root.auto-connect-known && !root.auto-connect-busy;
-                            toggled => { root.apply-auto-connect(root.auto-connect-on-start); }
-                        }
-                    }
-                    if root.auto-connect-known : Text {
-                        vertical-stretch: 0;
-                        text: "Reconnects to last connected device";
-                        color: #fbbf24;
-                        font-size: 14px;
-                        wrap: word-wrap;
-                    }
-                    if auto-connect-note != "" : Text {
-                        vertical-stretch: 0;
-                        text: auto-connect-note;
-                        color: #fbbf24;
-                        font-size: 14px;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        height: 36px;
-                        Text {
-                            text: root.dark-mode ? "Dark theme (#121212)" : "Light theme (white / blue)";
-                            color: Theme.text-2;
-                            font-size: 16px;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        ToggleSwitch {
-                            checked <=> root.dark-mode;
-                            toggled => { root.toggle-theme(); }
-                        }
-                    }
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 10px;
-                        height: 36px;
-                        Text {
-                            text: "Clipboard limit (MB)";
-                            color: Theme.text-2;
-                            font-size: 16px;
-                            vertical-alignment: center;
-                        }
-                        clipboard-max := LineEdit {
-                            height: 36px;
-                            text <=> root.clipboard-max-mb;
-                            placeholder-text: "2";
-                            width: 64px;
-                        }
-                        KvmButton {
-                            text: "Save";
-                            clicked => { apply-config(root.lock-screen-control, root.mode_index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-
-                    Rectangle {
-                        vertical-stretch: 0; height: 1px; background: Theme.border; }
-
-                    // SET-01: the plus and the title are ONE header row —
-                    // same centre line, same gap, aligned to the content
-                    // gutter, 36px target, section-size title.
-                    HorizontalLayout {
-                        vertical-stretch: 0;
-                        spacing: 8px;
-                        alignment: start;
                         IconButton {
                             glyph: "+";
                             clicked => { open-discovery(); }
-                        }
-                        Text {
-                            text: "Allowed connections";
-                            color: Theme.text;
-                            font-size: 16px;
-                            font-weight: 700;
-                            vertical-alignment: center;
                         }
                     }
                     // SET-02/03/04/06: fixed anatomy, left to right —
@@ -3602,7 +3227,7 @@ export component AppWindow inherits Window {
                     }
                     if root.trusted-peers.length == 0 : Text {
                         vertical-stretch: 0;
-                        text: "No allowed connections yet. Press + to add one.";
+                        text: "No computers yet. Press + to add one, or Scan to find some.";
                         color: Theme.faint;
                         font-size: 14px;
                         wrap: word-wrap;
@@ -3671,6 +3296,908 @@ export component AppWindow inherits Window {
                                 border-width: 1px;
                                 border-color: Theme.border;
                                 row-hit := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { connect-discovered(i); close-discovery(); }
+                                }
+                                accessible-role: button;
+                                accessible-label: label;
+                                accessible-action-default => { connect-discovered(i); close-discovery(); }
+                                Text {
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    text: label;
+                                    color: Theme.text-2;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                    }
+                    // Expanded per-computer detail, collapsible inline.
+                    if root.details-expanded : Rectangle {
+                        vertical-stretch: 0;
+                        background: Theme.surface;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                height: 36px;
+                                spacing: 8px;
+                                alignment: start;
+                                Text {
+                                    text: "Computer details";
+                                    color: Theme.text;
+                                    font-size: 16px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                CloseButton {
+                                    clicked => { root.details-expanded = false; }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 14px;
+                                VerticalLayout {
+                                    spacing: 3px;
+                                    Text { text: "THIS COMPUTER"; color: #6ee7b7; font-size: 12px; font-weight: 800; letter-spacing: 1.3px; }
+                                    Text { text: root.device-name == "" ? "Unknown" : root.device-name; color: Theme.text; font-size: 14px; font-weight: 700; wrap: word-wrap; }
+                                    Text { text: "LAN · " + (root.local-address == "" ? "…" : root.local-address); color: Theme.text-2; font-size: 14px; wrap: word-wrap; }
+                                    Text { text: "Fingerprint · " + root.fingerprint; color: Theme.muted; font-size: 12px; wrap: word-wrap; letter-spacing: 0.5px; }
+                                    Text { text: "Role · " + root.role-text; color: Theme.faint; font-size: 14px; }
+                                }
+                                Rectangle { width: 1px; background: Theme.border; vertical-stretch: 1; }
+                                VerticalLayout {
+                                    spacing: 3px;
+                                    Text { text: "LINKED COMPUTER"; color: #5eead4; font-size: 12px; font-weight: 800; letter-spacing: 1.3px; }
+                                    Text { text: root.linked-peer-name == "" ? "Not paired yet" : root.linked-peer-name; color: Theme.text; font-size: 14px; font-weight: 700; wrap: word-wrap; }
+                                    Text { text: "Address · " + (root.details-peer-address == "" ? "unknown" : root.details-peer-address); color: Theme.text-2; font-size: 14px; wrap: word-wrap; }
+                                    Text { text: "Fingerprint · " + (root.details-peer-fingerprint == "" ? "unknown" : root.details-peer-fingerprint); color: Theme.muted; font-size: 12px; wrap: word-wrap; letter-spacing: 0.5px; }
+                                    Text { text: "Link · " + (session-verified ? "Live" : (link-connecting || session-active ? "Connecting" : "Idle")); color: Theme.faint; font-size: 14px; }
+                                    Text { text: "Trust · Allowed"; color: Theme.faint; font-size: 14px; }
+                                    Text { text: "Capabilities · Control, Clipboard"; color: Theme.faint; font-size: 14px; }
+                                }
+                            }
+                        }
+                    }
+                    // Nearby devices + the single Connect/Disconnect button
+                    // live on the Connect tab. This tab stays arrangement
+                    // only, so there is exactly one action button in
+                    // the whole window.
+                    // (Past/present computer names deliberately not listed
+                    // here: the Devices tab shows what is arranged.
+                    // Remembered names/addresses come later.)
+
+                    Rectangle {
+                        vertical-stretch: 0; height: 1px; background: Theme.border; }
+
+                    // ---- Arrangement -------------------------------------
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        Text {
+                            text: "Screen arrangement";
+                            color: Theme.text;
+                            font-size: 16px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.edge-mode-index == 0 ? "Single" : "Mirror";
+                            color: #22c55e;
+                            font-size: 14px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    ArrangementMesh {
+                        vertical-stretch: 0;
+                        local-name: root.device-name;
+                        peer-name: root.linked-peer-name;
+                        peer-on-right: root.peer-on-right;
+                        enabled: root.link-live;
+                        link-live: root.link-live;
+                        crossing-pulse: root.crossing-pulse;
+                        edge-mode: root.edge-mode-index;
+                        our-mode: root.mode-index;
+                        peer-mode: root.peer-mode;
+                        to-left => { place-peer-left(); }
+                        to-right => { place-peer-right(); }
+                    }
+                    // Live cue for who has the cursor right now. Honest about
+                    // which computer currently makes this screen respond.
+                    if root.outbound-driving : Text {
+                        vertical-stretch: 0;
+                        text: "You are driving " + root.linked-peer-name;
+                        color: #22c55e; font-size: 14px; font-weight: 700;
+                    }
+                    if !root.outbound-driving && root.inbound-driving : Text {
+                        vertical-stretch: 0;
+                        text: root.linked-peer-name + " is driving this computer";
+                        color: #5eead4; font-size: 14px; font-weight: 700;
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 0; height: 1px; background: Theme.border; }
+
+                    // ---- Crossing edges ----------------------------------
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        Text {
+                            text: "Crossing edges";
+                            color: Theme.text;
+                            font-size: 16px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.edge-mode-index == 0 ? "Single" : "Mirror";
+                            color: #22c55e;
+                            font-size: 14px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    EdgeModePicker {
+                        vertical-stretch: 0;
+                        selected: root.edge-mode-index;
+                        applying: root.edge-applying;
+                        pending-index: root.pending-edge-index;
+                        // Crossing discipline is global config: selectable
+                        // before the first pair too, not only while linked.
+                        enabled: true;
+                        tick: root.spinner-tick;
+                        our-mode: root.mode-index;
+                        peer-mode: root.peer-mode;
+                        arranged-peer-on-right: root.peer-on-right;
+                        picked(index) => {
+                            root.pending-edge-index = index;
+                            set-edge-mode(index);
+                        }
+                        flip => {
+                            if (root.peer-on-right) {
+                                place-peer-left();
+                            } else {
+                                place-peer-right();
+                            }
+                        }
+                    }
+                    if driving-text != "" : Text {
+                        vertical-stretch: 0;
+                        text: driving-text;
+                        color: #22c55e;
+                        font-size: 14px;
+                        font-weight: 700;
+                    }
+
+                    // ---- Multi-node grid (opt-in; 2-device stays default) ----
+                    Rectangle {
+                        vertical-stretch: 0; height: 1px; background: Theme.border; }
+                    Rectangle {
+                        vertical-stretch: 0;
+                        height: 48px;
+                        border-radius: 10px;
+                        background: Theme.surface;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        Text {
+                            x: 12px; y: 5px;
+                            text: "Multi-node grid";
+                            color: Theme.text-2;
+                            font-size: 16px;
+                            font-weight: 600;
+                        }
+                        Text {
+                            x: 12px; y: 25px;
+                            text: root.multi-node ? "Up to 15 computers on a 5 x 3 grid" : "Two-device mode";
+                            color: Theme.faint;
+                            font-size: 10px;
+                        }
+                        ToggleSwitch {
+                            x: parent.width - 58px; y: 11px;
+                            checked <=> root.multi-node;
+                            toggled => { root.toggle-multi-node(); }
+                        }
+                    }
+                    if root.multi-node : Rectangle {
+                        vertical-stretch: 0;
+                        height: 36px;
+                        Rectangle {
+                            width: (parent.width - 16px) / 3; height: 32px;
+                            border-radius: 8px;
+                            background: root.mesh-mode == "bidirectional" ? Theme.accent-panel : Theme.hover;
+                            TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("bidirectional"); } }
+                            Text { text: "Both ways"; color: root.mesh-mode == "bidirectional" ? Theme.accent-text : Theme.faint; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Rectangle {
+                            x: (parent.width - 16px) / 3 + 8px; width: (parent.width - 16px) / 3; height: 32px;
+                            border-radius: 8px;
+                            background: root.mesh-mode == "server_client" ? Theme.accent-panel : Theme.hover;
+                            TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("server_client"); } }
+                            Text { text: "One server"; color: root.mesh-mode == "server_client" ? Theme.accent-text : Theme.faint; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Rectangle {
+                            x: (parent.width - 16px) / 3 * 2 + 16px; width: (parent.width - 16px) / 3; height: 32px;
+                            border-radius: 8px;
+                            background: root.mesh-mode == "client_only" ? Theme.accent-panel : Theme.hover;
+                            TouchArea { mouse-cursor: pointer; clicked => { root.set-mesh-mode("client_only"); } }
+                            Text { text: "Clients"; color: root.mesh-mode == "client_only" ? Theme.accent-text : Theme.faint; font-size: 14px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                    if root.multi-node : KvmButton {
+                        vertical-stretch: 0;
+                        text: "Configure grid";
+                        primary: true;
+                        enabled: !root.mesh-applying;
+                        tooltip: root.mesh-applying ? "The current arrangement is still being applied" : "";
+                        clicked => { root.open-mesh-grid(); }
+                    }
+
+                    Rectangle { height: 28px; background: transparent; }
+                }
+                }
+                }
+
+                if root.settings-section == "general" : PageScroll {
+                    vertical-stretch: 1;
+                Rectangle {
+                // Exactly the Flickable's width: the content must never ask the
+                // viewport to be wider than the window, or the panels get
+                // sliced off at the right edge and a horizontal scrollbar
+                // appears for no reason. Height comes from the layout's
+                // own preferred height so long content overflows the
+                // viewport and the ScrollView actually scrolls (a
+                // layout-managed child otherwise measures the viewport
+                // height and everything below the fold is unreachable).
+                width: parent.width;
+                height: content-settings.preferred-height + 24px;
+                content-settings := VerticalLayout {
+                    padding: 12px;
+                    // One 10px step between blocks: the allowed-connection
+                    // cards read as separate objects instead of one stack.
+                    spacing: 10px;
+
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        Text {
+                            text: "Computer name";
+                            color: Theme.text-2;
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+                        name := LineEdit {
+                            height: 36px;
+                            text <=> root.device-name;
+                            placeholder-text: "friendly name";
+                            width: 230px;
+                        }
+                        KvmButton {
+                            text: "Save";
+                            enabled: name.text != "";
+                            clicked => { apply-config(lock-screen-control, mode-index, name.text, auto-connect-address, clipboard-enabled, root.clipboard-max-mb); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: "Control login, lock and startup screens";
+                            color: Theme.text-2;
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ToggleSwitch {
+                            checked <=> root.lock-screen-control;
+                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb); }
+                        }
+                    }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: "Switch computers with Ctrl+Shift+number";
+                            color: Theme.text-2;
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ToggleSwitch {
+                            checked <=> root.hotkey-switch-enabled;
+                            toggled => { root.apply-hotkey-switch(root.hotkey-switch-enabled); }
+                        }
+                    }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: "Sync text clipboard";
+                            color: Theme.text-2;
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ToggleSwitch {
+                            checked <=> root.clipboard-enabled;
+                            toggled => { apply-config(root.lock-screen-control, root.mode-index, root.device-name, root.auto-connect-address, root.clipboard-enabled, root.clipboard-max-mb); }
+                        }
+                    }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: "Reverse scroll on the other computer";
+                            color: Theme.text-2;
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ToggleSwitch {
+                            checked <=> root.reverse-scroll;
+                            toggled => { root.set-reverse-scroll(root.reverse-scroll); }
+                        }
+                    }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: "Find nearby computers";
+                            color: Theme.text-2;
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ToggleSwitch {
+                            checked <=> root.auto-discover;
+                            toggled => { root.apply-auto-discover(root.auto-discover); }
+                        }
+                    }
+                    // Manual control gates the typed-IP + typed-code path. When
+                    // off, auto-discovery is the only way machines come in.
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: "Manual control";
+                            color: Theme.text-2;
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ToggleSwitch {
+                            checked <=> root.manual-control-enabled;
+                            toggled => { root.apply-manual-control(root.manual-control-enabled); }
+                        }
+                    }
+                    Text {
+                        vertical-stretch: 0;
+                        text: "Typed address and pairing code for this computer; the auto-connect path never uses it.";
+                        color: Theme.faint;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: "Start when I log in";
+                            color: root.autostart-supported && !root.autostart-busy ? Theme.text-2 : Theme.faint;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ToggleSwitch {
+                            checked <=> root.autostart-enabled;
+            enabled: root.autostart-supported && !root.autostart-busy;
+                            toggled => { root.apply-autostart(root.autostart-enabled); }
+                        }
+                    }
+                    if autostart-note != "" : Text {
+                        vertical-stretch: 0;
+                        text: autostart-note;
+                        color: #fbbf24;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: "Reconnect at startup";
+                            color: root.auto-connect-known && !root.auto-connect-busy ? Theme.text-2 : Theme.faint;
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ToggleSwitch {
+                            checked <=> root.auto-connect-on-start;
+                            enabled: root.auto-connect-known && !root.auto-connect-busy;
+                            toggled => { root.apply-auto-connect(root.auto-connect-on-start); }
+                        }
+                    }
+                    if root.auto-connect-known : Text {
+                        vertical-stretch: 0;
+                        text: "Reconnects to last connected device";
+                        color: #fbbf24;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
+                    if auto-connect-note != "" : Text {
+                        vertical-stretch: 0;
+                        text: auto-connect-note;
+                        color: #fbbf24;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: root.dark-mode ? "Dark theme (#121212)" : "Light theme (white / blue)";
+                            color: Theme.text-2;
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        ToggleSwitch {
+                            checked <=> root.dark-mode;
+                            toggled => { root.toggle-theme(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        height: 36px;
+                        Text {
+                            text: "Clipboard limit (MB)";
+                            color: Theme.text-2;
+                            font-size: 16px;
+                            vertical-alignment: center;
+                        }
+                        clipboard-max := LineEdit {
+                            height: 36px;
+                            text <=> root.clipboard-max-mb;
+                            placeholder-text: "2";
+                            width: 64px;
+                        }
+                        KvmButton {
+                            text: "Save";
+                            clicked => { apply-config(root.lock-screen-control, root.mode_index, root.device-name, root.auto-connect-address, root.clipboard-enabled, clipboard-max.text); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+
+                    // Allowed connections (same block as Settings > Devices >
+                    // Computers, second home so it is reachable from
+                    // General too): one 36px line — title, count, a
+                    // FIXED spinner slot (reserved whether or not a scan
+                    // is running, so nothing floats or shifts), then the
+                    // actions. Everything shares the title's centre line.
+                    HorizontalLayout {
+                        vertical-stretch: 0;
+                        height: 36px;
+                        spacing: 8px;
+                        alignment: start;
+                        Text {
+                            text: "Allowed connections";
+                            color: Theme.text;
+                            font-size: 16px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.trusted-peers.length == 0 ? "" : root.trusted-peers.length + " allowed";
+                            color: Theme.faint;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            width: 18px;
+                            height: 36px;
+                            if root.discovery-scanning : SpinnerArc {
+                                x: 0px;
+                                y: 9px;
+                                diameter: 18px;
+                                tick: root.spinner-tick;
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        KvmButton {
+                            text: "Scan";
+                            enabled: !root.discovery-scanning;
+                            clicked => { discover-lan(); }
+                        }
+                        IconButton {
+                            glyph: "+";
+                            clicked => { open-discovery(); }
+                        }
+                    }
+                    // SET-02/03/04/06: fixed anatomy, left to right —
+                    // index; name; 1px VERTICAL separator; IP; flexible
+                    // spacer; 3-dot overflow at the far right edge.
+                    // The order never changes; the 3-dot is rightmost and
+                    // "Remove" lives inside its menu (no trash button).
+                    for peer[i] in root.trusted-peers : Rectangle {
+                        vertical-stretch: 0;
+                        border-radius: 10px;
+                        background: row-hover-g.has-hover ? Theme.hover : Theme.bg;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        // SET-10: the delete confirmation lives inside
+                        // its own row (below the 48px anatomy) so focus
+                        // can trap in the confirm and return to this
+                        // row's 3-dot button.
+                        VerticalLayout {
+                            padding: 0px;
+                            spacing: 0px;
+                            alignment: start;
+                            Rectangle {
+                                height: 48px;
+                                row-hover-g := TouchArea { mouse-cursor: pointer; }
+                                HorizontalLayout {
+                            padding-left: 12px;
+                            // The 3-dot is the row's last element and sits
+                            // on the right edge itself, not inset by a gap.
+                            padding-right: 4px;
+                            spacing: 8px;
+                            // Content hugs the left gutter (index starts
+                            // at the box edge); the spacer pushes the 3-dot
+                            // to the right edge.
+                            alignment: start;
+                            // SET-03: one-based index, left-aligned so it
+                            // starts at the box edge; numbers renumber
+                            // automatically after a delete.
+                            Text {
+                                width: 32px;
+                                text: (i + 1) + ".";
+                                // SET-03: one type level above the 14px
+                                // name/IP, bold, left-aligned in its own
+                                // fixed column so every name starts on the
+                                // same edge. Muted, never name-coloured.
+                                color: Theme.muted;
+                                font-size: 16px;
+                                font-weight: 700;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                            }
+                            // Fixed columns (SET-02 acceptance): name and
+                            // IP share one column edge across EVERY row.
+                            // Tight: a too-wide name field read as a huge
+                            // hollow gap between the name and the IP.
+                            Text {
+                                width: 150px;
+                                text: peer.name == "" ? "Unnamed computer" : peer.name;
+                                color: Theme.text;
+                                font-size: 14px;
+                                font-weight: 600;
+                                overflow: elide;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                            }
+                            // SET-04: one 1px VERTICAL hairline, 24px,
+                            // centred and dark-theme-visible (a #3a3a3a
+                            // line on #121212 was invisible).
+                            Rectangle {
+                                width: 1px;
+                                height: 24px;
+                                background: #5b6675;
+                            }
+                            Text {
+                                width: 150px;
+                                text: peer.address == "" ? "—" : peer.address;
+                                color: Theme.text-2;
+                                font-size: 14px;
+                                overflow: elide;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            // SET-06: 3-dot overflow, at the far right
+                            // edge, opens a menu with the five documented
+                            // actions (Remove is the last). Closes on
+                            // outside click or Escape (PopupWindow
+                            // close-on-click-outside).
+                            Rectangle {
+                                width: 36px;
+                                height: 36px;
+                                border-radius: 8px;
+                                background: over-hit-g.has-hover ? Theme.hover : transparent;
+                                // SET-10: keyboard-navigable (SET-06). Tab
+                                // reaches the 3-dot; Enter/Space toggles the
+                                // menu; Escape closes it.
+                                over-scope-g := FocusScope {
+                                    focus_on_tab_navigation: true;
+                                    key_pressed(event) => {
+                                        if (event.text == "\n" || event.text == " ") {
+                                            if (over-popup-g.is-open) { over-popup-g.close(); } else { over-popup-g.show(); }
+                                            accept
+                                        } else if (event.text == "\u{1b}") {
+                                            over-popup-g.close();
+                                            accept
+                                        } else {
+                                            reject
+                                        }
+                                    }
+                                    key_released(event) => { reject }
+                                }
+                                over-hit-g := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if (over-popup-g.is-open) { over-popup-g.close(); } else { over-popup-g.show(); }
+                                    }
+                                }
+                                accessible-role: button;
+                                accessible-label: "More actions for " + peer.name + ", row " + (i + 1) + " of " + root.trusted-peers.length;
+                                accessible-action-default => { over-popup-g.show(); }
+                                OverflowIcon { x: 9px; y: 9px; }
+                                over-popup-g := PopupWindow {
+                                    x: parent.width - 220px;
+                                    y: 40px;
+                                    width: 220px;
+                                    height: 5 * 36px + 8px;
+                                    close-policy: close-on-click-outside;
+                                    Rectangle {
+                                        width: 100%;
+                                        height: 100%;
+                                        background: Theme.surface;
+                                        border-radius: 11px;
+                                        border-width: 1px;
+                                        border-color: Theme.border;
+                                        clip: true;
+                                        VerticalLayout {
+                                            padding: 4px;
+                                            spacing: 2px;
+                                            alignment: start;
+                                            RowMenuAction {
+                                                label: "View details";
+                                                fg: Theme.text;
+                                                acted => { over-popup-g.close(); root.peer-view-details(peer.fingerprint); }
+                                                escape-closed => { over-popup-g.close(); }
+                                            }
+                                            RowMenuAction {
+                                                label: "Device keys and fingerprint";
+                                                fg: Theme.text;
+                                                acted => { over-popup-g.close(); root.peer-show-keys(peer.fingerprint); }
+                                                escape-closed => { over-popup-g.close(); }
+                                            }
+                                            RowMenuAction {
+                                                label: "Copy address";
+                                                fg: Theme.text;
+                                                acted => { over-popup-g.close(); root.peer-copy-address(peer.fingerprint); }
+                                                escape-closed => { over-popup-g.close(); }
+                                            }
+                                            RowMenuAction {
+                                                label: "Rename";
+                                                fg: Theme.text;
+                                                acted => { over-popup-g.close(); root.peer-rename(peer.fingerprint, peer.name); }
+                                                escape-closed => { over-popup-g.close(); }
+                                            }
+                                            RowMenuAction {
+                                                label: "Remove";
+                                                fg: #f87171;
+                                                acted => { over-popup-g.close(); root.pending-delete = peer.fingerprint; root.pending-delete-name = peer.name == "" ? "Unnamed computer" : peer.name; }
+                                                escape-closed => { over-popup-g.close(); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // SET-05: deletion lives inside the 3-dot menu
+                            // as "Remove" — no separate trash button. The
+                            // 3-dot is the last element on the right edge.
+                                }
+                            }
+                            // SET-10: delete confirmation. Cancel is
+                            // the default (focused on open); Tab /
+                            // Shift-Tab cycle between Cancel and Delete
+                            // only (focus trap); Escape cancels; closing
+                            // returns focus to this row's 3-dot button.
+                            if root.pending-delete == peer.fingerprint : trap-g := FocusScope {
+                                focus_on_tab_navigation: false;
+                                capture_key_pressed(event) => {
+                                    if (event.text == "\u{9}" || event.text == "\u{19}") {
+                                        if (delete-b-g.has-focus) { cancel-b-g.focus(); } else { delete-b-g.focus(); }
+                                        accept
+                                    } else if (event.text == "\u{1b}") {
+                                        cancel-delete();
+                                        over-scope-g.focus();
+                                        accept
+                                    } else {
+                                        reject
+                                    }
+                                }
+                                key_released(event) => { reject }
+                                focus-timer-g := Timer {
+                                    interval: 10ms;
+                                    running: true;
+                                    triggered => {
+                                        cancel-b-g.focus();
+                                        self.running = false;
+                                    }
+                                }
+                                Rectangle {
+                                    vertical-stretch: 0;
+                                    background: Theme.bg;
+                                    border-radius: 10px;
+                                    border-width: 1px;
+                                    border-color: #f87171;
+                                    VerticalLayout {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        alignment: start;
+                                        Text {
+                                            text: "Are you sure you want to remove " + (peer.name == "" ? "Unnamed computer" : peer.name) + "?";
+                                            color: Theme.text;
+                                            font-size: 14px;
+                                            font-weight: 700;
+                                            wrap: word-wrap;
+                                        }
+                                        Text {
+                                            text: "This computer will no longer be allowed to connect automatically.";
+                                            color: Theme.faint;
+                                            font-size: 14px;
+                                            wrap: word-wrap;
+                                        }
+                                        HorizontalLayout {
+                                            alignment: end;
+                                            spacing: 8px;
+                                            cancel-b-g := KvmButton {
+                                                text: "Cancel";
+                                                btn-width: 96px;
+                                                aria-label: "Cancel removing " + peer.name;
+                                                clicked => {
+                                                    cancel-delete();
+                                                    over-scope-g.focus();
+                                                }
+                                            }
+                                            delete-b-g := KvmButton {
+                                                text: "Delete";
+                                                danger: true;
+                                                btn-width: 96px;
+                                                aria-label: "Delete " + peer.name;
+                                                clicked => {
+                                                    confirm-delete();
+                                                    over-scope-g.focus();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Rename editor (SET-06): opened from the overflow menu.
+                    if root.rename-peer-fp != "" : Rectangle {
+                        vertical-stretch: 0;
+                        background: Theme.bg;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+                            alignment: start;
+                            Text {
+                                text: "Rename computer";
+                                color: Theme.text;
+                                font-size: 14px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            rename-edit-g := LineEdit {
+                                height: 36px;
+                                text <=> root.rename-peer-name;
+                                placeholder-text: "Friendly name";
+                                width: 320px;
+                            }
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: 8px;
+                                KvmButton {
+                                    text: "Cancel";
+                                    btn-width: 96px;
+                                    clicked => { root.rename-peer-fp = ""; root.rename-peer-name = ""; }
+                                }
+                                KvmButton {
+                                    text: "Save";
+                                    primary: true;
+                                    btn-width: 96px;
+                                    enabled: rename-edit-g.text != "";
+                                    tooltip: rename-edit-g.text == "" ? "Enter a computer name first" : "";
+                                    clicked => { root.peer-save-rename(root.rename-peer-fp, rename-edit-g.text); root.rename-peer-fp = ""; root.rename-peer-name = ""; }
+                                }
+                            }
+                        }
+                    }
+                    if root.trusted-peers.length == 0 : Text {
+                        vertical-stretch: 0;
+                        text: "No computers yet. Press + to add one, or Scan to find some.";
+                        color: Theme.faint;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
+
+                    // Delete confirmation (SET-10) lives inside its
+                    // own row now (trap + default Cancel + return
+                    // focus); nothing is removed until confirmed.
+
+                    // Discovery sheet: green radar sweep while scanning,
+                    // then the found devices as tappable rows.
+                    if root.discovery-open : Rectangle {
+                        vertical-stretch: 0;
+                        background: Theme.bg;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 8px;
+                            alignment: start;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                alignment: center;
+                                RadarIcon {
+                                    width: 46px;
+                                    height: 46px;
+                                    sweeping: root.discovery-scanning;
+                                    tick: root.spinner-tick;
+                                }
+                                Text {
+                                    text: root.discovered-labels.length == 0
+                                        ? (root.discovery-scanning ? "" : "No devices found yet")
+                                        : root.discovered-labels.length == 1 ? "1 device found" : root.discovered-labels.length + " devices found";
+                                    color: Theme.text-2;
+                                    font-size: 14px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                RescanButton {
+                                    scanning: root.discovery-scanning;
+                                    tick: root.spinner-tick;
+                                    clicked => { discover-lan(); }
+                                }
+                                CloseButton {
+                                    clicked => { close-discovery(); }
+                                }
+                            }
+                            Text {
+                                text: "Tap a device to connect it";
+                                color: Theme.faint;
+                                font-size: 14px;
+                            }
+                            if !root.discovery-scanning && root.discovered-labels.length == 0 : Text {
+                                text: "Press the refresh icon to search again";
+                                color: Theme.faint;
+                                font-size: 14px;
+                            }
+                            for label[i] in root.discovered-labels : Rectangle {
+                                vertical-stretch: 0;
+                                height: 36px;
+                                border-radius: 8px;
+                                background: row-hit-g.has-hover ? Theme.hover : transparent;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                row-hit-g := TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => { connect-discovered(i); close-discovery(); }
                                 }
@@ -3786,7 +4313,6 @@ export component AppWindow inherits Window {
                 }
                 }
             }
-        }
 
             // Approval popups: conditional (not merely hidden) so they
             // occupy ZERO space when nothing pends, and overlapped onto
@@ -4122,6 +4648,7 @@ export component AppWindow inherits Window {
             }
     }
 }
+
 
 
 
