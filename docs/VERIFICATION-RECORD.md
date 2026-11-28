@@ -282,6 +282,54 @@ match (see deploy-windows-v3.log).
   the behavior needs physical crossing verification only this user
   can do with two nodes.
 
+## Fix pass 8, 2026-11-28 (user: launched apps stale, Fn+Shift, Android glitch, final release)
+- ROOT CAUSE of "launched app lacks the changes": the launchers run
+  installed binaries (Windows `C:\Program Files\TheKVM\kvm-ui.exe`,
+  Mint `/usr/bin/kvm-ui` from Nov 25), not the build tree. This pass
+  deploys to the installed paths on both machines and hash-verifies.
+- Connect (launched Windows app, screenshotted): rows numbered
+  "1. This computer" / "2. <peer>" in the same fixed index column,
+  dots flush-left under "Computers", and NO "Connected to <ip>" text
+  anywhere (the grey line came from `session_text`; all three writers
+  now emit "" / "Connecting…", never an address).
+- Settings: allowed-connection inter-block spacing raised to 10px;
+  3-dot sits on the row's right edge (padding-right 4px); index column
+  widened to 32px. New toggle "Switch computers with Fn+Shift+number".
+- Fn+Shift+number SHIPPED (CON-08): daemon consumes Shift+F1..F9 in
+  the topology event path before routing; 1 = home (park + return),
+  2..N = Nth placed trusted peer in Devices order; opens the same
+  bounded `open_topology_session` crossing (two-node and multi-node);
+  `Config.hotkey_switch_enabled` (default on) + `SetConfig` field +
+  `DaemonStatus` + Settings toggle. Unit test:
+  `hotkey_switch_reads_shift_f1_to_f9_only`. Tests: 290 green
+  (daemon 99).
+- Android backend rewritten (user: works first time, then freezes and
+  flips between trackpad/Devices every few seconds):
+  (1) single writer task owns the send stream — input, Pong and text
+  queue through one channel; the shared-mutex Pong stall freeze is
+  gone; writes bounded at 2s, failure evicts once.
+  (2) connect-in-flight guard: auto-connect can no longer spawn
+  parallel attempts during the up-to-180s Allow wait that replaced
+  each other's sessions (the flip-flop generator).
+  (3) process-wide input sequence, never reset on reconnect (desktop
+  dedup no longer drops the new session as stale).
+  (4) `on_session_lost` never changes phase: the trackpad stays up
+  with an amber "Reconnecting" strip; background-device loss touches
+  neither phase nor active device; `stop` of a background device no
+  longer switches screens. Discovery no longer repaints the status
+  line every ~2s while controlling.
+  (5) frontend: raw touch/frame debug counters removed from the
+  trackpad; reconnecting state is a proper amber banner + amber dot.
+  `kvm-android` compiles for `aarch64-linux-android`; APK rebuilt.
+  Physical-device verification still pending (no device attached).
+- Horizontal scroll: capture (hook HWHEEL + raw HID + PTP both-axis
+  pan), wire (SmoothWheel x, detent downgrade debt per axis), and
+  injection (Windows MOUSEEVENTF_HWHEEL chunks; Linux REL_HWHEEL +
+  REL_HWHEEL_HI_RES with banked detents) all carry X and are covered
+  by unit tests at each hop. No code defect found by inspection this
+  pass; needs the user's physical gesture on the final build to
+  confirm or to capture a failing census line.
+
 ## Definition of done status
 Implemented + evidenced: DS (type, targets, colors, focus ring,
 pressed/disabled tooltips, reduced motion), SET (rows, menu, header,

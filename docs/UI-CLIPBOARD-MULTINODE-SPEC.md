@@ -120,6 +120,8 @@ The mapping is good; the execution is not yet cohesive.
 
 **CON-07 — Empty state and truncation.** With no peers, the overlay still shows the local row and a one-line prompt to add a computer. Names and addresses elide with tooltips. The roster never collapses to a single row merely because only one peer is connected.
 
+**CON-08 — Instant switching by number.** Pressing Fn+Shift+<number> (delivered to the OS as Shift+F1..F9) switches control without any cursor travel: 1 returns to this computer; 2..N drives the Nth trusted computer in Devices order that has a placed screen. It works identically in a two-node link and in multi-node topology, is consumed by the daemon (never typed into the peer), and can be turned off in Settings ("Switch computers with Fn+Shift+number"). An unplaced or out-of-range number is a logged no-op, never a wrong drive. The Connect grid numbers its rows (1. This computer, 2. Connected computer) with the same one-based indexing.
+
 **Acceptance:** vision passes confirm same-line starts, a shared dot column, body-size text, and a complete roster including Android and multi-node peers. Black-box passes connect and disconnect each row type. No row overflows at any supported size.
 
 ## 5. Multi-node: a real, usable protocol
